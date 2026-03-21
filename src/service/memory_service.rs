@@ -1,9 +1,5 @@
 use std::{
-    path::PathBuf,
-    sync::{
-        atomic::{AtomicU64, Ordering},
-        Arc,
-    },
+    sync::atomic::{AtomicU64, Ordering},
     time::{SystemTime, UNIX_EPOCH},
 };
 
@@ -35,24 +31,22 @@ impl From<MemoryRecord> for IngestMemoryResponse {
 
 #[derive(Debug, Clone)]
 pub struct MemoryService {
-    db_path: Arc<PathBuf>,
+    repository: DuckDbRepository,
 }
 
 impl MemoryService {
-    pub fn new(db_path: impl Into<PathBuf>) -> Self {
-        Self {
-            db_path: Arc::new(db_path.into()),
-        }
+    pub fn new(repository: DuckDbRepository) -> Self {
+        Self { repository }
     }
 
     pub async fn ingest(
         &self,
         request: IngestMemoryRequest,
     ) -> Result<IngestMemoryResponse, StorageError> {
-        let repo = DuckDbRepository::open(self.db_path.as_ref()).await?;
         let content_hash = compute_content_hash(&request);
 
-        if let Some(existing) = repo
+        if let Some(existing) = self
+            .repository
             .find_by_idempotency_or_hash(&request.tenant, &request.idempotency_key, &content_hash)
             .await?
         {
@@ -89,7 +83,7 @@ impl MemoryService {
             last_validated_at: None,
         };
 
-        let stored = repo.insert_memory(memory).await?;
+        let stored = self.repository.insert_memory(memory).await?;
         Ok(stored.into())
     }
 }

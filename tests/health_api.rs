@@ -49,7 +49,7 @@ impl TestApp {
 
 async fn test_app() -> TestApp {
     TestApp {
-        router: mem::app::router(),
+        router: mem::app::router().await.expect("app router should build"),
     }
 }
 

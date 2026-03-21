@@ -3,10 +3,10 @@ pub mod health;
 
 use axum::Router;
 
-pub fn router() -> Router {
-    let app_state = memory::AppState::local();
+use crate::app::AppState;
 
-    Router::new()
-        .merge(health::router())
-        .merge(memory::router().with_state(app_state))
+pub fn router() -> Router<AppState> {
+    Router::<AppState>::new()
+        .merge(health::router::<AppState>())
+        .merge(memory::router())
 }

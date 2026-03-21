@@ -4,6 +4,6 @@ use mem::{app, config, error};
 async fn main() -> error::Result<()> {
     let config = config::Config::local();
     let listener = tokio::net::TcpListener::bind(&config.bind_addr).await?;
-    axum::serve(listener, app::router()).await?;
+    axum::serve(listener, app::router().await?).await?;
     Ok(())
 }

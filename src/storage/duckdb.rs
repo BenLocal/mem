@@ -23,7 +23,7 @@ pub struct FeedbackEvent {
     pub created_at: String,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct DuckDbRepository {
     conn: Arc<Mutex<Connection>>,
 }
