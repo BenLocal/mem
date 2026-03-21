@@ -46,7 +46,7 @@ pub struct PatternItem {
     pub source_summary: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
 #[serde(rename_all = "snake_case")]
 pub struct SearchMemoryResponse {
     pub directives: Vec<DirectiveItem>,
@@ -54,15 +54,4 @@ pub struct SearchMemoryResponse {
     pub reusable_patterns: Vec<PatternItem>,
     #[serde(skip_serializing_if = "skip_none")]
     pub suggested_workflow: Option<WorkflowOutline>,
-}
-
-impl Default for SearchMemoryResponse {
-    fn default() -> Self {
-        Self {
-            directives: Vec::new(),
-            relevant_facts: Vec::new(),
-            reusable_patterns: Vec::new(),
-            suggested_workflow: None,
-        }
-    }
 }

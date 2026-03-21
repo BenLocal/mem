@@ -9,9 +9,7 @@ use serde::Deserialize;
 use crate::{
     app::AppState,
     domain::episode::{EpisodeResponse, IngestEpisodeRequest},
-    domain::memory::{
-        FeedbackKind, IngestMemoryRequest, MemoryType, Scope, Visibility, WriteMode,
-    },
+    domain::memory::{FeedbackKind, IngestMemoryRequest, MemoryType, Scope, Visibility, WriteMode},
     domain::query::SearchMemoryRequest,
     error::AppError,
     service::IngestMemoryResponse,

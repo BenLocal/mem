@@ -73,7 +73,7 @@ impl Default for IngestEpisodeRequest {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
 #[serde(rename_all = "snake_case")]
 pub struct EpisodeRecord {
     pub episode_id: String,
@@ -98,30 +98,6 @@ pub struct EpisodeRecord {
     pub updated_at: String,
     #[serde(skip_serializing_if = "skip_none")]
     pub workflow_candidate: Option<WorkflowCandidate>,
-}
-
-impl Default for EpisodeRecord {
-    fn default() -> Self {
-        Self {
-            episode_id: String::new(),
-            tenant: String::new(),
-            goal: String::new(),
-            steps: Vec::new(),
-            outcome: String::new(),
-            evidence: Vec::new(),
-            scope: Scope::default(),
-            visibility: Visibility::default(),
-            project: None,
-            repo: None,
-            module: None,
-            tags: Vec::new(),
-            source_agent: String::new(),
-            idempotency_key: None,
-            created_at: String::new(),
-            updated_at: String::new(),
-            workflow_candidate: None,
-        }
-    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

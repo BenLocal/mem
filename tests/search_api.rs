@@ -29,6 +29,20 @@ struct TestResponse {
     body: String,
 }
 
+struct MemorySpec<'a> {
+    tenant: &'a str,
+    memory_id: &'a str,
+    memory_type: MemoryType,
+    scope: Scope,
+    repo: Option<&'a str>,
+    project: Option<&'a str>,
+    module: Option<&'a str>,
+    content: &'a str,
+    summary: &'a str,
+    updated_at: &'a str,
+    decay_score: f32,
+}
+
 impl TestResponse {
     fn status(&self) -> u16 {
         self.status.as_u16()
@@ -64,44 +78,32 @@ impl TestApp {
     }
 }
 
-fn memory(
-    tenant: &str,
-    memory_id: &str,
-    memory_type: MemoryType,
-    scope: Scope,
-    repo: Option<&str>,
-    project: Option<&str>,
-    module: Option<&str>,
-    content: &str,
-    summary: &str,
-    updated_at: &str,
-    decay_score: f32,
-) -> MemoryRecord {
+fn memory(spec: MemorySpec<'_>) -> MemoryRecord {
     MemoryRecord {
-        memory_id: memory_id.into(),
-        tenant: tenant.into(),
-        memory_type,
+        memory_id: spec.memory_id.into(),
+        tenant: spec.tenant.into(),
+        memory_type: spec.memory_type,
         status: MemoryStatus::Active,
-        scope,
+        scope: spec.scope,
         visibility: Visibility::Shared,
         version: 1,
-        summary: summary.into(),
-        content: content.into(),
-        evidence: vec![format!("docs/{memory_id}.md")],
-        code_refs: vec![format!("src/{memory_id}.rs")],
-        project: project.map(str::to_string),
-        repo: repo.map(str::to_string),
-        module: module.map(str::to_string),
+        summary: spec.summary.into(),
+        content: spec.content.into(),
+        evidence: vec![format!("docs/{}.md", spec.memory_id)],
+        code_refs: vec![format!("src/{}.rs", spec.memory_id)],
+        project: spec.project.map(str::to_string),
+        repo: spec.repo.map(str::to_string),
+        module: spec.module.map(str::to_string),
         task_type: Some("implementation".into()),
         tags: vec!["search".into()],
         confidence: 0.9,
-        decay_score,
-        content_hash: format!("hash-{memory_id}"),
+        decay_score: spec.decay_score,
+        content_hash: format!("hash-{}", spec.memory_id),
         idempotency_key: None,
         supersedes_memory_id: None,
         source_agent: "codex-worker".into(),
-        created_at: updated_at.into(),
-        updated_at: updated_at.into(),
+        created_at: spec.updated_at.into(),
+        updated_at: spec.updated_at.into(),
         last_validated_at: None,
     }
 }
@@ -187,58 +189,58 @@ fn search_response_serializes_compressed_shapes() {
 #[tokio::test]
 async fn search_returns_compressed_memory_pack() {
     let app = seeded_search_app(vec![
-        memory(
-            "local",
-            "mem_pref",
-            MemoryType::Preference,
-            Scope::Global,
-            None,
-            None,
-            None,
-            "Prefer concise answers and mention rollback risk",
-            "prefer concise answers",
-            "2026-03-21T00:00:01Z",
-            0.0,
-        ),
-        memory(
-            "local",
-            "mem_fact",
-            MemoryType::Implementation,
-            Scope::Repo,
-            Some("billing"),
-            Some("billing"),
-            Some("invoice"),
-            "DuckDB stores canonical memory records and keeps indexes local",
-            "DuckDB storage layout",
-            "2026-03-21T00:00:02Z",
-            0.0,
-        ),
-        memory(
-            "local",
-            "mem_pattern",
-            MemoryType::Experience,
-            Scope::Workspace,
-            Some("billing"),
-            Some("billing"),
-            Some("invoice"),
-            "When retrying invoice jobs, check logs, isolate cache state, then verify the fix",
-            "retry debugging pattern",
-            "2026-03-21T00:00:03Z",
-            0.0,
-        ),
-        memory(
-            "local",
-            "mem_workflow",
-            MemoryType::Workflow,
-            Scope::Repo,
-            Some("billing"),
-            Some("billing"),
-            Some("invoice"),
-            "inspect logs; trace the job; patch the retry path; rerun the scenario; confirm success",
-            "invoice retry workflow",
-            "2026-03-21T00:00:04Z",
-            0.0,
-        ),
+        memory(MemorySpec {
+            tenant: "local",
+            memory_id: "mem_pref",
+            memory_type: MemoryType::Preference,
+            scope: Scope::Global,
+            repo: None,
+            project: None,
+            module: None,
+            content: "Prefer concise answers and mention rollback risk",
+            summary: "prefer concise answers",
+            updated_at: "2026-03-21T00:00:01Z",
+            decay_score: 0.0,
+        }),
+        memory(MemorySpec {
+            tenant: "local",
+            memory_id: "mem_fact",
+            memory_type: MemoryType::Implementation,
+            scope: Scope::Repo,
+            repo: Some("billing"),
+            project: Some("billing"),
+            module: Some("invoice"),
+            content: "DuckDB stores canonical memory records and keeps indexes local",
+            summary: "DuckDB storage layout",
+            updated_at: "2026-03-21T00:00:02Z",
+            decay_score: 0.0,
+        }),
+        memory(MemorySpec {
+            tenant: "local",
+            memory_id: "mem_pattern",
+            memory_type: MemoryType::Experience,
+            scope: Scope::Workspace,
+            repo: Some("billing"),
+            project: Some("billing"),
+            module: Some("invoice"),
+            content: "When retrying invoice jobs, check logs, isolate cache state, then verify the fix",
+            summary: "retry debugging pattern",
+            updated_at: "2026-03-21T00:00:03Z",
+            decay_score: 0.0,
+        }),
+        memory(MemorySpec {
+            tenant: "local",
+            memory_id: "mem_workflow",
+            memory_type: MemoryType::Workflow,
+            scope: Scope::Repo,
+            repo: Some("billing"),
+            project: Some("billing"),
+            module: Some("invoice"),
+            content: "inspect logs; trace the job; patch the retry path; rerun the scenario; confirm success",
+            summary: "invoice retry workflow",
+            updated_at: "2026-03-21T00:00:04Z",
+            decay_score: 0.0,
+        }),
     ])
     .await;
 
@@ -271,32 +273,32 @@ async fn search_returns_compressed_memory_pack() {
 #[tokio::test]
 async fn scope_bias_prefers_matching_repo_memory() {
     let app = seeded_search_app(vec![
-        memory(
-            "local",
-            "mem_other",
-            MemoryType::Implementation,
-            Scope::Repo,
-            Some("analytics"),
-            Some("analytics"),
-            Some("reports"),
-            "Fix report rendering in the analytics pipeline",
-            "analytics fix",
-            "2026-03-21T00:00:01Z",
-            0.0,
-        ),
-        memory(
-            "local",
-            "mem_billing",
-            MemoryType::Implementation,
-            Scope::Repo,
-            Some("billing"),
-            Some("billing"),
-            Some("invoice"),
-            "Invoice retry failures are caused by stale cache state",
-            "billing fix",
-            "2026-03-21T00:00:02Z",
-            0.0,
-        ),
+        memory(MemorySpec {
+            tenant: "local",
+            memory_id: "mem_other",
+            memory_type: MemoryType::Implementation,
+            scope: Scope::Repo,
+            repo: Some("analytics"),
+            project: Some("analytics"),
+            module: Some("reports"),
+            content: "Fix report rendering in the analytics pipeline",
+            summary: "analytics fix",
+            updated_at: "2026-03-21T00:00:01Z",
+            decay_score: 0.0,
+        }),
+        memory(MemorySpec {
+            tenant: "local",
+            memory_id: "mem_billing",
+            memory_type: MemoryType::Implementation,
+            scope: Scope::Repo,
+            repo: Some("billing"),
+            project: Some("billing"),
+            module: Some("invoice"),
+            content: "Invoice retry failures are caused by stale cache state",
+            summary: "billing fix",
+            updated_at: "2026-03-21T00:00:02Z",
+            decay_score: 0.0,
+        }),
     ])
     .await;
 
@@ -325,32 +327,32 @@ async fn scope_bias_prefers_matching_repo_memory() {
 #[tokio::test]
 async fn stale_memory_penalty_prefers_recent_memory() {
     let app = seeded_search_app(vec![
-        memory(
-            "local",
-            "mem_old",
-            MemoryType::Implementation,
-            Scope::Repo,
-            Some("billing"),
-            Some("billing"),
-            Some("invoice"),
-            "Retry failures happen when cache metadata is stale",
-            "retry failure note",
-            "2025-03-21T00:00:01Z",
-            0.8,
-        ),
-        memory(
-            "local",
-            "mem_new",
-            MemoryType::Implementation,
-            Scope::Repo,
-            Some("billing"),
-            Some("billing"),
-            Some("invoice"),
-            "Retry failures happen when cache metadata is stale",
-            "retry failure note",
-            "2026-03-21T00:00:01Z",
-            0.0,
-        ),
+        memory(MemorySpec {
+            tenant: "local",
+            memory_id: "mem_old",
+            memory_type: MemoryType::Implementation,
+            scope: Scope::Repo,
+            repo: Some("billing"),
+            project: Some("billing"),
+            module: Some("invoice"),
+            content: "Retry failures happen when cache metadata is stale",
+            summary: "retry failure note",
+            updated_at: "2025-03-21T00:00:01Z",
+            decay_score: 0.8,
+        }),
+        memory(MemorySpec {
+            tenant: "local",
+            memory_id: "mem_new",
+            memory_type: MemoryType::Implementation,
+            scope: Scope::Repo,
+            repo: Some("billing"),
+            project: Some("billing"),
+            module: Some("invoice"),
+            content: "Retry failures happen when cache metadata is stale",
+            summary: "retry failure note",
+            updated_at: "2026-03-21T00:00:01Z",
+            decay_score: 0.0,
+        }),
     ])
     .await;
 
@@ -376,32 +378,32 @@ async fn stale_memory_penalty_prefers_recent_memory() {
 #[tokio::test]
 async fn search_respects_tenant_scope() {
     let app = seeded_search_app(vec![
-        memory(
-            "tenant-a",
-            "mem_a",
-            MemoryType::Implementation,
-            Scope::Repo,
-            Some("billing"),
-            Some("billing"),
-            Some("invoice"),
-            "Invoice retry failures are caused by stale cache state",
-            "billing fix tenant a",
-            "2026-03-21T00:00:02Z",
-            0.0,
-        ),
-        memory(
-            "tenant-b",
-            "mem_b",
-            MemoryType::Implementation,
-            Scope::Repo,
-            Some("billing"),
-            Some("billing"),
-            Some("invoice"),
-            "Invoice retry failures are caused by stale cache state",
-            "billing fix tenant b",
-            "2026-03-21T00:00:03Z",
-            0.0,
-        ),
+        memory(MemorySpec {
+            tenant: "tenant-a",
+            memory_id: "mem_a",
+            memory_type: MemoryType::Implementation,
+            scope: Scope::Repo,
+            repo: Some("billing"),
+            project: Some("billing"),
+            module: Some("invoice"),
+            content: "Invoice retry failures are caused by stale cache state",
+            summary: "billing fix tenant a",
+            updated_at: "2026-03-21T00:00:02Z",
+            decay_score: 0.0,
+        }),
+        memory(MemorySpec {
+            tenant: "tenant-b",
+            memory_id: "mem_b",
+            memory_type: MemoryType::Implementation,
+            scope: Scope::Repo,
+            repo: Some("billing"),
+            project: Some("billing"),
+            module: Some("invoice"),
+            content: "Invoice retry failures are caused by stale cache state",
+            summary: "billing fix tenant b",
+            updated_at: "2026-03-21T00:00:03Z",
+            decay_score: 0.0,
+        }),
     ])
     .await;
 
@@ -427,32 +429,32 @@ async fn search_respects_tenant_scope() {
 #[tokio::test]
 async fn negative_feedback_penalizes_future_recall() {
     let app = seeded_search_app(vec![
-        memory(
-            "local",
-            "mem_target",
-            MemoryType::Implementation,
-            Scope::Repo,
-            Some("billing"),
-            Some("billing"),
-            Some("invoice"),
-            "Invoice retry failures are caused by stale cache state",
-            "invoice retry failure note",
-            "2026-03-21T00:00:02Z",
-            0.0,
-        ),
-        memory(
-            "local",
-            "mem_backup",
-            MemoryType::Implementation,
-            Scope::Repo,
-            Some("analytics"),
-            Some("analytics"),
-            Some("reports"),
-            "Invoice retry failures are caused by stale cache state",
-            "invoice retry failure note",
-            "2026-03-21T00:00:01Z",
-            0.0,
-        ),
+        memory(MemorySpec {
+            tenant: "local",
+            memory_id: "mem_target",
+            memory_type: MemoryType::Implementation,
+            scope: Scope::Repo,
+            repo: Some("billing"),
+            project: Some("billing"),
+            module: Some("invoice"),
+            content: "Invoice retry failures are caused by stale cache state",
+            summary: "invoice retry failure note",
+            updated_at: "2026-03-21T00:00:02Z",
+            decay_score: 0.0,
+        }),
+        memory(MemorySpec {
+            tenant: "local",
+            memory_id: "mem_backup",
+            memory_type: MemoryType::Implementation,
+            scope: Scope::Repo,
+            repo: Some("analytics"),
+            project: Some("analytics"),
+            module: Some("reports"),
+            content: "Invoice retry failures are caused by stale cache state",
+            summary: "invoice retry failure note",
+            updated_at: "2026-03-21T00:00:01Z",
+            decay_score: 0.0,
+        }),
     ])
     .await;
 
@@ -472,7 +474,10 @@ async fn negative_feedback_penalizes_future_recall() {
         .await;
 
     assert_eq!(before.status(), 200);
-    assert_eq!(before.json()["relevant_facts"][0]["memory_id"], "mem_target");
+    assert_eq!(
+        before.json()["relevant_facts"][0]["memory_id"],
+        "mem_target"
+    );
 
     let feedback = app
         .post_json(

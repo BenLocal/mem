@@ -119,7 +119,9 @@ async fn test_app() -> TestApp {
 async fn test_app_with_unavailable_graph() -> TestApp {
     let temp_dir = tempdir().unwrap();
     let db_path = temp_dir.path().join("graph-unavailable.duckdb");
-    let repository = mem::storage::DuckDbRepository::open(&db_path).await.unwrap();
+    let repository = mem::storage::DuckDbRepository::open(&db_path)
+        .await
+        .unwrap();
     let state = AppState {
         memory_service: MemoryService::with_graph(repository, Arc::new(IndraDbGraphAdapter::new())),
     };
@@ -205,8 +207,7 @@ async fn http_neighbors_returns_graph_edges_after_ingest() {
 
     assert_eq!(neighbors.status(), 200);
     assert!(neighbors.json().as_array().unwrap().iter().any(|edge| {
-        edge["relation"] == "relevant_to"
-            && edge["to_node_id"] == "module:mem:invoice"
+        edge["relation"] == "relevant_to" && edge["to_node_id"] == "module:mem:invoice"
     }));
 }
 

@@ -138,14 +138,26 @@ impl IndraDbGraphAdapter {
 
 impl GraphStore for IndraDbGraphAdapter {
     fn sync_memory<'a>(&'a self, _memory: &'a MemoryRecord) -> GraphFuture<'a, ()> {
-        Box::pin(async move { Err(GraphError::Unavailable("indra db graph sync is not configured")) })
+        Box::pin(async move {
+            Err(GraphError::Unavailable(
+                "indra db graph sync is not configured",
+            ))
+        })
     }
 
     fn neighbors<'a>(&'a self, _node_id: &'a str) -> GraphFuture<'a, Vec<GraphEdge>> {
-        Box::pin(async move { Err(GraphError::Unavailable("indra db graph lookup is not configured")) })
+        Box::pin(async move {
+            Err(GraphError::Unavailable(
+                "indra db graph lookup is not configured",
+            ))
+        })
     }
 
     fn related_memory_ids<'a>(&'a self, _node_ids: &'a [String]) -> GraphFuture<'a, Vec<String>> {
-        Box::pin(async move { Err(GraphError::Unavailable("indra db graph lookup is not configured")) })
+        Box::pin(async move {
+            Err(GraphError::Unavailable(
+                "indra db graph lookup is not configured",
+            ))
+        })
     }
 }

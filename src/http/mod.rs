@@ -1,7 +1,7 @@
-pub mod memory;
-pub mod health;
-pub mod review;
 pub mod graph;
+pub mod health;
+pub mod memory;
+pub mod review;
 
 use axum::Router;
 

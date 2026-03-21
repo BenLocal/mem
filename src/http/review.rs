@@ -6,18 +6,17 @@ use axum::{
 };
 use serde::Deserialize;
 
-use crate::{
-    app::AppState,
-    domain::memory::EditPendingRequest,
-    error::AppError,
-};
+use crate::{app::AppState, domain::memory::EditPendingRequest, error::AppError};
 
 pub fn router() -> Router<AppState> {
     Router::new()
         .route("/reviews/pending", get(list_pending))
         .route("/reviews/pending/accept", post(accept_pending))
         .route("/reviews/pending/reject", post(reject_pending))
-        .route("/reviews/pending/edit_accept", post(edit_and_accept_pending))
+        .route(
+            "/reviews/pending/edit_accept",
+            post(edit_and_accept_pending),
+        )
 }
 
 #[derive(Debug, Deserialize)]
@@ -39,7 +38,11 @@ async fn list_pending(
     State(app): State<AppState>,
     Query(query): Query<PendingReviewQuery>,
 ) -> Result<Json<Vec<crate::domain::memory::MemoryRecord>>, AppError> {
-    Ok(Json(app.memory_service.list_pending_review(&query.tenant).await?))
+    Ok(Json(
+        app.memory_service
+            .list_pending_review(&query.tenant)
+            .await?,
+    ))
 }
 
 async fn accept_pending(

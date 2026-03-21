@@ -10,7 +10,7 @@ use thiserror::Error;
 use crate::domain::{episode::EpisodeResponse, memory::MemoryDetailResponse};
 use crate::{
     domain::{
-        episode::{IngestEpisodeRequest, EpisodeRecord},
+        episode::{EpisodeRecord, IngestEpisodeRequest},
         memory::{
             EditPendingRequest, EditPendingResponse, FeedbackKind, GraphEdge, IngestMemoryRequest,
             MemoryRecord, MemoryStatus,
@@ -343,18 +343,12 @@ impl MemoryService {
         query: SearchMemoryRequest,
     ) -> Result<SearchMemoryResponse, ServiceError> {
         let tenant = query.tenant.as_deref().unwrap_or("local");
-        let candidates = self
-            .repository
-            .search_candidates(tenant)
-            .await?;
+        let candidates = self.repository.search_candidates(tenant).await?;
         let ranked = match retrieve::rank_with_graph(candidates, &query, self.graph.as_ref()).await
         {
             Ok(ranked) => ranked,
             Err(GraphError::Unavailable(_)) => {
-                let base = self
-                    .repository
-                    .search_candidates(tenant)
-                    .await?;
+                let base = self.repository.search_candidates(tenant).await?;
                 retrieve::rank_candidates(base, &query)
             }
             Err(error) => return Err(error.into()),

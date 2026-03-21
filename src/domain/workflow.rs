@@ -11,7 +11,7 @@ pub struct WorkflowOutline {
     pub success_signals: Vec<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
 #[serde(rename_all = "snake_case")]
 pub struct WorkflowCandidate {
     pub memory_id: Option<String>,
@@ -23,20 +23,4 @@ pub struct WorkflowCandidate {
     pub failure_signals: Vec<String>,
     pub evidence: Vec<String>,
     pub scope: Scope,
-}
-
-impl Default for WorkflowCandidate {
-    fn default() -> Self {
-        Self {
-            memory_id: None,
-            goal: String::new(),
-            preconditions: Vec::new(),
-            steps: Vec::new(),
-            decision_points: Vec::new(),
-            success_signals: Vec::new(),
-            failure_signals: Vec::new(),
-            evidence: Vec::new(),
-            scope: Scope::default(),
-        }
-    }
 }

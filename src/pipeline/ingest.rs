@@ -5,7 +5,9 @@ use std::{
 
 use serde_json::json;
 
-use crate::domain::memory::{GraphEdge, IngestMemoryRequest, MemoryRecord, MemoryStatus, MemoryType, WriteMode};
+use crate::domain::memory::{
+    GraphEdge, IngestMemoryRequest, MemoryRecord, MemoryStatus, MemoryType, WriteMode,
+};
 
 pub fn initial_status(memory_type: &MemoryType, write_mode: &WriteMode) -> MemoryStatus {
     match (memory_type, write_mode) {
@@ -88,7 +90,11 @@ pub fn extract_graph_edges(memory: &MemoryRecord) -> Vec<GraphEdge> {
         });
     }
 
-    if let Some(workflow_id) = memory.task_type.as_deref().filter(|value| !value.is_empty()) {
+    if let Some(workflow_id) = memory
+        .task_type
+        .as_deref()
+        .filter(|value| !value.is_empty())
+    {
         edges.push(GraphEdge {
             from_node_id: from_node_id.clone(),
             to_node_id: workflow_node_id(workflow_id),
@@ -102,7 +108,11 @@ pub fn extract_graph_edges(memory: &MemoryRecord) -> Vec<GraphEdge> {
         });
     }
 
-    if let Some(previous) = memory.supersedes_memory_id.as_deref().filter(|value| !value.is_empty()) {
+    if let Some(previous) = memory
+        .supersedes_memory_id
+        .as_deref()
+        .filter(|value| !value.is_empty())
+    {
         edges.push(GraphEdge {
             from_node_id: from_node_id.clone(),
             to_node_id: memory_node_id(previous),

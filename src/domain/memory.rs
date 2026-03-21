@@ -100,7 +100,7 @@ impl FeedbackKind {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
 #[serde(rename_all = "snake_case")]
 pub struct IngestMemoryRequest {
     pub tenant: String,
@@ -123,28 +123,6 @@ pub struct IngestMemoryRequest {
     #[serde(skip_serializing_if = "skip_none")]
     pub idempotency_key: Option<String>,
     pub write_mode: WriteMode,
-}
-
-impl Default for IngestMemoryRequest {
-    fn default() -> Self {
-        Self {
-            tenant: String::new(),
-            memory_type: MemoryType::default(),
-            content: String::new(),
-            evidence: Vec::new(),
-            code_refs: Vec::new(),
-            scope: Scope::default(),
-            visibility: Visibility::default(),
-            project: None,
-            repo: None,
-            module: None,
-            task_type: None,
-            tags: Vec::new(),
-            source_agent: String::new(),
-            idempotency_key: None,
-            write_mode: WriteMode::default(),
-        }
-    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]

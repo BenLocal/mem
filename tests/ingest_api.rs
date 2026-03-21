@@ -4,7 +4,9 @@ use axum::{
 };
 use mem::{
     app::{self, AppState},
-    domain::memory::{IngestMemoryRequest, MemoryRecord, MemoryStatus, MemoryType, Scope, Visibility, WriteMode},
+    domain::memory::{
+        IngestMemoryRequest, MemoryRecord, MemoryStatus, MemoryType, Scope, Visibility, WriteMode,
+    },
     http,
     pipeline::ingest::{compute_content_hash, initial_status},
     storage::DuckDbRepository,
@@ -176,7 +178,10 @@ fn content_hash_is_deterministic_for_same_request() {
         write_mode: WriteMode::Auto,
     };
 
-    assert_eq!(compute_content_hash(&request), compute_content_hash(&request));
+    assert_eq!(
+        compute_content_hash(&request),
+        compute_content_hash(&request)
+    );
 }
 
 #[tokio::test]
@@ -350,7 +355,10 @@ async fn get_memory_returns_full_record() {
 
     assert_eq!(response.status(), 200);
     assert_eq!(response.json()["memory"]["memory_id"], memory_id);
-    assert_eq!(response.json()["memory"]["content"], "invalidate cache when schema changes");
+    assert_eq!(
+        response.json()["memory"]["content"],
+        "invalidate cache when schema changes"
+    );
     assert!(response.json()["memory"]["content_hash"].is_string());
     assert!(response.json()["version_chain"].is_array());
     assert_eq!(response.json()["graph_links"], json!([]));
