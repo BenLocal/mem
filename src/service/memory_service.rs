@@ -7,9 +7,10 @@ use serde::Serialize;
 use std::sync::Arc;
 use thiserror::Error;
 
-use crate::domain::memory::MemoryDetailResponse;
+use crate::domain::{episode::EpisodeResponse, memory::MemoryDetailResponse};
 use crate::{
     domain::{
+        episode::{IngestEpisodeRequest, EpisodeRecord},
         memory::{
             EditPendingRequest, EditPendingResponse, FeedbackKind, GraphEdge, IngestMemoryRequest,
             MemoryRecord, MemoryStatus,
@@ -17,10 +18,12 @@ use crate::{
         query::{SearchMemoryRequest, SearchMemoryResponse},
     },
     pipeline::ingest::{compute_content_hash, initial_status, memory_node_id},
+    pipeline::workflow,
     pipeline::{compress, retrieve},
     storage::{DuckDbRepository, GraphError, GraphStore, LocalGraphAdapter, StorageError},
 };
 
+static EPISODE_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 static MEMORY_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 static FEEDBACK_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 
@@ -115,6 +118,58 @@ impl MemoryService {
         let stored = self.repository.insert_memory(memory).await?;
         ignore_graph_unavailable(self.graph.sync_memory(&stored).await)?;
         Ok(stored.into())
+    }
+
+    pub async fn ingest_episode(
+        &self,
+        request: IngestEpisodeRequest,
+    ) -> Result<EpisodeResponse, ServiceError> {
+        let episode_id = next_episode_id();
+        let now = current_timestamp();
+        let mut episode = EpisodeRecord {
+            episode_id: episode_id.clone(),
+            tenant: request.tenant.clone(),
+            goal: request.goal.clone(),
+            steps: request.steps.clone(),
+            outcome: request.outcome.clone(),
+            evidence: request.evidence.clone(),
+            scope: request.scope.clone(),
+            visibility: request.visibility.clone(),
+            project: request.project.clone(),
+            repo: request.repo.clone(),
+            module: request.module.clone(),
+            tags: request.tags.clone(),
+            source_agent: request.source_agent.clone(),
+            idempotency_key: request.idempotency_key.clone(),
+            created_at: now.clone(),
+            updated_at: now,
+            workflow_candidate: None,
+        };
+
+        let mut workflow_candidate = {
+            let mut episodes = self
+                .repository
+                .list_successful_episodes_for_tenant(&episode.tenant)
+                .await?;
+            episodes.push(episode.clone());
+            workflow::maybe_extract_workflow(&episodes)
+        };
+
+        if let Some(candidate) = workflow_candidate.as_mut() {
+            let workflow_memory = self
+                .ingest(workflow::workflow_memory_request(&episode, candidate))
+                .await?;
+            candidate.memory_id = Some(workflow_memory.memory_id);
+            episode.workflow_candidate = Some(candidate.clone());
+        }
+
+        self.repository.insert_episode(episode).await?;
+
+        Ok(EpisodeResponse {
+            episode_id,
+            status: "created".to_string(),
+            workflow_candidate,
+        })
     }
 
     pub async fn list_pending_review(
@@ -355,4 +410,9 @@ fn next_feedback_id() -> String {
 fn next_memory_id() -> String {
     let sequence = MEMORY_SEQUENCE.fetch_add(1, Ordering::Relaxed);
     format!("mem_{sequence:020}")
+}
+
+fn next_episode_id() -> String {
+    let sequence = EPISODE_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+    format!("ep_{sequence:020}")
 }

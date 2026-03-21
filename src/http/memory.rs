@@ -8,6 +8,7 @@ use serde::Deserialize;
 
 use crate::{
     app::AppState,
+    domain::episode::{EpisodeResponse, IngestEpisodeRequest},
     domain::memory::{
         FeedbackKind, IngestMemoryRequest, MemoryType, Scope, Visibility, WriteMode,
     },
@@ -19,6 +20,7 @@ use crate::{
 pub fn router() -> Router<AppState> {
     Router::new()
         .route("/memories", post(ingest_memory))
+        .route("/episodes", post(ingest_episode))
         .route("/memories/search", post(search_memory))
         .route("/memories/feedback", post(submit_feedback))
         .route("/memories/:id", get(get_memory))
@@ -83,6 +85,14 @@ async fn ingest_memory(
     Json(request): Json<HttpIngestMemoryRequest>,
 ) -> Result<(StatusCode, Json<IngestMemoryResponse>), AppError> {
     let response = app.memory_service.ingest(request.into()).await?;
+    Ok((StatusCode::CREATED, Json(response)))
+}
+
+async fn ingest_episode(
+    State(app): State<AppState>,
+    Json(request): Json<IngestEpisodeRequest>,
+) -> Result<(StatusCode, Json<EpisodeResponse>), AppError> {
+    let response = app.memory_service.ingest_episode(request).await?;
     Ok((StatusCode::CREATED, Json(response)))
 }
 

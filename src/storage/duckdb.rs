@@ -501,34 +501,30 @@ impl DuckDbRepository {
                  from episodes
                  where episode_id = ?1",
                 params![episode_id],
-                |row| {
-                    Ok(EpisodeRecord {
-                        episode_id: row.get(0)?,
-                        tenant: row.get(1)?,
-                        goal: row.get(2)?,
-                        steps: decode_json(&row.get::<_, String>(3)?).map_err(to_from_sql_error)?,
-                        outcome: row.get(4)?,
-                        evidence: decode_json(&row.get::<_, String>(5)?)
-                            .map_err(to_from_sql_error)?,
-                        scope: decode_text(&row.get::<_, String>(6)?).map_err(to_from_sql_error)?,
-                        visibility: decode_text(&row.get::<_, String>(7)?)
-                            .map_err(to_from_sql_error)?,
-                        project: row.get(8)?,
-                        repo: row.get(9)?,
-                        module: row.get(10)?,
-                        tags: decode_json(&row.get::<_, String>(11)?).map_err(to_from_sql_error)?,
-                        source_agent: row.get(12)?,
-                        idempotency_key: row.get(13)?,
-                        created_at: row.get(14)?,
-                        updated_at: row.get(15)?,
-                        workflow_candidate: decode_optional_json(row.get::<_, Option<String>>(16)?)
-                            .map_err(to_from_sql_error)?,
-                    })
-                },
+                map_episode_row,
             )
             .optional()?;
 
         Ok(episode)
+    }
+
+    pub async fn list_successful_episodes_for_tenant(
+        &self,
+        tenant: &str,
+    ) -> Result<Vec<EpisodeRecord>, StorageError> {
+        let conn = self.conn()?;
+        let mut stmt = conn.prepare(
+            "select
+                episode_id, tenant, goal, steps_json, outcome, evidence_json, scope,
+                visibility, project, repo, module, tags_json, source_agent, idempotency_key,
+                created_at, updated_at, workflow_candidate_json
+             from episodes
+             where tenant = ?1 and lower(trim(outcome)) = 'success'
+             order by created_at asc, episode_id asc",
+        )?;
+        let rows = stmt.query_map(params![tenant], map_episode_row)?;
+        let collected = rows.collect::<Result<Vec<_>, _>>()?;
+        Ok(collected)
     }
 
     pub async fn list_memory_versions(
@@ -699,6 +695,29 @@ fn map_memory_row(row: &duckdb::Row<'_>) -> Result<MemoryRecord, duckdb::Error> 
         created_at: row.get(22)?,
         updated_at: row.get(23)?,
         last_validated_at: row.get(24)?,
+    })
+}
+
+fn map_episode_row(row: &duckdb::Row<'_>) -> Result<EpisodeRecord, duckdb::Error> {
+    Ok(EpisodeRecord {
+        episode_id: row.get(0)?,
+        tenant: row.get(1)?,
+        goal: row.get(2)?,
+        steps: decode_json(&row.get::<_, String>(3)?).map_err(to_from_sql_error)?,
+        outcome: row.get(4)?,
+        evidence: decode_json(&row.get::<_, String>(5)?).map_err(to_from_sql_error)?,
+        scope: decode_text(&row.get::<_, String>(6)?).map_err(to_from_sql_error)?,
+        visibility: decode_text(&row.get::<_, String>(7)?).map_err(to_from_sql_error)?,
+        project: row.get(8)?,
+        repo: row.get(9)?,
+        module: row.get(10)?,
+        tags: decode_json(&row.get::<_, String>(11)?).map_err(to_from_sql_error)?,
+        source_agent: row.get(12)?,
+        idempotency_key: row.get(13)?,
+        created_at: row.get(14)?,
+        updated_at: row.get(15)?,
+        workflow_candidate: decode_optional_json(row.get::<_, Option<String>>(16)?)
+            .map_err(to_from_sql_error)?,
     })
 }
 
