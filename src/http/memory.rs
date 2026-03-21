@@ -8,7 +8,9 @@ use serde::Deserialize;
 
 use crate::{
     app::AppState,
-    domain::memory::{IngestMemoryRequest, MemoryType, Scope, Visibility, WriteMode},
+    domain::memory::{
+        FeedbackKind, IngestMemoryRequest, MemoryType, Scope, Visibility, WriteMode,
+    },
     domain::query::SearchMemoryRequest,
     error::AppError,
     service::IngestMemoryResponse,
@@ -18,6 +20,7 @@ pub fn router() -> Router<AppState> {
     Router::new()
         .route("/memories", post(ingest_memory))
         .route("/memories/search", post(search_memory))
+        .route("/memories/feedback", post(submit_feedback))
         .route("/memories/:id", get(get_memory))
 }
 
@@ -102,6 +105,17 @@ async fn search_memory(
     Ok(Json(app.memory_service.search(request).await?))
 }
 
+async fn submit_feedback(
+    State(app): State<AppState>,
+    Json(request): Json<HttpFeedbackRequest>,
+) -> Result<Json<crate::domain::memory::MemoryRecord>, AppError> {
+    Ok(Json(
+        app.memory_service
+            .submit_feedback(&request.tenant, &request.memory_id, request.feedback_kind)
+            .await?,
+    ))
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "snake_case")]
 struct MemoryDetailQuery {
@@ -115,4 +129,13 @@ fn default_tenant() -> String {
 
 fn default_source_agent() -> String {
     "api".to_string()
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "snake_case")]
+struct HttpFeedbackRequest {
+    #[serde(default = "default_tenant")]
+    tenant: String,
+    memory_id: String,
+    feedback_kind: FeedbackKind,
 }

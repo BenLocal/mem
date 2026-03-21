@@ -142,6 +142,25 @@ async fn seeded_app_with_pending_preference() -> TestApp {
     }
 }
 
+async fn seeded_app_with_active_preference() -> TestApp {
+    let temp_dir = tempdir().unwrap();
+    let db_path = temp_dir.path().join("review-api-active.duckdb");
+    let repo = DuckDbRepository::open(&db_path).await.unwrap();
+    repo.insert_memory(sample_memory("mem_123", MemoryStatus::Active))
+        .await
+        .unwrap();
+
+    let state = AppState {
+        memory_service: mem::service::MemoryService::new(repo.clone()),
+    };
+
+    TestApp {
+        _temp_dir: temp_dir,
+        router: http::router().with_state(state),
+        repo,
+    }
+}
+
 #[tokio::test]
 async fn duckdb_repository_lists_pending_review_rows() {
     let repo = test_duckdb_repo().await;
@@ -291,6 +310,38 @@ async fn editing_pending_memory_rejects_original_and_creates_active_successor() 
     assert_eq!(successor.project.as_deref(), Some("memory-service"));
     assert_eq!(successor.repo.as_deref(), Some("mem"));
     assert_eq!(successor.module.as_deref(), Some("review"));
+}
+
+#[tokio::test]
+async fn submitting_feedback_updates_summary_and_lifecycle_fields() {
+    let app = seeded_app_with_active_preference().await;
+
+    let response = app
+        .post_json(
+            "/memories/feedback",
+            json!({
+                "tenant": "local",
+                "memory_id": "mem_123",
+                "feedback_kind": "useful"
+            }),
+        )
+        .await;
+
+    assert_eq!(response.status(), 200);
+    assert_eq!(response.json()["memory_id"], "mem_123");
+    let confidence = response.json()["confidence"].as_f64().unwrap();
+    let decay_score = response.json()["decay_score"].as_f64().unwrap();
+    assert!((confidence - 0.8).abs() < 1e-6);
+    assert!((decay_score - 0.2).abs() < 1e-6);
+
+    let detail = app.get("/memories/mem_123?tenant=local").await;
+    assert_eq!(detail.status(), 200);
+    assert_eq!(detail.json()["feedback_summary"]["total"], 1);
+    assert_eq!(detail.json()["feedback_summary"]["useful"], 1);
+    let detail_confidence = detail.json()["memory"]["confidence"].as_f64().unwrap();
+    let detail_decay_score = detail.json()["memory"]["decay_score"].as_f64().unwrap();
+    assert!((detail_confidence - 0.8).abs() < 1e-6);
+    assert!((detail_decay_score - 0.2).abs() < 1e-6);
 }
 
 #[tokio::test]

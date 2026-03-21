@@ -423,3 +423,86 @@ async fn search_respects_tenant_scope() {
     assert_eq!(response.status(), 200);
     assert_eq!(response.json()["relevant_facts"][0]["memory_id"], "mem_b");
 }
+
+#[tokio::test]
+async fn negative_feedback_penalizes_future_recall() {
+    let app = seeded_search_app(vec![
+        memory(
+            "local",
+            "mem_target",
+            MemoryType::Implementation,
+            Scope::Repo,
+            Some("billing"),
+            Some("billing"),
+            Some("invoice"),
+            "Invoice retry failures are caused by stale cache state",
+            "invoice retry failure note",
+            "2026-03-21T00:00:02Z",
+            0.0,
+        ),
+        memory(
+            "local",
+            "mem_backup",
+            MemoryType::Implementation,
+            Scope::Repo,
+            Some("analytics"),
+            Some("analytics"),
+            Some("reports"),
+            "Invoice retry failures are caused by stale cache state",
+            "invoice retry failure note",
+            "2026-03-21T00:00:01Z",
+            0.0,
+        ),
+    ])
+    .await;
+
+    let before = app
+        .post_json(
+            "/memories/search",
+            json!({
+                "query": "invoice retry failure stale cache state",
+                "intent": "debugging",
+                "scope_filters": ["repo:billing"],
+                "token_budget": 300,
+                "caller_agent": "codex-worker",
+                "expand_graph": true,
+                "tenant": "local"
+            }),
+        )
+        .await;
+
+    assert_eq!(before.status(), 200);
+    assert_eq!(before.json()["relevant_facts"][0]["memory_id"], "mem_target");
+
+    let feedback = app
+        .post_json(
+            "/memories/feedback",
+            json!({
+                "tenant": "local",
+                "memory_id": "mem_target",
+                "feedback_kind": "incorrect"
+            }),
+        )
+        .await;
+
+    assert_eq!(feedback.status(), 200);
+    assert_eq!(feedback.json()["status"], "archived");
+
+    let after = app
+        .post_json(
+            "/memories/search",
+            json!({
+                "query": "invoice retry failure stale cache state",
+                "intent": "debugging",
+                "scope_filters": ["repo:billing"],
+                "token_budget": 300,
+                "caller_agent": "codex-worker",
+                "expand_graph": true,
+                "tenant": "local"
+            }),
+        )
+        .await;
+
+    assert_eq!(after.status(), 200);
+    assert_eq!(after.json()["relevant_facts"][0]["memory_id"], "mem_backup");
+}

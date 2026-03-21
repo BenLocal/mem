@@ -12,7 +12,7 @@ use thiserror::Error;
 
 use crate::domain::{
     episode::EpisodeRecord,
-    memory::{FeedbackSummary, MemoryRecord, MemoryStatus, MemoryVersionLink},
+    memory::{FeedbackKind, FeedbackSummary, MemoryRecord, MemoryStatus, MemoryVersionLink},
 };
 
 use super::schema;
@@ -366,6 +366,65 @@ impl DuckDbRepository {
         Ok(feedback)
     }
 
+    pub async fn apply_feedback(
+        &self,
+        memory: &MemoryRecord,
+        feedback: FeedbackEvent,
+    ) -> Result<MemoryRecord, StorageError> {
+        let adjustments = feedback_adjustments(&feedback.feedback_kind)
+            .ok_or(StorageError::InvalidData("invalid feedback kind"))?;
+        let updated_at = feedback.created_at.clone();
+        let mut updated = memory.clone();
+        updated.updated_at = updated_at.clone();
+        updated.confidence = (updated.confidence + adjustments.confidence_delta).clamp(0.0, 1.0);
+        updated.decay_score = (updated.decay_score + adjustments.decay_delta).clamp(0.0, 1.0);
+        if let Some(status) = adjustments.status {
+            updated.status = status;
+        }
+        if adjustments.mark_validated {
+            updated.last_validated_at = Some(updated_at.clone());
+        }
+
+        let mut conn = self.conn()?;
+        let tx = conn.transaction()?;
+        tx.execute(
+            "insert into feedback_events (feedback_id, memory_id, feedback_kind, created_at)
+             values (?1, ?2, ?3, ?4)",
+            params![
+                feedback.feedback_id,
+                feedback.memory_id,
+                feedback.feedback_kind,
+                feedback.created_at
+            ],
+        )?;
+
+        let rows_updated = tx.execute(
+            "update memories
+             set status = ?1,
+                 confidence = ?2,
+                 decay_score = ?3,
+                 updated_at = ?4,
+                 last_validated_at = ?5
+             where tenant = ?6 and memory_id = ?7",
+            params![
+                encode_text(&updated.status)?,
+                f64::from(updated.confidence),
+                f64::from(updated.decay_score),
+                updated.updated_at.clone(),
+                updated.last_validated_at.clone(),
+                updated.tenant.clone(),
+                updated.memory_id.clone(),
+            ],
+        )?;
+
+        if rows_updated == 0 {
+            return Err(StorageError::InvalidData("memory not found"));
+        }
+
+        tx.commit()?;
+        Ok(updated)
+    }
+
     pub async fn list_feedback_for_memory(
         &self,
         memory_id: &str,
@@ -697,4 +756,36 @@ fn current_timestamp() -> String {
         .expect("system time should be after unix epoch")
         .as_millis();
     format!("{millis:020}")
+}
+
+struct FeedbackAdjustments {
+    confidence_delta: f32,
+    decay_delta: f32,
+    status: Option<MemoryStatus>,
+    mark_validated: bool,
+}
+
+fn feedback_adjustments(feedback_kind: &str) -> Option<FeedbackAdjustments> {
+    let feedback_kind = decode_feedback_kind(feedback_kind)?;
+    Some(FeedbackAdjustments {
+        confidence_delta: feedback_kind.confidence_delta(),
+        decay_delta: feedback_kind.decay_delta(),
+        status: if feedback_kind.archived_status() {
+            Some(MemoryStatus::Archived)
+        } else {
+            None
+        },
+        mark_validated: feedback_kind.marks_validated(),
+    })
+}
+
+fn decode_feedback_kind(value: &str) -> Option<FeedbackKind> {
+    match value {
+        "useful" => Some(FeedbackKind::Useful),
+        "outdated" => Some(FeedbackKind::Outdated),
+        "incorrect" => Some(FeedbackKind::Incorrect),
+        "applies_here" => Some(FeedbackKind::AppliesHere),
+        "does_not_apply_here" => Some(FeedbackKind::DoesNotApplyHere),
+        _ => None,
+    }
 }

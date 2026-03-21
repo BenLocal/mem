@@ -11,8 +11,8 @@ use crate::domain::memory::MemoryDetailResponse;
 use crate::{
     domain::{
         memory::{
-            EditPendingRequest, EditPendingResponse, GraphEdge, IngestMemoryRequest, MemoryRecord,
-            MemoryStatus,
+            EditPendingRequest, EditPendingResponse, FeedbackKind, GraphEdge, IngestMemoryRequest,
+            MemoryRecord, MemoryStatus,
         },
         query::{SearchMemoryRequest, SearchMemoryResponse},
     },
@@ -22,6 +22,7 @@ use crate::{
 };
 
 static MEMORY_SEQUENCE: AtomicU64 = AtomicU64::new(1);
+static FEEDBACK_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -203,6 +204,28 @@ impl MemoryService {
         })
     }
 
+    pub async fn submit_feedback(
+        &self,
+        tenant: &str,
+        memory_id: &str,
+        feedback_kind: FeedbackKind,
+    ) -> Result<MemoryRecord, ServiceError> {
+        let memory = self
+            .repository
+            .get_memory_for_tenant(tenant, memory_id)
+            .await?
+            .ok_or(ServiceError::NotFound)?;
+
+        let feedback = crate::storage::duckdb::FeedbackEvent {
+            feedback_id: next_feedback_id(),
+            memory_id: memory.memory_id.clone(),
+            feedback_kind: feedback_kind.as_str().to_string(),
+            created_at: current_timestamp(),
+        };
+
+        Ok(self.repository.apply_feedback(&memory, feedback).await?)
+    }
+
     fn superseding_active_version(
         &self,
         original: &MemoryRecord,
@@ -322,6 +345,11 @@ fn current_timestamp() -> String {
         .expect("system time should be after unix epoch")
         .as_millis();
     format!("{millis:020}")
+}
+
+fn next_feedback_id() -> String {
+    let sequence = FEEDBACK_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+    format!("fb_{sequence:020}")
 }
 
 fn next_memory_id() -> String {

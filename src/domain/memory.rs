@@ -54,6 +54,52 @@ pub enum WriteMode {
     Propose,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum FeedbackKind {
+    Useful,
+    Outdated,
+    Incorrect,
+    AppliesHere,
+    DoesNotApplyHere,
+}
+
+impl FeedbackKind {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Useful => "useful",
+            Self::Outdated => "outdated",
+            Self::Incorrect => "incorrect",
+            Self::AppliesHere => "applies_here",
+            Self::DoesNotApplyHere => "does_not_apply_here",
+        }
+    }
+
+    pub fn confidence_delta(&self) -> f32 {
+        match self {
+            Self::Useful => 0.1,
+            Self::AppliesHere => 0.05,
+            _ => 0.0,
+        }
+    }
+
+    pub fn decay_delta(&self) -> f32 {
+        match self {
+            Self::Outdated => 0.2,
+            Self::DoesNotApplyHere => 0.1,
+            _ => 0.0,
+        }
+    }
+
+    pub fn marks_validated(&self) -> bool {
+        matches!(self, Self::Useful | Self::AppliesHere)
+    }
+
+    pub fn archived_status(&self) -> bool {
+        matches!(self, Self::Incorrect)
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "snake_case")]
 pub struct IngestMemoryRequest {
