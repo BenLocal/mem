@@ -15,6 +15,8 @@ pub struct SearchMemoryRequest {
     pub token_budget: usize,
     pub caller_agent: String,
     pub expand_graph: bool,
+    #[serde(skip_serializing_if = "skip_none")]
+    pub tenant: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

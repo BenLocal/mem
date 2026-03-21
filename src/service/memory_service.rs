@@ -264,9 +264,10 @@ impl MemoryService {
         &self,
         query: SearchMemoryRequest,
     ) -> Result<SearchMemoryResponse, ServiceError> {
+        let tenant = query.tenant.as_deref().unwrap_or("local");
         let candidates = self
             .repository
-            .search_candidates(retrieve::search_tenant())
+            .search_candidates(tenant)
             .await?;
         let ranked = match retrieve::rank_with_graph(candidates, &query, self.graph.as_ref()).await
         {
@@ -274,7 +275,7 @@ impl MemoryService {
             Err(GraphError::Unavailable(_)) => {
                 let base = self
                     .repository
-                    .search_candidates(retrieve::search_tenant())
+                    .search_candidates(tenant)
                     .await?;
                 retrieve::rank_candidates(base, &query)
             }

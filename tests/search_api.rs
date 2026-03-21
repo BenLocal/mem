@@ -65,6 +65,7 @@ impl TestApp {
 }
 
 fn memory(
+    tenant: &str,
     memory_id: &str,
     memory_type: MemoryType,
     scope: Scope,
@@ -78,7 +79,7 @@ fn memory(
 ) -> MemoryRecord {
     MemoryRecord {
         memory_id: memory_id.into(),
-        tenant: "local".into(),
+        tenant: tenant.into(),
         memory_type,
         status: MemoryStatus::Active,
         scope,
@@ -187,6 +188,7 @@ fn search_response_serializes_compressed_shapes() {
 async fn search_returns_compressed_memory_pack() {
     let app = seeded_search_app(vec![
         memory(
+            "local",
             "mem_pref",
             MemoryType::Preference,
             Scope::Global,
@@ -199,6 +201,7 @@ async fn search_returns_compressed_memory_pack() {
             0.0,
         ),
         memory(
+            "local",
             "mem_fact",
             MemoryType::Implementation,
             Scope::Repo,
@@ -211,6 +214,7 @@ async fn search_returns_compressed_memory_pack() {
             0.0,
         ),
         memory(
+            "local",
             "mem_pattern",
             MemoryType::Experience,
             Scope::Workspace,
@@ -223,6 +227,7 @@ async fn search_returns_compressed_memory_pack() {
             0.0,
         ),
         memory(
+            "local",
             "mem_workflow",
             MemoryType::Workflow,
             Scope::Repo,
@@ -246,7 +251,8 @@ async fn search_returns_compressed_memory_pack() {
                 "scope_filters": ["repo:billing"],
                 "token_budget": 500,
                 "caller_agent": "codex-worker",
-                "expand_graph": true
+                "expand_graph": true,
+                "tenant": "local"
             }),
         )
         .await;
@@ -266,6 +272,7 @@ async fn search_returns_compressed_memory_pack() {
 async fn scope_bias_prefers_matching_repo_memory() {
     let app = seeded_search_app(vec![
         memory(
+            "local",
             "mem_other",
             MemoryType::Implementation,
             Scope::Repo,
@@ -278,6 +285,7 @@ async fn scope_bias_prefers_matching_repo_memory() {
             0.0,
         ),
         memory(
+            "local",
             "mem_billing",
             MemoryType::Implementation,
             Scope::Repo,
@@ -301,7 +309,8 @@ async fn scope_bias_prefers_matching_repo_memory() {
                 "scope_filters": ["repo:billing"],
                 "token_budget": 300,
                 "caller_agent": "codex-worker",
-                "expand_graph": true
+                "expand_graph": true,
+                "tenant": "local"
             }),
         )
         .await;
@@ -317,6 +326,7 @@ async fn scope_bias_prefers_matching_repo_memory() {
 async fn stale_memory_penalty_prefers_recent_memory() {
     let app = seeded_search_app(vec![
         memory(
+            "local",
             "mem_old",
             MemoryType::Implementation,
             Scope::Repo,
@@ -329,6 +339,7 @@ async fn stale_memory_penalty_prefers_recent_memory() {
             0.8,
         ),
         memory(
+            "local",
             "mem_new",
             MemoryType::Implementation,
             Scope::Repo,
@@ -352,11 +363,63 @@ async fn stale_memory_penalty_prefers_recent_memory() {
                 "scope_filters": ["repo:billing"],
                 "token_budget": 300,
                 "caller_agent": "codex-worker",
-                "expand_graph": true
+                "expand_graph": true,
+                "tenant": "local"
             }),
         )
         .await;
 
     assert_eq!(response.status(), 200);
     assert_eq!(response.json()["relevant_facts"][0]["memory_id"], "mem_new");
+}
+
+#[tokio::test]
+async fn search_respects_tenant_scope() {
+    let app = seeded_search_app(vec![
+        memory(
+            "tenant-a",
+            "mem_a",
+            MemoryType::Implementation,
+            Scope::Repo,
+            Some("billing"),
+            Some("billing"),
+            Some("invoice"),
+            "Invoice retry failures are caused by stale cache state",
+            "billing fix tenant a",
+            "2026-03-21T00:00:02Z",
+            0.0,
+        ),
+        memory(
+            "tenant-b",
+            "mem_b",
+            MemoryType::Implementation,
+            Scope::Repo,
+            Some("billing"),
+            Some("billing"),
+            Some("invoice"),
+            "Invoice retry failures are caused by stale cache state",
+            "billing fix tenant b",
+            "2026-03-21T00:00:03Z",
+            0.0,
+        ),
+    ])
+    .await;
+
+    let response = app
+        .post_json(
+            "/memories/search",
+            json!({
+                "query": "invoice retry failure",
+                "intent": "debugging",
+                "scope_filters": ["repo:billing"],
+                "token_budget": 300,
+                "caller_agent": "codex-worker",
+                "expand_graph": true,
+                "tenant": "tenant-b"
+            }),
+        )
+        .await;
+
+    assert_eq!(response.status(), 200);
+    assert_eq!(response.json()["relevant_facts"][0]["memory_id"], "mem_b");
 }

@@ -8,16 +8,10 @@ use crate::{
     storage::GraphStore,
 };
 
-const SEARCH_TENANT: &str = "local";
-
 #[derive(Debug, Clone)]
 struct ScoredMemory {
     memory: MemoryRecord,
     score: i64,
-}
-
-pub fn search_tenant() -> &'static str {
-    SEARCH_TENANT
 }
 
 pub fn rank_candidates(
