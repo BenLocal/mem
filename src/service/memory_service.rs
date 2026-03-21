@@ -101,15 +101,22 @@ impl MemoryService {
         Ok(self.repository.list_pending_review(tenant).await?)
     }
 
-    pub async fn get_memory(&self, memory_id: &str) -> Result<MemoryDetailResponse, ServiceError> {
+    pub async fn get_memory(
+        &self,
+        tenant: &str,
+        memory_id: &str,
+    ) -> Result<MemoryDetailResponse, ServiceError> {
         let memory = self
             .repository
-            .get_memory(memory_id.to_string())
+            .get_memory_for_tenant(tenant, memory_id)
             .await?
             .ok_or(ServiceError::NotFound)?;
 
         Ok(MemoryDetailResponse {
-            version_chain: self.repository.list_memory_versions(memory_id).await?,
+            version_chain: self
+                .repository
+                .list_memory_versions_for_tenant(tenant, memory_id)
+                .await?,
             graph_links: Vec::new(),
             feedback_summary: self.repository.feedback_summary(memory_id).await?,
             memory,

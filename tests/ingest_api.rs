@@ -3,16 +3,18 @@ use axum::{
     http::{Request, StatusCode},
 };
 use mem::{
-    app,
-    domain::memory::{IngestMemoryRequest, MemoryStatus, MemoryType, Scope, Visibility, WriteMode},
+    app::{self, AppState},
+    domain::memory::{IngestMemoryRequest, MemoryRecord, MemoryStatus, MemoryType, Scope, Visibility, WriteMode},
+    http,
     pipeline::ingest::{compute_content_hash, initial_status},
     storage::DuckDbRepository,
 };
 use serde_json::{json, Value};
-use tempfile::tempdir;
+use tempfile::{tempdir, TempDir};
 use tower::util::ServiceExt;
 
 struct TestApp {
+    _temp_dir: Option<TempDir>,
     router: axum::Router,
 }
 
@@ -80,7 +82,61 @@ impl TestApp {
 
 async fn test_app() -> TestApp {
     TestApp {
+        _temp_dir: None,
         router: app::router().await.expect("app router should build"),
+    }
+}
+
+fn sample_memory(
+    memory_id: &str,
+    tenant: &str,
+    version: u64,
+    supersedes_memory_id: Option<&str>,
+) -> MemoryRecord {
+    MemoryRecord {
+        memory_id: memory_id.into(),
+        tenant: tenant.into(),
+        memory_type: MemoryType::Implementation,
+        status: MemoryStatus::Active,
+        scope: Scope::Repo,
+        visibility: Visibility::Shared,
+        version,
+        summary: format!("summary-{memory_id}"),
+        content: format!("content-{memory_id}"),
+        evidence: vec![format!("evidence-{memory_id}")],
+        code_refs: vec![format!("src/{memory_id}.rs")],
+        project: Some("memory-service".into()),
+        repo: Some("mem".into()),
+        module: Some("memory".into()),
+        task_type: Some("implementation".into()),
+        tags: vec![format!("tag-{memory_id}")],
+        confidence: 0.9,
+        decay_score: 0.0,
+        content_hash: format!("hash-{memory_id}"),
+        idempotency_key: None,
+        supersedes_memory_id: supersedes_memory_id.map(str::to_string),
+        source_agent: "api".into(),
+        created_at: format!("2026-03-21T00:00:0{version}Z"),
+        updated_at: format!("2026-03-21T00:05:0{version}Z"),
+        last_validated_at: None,
+    }
+}
+
+async fn seeded_app(memories: Vec<MemoryRecord>) -> TestApp {
+    let temp_dir = tempdir().unwrap();
+    let db_path = temp_dir.path().join("ingest-api.duckdb");
+    let repo = DuckDbRepository::open(&db_path).await.unwrap();
+    for memory in memories {
+        repo.insert_memory(memory).await.unwrap();
+    }
+
+    let state = AppState {
+        memory_service: mem::service::MemoryService::new(repo),
+    };
+
+    TestApp {
+        _temp_dir: Some(temp_dir),
+        router: http::router().with_state(state),
     }
 }
 
@@ -309,4 +365,64 @@ async fn get_memory_returns_not_found_for_missing_memory() {
 
     assert_eq!(response.status(), 404);
     assert_eq!(response.json()["error"], "memory not found");
+}
+
+#[tokio::test]
+async fn get_memory_returns_not_found_for_wrong_tenant() {
+    let app = seeded_app(vec![sample_memory("mem_123", "tenant-a", 1, None)]).await;
+
+    let response = app.get("/memories/mem_123?tenant=tenant-b").await;
+
+    assert_eq!(response.status(), 404);
+    assert_eq!(response.json()["error"], "memory not found");
+}
+
+#[tokio::test]
+async fn get_memory_defaults_tenant_to_local() {
+    let app = seeded_app(vec![sample_memory("mem_123", "tenant-a", 1, None)]).await;
+
+    let response = app.get("/memories/mem_123").await;
+
+    assert_eq!(response.status(), 404);
+    assert_eq!(response.json()["error"], "memory not found");
+}
+
+#[tokio::test]
+async fn get_memory_returns_full_version_chain_for_successor_ids() {
+    let app = seeded_app(vec![
+        sample_memory("mem_v1", "local", 1, None),
+        sample_memory("mem_v2", "local", 2, Some("mem_v1")),
+        sample_memory("mem_v3", "local", 3, Some("mem_v2")),
+    ])
+    .await;
+
+    let response = app.get("/memories/mem_v2?tenant=local").await;
+
+    assert_eq!(response.status(), 200);
+    assert_eq!(response.json()["memory"]["memory_id"], "mem_v2");
+    assert_eq!(
+        response.json()["version_chain"],
+        json!([
+            {
+                "memory_id": "mem_v3",
+                "version": 3,
+                "status": "active",
+                "updated_at": "2026-03-21T00:05:03Z",
+                "supersedes_memory_id": "mem_v2"
+            },
+            {
+                "memory_id": "mem_v2",
+                "version": 2,
+                "status": "active",
+                "updated_at": "2026-03-21T00:05:02Z",
+                "supersedes_memory_id": "mem_v1"
+            },
+            {
+                "memory_id": "mem_v1",
+                "version": 1,
+                "status": "active",
+                "updated_at": "2026-03-21T00:05:01Z"
+            }
+        ])
+    );
 }

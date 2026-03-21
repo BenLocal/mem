@@ -1,4 +1,5 @@
 use std::{
+    collections::{HashMap, HashSet, VecDeque},
     path::Path,
     sync::{Arc, Mutex, MutexGuard},
     time::{SystemTime, UNIX_EPOCH},
@@ -116,6 +117,29 @@ impl DuckDbRepository {
                  from memories
                  where memory_id = ?1",
                 params![memory_id],
+                map_memory_row,
+            )
+            .optional()?;
+
+        Ok(memory)
+    }
+
+    pub async fn get_memory_for_tenant(
+        &self,
+        tenant: &str,
+        memory_id: &str,
+    ) -> Result<Option<MemoryRecord>, StorageError> {
+        let conn = self.conn()?;
+        let memory = conn
+            .query_row(
+                "select
+                    memory_id, tenant, memory_type, status, scope, visibility, version, summary,
+                    content, evidence_json, code_refs_json, project, repo, module, task_type,
+                    tags_json, confidence, decay_score, content_hash, idempotency_key,
+                    supersedes_memory_id, source_agent, created_at, updated_at, last_validated_at
+                 from memories
+                 where tenant = ?1 and memory_id = ?2",
+                params![tenant, memory_id],
                 map_memory_row,
             )
             .optional()?;
@@ -416,14 +440,28 @@ impl DuckDbRepository {
         &self,
         memory_id: &str,
     ) -> Result<Vec<MemoryVersionLink>, StorageError> {
+        let memory = self
+            .get_memory(memory_id.to_string())
+            .await?
+            .ok_or(StorageError::InvalidData("memory not found"))?;
+
+        self.list_memory_versions_for_tenant(&memory.tenant, memory_id)
+            .await
+    }
+
+    pub async fn list_memory_versions_for_tenant(
+        &self,
+        tenant: &str,
+        memory_id: &str,
+    ) -> Result<Vec<MemoryVersionLink>, StorageError> {
         let conn = self.conn()?;
         let mut stmt = conn.prepare(
             "select memory_id, version, status, updated_at, supersedes_memory_id
              from memories
-             where memory_id = ?1 or supersedes_memory_id = ?1
+             where tenant = ?1
              order by version desc, updated_at desc",
         )?;
-        let rows = stmt.query_map(params![memory_id], |row| {
+        let rows = stmt.query_map(params![tenant], |row| {
             Ok(MemoryVersionLink {
                 memory_id: row.get(0)?,
                 version: to_u64(row.get::<_, i64>(1)?).map_err(to_from_sql_error)?,
@@ -432,7 +470,54 @@ impl DuckDbRepository {
                 supersedes_memory_id: row.get(4)?,
             })
         })?;
-        let collected = rows.collect::<Result<Vec<_>, _>>()?;
+        let all_versions = rows.collect::<Result<Vec<_>, _>>()?;
+        let mut by_id = HashMap::new();
+        let mut neighbors: HashMap<String, Vec<String>> = HashMap::new();
+
+        for version in all_versions {
+            let current_id = version.memory_id.clone();
+            if let Some(parent_id) = version.supersedes_memory_id.clone() {
+                neighbors
+                    .entry(current_id.clone())
+                    .or_default()
+                    .push(parent_id.clone());
+                neighbors
+                    .entry(parent_id)
+                    .or_default()
+                    .push(current_id.clone());
+            }
+            by_id.insert(current_id, version);
+        }
+
+        if !by_id.contains_key(memory_id) {
+            return Err(StorageError::InvalidData("memory not found"));
+        }
+
+        let mut queue = VecDeque::from([memory_id.to_string()]);
+        let mut connected = HashSet::new();
+
+        while let Some(current_id) = queue.pop_front() {
+            if !connected.insert(current_id.clone()) {
+                continue;
+            }
+
+            if let Some(next_ids) = neighbors.get(&current_id) {
+                for next_id in next_ids {
+                    queue.push_back(next_id.clone());
+                }
+            }
+        }
+
+        let mut collected = connected
+            .into_iter()
+            .filter_map(|id| by_id.remove(&id))
+            .collect::<Vec<_>>();
+        collected.sort_by(|left, right| {
+            right
+                .version
+                .cmp(&left.version)
+                .then_with(|| right.updated_at.cmp(&left.updated_at))
+        });
         Ok(collected)
     }
 

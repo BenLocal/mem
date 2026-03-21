@@ -1,5 +1,5 @@
 use axum::{
-    extract::{Path, State},
+    extract::{Path, Query, State},
     http::StatusCode,
     routing::{get, post},
     Json, Router,
@@ -84,8 +84,20 @@ async fn ingest_memory(
 async fn get_memory(
     State(app): State<AppState>,
     Path(memory_id): Path<String>,
+    Query(query): Query<MemoryDetailQuery>,
 ) -> Result<Json<crate::domain::memory::MemoryDetailResponse>, AppError> {
-    Ok(Json(app.memory_service.get_memory(&memory_id).await?))
+    Ok(Json(
+        app.memory_service
+            .get_memory(&query.tenant, &memory_id)
+            .await?,
+    ))
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "snake_case")]
+struct MemoryDetailQuery {
+    #[serde(default = "default_tenant")]
+    tenant: String,
 }
 
 fn default_tenant() -> String {
