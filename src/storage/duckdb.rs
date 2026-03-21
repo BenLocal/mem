@@ -1,6 +1,7 @@
 use std::{
     path::Path,
     sync::{Arc, Mutex, MutexGuard},
+    time::{SystemTime, UNIX_EPOCH},
 };
 
 use duckdb::{params, Connection, OptionalExt};
@@ -122,6 +123,33 @@ impl DuckDbRepository {
         Ok(memory)
     }
 
+    pub async fn get_pending(
+        &self,
+        tenant: &str,
+        memory_id: &str,
+    ) -> Result<Option<MemoryRecord>, StorageError> {
+        let conn = self.conn()?;
+        let memory = conn
+            .query_row(
+                "select
+                    memory_id, tenant, memory_type, status, scope, visibility, version, summary,
+                    content, evidence_json, code_refs_json, project, repo, module, task_type,
+                    tags_json, confidence, decay_score, content_hash, idempotency_key,
+                    supersedes_memory_id, source_agent, created_at, updated_at, last_validated_at
+                 from memories
+                 where tenant = ?1 and memory_id = ?2 and status = ?3",
+                params![
+                    tenant,
+                    memory_id,
+                    encode_text(&MemoryStatus::PendingConfirmation)?
+                ],
+                map_memory_row,
+            )
+            .optional()?;
+
+        Ok(memory)
+    }
+
     pub async fn find_by_idempotency_or_hash(
         &self,
         tenant: &str,
@@ -151,7 +179,7 @@ impl DuckDbRepository {
         Ok(memory)
     }
 
-    pub async fn list_pending_review(&self) -> Result<Vec<MemoryRecord>, StorageError> {
+    pub async fn list_pending_review(&self, tenant: &str) -> Result<Vec<MemoryRecord>, StorageError> {
         let conn = self.conn()?;
         let mut stmt = conn.prepare(
             "select
@@ -160,12 +188,105 @@ impl DuckDbRepository {
                 tags_json, confidence, decay_score, content_hash, idempotency_key,
                 supersedes_memory_id, source_agent, created_at, updated_at, last_validated_at
              from memories
-             where status = ?1
+             where tenant = ?1 and status = ?2
              order by created_at desc",
         )?;
-        let rows = stmt.query_map(params![encode_text(&MemoryStatus::PendingConfirmation)?], map_memory_row)?;
+        let rows = stmt.query_map(
+            params![tenant, encode_text(&MemoryStatus::PendingConfirmation)?],
+            map_memory_row,
+        )?;
         let collected = rows.collect::<Result<Vec<_>, _>>()?;
         Ok(collected)
+    }
+
+    pub async fn accept_pending(
+        &self,
+        tenant: &str,
+        memory_id: &str,
+    ) -> Result<MemoryRecord, StorageError> {
+        self.update_status(tenant, memory_id, MemoryStatus::Active).await
+    }
+
+    pub async fn reject_pending(
+        &self,
+        tenant: &str,
+        memory_id: &str,
+    ) -> Result<MemoryRecord, StorageError> {
+        self.update_status(tenant, memory_id, MemoryStatus::Rejected).await
+    }
+
+    pub async fn replace_pending_with_successor(
+        &self,
+        tenant: &str,
+        original_memory_id: &str,
+        successor: MemoryRecord,
+    ) -> Result<MemoryRecord, StorageError> {
+        {
+            let updated_at = current_timestamp();
+            let mut conn = self.conn()?;
+            let tx = conn.transaction()?;
+            let stored = successor.clone();
+            let rows_updated = tx.execute(
+                "update memories
+                 set status = ?1, updated_at = ?2
+                 where tenant = ?3 and memory_id = ?4 and status = ?5",
+                params![
+                    encode_text(&MemoryStatus::Rejected)?,
+                    updated_at,
+                    tenant,
+                    original_memory_id,
+                    encode_text(&MemoryStatus::PendingConfirmation)?,
+                ],
+            )?;
+
+            if rows_updated == 0 {
+                return Err(StorageError::InvalidData("pending memory not found"));
+            }
+
+            tx.execute(
+                "insert into memories (
+                    memory_id, tenant, memory_type, status, scope, visibility, version, summary,
+                    content, evidence_json, code_refs_json, project, repo, module, task_type,
+                    tags_json, confidence, decay_score, content_hash, idempotency_key,
+                    supersedes_memory_id, source_agent, created_at, updated_at, last_validated_at
+                ) values (
+                    ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8,
+                    ?9, ?10, ?11, ?12, ?13, ?14, ?15,
+                    ?16, ?17, ?18, ?19, ?20,
+                    ?21, ?22, ?23, ?24, ?25
+                )",
+                params![
+                    stored.memory_id,
+                    stored.tenant,
+                    encode_text(&stored.memory_type)?,
+                    encode_text(&stored.status)?,
+                    encode_text(&stored.scope)?,
+                    encode_text(&stored.visibility)?,
+                    stored.version as i64,
+                    stored.summary,
+                    stored.content,
+                    encode_json(&stored.evidence)?,
+                    encode_json(&stored.code_refs)?,
+                    stored.project,
+                    stored.repo,
+                    stored.module,
+                    stored.task_type,
+                    encode_json(&stored.tags)?,
+                    f64::from(stored.confidence),
+                    f64::from(stored.decay_score),
+                    stored.content_hash,
+                    stored.idempotency_key,
+                    stored.supersedes_memory_id,
+                    stored.source_agent,
+                    stored.created_at,
+                    stored.updated_at,
+                    stored.last_validated_at,
+                ],
+            )?;
+            tx.commit()?;
+        }
+
+        Ok(successor)
     }
 
     pub async fn insert_feedback(
@@ -340,6 +461,38 @@ impl DuckDbRepository {
             .lock()
             .map_err(|_| StorageError::InvalidData("duckdb connection mutex poisoned"))
     }
+
+    async fn update_status(
+        &self,
+        tenant: &str,
+        memory_id: &str,
+        status: MemoryStatus,
+    ) -> Result<MemoryRecord, StorageError> {
+        let updated_at = current_timestamp();
+        {
+            let conn = self.conn()?;
+            let rows_updated = conn.execute(
+                "update memories
+                 set status = ?1, updated_at = ?2
+                 where tenant = ?3 and memory_id = ?4 and status = ?5",
+                params![
+                    encode_text(&status)?,
+                    updated_at,
+                    tenant,
+                    memory_id,
+                    encode_text(&MemoryStatus::PendingConfirmation)?,
+                ],
+            )?;
+
+            if rows_updated == 0 {
+                return Err(StorageError::InvalidData("pending memory not found"));
+            }
+        }
+
+        self.get_memory(memory_id.to_string())
+            .await?
+            .ok_or(StorageError::InvalidData("updated memory not found"))
+    }
 }
 
 fn map_memory_row(row: &duckdb::Row<'_>) -> Result<MemoryRecord, duckdb::Error> {
@@ -410,4 +563,12 @@ fn to_from_sql_error(error: StorageError) -> duckdb::Error {
         duckdb::types::Type::Text,
         Box::new(error),
     )
+}
+
+fn current_timestamp() -> String {
+    let millis = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system time should be after unix epoch")
+        .as_millis();
+    format!("{millis:020}")
 }

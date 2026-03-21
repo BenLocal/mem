@@ -4,9 +4,10 @@ use std::{
 };
 
 use serde::Serialize;
+use thiserror::Error;
 
 use crate::{
-    domain::memory::{IngestMemoryRequest, MemoryRecord, MemoryStatus},
+    domain::memory::{EditPendingRequest, EditPendingResponse, IngestMemoryRequest, MemoryRecord, MemoryStatus},
     pipeline::ingest::{compute_content_hash, initial_status},
     storage::{DuckDbRepository, StorageError},
 };
@@ -18,6 +19,14 @@ static MEMORY_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 pub struct IngestMemoryResponse {
     pub memory_id: String,
     pub status: MemoryStatus,
+}
+
+#[derive(Debug, Error)]
+pub enum ServiceError {
+    #[error("memory not found")]
+    NotFound,
+    #[error(transparent)]
+    Storage(#[from] StorageError),
 }
 
 impl From<MemoryRecord> for IngestMemoryResponse {
@@ -85,6 +94,106 @@ impl MemoryService {
 
         let stored = self.repository.insert_memory(memory).await?;
         Ok(stored.into())
+    }
+
+    pub async fn list_pending_review(&self, tenant: &str) -> Result<Vec<MemoryRecord>, ServiceError> {
+        Ok(self.repository.list_pending_review(tenant).await?)
+    }
+
+    pub async fn accept_pending(&self, tenant: &str, memory_id: &str) -> Result<MemoryRecord, ServiceError> {
+        self.repository
+            .get_pending(tenant, memory_id)
+            .await?
+            .ok_or(ServiceError::NotFound)?;
+        Ok(self.repository.accept_pending(tenant, memory_id).await?)
+    }
+
+    pub async fn reject_pending(&self, tenant: &str, memory_id: &str) -> Result<MemoryRecord, ServiceError> {
+        self.repository
+            .get_pending(tenant, memory_id)
+            .await?
+            .ok_or(ServiceError::NotFound)?;
+        Ok(self.repository.reject_pending(tenant, memory_id).await?)
+    }
+
+    pub async fn edit_and_accept_pending(
+        &self,
+        tenant: &str,
+        patch: EditPendingRequest,
+    ) -> Result<EditPendingResponse, ServiceError> {
+        let original_memory_id = patch.memory_id.clone();
+        let original = self
+            .repository
+            .get_pending(tenant, &original_memory_id)
+            .await?
+            .ok_or(ServiceError::NotFound)?;
+
+        let superseding = self
+            .repository
+            .replace_pending_with_successor(
+                tenant,
+                &original_memory_id,
+                self.superseding_active_version(&original, patch),
+            )
+            .await?;
+
+        Ok(EditPendingResponse {
+            original_memory_id: original.memory_id,
+            memory: superseding,
+        })
+    }
+
+    fn superseding_active_version(
+        &self,
+        original: &MemoryRecord,
+        patch: EditPendingRequest,
+    ) -> MemoryRecord {
+        let request = IngestMemoryRequest {
+            tenant: original.tenant.clone(),
+            memory_type: original.memory_type.clone(),
+            content: patch.content.clone(),
+            evidence: patch.evidence.clone(),
+            code_refs: patch.code_refs.clone(),
+            scope: original.scope.clone(),
+            visibility: original.visibility.clone(),
+            project: original.project.clone(),
+            repo: original.repo.clone(),
+            module: original.module.clone(),
+            task_type: original.task_type.clone(),
+            tags: patch.tags.clone(),
+            source_agent: original.source_agent.clone(),
+            idempotency_key: None,
+            write_mode: crate::domain::memory::WriteMode::Auto,
+        };
+        let now = current_timestamp();
+
+        MemoryRecord {
+            memory_id: next_memory_id(),
+            tenant: original.tenant.clone(),
+            memory_type: original.memory_type.clone(),
+            status: MemoryStatus::Active,
+            scope: original.scope.clone(),
+            visibility: original.visibility.clone(),
+            version: original.version + 1,
+            summary: patch.summary,
+            content: patch.content,
+            evidence: patch.evidence,
+            code_refs: patch.code_refs,
+            project: original.project.clone(),
+            repo: original.repo.clone(),
+            module: original.module.clone(),
+            task_type: original.task_type.clone(),
+            tags: patch.tags,
+            confidence: default_confidence(&MemoryStatus::Active),
+            decay_score: 0.0,
+            content_hash: compute_content_hash(&request),
+            idempotency_key: None,
+            supersedes_memory_id: Some(original.memory_id.clone()),
+            source_agent: original.source_agent.clone(),
+            created_at: now.clone(),
+            updated_at: now,
+            last_validated_at: None,
+        }
     }
 }
 

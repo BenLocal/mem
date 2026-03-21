@@ -1,8 +1,16 @@
+use axum::{
+    body::{to_bytes, Body},
+    http::{Request, StatusCode},
+};
 use mem::{
+    app::AppState,
     domain::memory::{FeedbackSummary, MemoryRecord, MemoryStatus, MemoryType, Scope, Visibility},
+    http,
     storage::duckdb::DuckDbRepository,
 };
-use tempfile::tempdir;
+use serde_json::{json, Value};
+use tempfile::{tempdir, TempDir};
+use tower::util::ServiceExt;
 
 fn sample_memory(memory_id: &str, status: MemoryStatus) -> MemoryRecord {
     MemoryRecord {
@@ -34,10 +42,104 @@ fn sample_memory(memory_id: &str, status: MemoryStatus) -> MemoryRecord {
     }
 }
 
+fn sample_memory_for_tenant(memory_id: &str, tenant: &str, status: MemoryStatus) -> MemoryRecord {
+    MemoryRecord {
+        tenant: tenant.into(),
+        ..sample_memory(memory_id, status)
+    }
+}
+
 async fn test_duckdb_repo() -> DuckDbRepository {
     let temp_dir = tempdir().unwrap();
     let db_path = temp_dir.path().join("review-test.duckdb");
     DuckDbRepository::open(&db_path).await.unwrap()
+}
+
+struct TestApp {
+    _temp_dir: TempDir,
+    router: axum::Router,
+    repo: DuckDbRepository,
+}
+
+struct TestResponse {
+    status: StatusCode,
+    body: String,
+}
+
+impl TestResponse {
+    fn status(&self) -> u16 {
+        self.status.as_u16()
+    }
+
+    fn json(&self) -> Value {
+        serde_json::from_str(&self.body).expect("body should be valid json")
+    }
+}
+
+impl TestApp {
+    async fn get(&self, path: &str) -> TestResponse {
+        let request = Request::builder()
+            .method("GET")
+            .uri(path)
+            .body(Body::empty())
+            .expect("request should build");
+        let response = self
+            .router
+            .clone()
+            .oneshot(request)
+            .await
+            .expect("request should succeed");
+        let status = response.status();
+        let body = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body should read");
+        TestResponse {
+            status,
+            body: String::from_utf8(body.to_vec()).expect("body should be utf-8"),
+        }
+    }
+
+    async fn post_json(&self, path: &str, body: Value) -> TestResponse {
+        let request = Request::builder()
+            .method("POST")
+            .uri(path)
+            .header("content-type", "application/json")
+            .body(Body::from(body.to_string()))
+            .expect("request should build");
+        let response = self
+            .router
+            .clone()
+            .oneshot(request)
+            .await
+            .expect("request should succeed");
+        let status = response.status();
+        let body = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body should read");
+        TestResponse {
+            status,
+            body: String::from_utf8(body.to_vec()).expect("body should be utf-8"),
+        }
+    }
+}
+
+async fn seeded_app_with_pending_preference() -> TestApp {
+    let temp_dir = tempdir().unwrap();
+    let db_path = temp_dir.path().join("review-api.duckdb");
+    let repo = DuckDbRepository::open(&db_path).await.unwrap();
+    repo.insert_memory(sample_memory("mem_123", MemoryStatus::PendingConfirmation))
+        .await
+        .unwrap();
+
+    let state = AppState {
+        memory_service: mem::service::MemoryService::new(repo.clone()),
+    };
+
+    TestApp {
+        _temp_dir: temp_dir,
+        router: http::router().with_state(state),
+        repo,
+    }
 }
 
 #[tokio::test]
@@ -50,7 +152,7 @@ async fn duckdb_repository_lists_pending_review_rows() {
         .await
         .unwrap();
 
-    let pending = repo.list_pending_review().await.unwrap();
+    let pending = repo.list_pending_review("local").await.unwrap();
 
     assert_eq!(pending.len(), 1);
     assert_eq!(pending[0].memory_id, "001");
@@ -90,4 +192,216 @@ async fn duckdb_repository_summarizes_feedback_by_kind() {
             does_not_apply_here: 0,
         }
     );
+}
+
+#[tokio::test]
+async fn listing_pending_memories_returns_pending_rows() {
+    let app = seeded_app_with_pending_preference().await;
+
+    let response = app.get("/reviews/pending?tenant=local").await;
+
+    assert_eq!(response.status(), 200);
+    assert_eq!(response.json()[0]["memory_id"], "mem_123");
+    assert_eq!(response.json()[0]["status"], "pending_confirmation");
+}
+
+#[tokio::test]
+async fn accepting_pending_memory_marks_it_active() {
+    let app = seeded_app_with_pending_preference().await;
+
+    let response = app
+        .post_json(
+            "/reviews/pending/accept",
+            json!({
+                "tenant": "local",
+                "memory_id": "mem_123"
+            }),
+        )
+        .await;
+
+    assert_eq!(response.status(), 200);
+    assert_eq!(response.json()["status"], "active");
+}
+
+#[tokio::test]
+async fn rejecting_pending_memory_marks_it_rejected() {
+    let app = seeded_app_with_pending_preference().await;
+
+    let response = app
+        .post_json(
+            "/reviews/pending/reject",
+            json!({
+                "tenant": "local",
+                "memory_id": "mem_123"
+            }),
+        )
+        .await;
+
+    assert_eq!(response.status(), 200);
+    assert_eq!(response.json()["status"], "rejected");
+}
+
+#[tokio::test]
+async fn editing_pending_memory_rejects_original_and_creates_active_successor() {
+    let app = seeded_app_with_pending_preference().await;
+
+    let response = app
+        .post_json(
+            "/reviews/pending/edit_accept",
+            json!({
+                "tenant": "local",
+                "memory_id": "mem_123",
+                "summary": "updated summary",
+                "content": "updated content",
+                "evidence": ["docs/updated.md"],
+                "code_refs": ["src/updated.rs"],
+                "tags": ["updated"]
+            }),
+        )
+        .await;
+
+    assert_eq!(response.status(), 200);
+    assert_eq!(response.json()["original_memory_id"], "mem_123");
+    assert_eq!(response.json()["memory"]["status"], "active");
+    assert_eq!(response.json()["memory"]["supersedes_memory_id"], "mem_123");
+    assert_ne!(response.json()["memory"]["memory_id"], "mem_123");
+
+    let original = app
+        .repo
+        .get_memory("mem_123".into())
+        .await
+        .unwrap()
+        .expect("original memory should exist");
+    assert_eq!(original.status, MemoryStatus::Rejected);
+
+    let successor_id = response.json()["memory"]["memory_id"]
+        .as_str()
+        .expect("successor memory id should be present")
+        .to_string();
+    let successor = app
+        .repo
+        .get_memory(successor_id)
+        .await
+        .unwrap()
+        .expect("successor memory should exist");
+    assert_eq!(successor.version, 2);
+    assert_eq!(successor.tenant, "local");
+    assert_eq!(successor.scope, Scope::Repo);
+    assert_eq!(successor.visibility, Visibility::Shared);
+    assert_eq!(successor.project.as_deref(), Some("memory-service"));
+    assert_eq!(successor.repo.as_deref(), Some("mem"));
+    assert_eq!(successor.module.as_deref(), Some("review"));
+}
+
+#[tokio::test]
+async fn listing_pending_memories_respects_tenant_scope() {
+    let temp_dir = tempdir().unwrap();
+    let db_path = temp_dir.path().join("review-api-tenants.duckdb");
+    let repo = DuckDbRepository::open(&db_path).await.unwrap();
+    repo.insert_memory(sample_memory_for_tenant(
+        "mem_local",
+        "tenant-a",
+        MemoryStatus::PendingConfirmation,
+    ))
+    .await
+    .unwrap();
+    repo.insert_memory(sample_memory_for_tenant(
+        "mem_other",
+        "tenant-b",
+        MemoryStatus::PendingConfirmation,
+    ))
+    .await
+    .unwrap();
+
+    let state = AppState {
+        memory_service: mem::service::MemoryService::new(repo.clone()),
+    };
+    let app = TestApp {
+        _temp_dir: temp_dir,
+        router: http::router().with_state(state),
+        repo,
+    };
+
+    let response = app.get("/reviews/pending?tenant=tenant-a").await;
+
+    assert_eq!(response.status(), 200);
+    assert_eq!(response.json().as_array().unwrap().len(), 1);
+    assert_eq!(response.json()[0]["memory_id"], "mem_local");
+}
+
+#[tokio::test]
+async fn accepting_pending_memory_from_wrong_tenant_returns_not_found() {
+    let app = seeded_app_with_pending_preference().await;
+
+    let response = app
+        .post_json(
+            "/reviews/pending/accept",
+            json!({
+                "tenant": "other-tenant",
+                "memory_id": "mem_123"
+            }),
+        )
+        .await;
+
+    assert_eq!(response.status(), 404);
+    assert_eq!(response.json()["error"], "memory not found");
+}
+
+#[tokio::test]
+async fn accepting_unknown_pending_memory_returns_not_found() {
+    let app = seeded_app_with_pending_preference().await;
+
+    let response = app
+        .post_json(
+            "/reviews/pending/accept",
+            json!({
+                "tenant": "local",
+                "memory_id": "missing"
+            }),
+        )
+        .await;
+
+    assert_eq!(response.status(), 404);
+    assert_eq!(response.json()["error"], "memory not found");
+}
+
+#[tokio::test]
+async fn rejecting_unknown_pending_memory_returns_not_found() {
+    let app = seeded_app_with_pending_preference().await;
+
+    let response = app
+        .post_json(
+            "/reviews/pending/reject",
+            json!({
+                "tenant": "local",
+                "memory_id": "missing"
+            }),
+        )
+        .await;
+
+    assert_eq!(response.status(), 404);
+    assert_eq!(response.json()["error"], "memory not found");
+}
+
+#[tokio::test]
+async fn editing_unknown_pending_memory_returns_not_found() {
+    let app = seeded_app_with_pending_preference().await;
+
+    let response = app
+        .post_json(
+            "/reviews/pending/edit_accept",
+            json!({
+                "tenant": "local",
+                "memory_id": "missing",
+                "summary": "updated summary",
+                "content": "updated content",
+                "evidence": ["docs/updated.md"],
+                "code_refs": ["src/updated.rs"],
+                "tags": ["updated"]
+            }),
+        )
+        .await;
+
+    assert_eq!(response.status(), 404);
+    assert_eq!(response.json()["error"], "memory not found");
 }

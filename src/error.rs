@@ -5,7 +5,7 @@ use axum::{
 };
 use serde_json::json;
 
-use crate::storage::StorageError;
+use crate::{service::memory_service::ServiceError, storage::StorageError};
 
 pub type Result<T> = std::result::Result<T, anyhow::Error>;
 
@@ -18,12 +18,25 @@ impl From<StorageError> for AppError {
     }
 }
 
+impl From<ServiceError> for AppError {
+    fn from(error: ServiceError) -> Self {
+        Self(error.into())
+    }
+}
+
 impl IntoResponse for AppError {
     fn into_response(self) -> Response {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(json!({ "error": self.0.to_string() })),
-        )
-            .into_response()
+        match self.0.downcast_ref::<ServiceError>() {
+            Some(ServiceError::NotFound) => (
+                StatusCode::NOT_FOUND,
+                Json(json!({ "error": "memory not found" })),
+            )
+                .into_response(),
+            _ => (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({ "error": self.0.to_string() })),
+            )
+                .into_response(),
+        }
     }
 }
