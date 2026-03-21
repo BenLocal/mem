@@ -122,6 +122,33 @@ impl DuckDbRepository {
         Ok(memory)
     }
 
+    pub async fn find_by_idempotency_or_hash(
+        &self,
+        idempotency_key: &Option<String>,
+        content_hash: &str,
+    ) -> Result<Option<MemoryRecord>, StorageError> {
+        let conn = self.conn()?;
+        let memory = conn
+            .query_row(
+                "select
+                    memory_id, tenant, memory_type, status, scope, visibility, version, summary,
+                    content, evidence_json, code_refs_json, project, repo, module, task_type,
+                    tags_json, confidence, decay_score, content_hash, idempotency_key,
+                    supersedes_memory_id, source_agent, created_at, updated_at, last_validated_at
+                 from memories
+                 where (?1 is not null and idempotency_key = ?1) or content_hash = ?2
+                 order by
+                    case when ?1 is not null and idempotency_key = ?1 then 0 else 1 end,
+                    updated_at desc
+                 limit 1",
+                params![idempotency_key.as_deref(), content_hash],
+                map_memory_row,
+            )
+            .optional()?;
+
+        Ok(memory)
+    }
+
     pub async fn list_pending_review(&self) -> Result<Vec<MemoryRecord>, StorageError> {
         let conn = self.conn()?;
         let mut stmt = conn.prepare(

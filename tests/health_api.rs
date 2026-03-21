@@ -4,12 +4,6 @@ use axum::{
 };
 use tower::util::ServiceExt;
 
-#[path = "../src/app.rs"]
-mod app;
-
-#[path = "../src/http/mod.rs"]
-mod http;
-
 struct TestApp {
     router: axum::Router,
 }
@@ -55,7 +49,7 @@ impl TestApp {
 
 async fn test_app() -> TestApp {
     TestApp {
-        router: app::router(),
+        router: mem::app::router(),
     }
 }
 
