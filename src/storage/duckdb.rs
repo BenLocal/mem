@@ -124,6 +124,7 @@ impl DuckDbRepository {
 
     pub async fn find_by_idempotency_or_hash(
         &self,
+        tenant: &str,
         idempotency_key: &Option<String>,
         content_hash: &str,
     ) -> Result<Option<MemoryRecord>, StorageError> {
@@ -136,12 +137,13 @@ impl DuckDbRepository {
                     tags_json, confidence, decay_score, content_hash, idempotency_key,
                     supersedes_memory_id, source_agent, created_at, updated_at, last_validated_at
                  from memories
-                 where (?1 is not null and idempotency_key = ?1) or content_hash = ?2
+                 where tenant = ?1
+                   and (((?2 is not null and idempotency_key = ?2) or content_hash = ?3))
                  order by
-                    case when ?1 is not null and idempotency_key = ?1 then 0 else 1 end,
+                    case when ?2 is not null and idempotency_key = ?2 then 0 else 1 end,
                     updated_at desc
                  limit 1",
-                params![idempotency_key.as_deref(), content_hash],
+                params![tenant, idempotency_key.as_deref(), content_hash],
                 map_memory_row,
             )
             .optional()?;

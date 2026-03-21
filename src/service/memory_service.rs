@@ -53,7 +53,7 @@ impl MemoryService {
         let content_hash = compute_content_hash(&request);
 
         if let Some(existing) = repo
-            .find_by_idempotency_or_hash(&request.idempotency_key, &content_hash)
+            .find_by_idempotency_or_hash(&request.tenant, &request.idempotency_key, &content_hash)
             .await?
         {
             return Ok(existing.into());
