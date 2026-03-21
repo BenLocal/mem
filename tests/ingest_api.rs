@@ -8,6 +8,7 @@ use mem::domain::{
     },
     workflow::WorkflowCandidate,
 };
+use tempfile::tempdir;
 
 fn sample_memory_record() -> MemoryRecord {
     MemoryRecord {
@@ -37,6 +38,26 @@ fn sample_memory_record() -> MemoryRecord {
         updated_at: "2026-03-21T00:05:00Z".into(),
         last_validated_at: Some("2026-03-21T00:06:00Z".into()),
     }
+}
+
+fn sample_memory() -> MemoryRecord {
+    sample_memory_record()
+}
+
+async fn test_duckdb_repo() -> mem::storage::duckdb::DuckDbRepository {
+    let temp_dir = tempdir().unwrap();
+    let db_path = temp_dir.path().join("test.duckdb");
+
+    mem::storage::duckdb::DuckDbRepository::open(&db_path).await.unwrap()
+}
+
+#[tokio::test]
+async fn duckdb_repository_persists_memory_rows() {
+    let repo = test_duckdb_repo().await;
+    let saved = repo.insert_memory(sample_memory()).await.unwrap();
+    let loaded = repo.get_memory(saved.memory_id).await.unwrap().unwrap();
+
+    assert_eq!(loaded.summary, "cache invalidation rule");
 }
 
 #[test]
