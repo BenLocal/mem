@@ -25,6 +25,30 @@ pub struct FeedbackEvent {
     pub created_at: String,
 }
 
+/// Row claimed by the embedding worker (`status = processing`).
+#[derive(Debug, Clone)]
+pub struct ClaimedEmbeddingJob {
+    pub job_id: String,
+    pub tenant: String,
+    pub memory_id: String,
+    pub target_content_hash: String,
+    pub provider: String,
+    pub attempt_count: i64,
+}
+
+/// Insert payload for `embedding_jobs` (worker and APIs use the same row shape).
+#[derive(Debug, Clone)]
+pub struct EmbeddingJobInsert {
+    pub job_id: String,
+    pub tenant: String,
+    pub memory_id: String,
+    pub target_content_hash: String,
+    pub provider: String,
+    pub available_at: String,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
 #[derive(Debug, Clone)]
 pub struct DuckDbRepository {
     conn: Arc<Mutex<Connection>>,
@@ -103,6 +127,487 @@ impl DuckDbRepository {
         )?;
 
         Ok(memory)
+    }
+
+    /// Enqueues a pending embedding job unless a live (`pending` or `processing`) job
+    /// already exists for the same `(tenant, memory_id, target_content_hash, provider)`.
+    /// Returns `true` if a new row was inserted.
+    pub async fn try_enqueue_embedding_job(
+        &self,
+        insert: EmbeddingJobInsert,
+    ) -> Result<bool, StorageError> {
+        let mut conn = self.conn()?;
+        let tx = conn.transaction()?;
+        let live: i64 = tx.query_row(
+            "select count(*) from embedding_jobs
+             where tenant = ?1
+               and memory_id = ?2
+               and target_content_hash = ?3
+               and provider = ?4
+               and status in ('pending', 'processing')",
+            params![
+                &insert.tenant,
+                &insert.memory_id,
+                &insert.target_content_hash,
+                &insert.provider,
+            ],
+            |row| row.get(0),
+        )?;
+        if live > 0 {
+            return Ok(false);
+        }
+
+        tx.execute(
+            "insert into embedding_jobs (
+                job_id, tenant, memory_id, target_content_hash, provider,
+                status, attempt_count, last_error, available_at, created_at, updated_at
+            ) values (
+                ?1, ?2, ?3, ?4, ?5,
+                'pending', 0, null, ?6, ?7, ?8
+            )",
+            params![
+                insert.job_id,
+                insert.tenant,
+                insert.memory_id,
+                insert.target_content_hash,
+                insert.provider,
+                insert.available_at,
+                insert.created_at,
+                insert.updated_at,
+            ],
+        )?;
+        tx.commit()?;
+        Ok(true)
+    }
+
+    pub async fn count_embedding_jobs_for_memory(
+        &self,
+        memory_id: &str,
+    ) -> Result<i64, StorageError> {
+        let conn = self.conn()?;
+        let count: i64 = conn.query_row(
+            "select count(*) from embedding_jobs where memory_id = ?1",
+            params![memory_id],
+            |row| row.get(0),
+        )?;
+        Ok(count)
+    }
+
+    pub async fn count_memory_embeddings_for_memory(
+        &self,
+        memory_id: &str,
+    ) -> Result<i64, StorageError> {
+        let conn = self.conn()?;
+        let count: i64 = conn.query_row(
+            "select count(*) from memory_embeddings where memory_id = ?1",
+            params![memory_id],
+            |row| row.get(0),
+        )?;
+        Ok(count)
+    }
+
+    pub async fn first_embedding_job_id_for_memory(
+        &self,
+        memory_id: &str,
+    ) -> Result<Option<String>, StorageError> {
+        let conn = self.conn()?;
+        let id: Option<String> = conn
+            .query_row(
+                "select job_id from embedding_jobs where memory_id = ?1 order by created_at asc limit 1",
+                params![memory_id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        Ok(id)
+    }
+
+    pub async fn get_embedding_job_status(
+        &self,
+        job_id: &str,
+    ) -> Result<Option<String>, StorageError> {
+        let conn = self.conn()?;
+        let status: Option<String> = conn
+            .query_row(
+                "select status from embedding_jobs where job_id = ?1",
+                params![job_id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        Ok(status)
+    }
+
+    /// Claims the next eligible job, moving it to `processing`. Eligible means `pending`, or
+    /// `failed` with `attempt_count < max_retries` (configured retry budget).
+    pub async fn claim_next_embedding_job(
+        &self,
+        now: &str,
+        max_retries: u32,
+    ) -> Result<Option<ClaimedEmbeddingJob>, StorageError> {
+        let mut conn = self.conn()?;
+        let tx = conn.transaction()?;
+        let max_r = i64::from(max_retries);
+
+        let job_id: Option<String> = tx
+            .query_row(
+                "select job_id from embedding_jobs
+                 where available_at <= ?1
+                   and (
+                     status = 'pending'
+                     or (status = 'failed' and attempt_count < ?2)
+                   )
+                 order by available_at asc, created_at asc
+                 limit 1",
+                params![now, max_r],
+                |row| row.get(0),
+            )
+            .optional()?;
+
+        let Some(job_id) = job_id else {
+            tx.commit()?;
+            return Ok(None);
+        };
+
+        let updated = tx.execute(
+            "update embedding_jobs
+             set status = 'processing', updated_at = ?1
+             where job_id = ?2
+               and (
+                 status = 'pending'
+                 or (status = 'failed' and attempt_count < ?3)
+               )",
+            params![now, job_id, max_r],
+        )?;
+
+        if updated == 0 {
+            tx.commit()?;
+            return Ok(None);
+        }
+
+        let job = tx.query_row(
+            "select job_id, tenant, memory_id, target_content_hash, provider, attempt_count
+             from embedding_jobs where job_id = ?1",
+            params![job_id],
+            |row| {
+                Ok(ClaimedEmbeddingJob {
+                    job_id: row.get(0)?,
+                    tenant: row.get(1)?,
+                    memory_id: row.get(2)?,
+                    target_content_hash: row.get(3)?,
+                    provider: row.get(4)?,
+                    attempt_count: row.get(5)?,
+                })
+            },
+        )?;
+
+        tx.commit()?;
+        Ok(Some(job))
+    }
+
+    pub async fn upsert_memory_embedding(
+        &self,
+        memory_id: &str,
+        tenant: &str,
+        embedding_model: &str,
+        embedding_dim: i64,
+        embedding_blob: &[u8],
+        content_hash: &str,
+        source_updated_at: &str,
+        now: &str,
+    ) -> Result<(), StorageError> {
+        let conn = self.conn()?;
+        conn.execute(
+            "delete from memory_embeddings where memory_id = ?1",
+            params![memory_id],
+        )?;
+        conn.execute(
+            "insert into memory_embeddings (
+                memory_id, tenant, embedding_model, embedding_dim, embedding,
+                content_hash, source_updated_at, created_at, updated_at
+            ) values (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+            params![
+                memory_id,
+                tenant,
+                embedding_model,
+                embedding_dim,
+                embedding_blob,
+                content_hash,
+                source_updated_at,
+                now,
+                now,
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub async fn delete_memory_embedding(&self, memory_id: &str) -> Result<(), StorageError> {
+        let conn = self.conn()?;
+        conn.execute(
+            "delete from memory_embeddings where memory_id = ?1",
+            params![memory_id],
+        )?;
+        Ok(())
+    }
+
+    /// Marks in-flight and queued jobs as `stale` so a new job can be enqueued (e.g. forced rebuild).
+    pub async fn stale_live_embedding_jobs_for_memory(
+        &self,
+        tenant: &str,
+        memory_id: &str,
+        provider: &str,
+        now: &str,
+    ) -> Result<usize, StorageError> {
+        let conn = self.conn()?;
+        let n = conn.execute(
+            "update embedding_jobs
+             set status = 'stale', updated_at = ?1
+             where tenant = ?2 and memory_id = ?3 and provider = ?4
+               and status in ('pending', 'processing')",
+            params![now, tenant, memory_id, provider],
+        )?;
+        Ok(n)
+    }
+
+    /// Snapshot row for embedding metadata (`model`, stored `content_hash`, `updated_at`).
+    pub async fn get_memory_embedding_row(
+        &self,
+        memory_id: &str,
+    ) -> Result<Option<(String, String, String)>, StorageError> {
+        let conn = self.conn()?;
+        let row: Option<(String, String, String)> = conn
+            .query_row(
+                "select embedding_model, content_hash, updated_at
+                 from memory_embeddings where memory_id = ?1",
+                params![memory_id],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .optional()?;
+        Ok(row)
+    }
+
+    /// Latest job status for an exact `(tenant, memory_id, target_content_hash)` match.
+    pub async fn latest_embedding_job_status_for_hash(
+        &self,
+        tenant: &str,
+        memory_id: &str,
+        target_content_hash: &str,
+    ) -> Result<Option<String>, StorageError> {
+        let conn = self.conn()?;
+        let status: Option<String> = conn
+            .query_row(
+                "select status from embedding_jobs
+                 where tenant = ?1 and memory_id = ?2 and target_content_hash = ?3
+                 order by updated_at desc limit 1",
+                params![tenant, memory_id, target_content_hash],
+                |row| row.get(0),
+            )
+            .optional()?;
+        Ok(status)
+    }
+
+    pub async fn list_embedding_jobs(
+        &self,
+        tenant: &str,
+        status_filter: Option<&str>,
+        memory_id_filter: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<crate::domain::embeddings::EmbeddingJobInfo>, StorageError> {
+        let conn = self.conn()?;
+        let lim = i64::try_from(limit).unwrap_or(1000).min(10_000);
+        let mut stmt = if status_filter.is_some() && memory_id_filter.is_some() {
+            conn.prepare(
+                "select job_id, tenant, memory_id, target_content_hash, provider, status,
+                        attempt_count, last_error, available_at, created_at, updated_at
+                 from embedding_jobs
+                 where tenant = ?1 and status = ?2 and memory_id = ?3
+                 order by updated_at desc
+                 limit ?4",
+            )?
+        } else if status_filter.is_some() {
+            conn.prepare(
+                "select job_id, tenant, memory_id, target_content_hash, provider, status,
+                        attempt_count, last_error, available_at, created_at, updated_at
+                 from embedding_jobs
+                 where tenant = ?1 and status = ?2
+                 order by updated_at desc
+                 limit ?3",
+            )?
+        } else if memory_id_filter.is_some() {
+            conn.prepare(
+                "select job_id, tenant, memory_id, target_content_hash, provider, status,
+                        attempt_count, last_error, available_at, created_at, updated_at
+                 from embedding_jobs
+                 where tenant = ?1 and memory_id = ?2
+                 order by updated_at desc
+                 limit ?3",
+            )?
+        } else {
+            conn.prepare(
+                "select job_id, tenant, memory_id, target_content_hash, provider, status,
+                        attempt_count, last_error, available_at, created_at, updated_at
+                 from embedding_jobs
+                 where tenant = ?1
+                 order by updated_at desc
+                 limit ?2",
+            )?
+        };
+
+        let map_row = |row: &duckdb::Row| -> duckdb::Result<crate::domain::embeddings::EmbeddingJobInfo> {
+            let attempt: i64 = row.get(6)?;
+            Ok(crate::domain::embeddings::EmbeddingJobInfo {
+                job_id: row.get(0)?,
+                tenant: row.get(1)?,
+                memory_id: row.get(2)?,
+                target_content_hash: row.get(3)?,
+                provider: row.get(4)?,
+                status: row.get(5)?,
+                attempt_count: u32::try_from(attempt).unwrap_or(0),
+                last_error: row.get(7)?,
+                available_at: row.get(8)?,
+                created_at: row.get(9)?,
+                updated_at: row.get(10)?,
+            })
+        };
+
+        let rows = match (status_filter, memory_id_filter) {
+            (Some(st), Some(mid)) => stmt.query_map(params![tenant, st, mid, lim], map_row)?,
+            (Some(st), None) => stmt.query_map(params![tenant, st, lim], map_row)?,
+            (None, Some(mid)) => stmt.query_map(params![tenant, mid, lim], map_row)?,
+            (None, None) => stmt.query_map(params![tenant, lim], map_row)?,
+        };
+
+        let mut out = Vec::new();
+        for r in rows {
+            out.push(r?);
+        }
+        Ok(out)
+    }
+
+    pub async fn list_memory_ids_for_tenant(
+        &self,
+        tenant: &str,
+    ) -> Result<Vec<String>, StorageError> {
+        let conn = self.conn()?;
+        let mut stmt = conn.prepare(
+            "select memory_id from memories where tenant = ?1 order by updated_at desc",
+        )?;
+        let rows = stmt.query_map(params![tenant], |row| row.get::<_, String>(0))?;
+        let mut out = Vec::new();
+        for r in rows {
+            out.push(r?);
+        }
+        Ok(out)
+    }
+
+    /// Joins `memories` with valid `memory_embeddings` (hash match), scores by cosine similarity in Rust.
+    pub async fn semantic_search_memories(
+        &self,
+        tenant: &str,
+        query_embedding: &[f32],
+        limit: usize,
+    ) -> Result<Vec<(MemoryRecord, f32)>, StorageError> {
+        if query_embedding.is_empty() || limit == 0 {
+            return Ok(vec![]);
+        }
+        let conn = self.conn()?;
+        let mut stmt = conn.prepare(
+            "select
+                m.memory_id, m.tenant, m.memory_type, m.status, m.scope, m.visibility, m.version,
+                m.summary, m.content, m.evidence_json, m.code_refs_json, m.project, m.repo,
+                m.module, m.task_type, m.tags_json, m.confidence, m.decay_score, m.content_hash,
+                m.idempotency_key, m.supersedes_memory_id, m.source_agent, m.created_at,
+                m.updated_at, m.last_validated_at,
+                e.embedding
+             from memories m
+             inner join memory_embeddings e on m.memory_id = e.memory_id
+             where m.tenant = ?1
+               and m.content_hash = e.content_hash
+               and m.status not in ('rejected', 'archived')
+             order by m.updated_at desc
+             limit 2000",
+        )?;
+
+        let rows = stmt.query_map(params![tenant], map_memory_with_blob)?;
+        let mut scored = Vec::new();
+        for row in rows {
+            let (memory, blob) = row?;
+            let Ok(emb) = decode_f32_blob(&blob, query_embedding.len()) else {
+                continue;
+            };
+            let sim = cosine_similarity(&emb, query_embedding);
+            scored.push((memory, sim));
+        }
+
+        scored.sort_by(|left, right| {
+            right
+                .1
+                .partial_cmp(&left.1)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| left.0.memory_id.cmp(&right.0.memory_id))
+        });
+        scored.truncate(limit);
+        Ok(scored)
+    }
+
+    pub async fn complete_embedding_job(&self, job_id: &str, now: &str) -> Result<(), StorageError> {
+        let conn = self.conn()?;
+        conn.execute(
+            "update embedding_jobs
+             set status = 'completed', last_error = null, updated_at = ?1
+             where job_id = ?2 and status = 'processing'",
+            params![now, job_id],
+        )?;
+        Ok(())
+    }
+
+    pub async fn mark_embedding_job_stale(&self, job_id: &str, now: &str) -> Result<(), StorageError> {
+        let conn = self.conn()?;
+        conn.execute(
+            "update embedding_jobs set status = 'stale', updated_at = ?1 where job_id = ?2",
+            params![now, job_id],
+        )?;
+        Ok(())
+    }
+
+    pub async fn reschedule_embedding_job_failure(
+        &self,
+        job_id: &str,
+        new_attempt_count: i64,
+        last_error: &str,
+        available_at: &str,
+        now: &str,
+    ) -> Result<(), StorageError> {
+        let conn = self.conn()?;
+        conn.execute(
+            "update embedding_jobs
+             set status = 'failed',
+                 attempt_count = ?1,
+                 last_error = ?2,
+                 available_at = ?3,
+                 updated_at = ?4
+             where job_id = ?5",
+            params![new_attempt_count, last_error, available_at, now, job_id],
+        )?;
+        Ok(())
+    }
+
+    pub async fn permanently_fail_embedding_job(
+        &self,
+        job_id: &str,
+        new_attempt_count: i64,
+        last_error: &str,
+        now: &str,
+    ) -> Result<(), StorageError> {
+        let conn = self.conn()?;
+        conn.execute(
+            "update embedding_jobs
+             set status = 'failed',
+                 attempt_count = ?1,
+                 last_error = ?2,
+                 updated_at = ?3
+             where job_id = ?4",
+            params![new_attempt_count, last_error, now, job_id],
+        )?;
+        Ok(())
     }
 
     pub async fn get_memory(
@@ -666,6 +1171,39 @@ impl DuckDbRepository {
             .await?
             .ok_or(StorageError::InvalidData("updated memory not found"))
     }
+}
+
+fn map_memory_with_blob(row: &duckdb::Row<'_>) -> Result<(MemoryRecord, Vec<u8>), duckdb::Error> {
+    let memory = map_memory_row(row)?;
+    let blob: Vec<u8> = row.get(25)?;
+    Ok((memory, blob))
+}
+
+fn decode_f32_blob(blob: &[u8], expected_len: usize) -> Result<Vec<f32>, StorageError> {
+    let expected_bytes = expected_len
+        .checked_mul(4)
+        .ok_or(StorageError::InvalidData("embedding dimension overflow"))?;
+    if blob.len() != expected_bytes {
+        return Err(StorageError::InvalidData("embedding blob length mismatch"));
+    }
+    let mut out = Vec::with_capacity(expected_len);
+    for chunk in blob.chunks_exact(4) {
+        out.push(f32::from_ne_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]));
+    }
+    Ok(out)
+}
+
+fn cosine_similarity(a: &[f32], b: &[f32]) -> f32 {
+    if a.len() != b.len() || a.is_empty() {
+        return 0.0;
+    }
+    let dot: f32 = a.iter().zip(b).map(|(x, y)| x * y).sum();
+    let na: f32 = a.iter().map(|x| x * x).sum::<f32>().sqrt();
+    let nb: f32 = b.iter().map(|x| x * x).sum::<f32>().sqrt();
+    if na == 0.0 || nb == 0.0 {
+        return 0.0;
+    }
+    dot / (na * nb)
 }
 
 fn map_memory_row(row: &duckdb::Row<'_>) -> Result<MemoryRecord, duckdb::Error> {

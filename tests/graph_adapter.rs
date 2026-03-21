@@ -124,6 +124,7 @@ async fn test_app_with_unavailable_graph() -> TestApp {
         .unwrap();
     let state = AppState {
         memory_service: MemoryService::with_graph(repository, Arc::new(IndraDbGraphAdapter::new())),
+        config: mem::config::Config::local(),
     };
 
     TestApp {

@@ -134,6 +134,7 @@ async fn seeded_app(memories: Vec<MemoryRecord>) -> TestApp {
 
     let state = AppState {
         memory_service: mem::service::MemoryService::new(repo),
+        config: mem::config::Config::local(),
     };
 
     TestApp {

@@ -133,6 +133,7 @@ async fn seeded_app_with_pending_preference() -> TestApp {
 
     let state = AppState {
         memory_service: mem::service::MemoryService::new(repo.clone()),
+        config: mem::config::Config::local(),
     };
 
     TestApp {
@@ -152,6 +153,7 @@ async fn seeded_app_with_active_preference() -> TestApp {
 
     let state = AppState {
         memory_service: mem::service::MemoryService::new(repo.clone()),
+        config: mem::config::Config::local(),
     };
 
     TestApp {
@@ -366,6 +368,7 @@ async fn listing_pending_memories_respects_tenant_scope() {
 
     let state = AppState {
         memory_service: mem::service::MemoryService::new(repo.clone()),
+        config: mem::config::Config::local(),
     };
     let app = TestApp {
         _temp_dir: temp_dir,

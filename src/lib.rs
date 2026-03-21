@@ -1,5 +1,6 @@
 pub mod app;
 pub mod config;
+pub mod embedding;
 pub mod domain;
 pub mod error;
 pub mod http;

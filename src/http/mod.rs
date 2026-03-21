@@ -1,3 +1,4 @@
+pub mod embeddings;
 pub mod graph;
 pub mod health;
 pub mod memory;
@@ -11,6 +12,7 @@ pub fn router() -> Router<AppState> {
     Router::<AppState>::new()
         .merge(health::router::<AppState>())
         .merge(memory::router())
+        .merge(embeddings::router())
         .merge(review::router())
         .merge(graph::router())
 }

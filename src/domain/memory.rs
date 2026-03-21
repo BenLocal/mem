@@ -249,4 +249,6 @@ pub struct MemoryDetailResponse {
     pub version_chain: Vec<MemoryVersionLink>,
     pub graph_links: Vec<GraphEdge>,
     pub feedback_summary: FeedbackSummary,
+    #[serde(default)]
+    pub embedding: super::embeddings::MemoryEmbeddingMeta,
 }

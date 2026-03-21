@@ -89,6 +89,7 @@ async fn test_app() -> TestApp {
     let repo = DuckDbRepository::open(&db_path).await.unwrap();
     let state = AppState {
         memory_service: mem::service::MemoryService::new(repo.clone()),
+        config: mem::config::Config::local(),
     };
 
     TestApp {

@@ -121,6 +121,7 @@ async fn seeded_search_app(memories: Vec<MemoryRecord>) -> TestApp {
 
     let state = AppState {
         memory_service: MemoryService::with_graph(repo, graph),
+        config: mem::config::Config::local(),
     };
 
     TestApp {

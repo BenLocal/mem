@@ -1,4 +1,5 @@
 use std::{
+    collections::HashSet,
     sync::atomic::{AtomicU64, Ordering},
     time::{SystemTime, UNIX_EPOCH},
 };
@@ -7,7 +8,12 @@ use serde::Serialize;
 use std::sync::Arc;
 use thiserror::Error;
 
-use crate::domain::{episode::EpisodeResponse, memory::MemoryDetailResponse};
+use crate::domain::{
+    embeddings::{EmbeddingsRebuildResponse, EmbeddingJobInfo, MemoryEmbeddingMeta},
+    episode::EpisodeResponse,
+    memory::MemoryDetailResponse,
+};
+use crate::embedding::EmbeddingProvider;
 use crate::{
     domain::{
         episode::{EpisodeRecord, IngestEpisodeRequest},
@@ -20,12 +26,15 @@ use crate::{
     pipeline::ingest::{compute_content_hash, initial_status, memory_node_id},
     pipeline::workflow,
     pipeline::{compress, retrieve},
-    storage::{DuckDbRepository, GraphError, GraphStore, LocalGraphAdapter, StorageError},
+    storage::{
+        DuckDbRepository, EmbeddingJobInsert, GraphError, GraphStore, LocalGraphAdapter, StorageError,
+    },
 };
 
 static EPISODE_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 static MEMORY_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 static FEEDBACK_SEQUENCE: AtomicU64 = AtomicU64::new(1);
+static EMBEDDING_JOB_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -57,18 +66,46 @@ impl From<MemoryRecord> for IngestMemoryResponse {
 pub struct MemoryService {
     repository: DuckDbRepository,
     graph: Arc<dyn GraphStore>,
+    /// Value stored on `embedding_jobs.provider` (e.g. `fake`, `openai`).
+    embedding_job_provider: String,
+    /// When set, search runs hybrid lexical + semantic retrieval.
+    embedding_search_provider: Option<Arc<dyn EmbeddingProvider>>,
 }
 
 impl MemoryService {
     pub fn new(repository: DuckDbRepository) -> Self {
-        Self {
+        Self::with_graph_and_embedding_providers(
             repository,
-            graph: Arc::new(LocalGraphAdapter::default()),
-        }
+            Arc::new(LocalGraphAdapter::default()),
+            "fake".to_string(),
+            None,
+        )
     }
 
     pub fn with_graph(repository: DuckDbRepository, graph: Arc<dyn GraphStore>) -> Self {
-        Self { repository, graph }
+        Self::with_graph_and_embedding_providers(repository, graph, "fake".to_string(), None)
+    }
+
+    pub fn with_graph_and_embedding_provider(
+        repository: DuckDbRepository,
+        graph: Arc<dyn GraphStore>,
+        embedding_job_provider: String,
+    ) -> Self {
+        Self::with_graph_and_embedding_providers(repository, graph, embedding_job_provider, None)
+    }
+
+    pub fn with_graph_and_embedding_providers(
+        repository: DuckDbRepository,
+        graph: Arc<dyn GraphStore>,
+        embedding_job_provider: String,
+        embedding_search_provider: Option<Arc<dyn EmbeddingProvider>>,
+    ) -> Self {
+        Self {
+            repository,
+            graph,
+            embedding_job_provider,
+            embedding_search_provider,
+        }
     }
 
     pub async fn ingest(
@@ -117,6 +154,7 @@ impl MemoryService {
 
         let stored = self.repository.insert_memory(memory).await?;
         ignore_graph_unavailable(self.graph.sync_memory(&stored).await)?;
+        self.enqueue_embedding_job_for_memory(&stored).await?;
         Ok(stored.into())
     }
 
@@ -194,6 +232,8 @@ impl MemoryService {
         }
         .ok_or(ServiceError::NotFound)?;
 
+        let embedding = self.embedding_meta_for_memory(&memory).await?;
+
         Ok(MemoryDetailResponse {
             version_chain: self
                 .repository
@@ -204,6 +244,120 @@ impl MemoryService {
             )?,
             feedback_summary: self.repository.feedback_summary(memory_id).await?,
             memory,
+            embedding,
+        })
+    }
+
+    pub async fn list_embedding_jobs(
+        &self,
+        tenant: &str,
+        status: Option<&str>,
+        memory_id: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<EmbeddingJobInfo>, ServiceError> {
+        Ok(self
+            .repository
+            .list_embedding_jobs(tenant, status, memory_id, limit)
+            .await?)
+    }
+
+    pub async fn rebuild_embeddings(
+        &self,
+        tenant: &str,
+        memory_ids: &[String],
+        force: bool,
+    ) -> Result<EmbeddingsRebuildResponse, ServiceError> {
+        let ids: Vec<String> = if memory_ids.is_empty() {
+            self.repository.list_memory_ids_for_tenant(tenant).await?
+        } else {
+            memory_ids.to_vec()
+        };
+
+        let mut enqueued: u32 = 0;
+        for mid in ids {
+            let memory = self
+                .repository
+                .get_memory_for_tenant(tenant, &mid)
+                .await?
+                .ok_or(ServiceError::NotFound)?;
+
+            let now = current_timestamp();
+            if force {
+                self.repository.delete_memory_embedding(&mid).await?;
+                self.repository
+                    .stale_live_embedding_jobs_for_memory(
+                        tenant,
+                        &mid,
+                        &self.embedding_job_provider,
+                        &now,
+                    )
+                    .await?;
+            }
+
+            let insert = EmbeddingJobInsert {
+                job_id: next_embedding_job_id(),
+                tenant: memory.tenant.clone(),
+                memory_id: memory.memory_id.clone(),
+                target_content_hash: memory.content_hash.clone(),
+                provider: self.embedding_job_provider.clone(),
+                available_at: now.clone(),
+                created_at: now.clone(),
+                updated_at: now,
+            };
+            if self.repository.try_enqueue_embedding_job(insert).await? {
+                enqueued += 1;
+            }
+        }
+
+        Ok(EmbeddingsRebuildResponse { enqueued })
+    }
+
+    async fn embedding_meta_for_memory(
+        &self,
+        memory: &MemoryRecord,
+    ) -> Result<MemoryEmbeddingMeta, ServiceError> {
+        if let Some((model, hash, updated_at)) = self
+            .repository
+            .get_memory_embedding_row(&memory.memory_id)
+            .await?
+        {
+            if hash == memory.content_hash {
+                return Ok(MemoryEmbeddingMeta {
+                    status: "indexed".to_string(),
+                    model: Some(model),
+                    updated_at: Some(updated_at),
+                    content_hash: Some(hash),
+                });
+            }
+            return Ok(MemoryEmbeddingMeta {
+                status: "stale".to_string(),
+                model: Some(model),
+                updated_at: Some(updated_at),
+                content_hash: Some(hash),
+            });
+        }
+
+        let job_status = self
+            .repository
+            .latest_embedding_job_status_for_hash(
+                &memory.tenant,
+                &memory.memory_id,
+                &memory.content_hash,
+            )
+            .await?;
+
+        let status_label = match job_status.as_deref() {
+            None => "none",
+            Some("pending") => "pending",
+            Some("processing") => "processing",
+            Some("failed") => "failed",
+            Some("completed") | Some("stale") => "none",
+            Some(_) => "none",
+        };
+
+        Ok(MemoryEmbeddingMeta {
+            status: status_label.to_string(),
+            ..Default::default()
         })
     }
 
@@ -252,6 +406,7 @@ impl MemoryService {
             )
             .await?;
         ignore_graph_unavailable(self.graph.sync_memory(&superseding).await)?;
+        self.enqueue_embedding_job_for_memory(&superseding).await?;
 
         Ok(EditPendingResponse {
             original_memory_id: original.memory_id,
@@ -343,18 +498,61 @@ impl MemoryService {
         query: SearchMemoryRequest,
     ) -> Result<SearchMemoryResponse, ServiceError> {
         let tenant = query.tenant.as_deref().unwrap_or("local");
-        let candidates = self.repository.search_candidates(tenant).await?;
-        let ranked = match retrieve::rank_with_graph(candidates, &query, self.graph.as_ref()).await
+        let lexical = self.repository.search_candidates(tenant).await?;
+
+        let semantic = if let Some(provider) = self.embedding_search_provider.as_ref() {
+            match provider.embed_text(&query.query).await {
+                Ok(q) => self
+                    .repository
+                    .semantic_search_memories(tenant, &q, 48)
+                    .await
+                    .unwrap_or_default(),
+                Err(_) => vec![],
+            }
+        } else {
+            vec![]
+        };
+
+        let ranked = match retrieve::rank_with_graph_hybrid(
+            lexical,
+            semantic.clone(),
+            &query,
+            self.graph.as_ref(),
+        )
+        .await
         {
             Ok(ranked) => ranked,
             Err(GraphError::Unavailable(_)) => {
-                let base = self.repository.search_candidates(tenant).await?;
-                retrieve::rank_candidates(base, &query)
+                let lex2 = self.repository.search_candidates(tenant).await?;
+                if semantic.is_empty() {
+                    retrieve::rank_candidates(lex2, &query)
+                } else {
+                    retrieve::merge_and_rank_hybrid(lex2, semantic, &query, &HashSet::new(), 0)
+                }
             }
             Err(error) => return Err(error.into()),
         };
 
         Ok(compress::compress(&ranked, query.token_budget))
+    }
+
+    async fn enqueue_embedding_job_for_memory(
+        &self,
+        memory: &MemoryRecord,
+    ) -> Result<(), ServiceError> {
+        let now = current_timestamp();
+        let insert = EmbeddingJobInsert {
+            job_id: next_embedding_job_id(),
+            tenant: memory.tenant.clone(),
+            memory_id: memory.memory_id.clone(),
+            target_content_hash: memory.content_hash.clone(),
+            provider: self.embedding_job_provider.clone(),
+            available_at: now.clone(),
+            created_at: now.clone(),
+            updated_at: now,
+        };
+        self.repository.try_enqueue_embedding_job(insert).await?;
+        Ok(())
     }
 }
 
@@ -399,6 +597,11 @@ fn current_timestamp() -> String {
 fn next_feedback_id() -> String {
     let sequence = FEEDBACK_SEQUENCE.fetch_add(1, Ordering::Relaxed);
     format!("fb_{sequence:020}")
+}
+
+fn next_embedding_job_id() -> String {
+    let sequence = EMBEDDING_JOB_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+    format!("ej_{sequence:020}")
 }
 
 fn next_memory_id() -> String {

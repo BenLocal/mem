@@ -22,6 +22,83 @@ pub fn rank_candidates(
     scored.into_iter().map(|entry| entry.memory).collect()
 }
 
+pub fn merge_and_rank_hybrid(
+    lexical: Vec<MemoryRecord>,
+    semantic: Vec<(MemoryRecord, f32)>,
+    query: &SearchMemoryRequest,
+    related_memory_ids: &HashSet<String>,
+    graph_boost: i64,
+) -> Vec<MemoryRecord> {
+    let lexical_ids: HashSet<String> = lexical.iter().map(|m| m.memory_id.clone()).collect();
+    let mut semantic_sims: HashMap<String, f32> = HashMap::new();
+    let mut by_id: HashMap<String, MemoryRecord> = HashMap::new();
+
+    for m in lexical {
+        by_id.insert(m.memory_id.clone(), m);
+    }
+    for (m, sim) in semantic {
+        let id = m.memory_id.clone();
+        semantic_sims.insert(id.clone(), sim);
+        by_id.entry(id).or_insert(m);
+    }
+
+    let candidates: Vec<MemoryRecord> = by_id.into_values().collect();
+    score_candidates_hybrid(
+        candidates,
+        query,
+        related_memory_ids,
+        graph_boost,
+        &lexical_ids,
+        &semantic_sims,
+    )
+    .into_iter()
+    .map(|entry| entry.memory)
+    .collect()
+}
+
+pub async fn rank_with_graph_hybrid(
+    lexical: Vec<MemoryRecord>,
+    semantic: Vec<(MemoryRecord, f32)>,
+    query: &SearchMemoryRequest,
+    graph: &dyn GraphStore,
+) -> Result<Vec<MemoryRecord>, crate::storage::graph::GraphError> {
+    if semantic.is_empty() {
+        return rank_with_graph(lexical, query, graph).await;
+    }
+
+    if !query.expand_graph {
+        return Ok(merge_and_rank_hybrid(
+            lexical,
+            semantic,
+            query,
+            &HashSet::new(),
+            0,
+        ));
+    }
+
+    let preliminary = merge_and_rank_hybrid(
+        lexical.clone(),
+        semantic.clone(),
+        query,
+        &HashSet::new(),
+        0,
+    );
+    let anchors = graph_anchor_nodes_from_records(&preliminary);
+    if anchors.is_empty() {
+        return Ok(preliminary);
+    }
+
+    let related_memory_ids = graph.related_memory_ids(&anchors).await?;
+    let related_lookup = related_memory_ids.into_iter().collect::<HashSet<_>>();
+    Ok(merge_and_rank_hybrid(
+        lexical,
+        semantic,
+        query,
+        &related_lookup,
+        12,
+    ))
+}
+
 pub async fn rank_with_graph(
     candidates: Vec<MemoryRecord>,
     query: &SearchMemoryRequest,
@@ -62,6 +139,86 @@ pub async fn candidate_memory_ids(
     nodes.sort();
     nodes.dedup();
     graph.related_memory_ids(&nodes).await
+}
+
+fn graph_anchor_nodes_from_records(memories: &[MemoryRecord]) -> Vec<String> {
+    let wrap: Vec<ScoredMemory> = memories
+        .iter()
+        .take(5)
+        .cloned()
+        .map(|memory| ScoredMemory { memory, score: 0 })
+        .collect();
+    graph_anchor_nodes(&wrap)
+}
+
+fn score_candidates_hybrid(
+    candidates: Vec<MemoryRecord>,
+    query: &SearchMemoryRequest,
+    related_memory_ids: &HashSet<String>,
+    graph_boost: i64,
+    lexical_ids: &HashSet<String>,
+    semantic_sims: &HashMap<String, f32>,
+) -> Vec<ScoredMemory> {
+    let newest = candidates
+        .iter()
+        .map(|memory| timestamp_score(&memory.updated_at))
+        .max()
+        .unwrap_or(0);
+
+    let query_terms = tokenize(&query.query);
+    let scope_filters = parse_scope_filters(&query.scope_filters);
+
+    let mut scored = candidates
+        .into_iter()
+        .map(|memory| {
+            let mut score = 0i64;
+            if let Some(sim) = semantic_sims.get(&memory.memory_id) {
+                let t = sim.clamp(-1.0, 1.0);
+                score += (((t + 1.0) / 2.0) * 64.0) as i64;
+            }
+            if lexical_ids.contains(&memory.memory_id) && semantic_sims.contains_key(&memory.memory_id)
+            {
+                score += 26;
+            }
+            if !memory.evidence.is_empty() {
+                score += 2;
+            }
+            score += text_match_score(&memory, &query_terms);
+            score += scope_score(&memory, &scope_filters);
+            score += memory_type_score(&memory.memory_type, &query.intent);
+            score += confidence_score(memory.confidence);
+            score += validation_score(memory.last_validated_at.is_some());
+            score += freshness_score(newest, timestamp_score(&memory.updated_at));
+            score -= staleness_penalty(memory.decay_score);
+
+            if related_memory_ids.contains(&memory.memory_id) {
+                score += graph_boost;
+            }
+
+            if matches!(
+                memory.status,
+                MemoryStatus::Provisional | MemoryStatus::PendingConfirmation
+            ) {
+                score -= 4;
+            }
+
+            ScoredMemory { memory, score }
+        })
+        .collect::<Vec<_>>();
+
+    scored.sort_by(|left, right| {
+        right
+            .score
+            .cmp(&left.score)
+            .then_with(|| {
+                timestamp_score(&right.memory.updated_at)
+                    .cmp(&timestamp_score(&left.memory.updated_at))
+            })
+            .then_with(|| right.memory.version.cmp(&left.memory.version))
+            .then_with(|| left.memory.memory_id.cmp(&right.memory.memory_id))
+    });
+
+    scored
 }
 
 fn score_candidates(
