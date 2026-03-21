@@ -105,7 +105,7 @@ impl MemoryService {
         };
 
         let stored = self.repository.insert_memory(memory).await?;
-        self.graph.sync_memory(&stored).await?;
+        ignore_graph_unavailable(self.graph.sync_memory(&stored).await)?;
         Ok(stored.into())
     }
 
@@ -129,7 +129,7 @@ impl MemoryService {
                 .repository
                 .list_memory_versions_for_tenant(&memory.tenant, memory_id)
                 .await?,
-            graph_links: self.graph.neighbors(&memory_node_id(memory_id)).await?,
+            graph_links: ignore_graph_unavailable(self.graph.neighbors(&memory_node_id(memory_id)).await)?,
             feedback_summary: self.repository.feedback_summary(memory_id).await?,
             memory,
         })
@@ -171,7 +171,7 @@ impl MemoryService {
                 self.superseding_active_version(&original, patch),
             )
             .await?;
-        self.graph.sync_memory(&superseding).await?;
+        ignore_graph_unavailable(self.graph.sync_memory(&superseding).await)?;
 
         Ok(EditPendingResponse {
             original_memory_id: original.memory_id,
@@ -233,7 +233,18 @@ impl MemoryService {
     }
 
     pub async fn graph_neighbors(&self, node_id: &str) -> Result<Vec<GraphEdge>, ServiceError> {
-        Ok(self.graph.neighbors(node_id).await?)
+        ignore_graph_unavailable(self.graph.neighbors(node_id).await)
+    }
+}
+
+fn ignore_graph_unavailable<T>(result: Result<T, GraphError>) -> Result<T, ServiceError>
+where
+    T: Default,
+{
+    match result {
+        Ok(value) => Ok(value),
+        Err(GraphError::Unavailable(_)) => Ok(T::default()),
+        Err(error) => Err(error.into()),
     }
 }
 

@@ -104,9 +104,22 @@ pub fn extract_graph_edges(memory: &MemoryRecord) -> Vec<GraphEdge> {
 
     if let Some(previous) = memory.supersedes_memory_id.as_deref().filter(|value| !value.is_empty()) {
         edges.push(GraphEdge {
-            from_node_id,
+            from_node_id: from_node_id.clone(),
             to_node_id: memory_node_id(previous),
             relation: "supersedes".into(),
+        });
+    }
+
+    for contradicted in memory
+        .tags
+        .iter()
+        .filter_map(|tag| tag.strip_prefix("contradicts:"))
+        .filter(|value| !value.is_empty())
+    {
+        edges.push(GraphEdge {
+            from_node_id: from_node_id.clone(),
+            to_node_id: memory_node_id(contradicted),
+            relation: "contradicts".into(),
         });
     }
 

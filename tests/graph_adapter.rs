@@ -3,11 +3,15 @@ use axum::{
     http::{Request, StatusCode},
 };
 use mem::{
-    app,
+    app::{self, AppState},
     domain::memory::{MemoryRecord, MemoryStatus, MemoryType, Scope, Visibility},
-    storage::{GraphStore, LocalGraphAdapter},
+    http,
+    service::MemoryService,
+    storage::{GraphStore, IndraDbGraphAdapter, LocalGraphAdapter},
 };
 use serde_json::{json, Value};
+use std::sync::Arc;
+use tempfile::tempdir;
 use tower::util::ServiceExt;
 
 fn sample_impl_memory(memory_id: &str, supersedes_memory_id: Option<&str>) -> MemoryRecord {
@@ -27,7 +31,7 @@ fn sample_impl_memory(memory_id: &str, supersedes_memory_id: Option<&str>) -> Me
         repo: Some("mem".into()),
         module: Some("invoice".into()),
         task_type: Some("implementation".into()),
-        tags: vec!["graph".into()],
+        tags: vec!["graph".into(), "contradicts:mem_legacy".into()],
         confidence: 0.9,
         decay_score: 0.0,
         content_hash: format!("hash-{memory_id}"),
@@ -112,6 +116,19 @@ async fn test_app() -> TestApp {
     }
 }
 
+async fn test_app_with_unavailable_graph() -> TestApp {
+    let temp_dir = tempdir().unwrap();
+    let db_path = temp_dir.path().join("graph-unavailable.duckdb");
+    let repository = mem::storage::DuckDbRepository::open(&db_path).await.unwrap();
+    let state = AppState {
+        memory_service: MemoryService::with_graph(repository, Arc::new(IndraDbGraphAdapter::new())),
+    };
+
+    TestApp {
+        router: http::router().with_state(state),
+    }
+}
+
 #[tokio::test]
 async fn ingest_extracts_project_and_module_nodes() {
     let graph = LocalGraphAdapter::new();
@@ -143,6 +160,7 @@ async fn ingest_extracts_workflow_and_supersedes_edges() {
 
     let workflow_neighbors = graph.neighbors("workflow:implementation").await.unwrap();
     let supersedes_neighbors = graph.neighbors("memory:mem_002").await.unwrap();
+    let contradiction_neighbors = graph.neighbors("memory:mem_002").await.unwrap();
 
     assert!(workflow_neighbors.iter().any(|edge| {
         edge.from_node_id == "memory:mem_002"
@@ -153,6 +171,11 @@ async fn ingest_extracts_workflow_and_supersedes_edges() {
         edge.from_node_id == "memory:mem_002"
             && edge.to_node_id == "memory:mem_001"
             && edge.relation == "supersedes"
+    }));
+    assert!(contradiction_neighbors.iter().any(|edge| {
+        edge.from_node_id == "memory:mem_002"
+            && edge.to_node_id == "memory:mem_legacy"
+            && edge.relation == "contradicts"
     }));
 }
 
@@ -185,4 +208,37 @@ async fn http_neighbors_returns_graph_edges_after_ingest() {
         edge["relation"] == "relevant_to"
             && edge["to_node_id"] == "module:mem:invoice"
     }));
+}
+
+#[tokio::test]
+async fn memory_routes_degrade_when_graph_backend_is_unavailable() {
+    let app = test_app_with_unavailable_graph().await;
+
+    let created = app
+        .post_json(
+            "/memories",
+            json!({
+                "memory_type": "implementation",
+                "content": "cache invoices after successful sync",
+                "scope": "repo",
+                "project": "billing",
+                "repo": "mem",
+                "module": "invoice",
+                "task_type": "implementation",
+                "write_mode": "auto"
+            }),
+        )
+        .await;
+
+    assert_eq!(created.status(), 201);
+    let created_json = created.json();
+    let memory_id = created_json["memory_id"].as_str().unwrap();
+
+    let detail = app.get(&format!("/memories/{memory_id}")).await;
+    assert_eq!(detail.status(), 200);
+    assert_eq!(detail.json()["graph_links"], json!([]));
+
+    let neighbors = app.get("/graph/neighbors/module:mem:invoice").await;
+    assert_eq!(neighbors.status(), 200);
+    assert_eq!(neighbors.json(), json!([]));
 }
