@@ -1,0 +1,42 @@
+#[path = "../src/domain/mod.rs"]
+mod domain;
+
+use domain::query::{DirectiveItem, FactItem, PatternItem, SearchMemoryResponse};
+use domain::workflow::WorkflowOutline;
+
+#[test]
+fn search_response_serializes_compressed_shapes() {
+    let response = SearchMemoryResponse {
+        directives: vec![DirectiveItem {
+            memory_id: "mem_1".into(),
+            text: "Use cache busting on schema changes".into(),
+            source_summary: "Known rule from prior implementation".into(),
+        }],
+        relevant_facts: vec![FactItem {
+            memory_id: "mem_2".into(),
+            text: "DuckDB stores canonical memory records".into(),
+            code_refs: vec!["src/storage/duckdb.rs".into()],
+            source_summary: "Architecture note".into(),
+        }],
+        reusable_patterns: vec![PatternItem {
+            memory_id: "mem_3".into(),
+            text: "Check invariants before writing migrations".into(),
+            applicability: None,
+            source_summary: "Repeated successful workflow".into(),
+        }],
+        suggested_workflow: Some(WorkflowOutline {
+            memory_id: "mem_4".into(),
+            goal: "ship a safe schema change".into(),
+            steps: vec!["write tests".into(), "implement".into(), "verify".into()],
+            success_signals: vec!["tests pass".into()],
+        }),
+    };
+
+    let value = serde_json::to_value(response).unwrap();
+
+    assert_eq!(value["directives"][0]["memory_id"], "mem_1");
+    assert_eq!(value["relevant_facts"][0]["code_refs"][0], "src/storage/duckdb.rs");
+    assert!(value["reusable_patterns"][0].get("applicability").is_none());
+    assert_eq!(value["suggested_workflow"]["goal"], "ship a safe schema change");
+}
+
