@@ -9,6 +9,7 @@ use serde::Deserialize;
 use crate::{
     app::AppState,
     domain::memory::{IngestMemoryRequest, MemoryType, Scope, Visibility, WriteMode},
+    domain::query::SearchMemoryRequest,
     error::AppError,
     service::IngestMemoryResponse,
 };
@@ -16,6 +17,7 @@ use crate::{
 pub fn router() -> Router<AppState> {
     Router::new()
         .route("/memories", post(ingest_memory))
+        .route("/memories/search", post(search_memory))
         .route("/memories/:id", get(get_memory))
 }
 
@@ -91,6 +93,13 @@ async fn get_memory(
             .get_memory(query.tenant.as_deref(), &memory_id)
             .await?,
     ))
+}
+
+async fn search_memory(
+    State(app): State<AppState>,
+    Json(request): Json<SearchMemoryRequest>,
+) -> Result<Json<crate::domain::query::SearchMemoryResponse>, AppError> {
+    Ok(Json(app.memory_service.search(request).await?))
 }
 
 #[derive(Debug, Deserialize)]

@@ -105,7 +105,10 @@ impl DuckDbRepository {
         Ok(memory)
     }
 
-    pub async fn get_memory(&self, memory_id: String) -> Result<Option<MemoryRecord>, StorageError> {
+    pub async fn get_memory(
+        &self,
+        memory_id: String,
+    ) -> Result<Option<MemoryRecord>, StorageError> {
         let conn = self.conn()?;
         let memory = conn
             .query_row(
@@ -203,7 +206,10 @@ impl DuckDbRepository {
         Ok(memory)
     }
 
-    pub async fn list_pending_review(&self, tenant: &str) -> Result<Vec<MemoryRecord>, StorageError> {
+    pub async fn list_pending_review(
+        &self,
+        tenant: &str,
+    ) -> Result<Vec<MemoryRecord>, StorageError> {
         let conn = self.conn()?;
         let mut stmt = conn.prepare(
             "select
@@ -223,12 +229,39 @@ impl DuckDbRepository {
         Ok(collected)
     }
 
+    pub async fn search_candidates(&self, tenant: &str) -> Result<Vec<MemoryRecord>, StorageError> {
+        let conn = self.conn()?;
+        let mut stmt = conn.prepare(
+            "select
+                memory_id, tenant, memory_type, status, scope, visibility, version, summary,
+                content, evidence_json, code_refs_json, project, repo, module, task_type,
+                tags_json, confidence, decay_score, content_hash, idempotency_key,
+                supersedes_memory_id, source_agent, created_at, updated_at, last_validated_at
+             from memories
+             where tenant = ?1
+             order by updated_at desc, version desc, memory_id asc",
+        )?;
+        let rows = stmt.query_map(params![tenant], map_memory_row)?;
+        let candidates = rows
+            .collect::<Result<Vec<_>, _>>()?
+            .into_iter()
+            .filter(|memory| {
+                !matches!(
+                    memory.status,
+                    MemoryStatus::Rejected | MemoryStatus::Archived
+                )
+            })
+            .collect::<Vec<_>>();
+        Ok(candidates)
+    }
+
     pub async fn accept_pending(
         &self,
         tenant: &str,
         memory_id: &str,
     ) -> Result<MemoryRecord, StorageError> {
-        self.update_status(tenant, memory_id, MemoryStatus::Active).await
+        self.update_status(tenant, memory_id, MemoryStatus::Active)
+            .await
     }
 
     pub async fn reject_pending(
@@ -236,7 +269,8 @@ impl DuckDbRepository {
         tenant: &str,
         memory_id: &str,
     ) -> Result<MemoryRecord, StorageError> {
-        self.update_status(tenant, memory_id, MemoryStatus::Rejected).await
+        self.update_status(tenant, memory_id, MemoryStatus::Rejected)
+            .await
     }
 
     pub async fn replace_pending_with_successor(
@@ -415,9 +449,11 @@ impl DuckDbRepository {
                         goal: row.get(2)?,
                         steps: decode_json(&row.get::<_, String>(3)?).map_err(to_from_sql_error)?,
                         outcome: row.get(4)?,
-                        evidence: decode_json(&row.get::<_, String>(5)?).map_err(to_from_sql_error)?,
+                        evidence: decode_json(&row.get::<_, String>(5)?)
+                            .map_err(to_from_sql_error)?,
                         scope: decode_text(&row.get::<_, String>(6)?).map_err(to_from_sql_error)?,
-                        visibility: decode_text(&row.get::<_, String>(7)?).map_err(to_from_sql_error)?,
+                        visibility: decode_text(&row.get::<_, String>(7)?)
+                            .map_err(to_from_sql_error)?,
                         project: row.get(8)?,
                         repo: row.get(9)?,
                         module: row.get(10)?,
@@ -521,10 +557,7 @@ impl DuckDbRepository {
         Ok(collected)
     }
 
-    pub async fn feedback_summary(
-        &self,
-        memory_id: &str,
-    ) -> Result<FeedbackSummary, StorageError> {
+    pub async fn feedback_summary(&self, memory_id: &str) -> Result<FeedbackSummary, StorageError> {
         let feedback = self.list_feedback_for_memory(memory_id).await?;
         let mut summary = FeedbackSummary::default();
         for event in feedback {
@@ -615,22 +648,33 @@ fn encode_json<T: Serialize>(value: &T) -> Result<String, StorageError> {
 }
 
 fn encode_optional_json<T: Serialize>(value: &Option<T>) -> Result<Option<String>, StorageError> {
-    value.as_ref().map(serde_json::to_string).transpose().map_err(Into::into)
+    value
+        .as_ref()
+        .map(serde_json::to_string)
+        .transpose()
+        .map_err(Into::into)
 }
 
 fn decode_json<T: DeserializeOwned>(value: &str) -> Result<T, StorageError> {
     Ok(serde_json::from_str(value)?)
 }
 
-fn decode_optional_json<T: DeserializeOwned>(value: Option<String>) -> Result<Option<T>, StorageError> {
-    value.map(|raw| serde_json::from_str(&raw)).transpose().map_err(Into::into)
+fn decode_optional_json<T: DeserializeOwned>(
+    value: Option<String>,
+) -> Result<Option<T>, StorageError> {
+    value
+        .map(|raw| serde_json::from_str(&raw))
+        .transpose()
+        .map_err(Into::into)
 }
 
 fn encode_text<T: Serialize>(value: &T) -> Result<String, StorageError> {
     let value = serde_json::to_value(value)?;
     match value {
         Value::String(value) => Ok(value),
-        _ => Err(StorageError::InvalidData("expected string-compatible value")),
+        _ => Err(StorageError::InvalidData(
+            "expected string-compatible value",
+        )),
     }
 }
 
@@ -639,15 +683,12 @@ fn decode_text<T: DeserializeOwned>(value: &str) -> Result<T, StorageError> {
 }
 
 fn to_u64(value: i64) -> Result<u64, StorageError> {
-    u64::try_from(value).map_err(|_| StorageError::InvalidData("negative integer in unsigned field"))
+    u64::try_from(value)
+        .map_err(|_| StorageError::InvalidData("negative integer in unsigned field"))
 }
 
 fn to_from_sql_error(error: StorageError) -> duckdb::Error {
-    duckdb::Error::FromSqlConversionFailure(
-        0,
-        duckdb::types::Type::Text,
-        Box::new(error),
-    )
+    duckdb::Error::FromSqlConversionFailure(0, duckdb::types::Type::Text, Box::new(error))
 }
 
 fn current_timestamp() -> String {

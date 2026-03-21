@@ -7,12 +7,19 @@ use serde::Serialize;
 use std::sync::Arc;
 use thiserror::Error;
 
-use crate::{
-    domain::memory::{EditPendingRequest, EditPendingResponse, GraphEdge, IngestMemoryRequest, MemoryRecord, MemoryStatus},
-    pipeline::ingest::{compute_content_hash, initial_status, memory_node_id},
-    storage::{GraphError, GraphStore, DuckDbRepository, LocalGraphAdapter, StorageError},
-};
 use crate::domain::memory::MemoryDetailResponse;
+use crate::{
+    domain::{
+        memory::{
+            EditPendingRequest, EditPendingResponse, GraphEdge, IngestMemoryRequest, MemoryRecord,
+            MemoryStatus,
+        },
+        query::{SearchMemoryRequest, SearchMemoryResponse},
+    },
+    pipeline::ingest::{compute_content_hash, initial_status, memory_node_id},
+    pipeline::{compress, retrieve},
+    storage::{DuckDbRepository, GraphError, GraphStore, LocalGraphAdapter, StorageError},
+};
 
 static MEMORY_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 
@@ -109,7 +116,10 @@ impl MemoryService {
         Ok(stored.into())
     }
 
-    pub async fn list_pending_review(&self, tenant: &str) -> Result<Vec<MemoryRecord>, ServiceError> {
+    pub async fn list_pending_review(
+        &self,
+        tenant: &str,
+    ) -> Result<Vec<MemoryRecord>, ServiceError> {
         Ok(self.repository.list_pending_review(tenant).await?)
     }
 
@@ -119,7 +129,11 @@ impl MemoryService {
         memory_id: &str,
     ) -> Result<MemoryDetailResponse, ServiceError> {
         let memory = match tenant {
-            Some(tenant) => self.repository.get_memory_for_tenant(tenant, memory_id).await?,
+            Some(tenant) => {
+                self.repository
+                    .get_memory_for_tenant(tenant, memory_id)
+                    .await?
+            }
             None => self.repository.get_memory(memory_id.to_string()).await?,
         }
         .ok_or(ServiceError::NotFound)?;
@@ -129,13 +143,19 @@ impl MemoryService {
                 .repository
                 .list_memory_versions_for_tenant(&memory.tenant, memory_id)
                 .await?,
-            graph_links: ignore_graph_unavailable(self.graph.neighbors(&memory_node_id(memory_id)).await)?,
+            graph_links: ignore_graph_unavailable(
+                self.graph.neighbors(&memory_node_id(memory_id)).await,
+            )?,
             feedback_summary: self.repository.feedback_summary(memory_id).await?,
             memory,
         })
     }
 
-    pub async fn accept_pending(&self, tenant: &str, memory_id: &str) -> Result<MemoryRecord, ServiceError> {
+    pub async fn accept_pending(
+        &self,
+        tenant: &str,
+        memory_id: &str,
+    ) -> Result<MemoryRecord, ServiceError> {
         self.repository
             .get_pending(tenant, memory_id)
             .await?
@@ -143,7 +163,11 @@ impl MemoryService {
         Ok(self.repository.accept_pending(tenant, memory_id).await?)
     }
 
-    pub async fn reject_pending(&self, tenant: &str, memory_id: &str) -> Result<MemoryRecord, ServiceError> {
+    pub async fn reject_pending(
+        &self,
+        tenant: &str,
+        memory_id: &str,
+    ) -> Result<MemoryRecord, ServiceError> {
         self.repository
             .get_pending(tenant, memory_id)
             .await?
@@ -234,6 +258,30 @@ impl MemoryService {
 
     pub async fn graph_neighbors(&self, node_id: &str) -> Result<Vec<GraphEdge>, ServiceError> {
         ignore_graph_unavailable(self.graph.neighbors(node_id).await)
+    }
+
+    pub async fn search(
+        &self,
+        query: SearchMemoryRequest,
+    ) -> Result<SearchMemoryResponse, ServiceError> {
+        let candidates = self
+            .repository
+            .search_candidates(retrieve::search_tenant())
+            .await?;
+        let ranked = match retrieve::rank_with_graph(candidates, &query, self.graph.as_ref()).await
+        {
+            Ok(ranked) => ranked,
+            Err(GraphError::Unavailable(_)) => {
+                let base = self
+                    .repository
+                    .search_candidates(retrieve::search_tenant())
+                    .await?;
+                retrieve::rank_candidates(base, &query)
+            }
+            Err(error) => return Err(error.into()),
+        };
+
+        Ok(compress::compress(&ranked, query.token_budget))
     }
 }
 
