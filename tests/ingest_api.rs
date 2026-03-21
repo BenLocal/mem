@@ -383,8 +383,9 @@ async fn get_memory_defaults_tenant_to_local() {
 
     let response = app.get("/memories/mem_123").await;
 
-    assert_eq!(response.status(), 404);
-    assert_eq!(response.json()["error"], "memory not found");
+    assert_eq!(response.status(), 200);
+    assert_eq!(response.json()["memory"]["memory_id"], "mem_123");
+    assert_eq!(response.json()["memory"]["tenant"], "tenant-a");
 }
 
 #[tokio::test]

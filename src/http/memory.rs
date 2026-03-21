@@ -88,7 +88,7 @@ async fn get_memory(
 ) -> Result<Json<crate::domain::memory::MemoryDetailResponse>, AppError> {
     Ok(Json(
         app.memory_service
-            .get_memory(&query.tenant, &memory_id)
+            .get_memory(query.tenant.as_deref(), &memory_id)
             .await?,
     ))
 }
@@ -96,8 +96,8 @@ async fn get_memory(
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "snake_case")]
 struct MemoryDetailQuery {
-    #[serde(default = "default_tenant")]
-    tenant: String,
+    #[serde(default)]
+    tenant: Option<String>,
 }
 
 fn default_tenant() -> String {
