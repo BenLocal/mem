@@ -1,11 +1,9 @@
 use serde::{Deserialize, Serialize};
 
-#[allow(dead_code)]
 fn skip_none<T>(value: &Option<T>) -> bool {
     value.is_none()
 }
 
-#[allow(dead_code)]
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum MemoryStatus {
@@ -17,7 +15,6 @@ pub enum MemoryStatus {
     Rejected,
 }
 
-#[allow(dead_code)]
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum MemoryType {
@@ -29,7 +26,6 @@ pub enum MemoryType {
     Workflow,
 }
 
-#[allow(dead_code)]
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum Scope {
@@ -40,7 +36,6 @@ pub enum Scope {
     Workspace,
 }
 
-#[allow(dead_code)]
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum Visibility {
@@ -50,16 +45,15 @@ pub enum Visibility {
     System,
 }
 
-#[allow(dead_code)]
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum WriteMode {
     #[default]
     Auto,
-    ProposeOnly,
+    #[serde(rename = "propose")]
+    Propose,
 }
 
-#[allow(dead_code)]
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "snake_case")]
 pub struct IngestMemoryRequest {
@@ -107,7 +101,6 @@ impl Default for IngestMemoryRequest {
     }
 }
 
-#[allow(dead_code)]
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "snake_case")]
 pub struct MemoryRecord {
@@ -177,7 +170,6 @@ impl Default for MemoryRecord {
     }
 }
 
-#[allow(dead_code)]
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub struct EditPendingRequest {
@@ -189,7 +181,6 @@ pub struct EditPendingRequest {
     pub tags: Vec<String>,
 }
 
-#[allow(dead_code)]
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "snake_case")]
 pub struct EditPendingResponse {
@@ -197,7 +188,6 @@ pub struct EditPendingResponse {
     pub memory: MemoryRecord,
 }
 
-#[allow(dead_code)]
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub struct MemoryVersionLink {
@@ -209,7 +199,6 @@ pub struct MemoryVersionLink {
     pub supersedes_memory_id: Option<String>,
 }
 
-#[allow(dead_code)]
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub struct GraphEdge {
@@ -218,7 +207,6 @@ pub struct GraphEdge {
     pub relation: String,
 }
 
-#[allow(dead_code)]
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub struct FeedbackSummary {
@@ -230,7 +218,6 @@ pub struct FeedbackSummary {
     pub does_not_apply_here: u64,
 }
 
-#[allow(dead_code)]
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "snake_case")]
 pub struct MemoryDetailResponse {

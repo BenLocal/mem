@@ -1,7 +1,4 @@
-mod app;
-mod config;
-mod error;
-mod http;
+use mem::{app, config, error};
 
 #[tokio::main]
 async fn main() -> error::Result<()> {

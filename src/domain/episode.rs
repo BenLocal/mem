@@ -5,12 +5,10 @@ use super::{
     workflow::WorkflowCandidate,
 };
 
-#[allow(dead_code)]
 fn skip_none<T>(value: &Option<T>) -> bool {
     value.is_none()
 }
 
-#[allow(dead_code)]
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub struct IngestEpisodeRequest {
@@ -53,7 +51,6 @@ impl Default for IngestEpisodeRequest {
     }
 }
 
-#[allow(dead_code)]
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub struct EpisodeRecord {
@@ -105,7 +102,6 @@ impl Default for EpisodeRecord {
     }
 }
 
-#[allow(dead_code)]
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub struct EpisodeResponse {

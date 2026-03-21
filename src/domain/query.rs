@@ -2,12 +2,10 @@ use serde::{Deserialize, Serialize};
 
 use super::workflow::WorkflowOutline;
 
-#[allow(dead_code)]
 fn skip_none<T>(value: &Option<T>) -> bool {
     value.is_none()
 }
 
-#[allow(dead_code)]
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub struct SearchMemoryRequest {
@@ -19,7 +17,6 @@ pub struct SearchMemoryRequest {
     pub expand_graph: bool,
 }
 
-#[allow(dead_code)]
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub struct DirectiveItem {
@@ -28,7 +25,6 @@ pub struct DirectiveItem {
     pub source_summary: String,
 }
 
-#[allow(dead_code)]
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub struct FactItem {
@@ -38,7 +34,6 @@ pub struct FactItem {
     pub source_summary: String,
 }
 
-#[allow(dead_code)]
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub struct PatternItem {
@@ -49,7 +44,6 @@ pub struct PatternItem {
     pub source_summary: String,
 }
 
-#[allow(dead_code)]
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub struct SearchMemoryResponse {

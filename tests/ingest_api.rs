@@ -1,9 +1,5 @@
 use serde_json::json;
-
-#[path = "../src/domain/mod.rs"]
-mod domain;
-
-use domain::{
+use mem::domain::{
     episode::{EpisodeRecord, EpisodeResponse, IngestEpisodeRequest},
     memory::{
         EditPendingRequest, EditPendingResponse, FeedbackSummary, GraphEdge, IngestMemoryRequest,
@@ -106,6 +102,31 @@ fn edit_pending_request_serializes_required_fields() {
     assert_eq!(value["memory_id"], "mem_123");
     assert_eq!(value["summary"], "cache invalidation rule");
     assert_eq!(value["tags"][0], "cache");
+}
+
+#[test]
+fn write_mode_propose_serializes_expected_shape() {
+    let request = IngestMemoryRequest {
+        tenant: "local".into(),
+        memory_type: MemoryType::Preference,
+        content: "prefer concise answers".into(),
+        evidence: vec!["user request".into()],
+        code_refs: vec![],
+        scope: Scope::Global,
+        visibility: Visibility::Private,
+        project: None,
+        repo: None,
+        module: None,
+        task_type: None,
+        tags: vec!["preference".into()],
+        source_agent: "codex-worker".into(),
+        idempotency_key: None,
+        write_mode: WriteMode::Propose,
+    };
+
+    let value = serde_json::to_value(request).unwrap();
+
+    assert_eq!(value["write_mode"], "propose");
 }
 
 #[test]

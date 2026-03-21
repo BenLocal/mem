@@ -1,9 +1,5 @@
 use serde_json::json;
-
-#[path = "../src/domain/mod.rs"]
-mod domain;
-
-use domain::{
+use mem::domain::{
     query::{DirectiveItem, FactItem, PatternItem, SearchMemoryRequest, SearchMemoryResponse},
     workflow::WorkflowOutline,
 };
