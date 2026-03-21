@@ -1,7 +1,7 @@
 use axum::{
-    extract::State,
+    extract::{Path, State},
     http::StatusCode,
-    routing::post,
+    routing::{get, post},
     Json, Router,
 };
 use serde::Deserialize;
@@ -14,7 +14,9 @@ use crate::{
 };
 
 pub fn router() -> Router<AppState> {
-    Router::new().route("/memories", post(ingest_memory))
+    Router::new()
+        .route("/memories", post(ingest_memory))
+        .route("/memories/:id", get(get_memory))
 }
 
 #[derive(Debug, Deserialize)]
@@ -77,6 +79,13 @@ async fn ingest_memory(
 ) -> Result<(StatusCode, Json<IngestMemoryResponse>), AppError> {
     let response = app.memory_service.ingest(request.into()).await?;
     Ok((StatusCode::CREATED, Json(response)))
+}
+
+async fn get_memory(
+    State(app): State<AppState>,
+    Path(memory_id): Path<String>,
+) -> Result<Json<crate::domain::memory::MemoryDetailResponse>, AppError> {
+    Ok(Json(app.memory_service.get_memory(&memory_id).await?))
 }
 
 fn default_tenant() -> String {

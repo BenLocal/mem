@@ -11,6 +11,7 @@ use crate::{
     pipeline::ingest::{compute_content_hash, initial_status},
     storage::{DuckDbRepository, StorageError},
 };
+use crate::domain::memory::MemoryDetailResponse;
 
 static MEMORY_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 
@@ -98,6 +99,21 @@ impl MemoryService {
 
     pub async fn list_pending_review(&self, tenant: &str) -> Result<Vec<MemoryRecord>, ServiceError> {
         Ok(self.repository.list_pending_review(tenant).await?)
+    }
+
+    pub async fn get_memory(&self, memory_id: &str) -> Result<MemoryDetailResponse, ServiceError> {
+        let memory = self
+            .repository
+            .get_memory(memory_id.to_string())
+            .await?
+            .ok_or(ServiceError::NotFound)?;
+
+        Ok(MemoryDetailResponse {
+            version_chain: self.repository.list_memory_versions(memory_id).await?,
+            graph_links: Vec::new(),
+            feedback_summary: self.repository.feedback_summary(memory_id).await?,
+            memory,
+        })
     }
 
     pub async fn accept_pending(&self, tenant: &str, memory_id: &str) -> Result<MemoryRecord, ServiceError> {

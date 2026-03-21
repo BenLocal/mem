@@ -32,6 +32,28 @@ impl TestResponse {
 }
 
 impl TestApp {
+    async fn get(&self, path: &str) -> TestResponse {
+        let request = Request::builder()
+            .method("GET")
+            .uri(path)
+            .body(Body::empty())
+            .expect("request should build");
+        let response = self
+            .router
+            .clone()
+            .oneshot(request)
+            .await
+            .expect("request should succeed");
+        let status = response.status();
+        let body = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body should read");
+        TestResponse {
+            status,
+            body: String::from_utf8(body.to_vec()).expect("body should be utf-8"),
+        }
+    }
+
     async fn post_json(&self, path: &str, body: Value) -> TestResponse {
         let request = Request::builder()
             .method("POST")
@@ -244,4 +266,47 @@ async fn same_idempotency_key_in_different_tenants_creates_distinct_memories() {
     assert_eq!(first.status(), 201);
     assert_eq!(second.status(), 201);
     assert_ne!(first.json()["memory_id"], second.json()["memory_id"]);
+}
+
+#[tokio::test]
+async fn get_memory_returns_full_record() {
+    let app = test_app().await;
+    let created = app
+        .post_json(
+            "/memories",
+            json!({
+                "memory_type": "implementation",
+                "content": "invalidate cache when schema changes",
+                "scope": "repo",
+                "write_mode": "auto",
+                "idempotency_key": "detail-lookup"
+            }),
+        )
+        .await;
+
+    assert_eq!(created.status(), 201);
+    let memory_id = created.json()["memory_id"]
+        .as_str()
+        .expect("memory id should be present")
+        .to_string();
+
+    let response = app.get(&format!("/memories/{memory_id}")).await;
+
+    assert_eq!(response.status(), 200);
+    assert_eq!(response.json()["memory"]["memory_id"], memory_id);
+    assert_eq!(response.json()["memory"]["content"], "invalidate cache when schema changes");
+    assert!(response.json()["memory"]["content_hash"].is_string());
+    assert!(response.json()["version_chain"].is_array());
+    assert_eq!(response.json()["graph_links"], json!([]));
+    assert_eq!(response.json()["feedback_summary"]["total"], 0);
+}
+
+#[tokio::test]
+async fn get_memory_returns_not_found_for_missing_memory() {
+    let app = test_app().await;
+
+    let response = app.get("/memories/missing").await;
+
+    assert_eq!(response.status(), 404);
+    assert_eq!(response.json()["error"], "memory not found");
 }
