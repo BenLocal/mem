@@ -1,30 +1,25 @@
-#![allow(dead_code)]
-
 use serde::{Deserialize, Serialize};
 
 use super::workflow::WorkflowOutline;
 
+#[allow(dead_code)]
 fn skip_none<T>(value: &Option<T>) -> bool {
     value.is_none()
 }
 
+#[allow(dead_code)]
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub struct SearchMemoryRequest {
-    #[serde(default)]
     pub query: String,
-    #[serde(default)]
     pub intent: String,
-    #[serde(default)]
     pub scope_filters: Vec<String>,
-    #[serde(default)]
     pub token_budget: usize,
-    #[serde(default)]
     pub caller_agent: String,
-    #[serde(default)]
     pub expand_graph: bool,
 }
 
+#[allow(dead_code)]
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub struct DirectiveItem {
@@ -33,6 +28,7 @@ pub struct DirectiveItem {
     pub source_summary: String,
 }
 
+#[allow(dead_code)]
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub struct FactItem {
@@ -42,23 +38,25 @@ pub struct FactItem {
     pub source_summary: String,
 }
 
+#[allow(dead_code)]
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub struct PatternItem {
     pub memory_id: String,
     pub text: String,
-    #[serde(default, skip_serializing_if = "skip_none")]
+    #[serde(skip_serializing_if = "skip_none")]
     pub applicability: Option<String>,
     pub source_summary: String,
 }
 
+#[allow(dead_code)]
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub struct SearchMemoryResponse {
     pub directives: Vec<DirectiveItem>,
     pub relevant_facts: Vec<FactItem>,
     pub reusable_patterns: Vec<PatternItem>,
-    #[serde(default, skip_serializing_if = "skip_none")]
+    #[serde(skip_serializing_if = "skip_none")]
     pub suggested_workflow: Option<WorkflowOutline>,
 }
 

@@ -1,11 +1,11 @@
-#![allow(dead_code)]
-
 use serde::{Deserialize, Serialize};
 
+#[allow(dead_code)]
 fn skip_none<T>(value: &Option<T>) -> bool {
     value.is_none()
 }
 
+#[allow(dead_code)]
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum MemoryStatus {
@@ -17,6 +17,7 @@ pub enum MemoryStatus {
     Rejected,
 }
 
+#[allow(dead_code)]
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum MemoryType {
@@ -28,6 +29,7 @@ pub enum MemoryType {
     Workflow,
 }
 
+#[allow(dead_code)]
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum Scope {
@@ -38,6 +40,7 @@ pub enum Scope {
     Workspace,
 }
 
+#[allow(dead_code)]
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum Visibility {
@@ -47,6 +50,7 @@ pub enum Visibility {
     System,
 }
 
+#[allow(dead_code)]
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum WriteMode {
@@ -55,38 +59,29 @@ pub enum WriteMode {
     ProposeOnly,
 }
 
+#[allow(dead_code)]
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "snake_case")]
 pub struct IngestMemoryRequest {
-    #[serde(default)]
     pub tenant: String,
-    #[serde(default)]
     pub memory_type: MemoryType,
-    #[serde(default)]
     pub content: String,
-    #[serde(default)]
     pub evidence: Vec<String>,
-    #[serde(default)]
     pub code_refs: Vec<String>,
-    #[serde(default)]
     pub scope: Scope,
-    #[serde(default)]
     pub visibility: Visibility,
-    #[serde(default, skip_serializing_if = "skip_none")]
+    #[serde(skip_serializing_if = "skip_none")]
     pub project: Option<String>,
-    #[serde(default, skip_serializing_if = "skip_none")]
+    #[serde(skip_serializing_if = "skip_none")]
     pub repo: Option<String>,
-    #[serde(default, skip_serializing_if = "skip_none")]
+    #[serde(skip_serializing_if = "skip_none")]
     pub module: Option<String>,
-    #[serde(default, skip_serializing_if = "skip_none")]
+    #[serde(skip_serializing_if = "skip_none")]
     pub task_type: Option<String>,
-    #[serde(default)]
     pub tags: Vec<String>,
-    #[serde(default)]
     pub source_agent: String,
-    #[serde(default, skip_serializing_if = "skip_none")]
+    #[serde(skip_serializing_if = "skip_none")]
     pub idempotency_key: Option<String>,
-    #[serde(default)]
     pub write_mode: WriteMode,
 }
 
@@ -112,57 +107,41 @@ impl Default for IngestMemoryRequest {
     }
 }
 
+#[allow(dead_code)]
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "snake_case")]
 pub struct MemoryRecord {
     pub memory_id: String,
-    #[serde(default)]
     pub tenant: String,
-    #[serde(default)]
     pub memory_type: MemoryType,
-    #[serde(default)]
     pub status: MemoryStatus,
-    #[serde(default)]
     pub scope: Scope,
-    #[serde(default)]
     pub visibility: Visibility,
-    #[serde(default)]
     pub version: u64,
-    #[serde(default)]
     pub summary: String,
-    #[serde(default)]
     pub content: String,
-    #[serde(default)]
     pub evidence: Vec<String>,
-    #[serde(default)]
     pub code_refs: Vec<String>,
-    #[serde(default, skip_serializing_if = "skip_none")]
+    #[serde(skip_serializing_if = "skip_none")]
     pub project: Option<String>,
-    #[serde(default, skip_serializing_if = "skip_none")]
+    #[serde(skip_serializing_if = "skip_none")]
     pub repo: Option<String>,
-    #[serde(default, skip_serializing_if = "skip_none")]
+    #[serde(skip_serializing_if = "skip_none")]
     pub module: Option<String>,
-    #[serde(default, skip_serializing_if = "skip_none")]
+    #[serde(skip_serializing_if = "skip_none")]
     pub task_type: Option<String>,
-    #[serde(default)]
     pub tags: Vec<String>,
-    #[serde(default)]
     pub confidence: f32,
-    #[serde(default)]
     pub decay_score: f32,
-    #[serde(default)]
     pub content_hash: String,
-    #[serde(default, skip_serializing_if = "skip_none")]
+    #[serde(skip_serializing_if = "skip_none")]
     pub idempotency_key: Option<String>,
-    #[serde(default, skip_serializing_if = "skip_none")]
+    #[serde(skip_serializing_if = "skip_none")]
     pub supersedes_memory_id: Option<String>,
-    #[serde(default)]
     pub source_agent: String,
-    #[serde(default)]
     pub created_at: String,
-    #[serde(default)]
     pub updated_at: String,
-    #[serde(default, skip_serializing_if = "skip_none")]
+    #[serde(skip_serializing_if = "skip_none")]
     pub last_validated_at: Option<String>,
 }
 
@@ -196,4 +175,67 @@ impl Default for MemoryRecord {
             last_validated_at: None,
         }
     }
+}
+
+#[allow(dead_code)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub struct EditPendingRequest {
+    pub memory_id: String,
+    pub summary: String,
+    pub content: String,
+    pub evidence: Vec<String>,
+    pub code_refs: Vec<String>,
+    pub tags: Vec<String>,
+}
+
+#[allow(dead_code)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub struct EditPendingResponse {
+    pub original_memory_id: String,
+    pub memory: MemoryRecord,
+}
+
+#[allow(dead_code)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub struct MemoryVersionLink {
+    pub memory_id: String,
+    pub version: u64,
+    pub status: MemoryStatus,
+    pub updated_at: String,
+    #[serde(skip_serializing_if = "skip_none")]
+    pub supersedes_memory_id: Option<String>,
+}
+
+#[allow(dead_code)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub struct GraphEdge {
+    pub from_node_id: String,
+    pub to_node_id: String,
+    pub relation: String,
+}
+
+#[allow(dead_code)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub struct FeedbackSummary {
+    pub total: u64,
+    pub useful: u64,
+    pub outdated: u64,
+    pub incorrect: u64,
+    pub applies_here: u64,
+    pub does_not_apply_here: u64,
+}
+
+#[allow(dead_code)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub struct MemoryDetailResponse {
+    pub memory: MemoryRecord,
+    pub version_chain: Vec<MemoryVersionLink>,
+    pub graph_links: Vec<GraphEdge>,
+    pub feedback_summary: FeedbackSummary,
 }

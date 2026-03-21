@@ -1,9 +1,8 @@
-#![allow(dead_code)]
-
 use serde::{Deserialize, Serialize};
 
 use super::memory::Scope;
 
+#[allow(dead_code)]
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub struct WorkflowOutline {
@@ -13,6 +12,7 @@ pub struct WorkflowOutline {
     pub success_signals: Vec<String>,
 }
 
+#[allow(dead_code)]
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub struct WorkflowCandidate {

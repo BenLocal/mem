@@ -1,8 +1,44 @@
+use serde_json::json;
+
 #[path = "../src/domain/mod.rs"]
 mod domain;
 
-use domain::query::{DirectiveItem, FactItem, PatternItem, SearchMemoryResponse};
-use domain::workflow::WorkflowOutline;
+use domain::{
+    query::{DirectiveItem, FactItem, PatternItem, SearchMemoryRequest, SearchMemoryResponse},
+    workflow::WorkflowOutline,
+};
+
+#[test]
+fn search_request_missing_required_field_fails_deserialization() {
+    let value = json!({
+        "intent": "debugging",
+        "scope_filters": ["repo:billing"],
+        "token_budget": 500,
+        "caller_agent": "codex-worker",
+        "expand_graph": true
+    });
+
+    let result = serde_json::from_value::<SearchMemoryRequest>(value);
+
+    assert!(result.is_err());
+}
+
+#[test]
+fn search_request_serializes_expected_shape() {
+    let request = SearchMemoryRequest {
+        query: "how should I debug invoice retry failures".into(),
+        intent: "debugging".into(),
+        scope_filters: vec!["repo:billing".into()],
+        token_budget: 500,
+        caller_agent: "codex-worker".into(),
+        expand_graph: true,
+    };
+
+    let value = serde_json::to_value(request).unwrap();
+
+    assert_eq!(value["query"], "how should I debug invoice retry failures");
+    assert_eq!(value["expand_graph"], true);
+}
 
 #[test]
 fn search_response_serializes_compressed_shapes() {
@@ -39,4 +75,3 @@ fn search_response_serializes_compressed_shapes() {
     assert!(value["reusable_patterns"][0].get("applicability").is_none());
     assert_eq!(value["suggested_workflow"]["goal"], "ship a safe schema change");
 }
-
