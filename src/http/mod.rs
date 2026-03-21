@@ -1,6 +1,7 @@
 pub mod memory;
 pub mod health;
 pub mod review;
+pub mod graph;
 
 use axum::Router;
 
@@ -11,4 +12,5 @@ pub fn router() -> Router<AppState> {
         .merge(health::router::<AppState>())
         .merge(memory::router())
         .merge(review::router())
+        .merge(graph::router())
 }

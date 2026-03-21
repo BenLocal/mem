@@ -4,12 +4,13 @@ use std::{
 };
 
 use serde::Serialize;
+use std::sync::Arc;
 use thiserror::Error;
 
 use crate::{
-    domain::memory::{EditPendingRequest, EditPendingResponse, IngestMemoryRequest, MemoryRecord, MemoryStatus},
-    pipeline::ingest::{compute_content_hash, initial_status},
-    storage::{DuckDbRepository, StorageError},
+    domain::memory::{EditPendingRequest, EditPendingResponse, GraphEdge, IngestMemoryRequest, MemoryRecord, MemoryStatus},
+    pipeline::ingest::{compute_content_hash, initial_status, memory_node_id},
+    storage::{GraphError, GraphStore, DuckDbRepository, LocalGraphAdapter, StorageError},
 };
 use crate::domain::memory::MemoryDetailResponse;
 
@@ -28,6 +29,8 @@ pub enum ServiceError {
     NotFound,
     #[error(transparent)]
     Storage(#[from] StorageError),
+    #[error(transparent)]
+    Graph(#[from] GraphError),
 }
 
 impl From<MemoryRecord> for IngestMemoryResponse {
@@ -39,20 +42,28 @@ impl From<MemoryRecord> for IngestMemoryResponse {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct MemoryService {
     repository: DuckDbRepository,
+    graph: Arc<dyn GraphStore>,
 }
 
 impl MemoryService {
     pub fn new(repository: DuckDbRepository) -> Self {
-        Self { repository }
+        Self {
+            repository,
+            graph: Arc::new(LocalGraphAdapter::default()),
+        }
+    }
+
+    pub fn with_graph(repository: DuckDbRepository, graph: Arc<dyn GraphStore>) -> Self {
+        Self { repository, graph }
     }
 
     pub async fn ingest(
         &self,
         request: IngestMemoryRequest,
-    ) -> Result<IngestMemoryResponse, StorageError> {
+    ) -> Result<IngestMemoryResponse, ServiceError> {
         let content_hash = compute_content_hash(&request);
 
         if let Some(existing) = self
@@ -94,6 +105,7 @@ impl MemoryService {
         };
 
         let stored = self.repository.insert_memory(memory).await?;
+        self.graph.sync_memory(&stored).await?;
         Ok(stored.into())
     }
 
@@ -117,7 +129,7 @@ impl MemoryService {
                 .repository
                 .list_memory_versions_for_tenant(&memory.tenant, memory_id)
                 .await?,
-            graph_links: Vec::new(),
+            graph_links: self.graph.neighbors(&memory_node_id(memory_id)).await?,
             feedback_summary: self.repository.feedback_summary(memory_id).await?,
             memory,
         })
@@ -159,6 +171,7 @@ impl MemoryService {
                 self.superseding_active_version(&original, patch),
             )
             .await?;
+        self.graph.sync_memory(&superseding).await?;
 
         Ok(EditPendingResponse {
             original_memory_id: original.memory_id,
@@ -217,6 +230,10 @@ impl MemoryService {
             updated_at: now,
             last_validated_at: None,
         }
+    }
+
+    pub async fn graph_neighbors(&self, node_id: &str) -> Result<Vec<GraphEdge>, ServiceError> {
+        Ok(self.graph.neighbors(node_id).await?)
     }
 }
 
