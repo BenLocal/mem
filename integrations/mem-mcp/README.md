@@ -61,6 +61,9 @@ After editing TypeScript, run `npm run build` before restarting the MCP client.
 | `memory_get` | `GET /memories/{id}` |
 | `memory_feedback` | `POST /memories/feedback` |
 | `memory_list_pending_review` | `GET /reviews/pending` |
+| `memory_review_accept` | `POST /reviews/pending/accept` |
+| `memory_review_reject` | `POST /reviews/pending/reject` |
+| `memory_review_edit_accept` | `POST /reviews/pending/edit_accept` |
 | `episode_ingest` | `POST /episodes` |
 | `memory_graph_neighbors` | `GET /graph/neighbors/{node_id}` |
 | `embeddings_*` | optional; see spec |

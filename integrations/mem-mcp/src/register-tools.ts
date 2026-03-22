@@ -9,6 +9,7 @@ import { registerMemHealth } from "./tools/health.js";
 import { registerMemoryIngest } from "./tools/ingest.js";
 import { registerMemoryGet } from "./tools/memory-get.js";
 import { registerMemoryListPendingReview } from "./tools/pending.js";
+import { registerReviewActionTools } from "./tools/review-actions.js";
 import { registerMemorySearch } from "./tools/search.js";
 import type { ToolContext } from "./tools/context.js";
 
@@ -26,6 +27,7 @@ export function registerMemTools(
   registerMemoryGet(server, ctx);
   registerMemoryFeedback(server, ctx);
   registerMemoryListPendingReview(server, ctx);
+  registerReviewActionTools(server, ctx);
   registerEpisodeIngest(server, ctx);
   registerMemoryGraphNeighbors(server, ctx);
 

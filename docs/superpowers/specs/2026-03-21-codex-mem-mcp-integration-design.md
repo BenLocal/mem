@@ -40,6 +40,9 @@ MCP server 为 **薄适配层**（可独立仓库或本 monorepo 子包），职
 | `memory_get` | `GET /memories/{id}` | 详情 + 版本链 + 图边 + embedding 元数据等。 |
 | `memory_feedback` | `POST /memories/feedback` | `useful` / `outdated` 等，反哺排序。 |
 | `memory_list_pending_review` | `GET /reviews/pending` | 可选，供「人工审核」类工作流。 |
+| `memory_review_accept` | `POST /reviews/pending/accept` | 审核通过（无编辑）。 |
+| `memory_review_reject` | `POST /reviews/pending/reject` | 审核拒绝。 |
+| `memory_review_edit_accept` | `POST /reviews/pending/edit_accept` | 修改 pending 内容后接受并生成 active 后继。 |
 | `episode_ingest` | `POST /episodes` | 可选，用于沉淀成功运行片段与工作流候选。 |
 | `memory_graph_neighbors` | `GET /graph/neighbors/{node_id}` | 按图节点 id 拉邻接边；`node_id` 含 `:` 时需 URL 编码（MCP 工具内处理）。 |
 | `embeddings_*` | `GET/POST /embeddings/*` | 可选，仅维护/调试角色暴露，默认可对普通 Codex 隐藏。 |

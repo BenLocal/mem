@@ -32,6 +32,12 @@ If other tools fail with connection errors, call **`mem_health`** first to confi
 - **Preferences / strong constraints**: prefer **`write_mode: propose`** and types that require review (`preference`, etc.) per product policy.
 - After a **successful multi-step run**, consider **`episode_ingest`** so workflows can be mined later.
 
+## Pending review
+
+- List with **`memory_list_pending_review`**. After the human decides:
+  - **`memory_review_accept`** / **`memory_review_reject`**, or
+  - **`memory_review_edit_accept`** when content should be fixed before activation (matches HTTP `edit_accept`).
+
 ## Feedback
 
 - When the user confirms a memory helped or hurt recall, use **`memory_feedback`** (`useful`, `outdated`, …).
