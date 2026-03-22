@@ -5,6 +5,7 @@ import { registerEpisodeIngest } from "./tools/episode.js";
 import { registerEmbeddingsTools } from "./tools/embeddings.js";
 import { registerMemoryFeedback } from "./tools/feedback.js";
 import { registerMemoryGraphNeighbors } from "./tools/graph.js";
+import { registerMemHealth } from "./tools/health.js";
 import { registerMemoryIngest } from "./tools/ingest.js";
 import { registerMemoryGet } from "./tools/memory-get.js";
 import { registerMemoryListPendingReview } from "./tools/pending.js";
@@ -19,6 +20,7 @@ export function registerMemTools(
   const { baseUrl, defaultTenant, exposeEmbeddings } = config;
   const ctx: ToolContext = { baseUrl, fetchFn, defaultTenant };
 
+  registerMemHealth(server, ctx);
   registerMemorySearch(server, ctx);
   registerMemoryIngest(server, ctx);
   registerMemoryGet(server, ctx);

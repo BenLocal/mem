@@ -7,6 +7,8 @@ description: Use shared mem service via MCP tools (memory_search, memory_ingest,
 
 When the **mem** MCP server is enabled, use its tools to read and write the same DuckDB-backed memory as other Codex / Cursor sessions.
 
+If other tools fail with connection errors, call **`mem_health`** first to confirm `MEM_BASE_URL` is correct and `cargo run` (or your deployment) is up.
+
 ## Environment (host of `node …/mem-mcp/dist/index.js`)
 
 - `MEM_BASE_URL` — mem HTTP root (default `http://127.0.0.1:3000`).

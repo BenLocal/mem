@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from "vitest";
-import { joinUrl, memRequestJson } from "./mem-client.js";
+import { joinUrl, memRequestJson, memRequestText } from "./mem-client.js";
 
 describe("joinUrl", () => {
   it("joins base and path", () => {
@@ -68,5 +68,36 @@ describe("memRequestJson", () => {
       "http://h/graph/neighbors/module%3Amem%3Ainvoice",
       expect.any(Object),
     );
+  });
+});
+
+describe("memRequestText", () => {
+  it("returns plain text without JSON parse", async () => {
+    const fetchFn = vi.fn(async () => ({
+      ok: true,
+      status: 200,
+      text: async () => "ok\n",
+    })) as unknown as typeof fetch;
+
+    const t = await memRequestText("http://h", fetchFn, "GET", "health");
+    expect(t).toBe("ok\n");
+    expect(fetchFn).toHaveBeenCalledWith(
+      "http://h/health",
+      expect.objectContaining({
+        headers: { Accept: "*/*" },
+      }),
+    );
+  });
+
+  it("throws on non-ok", async () => {
+    const fetchFn = vi.fn(async () => ({
+      ok: false,
+      status: 502,
+      text: async () => "bad gateway",
+    })) as unknown as typeof fetch;
+
+    await expect(
+      memRequestText("http://h", fetchFn, "GET", "health"),
+    ).rejects.toThrow(/mem HTTP 502/);
   });
 });

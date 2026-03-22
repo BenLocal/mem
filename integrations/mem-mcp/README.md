@@ -55,6 +55,7 @@ After editing TypeScript, run `npm run build` before restarting the MCP client.
 
 | Tool | mem API |
 |------|---------|
+| `mem_health` | `GET /health` (plain text) |
 | `memory_search` | `POST /memories/search` |
 | `memory_ingest` | `POST /memories` |
 | `memory_get` | `GET /memories/{id}` |

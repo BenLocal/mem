@@ -34,6 +34,7 @@ MCP server 为 **薄适配层**（可独立仓库或本 monorepo 子包），职
 
 | 工具（建议名） | 对应 mem API | 说明 |
 |----------------|--------------|------|
+| `mem_health` | `GET /health` | 探活；响应为纯文本（非 JSON），由 MCP 适配层按字符串处理。 |
 | `memory_search` | `POST /memories/search` | 核心读路径；必填 `query`，可选 `intent`、`scope_filters`、`token_budget`、`expand_graph`、`caller_agent`。 |
 | `memory_ingest` | `POST /memories` | 写入候选记忆；遵守 `write_mode` 与 `memory_type` 生命周期。 |
 | `memory_get` | `GET /memories/{id}` | 详情 + 版本链 + 图边 + embedding 元数据等。 |
