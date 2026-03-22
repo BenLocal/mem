@@ -1,13 +1,13 @@
 # mem：npm 发布 MCP、Docker 部署服务端、GitHub Actions 发布流水线
 
 日期：2026-03-22  
-状态：Draft（brainstorming 定稿，待你确认后进入 implementation plan）
+状态：Accepted
 
 ## 1. 目标
 
 1. 将 **`integrations/mem-mcp`** 发布到 **npm**，便于 `npx` / 全局安装，无需克隆仓库即可跑 MCP。  
 2. 将 **mem HTTP 服务**（Rust 二进制）做成 **Docker 镜像**，可在服务器或本地用容器运行，数据通过 volume 持久化 DuckDB。  
-3. 在 **GitHub Actions** 中增加**发布向**工作流（与现有 PR CI 区分）：在打 tag 或手动 dispatch 时构建并推送镜像，并发布 npm 包。
+3. 在 **GitHub Actions** 中增加**发布向**工作流（与现有 PR CI 区分）：在打 **`v*.*.*` tag** 时构建并推送镜像，并发布 npm 包。
 
 **部署模型（已定）**：Docker **仅承载 mem**；MCP 仍在客户端运行，通过 `MEM_BASE_URL` 指向容器内或负载均衡后的 mem。不把「远程 stdio MCP」作为本期目标。
 

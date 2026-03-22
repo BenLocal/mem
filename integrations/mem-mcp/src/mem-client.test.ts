@@ -1,4 +1,4 @@
-import { describe, expect, it, vi } from "vitest";
+import { describe, expect, it, vi, type MockedFunction } from "vitest";
 import { joinUrl, memRequestJson, memRequestText } from "./mem-client.js";
 
 describe("joinUrl", () => {
@@ -18,7 +18,7 @@ describe("memRequestJson", () => {
       ok: false,
       status: 503,
       text: async () => "down",
-    })) as unknown as typeof fetch;
+    })) as unknown as MockedFunction<typeof fetch>;
 
     await expect(
       memRequestJson("http://h", fetchFn, "GET", "health"),
@@ -33,7 +33,7 @@ describe("memRequestJson", () => {
       ok: true,
       status: 200,
       text: async () => '{"a":1}',
-    })) as unknown as typeof fetch;
+    })) as unknown as MockedFunction<typeof fetch>;
 
     const data = await memRequestJson("http://h", fetchFn, "GET", "x");
     expect(data).toEqual({ a: 1 });
@@ -44,7 +44,7 @@ describe("memRequestJson", () => {
       ok: true,
       status: 200,
       text: async () => "[]",
-    })) as unknown as typeof fetch;
+    })) as unknown as MockedFunction<typeof fetch>;
 
     await memRequestJson("http://h", fetchFn, "GET", "reviews/pending", {
       query: { tenant: "t1" },
@@ -60,7 +60,7 @@ describe("memRequestJson", () => {
       ok: true,
       status: 200,
       text: async () => "[]",
-    })) as unknown as typeof fetch;
+    })) as unknown as MockedFunction<typeof fetch>;
 
     const path = `graph/neighbors/${encodeURIComponent("module:mem:invoice")}`;
     await memRequestJson("http://h", fetchFn, "GET", path);
@@ -78,7 +78,7 @@ describe("memories/search POST body", () => {
       status: 200,
       text: async () =>
         '{"directives":[],"relevant_facts":[],"reusable_patterns":[]}',
-    })) as unknown as typeof fetch;
+    })) as unknown as MockedFunction<typeof fetch>;
 
     await memRequestJson("http://h", fetchFn, "POST", "memories/search", {
       body: {
@@ -114,7 +114,7 @@ describe("memRequestText", () => {
       ok: true,
       status: 200,
       text: async () => "ok\n",
-    })) as unknown as typeof fetch;
+    })) as unknown as MockedFunction<typeof fetch>;
 
     const t = await memRequestText("http://h", fetchFn, "GET", "health");
     expect(t).toBe("ok\n");
@@ -131,7 +131,7 @@ describe("memRequestText", () => {
       ok: false,
       status: 502,
       text: async () => "bad gateway",
-    })) as unknown as typeof fetch;
+    })) as unknown as MockedFunction<typeof fetch>;
 
     await expect(
       memRequestText("http://h", fetchFn, "GET", "health"),

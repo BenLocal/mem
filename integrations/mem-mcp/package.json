@@ -1,11 +1,25 @@
 {
   "name": "mem-mcp",
   "version": "0.1.0",
-  "private": true,
   "type": "module",
   "description": "MCP server that proxies to the mem HTTP API",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/BenLocal/mem.git",
+    "directory": "integrations/mem-mcp"
+  },
+  "files": [
+    "dist",
+    "README.md",
+    "package.json"
+  ],
+  "bin": {
+    "mem-mcp": "dist/index.js"
+  },
   "scripts": {
     "build": "tsc",
+    "prepack": "npm run build",
     "start": "node dist/index.js",
     "test": "vitest run"
   },

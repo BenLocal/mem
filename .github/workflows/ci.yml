@@ -17,6 +17,22 @@ jobs:
       - run: cargo clippy --all-targets -- -D warnings
       - run: cargo test
 
+  rust-cross:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: cross-linux
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cross
+      - name: Build release (x86_64-unknown-linux-gnu)
+        run: cross build --release --target x86_64-unknown-linux-gnu
+      - name: Build release (x86_64-unknown-linux-musl)
+        run: cross build --release --target x86_64-unknown-linux-musl
+
   mem-mcp:
     runs-on: ubuntu-latest
     steps:

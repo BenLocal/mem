@@ -1,0 +1,4 @@
+target/
+integrations/mem-mcp/node_modules/
+.git/
+**/.DS_Store

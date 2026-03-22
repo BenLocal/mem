@@ -7,7 +7,19 @@ MCP server that proxies to the [`mem`](../../README.md) HTTP API so Cursor / Cod
 - Node.js ≥ 20
 - A running `mem` instance (`cargo run` or release binary)
 
-## Install & build
+## Install from npm
+
+```bash
+npm install -g mem-mcp
+```
+
+Or run without a global install:
+
+```bash
+npx mem-mcp
+```
+
+## Install from source
 
 ```bash
 cd integrations/mem-mcp
@@ -25,6 +37,14 @@ npm run build
 
 ## Run (stdio)
 
+After a global install:
+
+```bash
+mem-mcp
+```
+
+From a clone (dev):
+
 ```bash
 cd integrations/mem-mcp
 npm start
@@ -32,14 +52,13 @@ npm start
 
 ## Cursor MCP (`mcp.json`)
 
-Use the **absolute** path to `dist/index.js` on your machine:
+With **`mem-mcp` on `PATH`** (e.g. after `npm install -g mem-mcp`):
 
 ```json
 {
   "mcpServers": {
     "mem": {
-      "command": "node",
-      "args": ["/ABS/PATH/TO/mem/integrations/mem-mcp/dist/index.js"],
+      "command": "mem-mcp",
       "env": {
         "MEM_BASE_URL": "http://127.0.0.1:3000",
         "MEM_TENANT": "local"
@@ -49,7 +68,9 @@ Use the **absolute** path to `dist/index.js` on your machine:
 }
 ```
 
-After editing TypeScript, run `npm run build` before restarting the MCP client.
+When developing from a clone, you can still point at the built file with `"command": "node"` and `"args": ["/ABS/PATH/TO/mem/integrations/mem-mcp/dist/index.js"]`.
+
+After editing TypeScript locally, run `npm run build` before restarting the MCP client.
 
 ## Tools
 

@@ -1,0 +1,15 @@
+services:
+  mem:
+    build:
+      context: ..
+      dockerfile: Dockerfile
+    ports:
+      - "3000:3000"
+    environment:
+      MEM_DB_PATH: /data/mem.duckdb
+      BIND_ADDR: 0.0.0.0:3000
+    volumes:
+      - mem_data:/data
+
+volumes:
+  mem_data:

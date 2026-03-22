@@ -1,0 +1,24 @@
+# https://github.com/cross-rs/cross
+#
+# 在 macOS / Windows 上编 Linux 服务端二进制（glibc，与 Debian bookworm 运行时一致）：
+#   cargo install cross --locked
+#   cross build --release
+#
+# 产物：target/x86_64-unknown-linux-gnu/release/mem
+#
+# 静态 musl（适合 Alpine / 无 glibc 环境）：
+#   cross build --release --target x86_64-unknown-linux-musl
+# 产物：target/x86_64-unknown-linux-musl/release/mem
+#
+# 其他目标示例：
+#   cross build --release --target aarch64-unknown-linux-gnu
+
+[build]
+default-target = "x86_64-unknown-linux-gnu"
+
+[target.x86_64-unknown-linux-gnu]
+# 与 Dockerfile builder 阶段使用同一套镜像，避免本机 cross 与镜像行为漂移
+image = ":edge"
+
+[target.x86_64-unknown-linux-musl]
+image = ":edge"
