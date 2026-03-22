@@ -10,6 +10,16 @@ cargo run
 
 The server binds to `127.0.0.1:3000` by default. Set `MEM_DB_PATH` to point at a specific DuckDB file if you do not want to use the default local dev path.
 
+## Codex / MCP (shared memory)
+
+- **Spec:** [docs/superpowers/specs/2026-03-21-codex-mem-mcp-integration-design.md](docs/superpowers/specs/2026-03-21-codex-mem-mcp-integration-design.md)
+- **Implementation plan:** [docs/superpowers/plans/2026-03-21-codex-mem-mcp-integration.md](docs/superpowers/plans/2026-03-21-codex-mem-mcp-integration.md)
+- **MCP package:** [integrations/mem-mcp](integrations/mem-mcp) — `npm install && npm run build && npm start` (stdio)
+- **Agent skill (workflow):** [docs/superpowers/skills/mem-mcp-codex/SKILL.md](docs/superpowers/skills/mem-mcp-codex/SKILL.md)
+- **CI without MCP:** [docs/superpowers/examples/ci-mem-http-snippet.md](docs/superpowers/examples/ci-mem-http-snippet.md)
+
+Point every client at the same `MEM_BASE_URL` and `tenant` so multiple Codex or Cursor processes share one store.
+
 ## API Smoke Checklist
 
 ```bash
