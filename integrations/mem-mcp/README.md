@@ -61,6 +61,7 @@ After editing TypeScript, run `npm run build` before restarting the MCP client.
 | `memory_feedback` | `POST /memories/feedback` |
 | `memory_list_pending_review` | `GET /reviews/pending` |
 | `episode_ingest` | `POST /episodes` |
+| `memory_graph_neighbors` | `GET /graph/neighbors/{node_id}` |
 | `embeddings_*` | optional; see spec |
 
 Design reference: `docs/superpowers/specs/2026-03-21-codex-mem-mcp-integration-design.md`

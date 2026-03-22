@@ -54,4 +54,19 @@ describe("memRequestJson", () => {
       expect.any(Object),
     );
   });
+
+  it("supports graph neighbor paths with encoded colons", async () => {
+    const fetchFn = vi.fn(async () => ({
+      ok: true,
+      status: 200,
+      text: async () => "[]",
+    })) as unknown as typeof fetch;
+
+    const path = `graph/neighbors/${encodeURIComponent("module:mem:invoice")}`;
+    await memRequestJson("http://h", fetchFn, "GET", path);
+    expect(fetchFn).toHaveBeenCalledWith(
+      "http://h/graph/neighbors/module%3Amem%3Ainvoice",
+      expect.any(Object),
+    );
+  });
 });

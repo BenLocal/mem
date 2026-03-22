@@ -27,7 +27,10 @@
 | MCP 包 | `integrations/mem-mcp/src/tools/pending.ts` | `memory_list_pending_review` → `GET /reviews/pending?tenant=` |
 | MCP 包 | `integrations/mem-mcp/src/tools/episode.ts` | `episode_ingest` → `POST /episodes` |
 | MCP 包 | `integrations/mem-mcp/src/tools/embeddings.ts`（可选） | 仅当 `MEM_MCP_EXPOSE_EMBEDDINGS=1` 时注册 `embeddings_list_jobs`、`embeddings_rebuild`、`embeddings_providers` |
-| MCP 包 | `integrations/mem-mcp/src/index.ts` | `Server` stdio transport，注册全部工具 |
+| MCP 包 | `integrations/mem-mcp/src/index.ts` | `Server` stdio transport，入口 |
+| MCP 包 | `integrations/mem-mcp/src/register-tools.ts` | 聚合注册 |
+| MCP 包 | `integrations/mem-mcp/src/tools/*.ts` | 各 MCP 工具（search、ingest、graph、embeddings 等） |
+| MCP 包 | `integrations/mem-mcp/src/schemas.ts`、`tool-result.ts` | 共享 Zod 与返回封装 |
 | MCP 包 | `integrations/mem-mcp/README.md` | 安装、环境变量、Cursor `mcp.json` 片段、本地联调步骤 |
 | MCP 测试 | `integrations/mem-mcp/src/mem-client.test.ts`（或 `tests/`） | mock `globalThis.fetch`，断言 URL 与 body |
 | Skill | `docs/superpowers/skills/mem-mcp-codex/SKILL.md` | 流程段落 + 指向 MCP 工具名 + 环境变量表 |

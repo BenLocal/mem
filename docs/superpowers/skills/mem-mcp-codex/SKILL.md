@@ -22,6 +22,7 @@ When the **mem** MCP server is enabled, use its tools to read and write the same
 ## During the task
 
 - If the user asks about past decisions, conventions, or bugs, **`memory_search`** again or **`memory_get`** if you already have a `memory_id`.
+- To explore entity relationships when you already have a graph **`node_id`** (from search metadata or docs), use **`memory_graph_neighbors`** (ids often look like `module:repo:foo`).
 
 ## Writing
 
