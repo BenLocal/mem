@@ -71,6 +71,43 @@ describe("memRequestJson", () => {
   });
 });
 
+describe("memories/search POST body", () => {
+  it("sends snake_case JSON with query and caller_agent", async () => {
+    const fetchFn = vi.fn(async () => ({
+      ok: true,
+      status: 200,
+      text: async () =>
+        '{"directives":[],"relevant_facts":[],"reusable_patterns":[]}',
+    })) as unknown as typeof fetch;
+
+    await memRequestJson("http://h", fetchFn, "POST", "memories/search", {
+      body: {
+        query: "debug cache",
+        intent: "debugging",
+        scope_filters: ["repo:mem"],
+        token_budget: 300,
+        caller_agent: "vitest-mcp",
+        expand_graph: true,
+        tenant: "local",
+      },
+    });
+
+    expect(fetchFn).toHaveBeenCalledTimes(1);
+    const init = fetchFn.mock.calls[0][1] as RequestInit;
+    expect(init.method).toBe("POST");
+    const parsed = JSON.parse(init.body as string);
+    expect(parsed).toMatchObject({
+      query: "debug cache",
+      caller_agent: "vitest-mcp",
+      intent: "debugging",
+      scope_filters: ["repo:mem"],
+      token_budget: 300,
+      expand_graph: true,
+      tenant: "local",
+    });
+  });
+});
+
 describe("memRequestText", () => {
   it("returns plain text without JSON parse", async () => {
     const fetchFn = vi.fn(async () => ({

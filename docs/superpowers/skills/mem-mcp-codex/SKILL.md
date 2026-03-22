@@ -1,6 +1,6 @@
 ---
 name: mem-mcp-codex
-description: Use shared mem service via MCP tools (memory_search, memory_ingest, memory_get, feedback, episodes) for Codex and multi-session agents.
+description: Use shared mem via MCP (mem_health, memory_search, ingest, get, graph, feedback, pending review actions, episodes, optional embeddings admin).
 ---
 
 # Shared memory (mem) via MCP
@@ -11,9 +11,13 @@ If other tools fail with connection errors, call **`mem_health`** first to confi
 
 ## Environment (host of `node …/mem-mcp/dist/index.js`)
 
-- `MEM_BASE_URL` — mem HTTP root (default `http://127.0.0.1:3000`).
-- `MEM_TENANT` — default tenant when a tool omits `tenant` (default `local`).
-- `MEM_MCP_EXPOSE_EMBEDDINGS=1` — optional; registers embedding admin tools.
+| Variable | Default | Meaning |
+|----------|---------|---------|
+| `MEM_BASE_URL` | `http://127.0.0.1:3000` | mem HTTP root (no trailing slash required). |
+| `MEM_TENANT` | `local` | Default `tenant` when a tool omits it. |
+| `MEM_MCP_EXPOSE_EMBEDDINGS` | unset | Set to `1` to register `embeddings_*` admin tools. |
+
+Run **`cargo run`** (or your deploy) for mem before starting the MCP server. See repo root [README.md](../../../../README.md) §「Codex / MCP」for links to spec, plan, and this skill.
 
 ## Before substantive work
 
@@ -48,4 +52,5 @@ If other tools fail with connection errors, call **`mem_health`** first to confi
 - Set `caller_agent` to a generic string; use a **per-runtime** value for traceability.
 
 **Spec:** `docs/superpowers/specs/2026-03-21-codex-mem-mcp-integration-design.md`  
+**Plan:** `docs/superpowers/plans/2026-03-21-codex-mem-mcp-integration.md`  
 **Package:** `integrations/mem-mcp/README.md`
