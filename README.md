@@ -55,7 +55,7 @@ Default in the image: `BIND_ADDR=0.0.0.0:3000`, `MEM_DB_PATH=/data/mem.duckdb`. 
 ## Release (npm + GHCR)
 
 1. （可选）若要发布 npm：在仓库 Secrets 中配置 **`NPM_TOKEN`**（npm Automation token）。未配置时 Release 工作流会**跳过** `publish-npm`，其余 job 仍会执行。
-2. Push a semver tag: `git tag v0.1.0 && git push origin v0.1.0`.
+2. Push a semver tag: `git tag v0.1.0 && git push origin v0.1.0`（会同时触发 **CI** 与 **Release**；Docker 镜像构建使用 GitHub Actions 缓存加速重复构建）。
 3. Workflow [`.github/workflows/release.yml`](.github/workflows/release.yml) 在有 token 时将 **`mem-mcp`** 发布到 npm（版本号与 tag 一致，不含前缀 `v`），推送 **`ghcr.io/<lowercase-owner>/mem:<tag>`** 与 **`:latest`**，并在 GitHub Release 上附带 **`mem-<tag>-x86_64-unknown-linux-gnu`**、**`mem-<tag>-x86_64-unknown-linux-musl`** 以及 **`mem-<tag>-SHA256SUMS`**（`sha256sum` 校验文件）。
 
 Plan: [docs/superpowers/plans/2026-03-22-mem-publish-docker-actions.md](docs/superpowers/plans/2026-03-22-mem-publish-docker-actions.md).
