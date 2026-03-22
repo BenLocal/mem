@@ -1,7 +1,7 @@
 pub mod app;
 pub mod config;
-pub mod embedding;
 pub mod domain;
+pub mod embedding;
 pub mod error;
 pub mod http;
 pub mod pipeline;

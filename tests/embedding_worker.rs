@@ -101,8 +101,8 @@ async fn worker_marks_stale_when_job_target_hash_mismatches_memory() {
 
     let ts = "00000000000000000000".to_string();
     let job_id = "ej_stale_manual".to_string();
-    assert!(
-        repo.try_enqueue_embedding_job(EmbeddingJobInsert {
+    assert!(repo
+        .try_enqueue_embedding_job(EmbeddingJobInsert {
             job_id: job_id.clone(),
             tenant: "tenant-s".into(),
             memory_id: "mem_stale_1".into(),
@@ -113,8 +113,7 @@ async fn worker_marks_stale_when_job_target_hash_mismatches_memory() {
             updated_at: ts,
         })
         .await
-        .unwrap()
-    );
+        .unwrap());
 
     embedding_worker::tick(&repo, provider.as_ref(), &settings)
         .await

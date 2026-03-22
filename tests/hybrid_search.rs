@@ -142,13 +142,18 @@ async fn hybrid_search_surfaces_semantic_match_without_lexical_overlap() {
     let mut ids = Vec::new();
     ids.extend(response.directives.iter().map(|d| d.memory_id.as_str()));
     ids.extend(response.relevant_facts.iter().map(|f| f.memory_id.as_str()));
-    ids.extend(response.reusable_patterns.iter().map(|p| p.memory_id.as_str()));
+    ids.extend(
+        response
+            .reusable_patterns
+            .iter()
+            .map(|p| p.memory_id.as_str()),
+    );
     if let Some(w) = response.suggested_workflow.as_ref() {
         ids.push(w.memory_id.as_str());
     }
 
     assert!(
-        ids.iter().any(|id| *id == "mem_hit"),
+        ids.contains(&"mem_hit"),
         "expected semantic hit mem_hit in compressed response, got {ids:?}"
     );
 }

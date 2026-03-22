@@ -303,6 +303,7 @@ impl DuckDbRepository {
         Ok(Some(job))
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub async fn upsert_memory_embedding(
         &self,
         memory_id: &str,
@@ -451,22 +452,23 @@ impl DuckDbRepository {
             )?
         };
 
-        let map_row = |row: &duckdb::Row| -> duckdb::Result<crate::domain::embeddings::EmbeddingJobInfo> {
-            let attempt: i64 = row.get(6)?;
-            Ok(crate::domain::embeddings::EmbeddingJobInfo {
-                job_id: row.get(0)?,
-                tenant: row.get(1)?,
-                memory_id: row.get(2)?,
-                target_content_hash: row.get(3)?,
-                provider: row.get(4)?,
-                status: row.get(5)?,
-                attempt_count: u32::try_from(attempt).unwrap_or(0),
-                last_error: row.get(7)?,
-                available_at: row.get(8)?,
-                created_at: row.get(9)?,
-                updated_at: row.get(10)?,
-            })
-        };
+        let map_row =
+            |row: &duckdb::Row| -> duckdb::Result<crate::domain::embeddings::EmbeddingJobInfo> {
+                let attempt: i64 = row.get(6)?;
+                Ok(crate::domain::embeddings::EmbeddingJobInfo {
+                    job_id: row.get(0)?,
+                    tenant: row.get(1)?,
+                    memory_id: row.get(2)?,
+                    target_content_hash: row.get(3)?,
+                    provider: row.get(4)?,
+                    status: row.get(5)?,
+                    attempt_count: u32::try_from(attempt).unwrap_or(0),
+                    last_error: row.get(7)?,
+                    available_at: row.get(8)?,
+                    created_at: row.get(9)?,
+                    updated_at: row.get(10)?,
+                })
+            };
 
         let rows = match (status_filter, memory_id_filter) {
             (Some(st), Some(mid)) => stmt.query_map(params![tenant, st, mid, lim], map_row)?,
@@ -487,9 +489,8 @@ impl DuckDbRepository {
         tenant: &str,
     ) -> Result<Vec<String>, StorageError> {
         let conn = self.conn()?;
-        let mut stmt = conn.prepare(
-            "select memory_id from memories where tenant = ?1 order by updated_at desc",
-        )?;
+        let mut stmt = conn
+            .prepare("select memory_id from memories where tenant = ?1 order by updated_at desc")?;
         let rows = stmt.query_map(params![tenant], |row| row.get::<_, String>(0))?;
         let mut out = Vec::new();
         for r in rows {
@@ -548,7 +549,11 @@ impl DuckDbRepository {
         Ok(scored)
     }
 
-    pub async fn complete_embedding_job(&self, job_id: &str, now: &str) -> Result<(), StorageError> {
+    pub async fn complete_embedding_job(
+        &self,
+        job_id: &str,
+        now: &str,
+    ) -> Result<(), StorageError> {
         let conn = self.conn()?;
         conn.execute(
             "update embedding_jobs
@@ -559,7 +564,11 @@ impl DuckDbRepository {
         Ok(())
     }
 
-    pub async fn mark_embedding_job_stale(&self, job_id: &str, now: &str) -> Result<(), StorageError> {
+    pub async fn mark_embedding_job_stale(
+        &self,
+        job_id: &str,
+        now: &str,
+    ) -> Result<(), StorageError> {
         let conn = self.conn()?;
         conn.execute(
             "update embedding_jobs set status = 'stale', updated_at = ?1 where job_id = ?2",

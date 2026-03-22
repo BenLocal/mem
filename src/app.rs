@@ -25,7 +25,8 @@ impl AppState {
         let repo_worker = repository.clone();
         let worker_settings = config.embedding.clone();
         tokio::spawn(async move {
-            crate::service::embedding_worker::run(repo_worker, provider_worker, worker_settings).await;
+            crate::service::embedding_worker::run(repo_worker, provider_worker, worker_settings)
+                .await;
         });
 
         let embedding_provider = config.embedding.job_provider_id().to_string();

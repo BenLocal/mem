@@ -8,7 +8,9 @@ use serde::Deserialize;
 use crate::{
     app::AppState,
     config::EmbeddingProviderKind,
-    domain::embeddings::{EmbeddingProviderInfo, EmbeddingsRebuildRequest, EmbeddingsRebuildResponse},
+    domain::embeddings::{
+        EmbeddingProviderInfo, EmbeddingsRebuildRequest, EmbeddingsRebuildResponse,
+    },
     error::AppError,
 };
 

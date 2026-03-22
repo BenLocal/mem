@@ -4,7 +4,11 @@ use crate::config::EmbeddingSettings;
 use crate::embedding::EmbeddingProvider;
 use crate::storage::{DuckDbRepository, StorageError};
 
-pub async fn run(repo: DuckDbRepository, provider: Arc<dyn EmbeddingProvider>, settings: EmbeddingSettings) {
+pub async fn run(
+    repo: DuckDbRepository,
+    provider: Arc<dyn EmbeddingProvider>,
+    settings: EmbeddingSettings,
+) {
     let mut interval = tokio::time::interval(std::time::Duration::from_millis(
         settings.worker_poll_interval_ms.max(1),
     ));
@@ -66,7 +70,7 @@ pub async fn tick(
     let embedding = match provider.embed_text(&text).await {
         Ok(v) => v,
         Err(err) => {
-            record_failure(repo, &job, &settings, &err.to_string()).await?;
+            record_failure(repo, &job, settings, &err.to_string()).await?;
             return Ok(());
         }
     };
@@ -75,7 +79,7 @@ pub async fn tick(
         record_failure(
             repo,
             &job,
-            &settings,
+            settings,
             &format!(
                 "provider returned length {} (expected {})",
                 embedding.len(),
@@ -107,12 +111,7 @@ pub async fn tick(
         return Ok(());
     }
 
-    if repo
-        .get_embedding_job_status(&job.job_id)
-        .await?
-        .as_deref()
-        != Some("processing")
-    {
+    if repo.get_embedding_job_status(&job.job_id).await?.as_deref() != Some("processing") {
         return Ok(());
     }
 

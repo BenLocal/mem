@@ -121,10 +121,10 @@ impl EmbeddingSettings {
             }
         }
 
-        if s.provider == EmbeddingProviderKind::Real {
-            if s.openai_api_key.as_deref().unwrap_or("").is_empty() {
-                return Err(ConfigError::MissingOpenAiApiKey);
-            }
+        if s.provider == EmbeddingProviderKind::Real
+            && s.openai_api_key.as_deref().unwrap_or("").is_empty()
+        {
+            return Err(ConfigError::MissingOpenAiApiKey);
         }
 
         Ok(s)
@@ -190,7 +190,8 @@ mod tests {
 
     #[test]
     fn embedding_real_requires_api_key() {
-        let err = EmbeddingSettings::from_env_vars(env(&[("EMBEDDING_PROVIDER", "real")])).unwrap_err();
+        let err =
+            EmbeddingSettings::from_env_vars(env(&[("EMBEDDING_PROVIDER", "real")])).unwrap_err();
         assert!(matches!(err, ConfigError::MissingOpenAiApiKey));
     }
 

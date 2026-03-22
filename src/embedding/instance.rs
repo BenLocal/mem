@@ -9,6 +9,8 @@ pub fn arc_embedding_provider(
 ) -> Result<Arc<dyn EmbeddingProvider>, EmbeddingError> {
     match settings.provider {
         EmbeddingProviderKind::Fake => Ok(Arc::new(FakeEmbeddingProvider::from_settings(settings))),
-        EmbeddingProviderKind::Real => Ok(Arc::new(OpenAiEmbeddingProvider::from_settings(settings)?)),
+        EmbeddingProviderKind::Real => {
+            Ok(Arc::new(OpenAiEmbeddingProvider::from_settings(settings)?))
+        }
     }
 }

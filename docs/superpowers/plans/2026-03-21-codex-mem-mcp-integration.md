@@ -218,9 +218,9 @@ export async function memRequest(
 **Files:**
 - Create 或 Modify: `.github/workflows/*.yml`（若仓库已有 CI 则追加 job）
 
-- [ ] **Step 1:** Job：`checkout` → `cd integrations/mem-mcp` → `npm ci` → `npm test`。
+- [x] **Step 1:** Job：`checkout` → `integrations/mem-mcp` → `npm ci` → `npm test` → `npm run build`（见 `.github/workflows/ci.yml`，与 Rust `fmt` / `clippy` / `test` 并行）。
 
-- [ ] **Step 2:** Commit：`ci: run mem-mcp package tests`
+- [x] **Step 2:** Commit：`ci: add GitHub Actions for Rust and mem-mcp`
 
 ---
 

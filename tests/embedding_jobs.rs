@@ -93,8 +93,14 @@ async fn stale_live_embedding_jobs_allow_fresh_enqueue_same_fingerprint() {
         updated_at: now.clone(),
     };
 
-    assert!(repo.try_enqueue_embedding_job(insert("ej_a")).await.unwrap());
-    assert!(!repo.try_enqueue_embedding_job(insert("ej_b")).await.unwrap());
+    assert!(repo
+        .try_enqueue_embedding_job(insert("ej_a"))
+        .await
+        .unwrap());
+    assert!(!repo
+        .try_enqueue_embedding_job(insert("ej_b"))
+        .await
+        .unwrap());
 
     let n = repo
         .stale_live_embedding_jobs_for_memory("t1", "mem_ej_stale", "fake", &now)
@@ -102,7 +108,10 @@ async fn stale_live_embedding_jobs_allow_fresh_enqueue_same_fingerprint() {
         .unwrap();
     assert_eq!(n, 1);
 
-    assert!(repo.try_enqueue_embedding_job(insert("ej_c")).await.unwrap());
+    assert!(repo
+        .try_enqueue_embedding_job(insert("ej_c"))
+        .await
+        .unwrap());
     assert_eq!(
         repo.count_embedding_jobs_for_memory("mem_ej_stale")
             .await

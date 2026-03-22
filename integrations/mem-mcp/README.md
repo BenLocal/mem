@@ -64,3 +64,7 @@ After editing TypeScript, run `npm run build` before restarting the MCP client.
 | `embeddings_*` | optional; see spec |
 
 Design reference: `docs/superpowers/specs/2026-03-21-codex-mem-mcp-integration-design.md`
+
+## CI
+
+The repo root workflow `.github/workflows/ci.yml` runs `npm ci`, `npm test`, and `npm run build` in this directory on every push/PR.

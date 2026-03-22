@@ -76,13 +76,8 @@ pub async fn rank_with_graph_hybrid(
         ));
     }
 
-    let preliminary = merge_and_rank_hybrid(
-        lexical.clone(),
-        semantic.clone(),
-        query,
-        &HashSet::new(),
-        0,
-    );
+    let preliminary =
+        merge_and_rank_hybrid(lexical.clone(), semantic.clone(), query, &HashSet::new(), 0);
     let anchors = graph_anchor_nodes_from_records(&preliminary);
     if anchors.is_empty() {
         return Ok(preliminary);
@@ -176,7 +171,8 @@ fn score_candidates_hybrid(
                 let t = sim.clamp(-1.0, 1.0);
                 score += (((t + 1.0) / 2.0) * 64.0) as i64;
             }
-            if lexical_ids.contains(&memory.memory_id) && semantic_sims.contains_key(&memory.memory_id)
+            if lexical_ids.contains(&memory.memory_id)
+                && semantic_sims.contains_key(&memory.memory_id)
             {
                 score += 26;
             }

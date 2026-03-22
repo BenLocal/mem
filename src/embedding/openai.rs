@@ -90,7 +90,10 @@ impl EmbeddingProvider for OpenAiEmbeddingProvider {
         }
 
         let parsed: OpenAiEmbeddingsResponse = serde_json::from_slice(&bytes).map_err(|e| {
-            EmbeddingError::Internal(format!("OpenAI embeddings JSON: {e}; body={}", String::from_utf8_lossy(&bytes)))
+            EmbeddingError::Internal(format!(
+                "OpenAI embeddings JSON: {e}; body={}",
+                String::from_utf8_lossy(&bytes)
+            ))
         })?;
 
         let vec = parsed

@@ -9,7 +9,7 @@ use std::sync::Arc;
 use thiserror::Error;
 
 use crate::domain::{
-    embeddings::{EmbeddingsRebuildResponse, EmbeddingJobInfo, MemoryEmbeddingMeta},
+    embeddings::{EmbeddingJobInfo, EmbeddingsRebuildResponse, MemoryEmbeddingMeta},
     episode::EpisodeResponse,
     memory::MemoryDetailResponse,
 };
@@ -27,7 +27,8 @@ use crate::{
     pipeline::workflow,
     pipeline::{compress, retrieve},
     storage::{
-        DuckDbRepository, EmbeddingJobInsert, GraphError, GraphStore, LocalGraphAdapter, StorageError,
+        DuckDbRepository, EmbeddingJobInsert, GraphError, GraphStore, LocalGraphAdapter,
+        StorageError,
     },
 };
 
