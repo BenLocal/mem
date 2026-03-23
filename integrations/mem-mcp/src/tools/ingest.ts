@@ -3,6 +3,7 @@ import { z } from "zod";
 import { memRequestJson } from "../mem-client.js";
 import {
   memoryTypeZ,
+  memoryProposePreferenceInputZ,
   scopeZ,
   visibilityZ,
   writeModeZ,
@@ -63,6 +64,54 @@ export function registerMemoryIngest(server: McpServer, ctx: ToolContext): void 
           "POST",
           "memories",
           { body },
+        );
+        return okJson(data);
+      } catch (e) {
+        return errResult(e);
+      }
+    },
+  );
+}
+
+export function registerMemoryProposePreference(
+  server: McpServer,
+  ctx: ToolContext,
+): void {
+  const { baseUrl, fetchFn, defaultTenant } = ctx;
+
+  server.registerTool(
+    "memory_propose_preference",
+    {
+      description:
+        "Propose a preference for review. Uses the standard memories endpoint with write_mode=propose.",
+      inputSchema: memoryProposePreferenceInputZ.extend({
+        tenant: z.string().optional().default(defaultTenant),
+      }),
+    },
+    async (args) => {
+      try {
+        const data = await memRequestJson(
+          baseUrl,
+          fetchFn,
+          "POST",
+          "memories",
+          {
+            body: {
+              tenant: args.tenant,
+              memory_type: "preference",
+              content: `${args.summary}\n\n${args.content}`,
+              evidence: args.evidence,
+              code_refs: [],
+              scope: "project",
+              visibility: "private",
+              project: args.project,
+              repo: args.repo,
+              module: args.module,
+              tags: [`caller_agent:${args.caller_agent}`],
+              source_agent: args.source_agent,
+              write_mode: "propose",
+            },
+          },
         );
         return okJson(data);
       } catch (e) {

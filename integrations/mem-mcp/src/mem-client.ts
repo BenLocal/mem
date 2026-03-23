@@ -1,5 +1,60 @@
 export type FetchFn = typeof fetch;
 
+export type HighLevelMemoryKind = "fact" | "experience" | "preference";
+export type HighLevelFeedbackKind = "useful" | "outdated" | "incorrect";
+
+export type HighLevelMemoryContext = {
+  tenant: string;
+  project: string;
+  repo?: string;
+  module?: string;
+  caller_agent: string;
+  source_agent: string;
+};
+
+export type MemoryBootstrapPayload = HighLevelMemoryContext & {
+  query: string;
+  scope?: "project";
+  token_budget?: number;
+};
+
+export type MemorySearchContextualPayload = HighLevelMemoryContext & {
+  query: string;
+  intent: "implementation" | "debugging" | "review";
+  scope?: "project" | "repo" | "workspace" | "global";
+  token_budget?: number;
+};
+
+export type MemoryCommitFactPayload = HighLevelMemoryContext & {
+  memory_kind: "fact";
+  summary: string;
+  content: string;
+  evidence: string[];
+};
+
+export type MemoryProposeExperiencePayload = HighLevelMemoryContext & {
+  memory_kind: "experience";
+  summary: string;
+  content: string;
+  evidence?: string[];
+};
+
+export type MemoryProposePreferencePayload = HighLevelMemoryContext & {
+  memory_kind: "preference";
+  summary: string;
+  content: string;
+  evidence?: string[];
+};
+
+export type MemoryApplyFeedbackPayload = {
+  tenant: string;
+  project: string;
+  caller_agent: string;
+  memory_id: string;
+  kind: HighLevelFeedbackKind;
+  note?: string;
+};
+
 export function joinUrl(baseUrl: string, path: string): string {
   const base = baseUrl.replace(/\/+$/, "");
   const p = path.startsWith("/") ? path.slice(1) : path;

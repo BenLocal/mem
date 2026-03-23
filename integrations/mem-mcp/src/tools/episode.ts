@@ -1,7 +1,11 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
 import { memRequestJson } from "../mem-client.js";
-import { scopeZ, visibilityZ } from "../schemas.js";
+import {
+  memoryProposeExperienceInputZ,
+  scopeZ,
+  visibilityZ,
+} from "../schemas.js";
 import { errResult, okJson } from "../tool-result.js";
 import type { ToolContext } from "./context.js";
 
@@ -54,6 +58,53 @@ export function registerEpisodeIngest(server: McpServer, ctx: ToolContext): void
           "POST",
           "episodes",
           { body },
+        );
+        return okJson(data);
+      } catch (e) {
+        return errResult(e);
+      }
+    },
+  );
+}
+
+export function registerMemoryProposeExperience(
+  server: McpServer,
+  ctx: ToolContext,
+): void {
+  const { baseUrl, fetchFn, defaultTenant } = ctx;
+
+  server.registerTool(
+    "memory_propose_experience",
+    {
+      description:
+        "Propose a candidate experience by recording it as an episode instead of a strong fact.",
+      inputSchema: memoryProposeExperienceInputZ.extend({
+        tenant: z.string().optional().default(defaultTenant),
+      }),
+    },
+    async (args) => {
+      try {
+        const data = await memRequestJson(
+          baseUrl,
+          fetchFn,
+          "POST",
+          "episodes",
+          {
+            body: {
+              tenant: args.tenant,
+              goal: args.summary,
+              steps: [],
+              outcome: args.content,
+              evidence: args.evidence,
+              scope: "project",
+              visibility: "private",
+              project: args.project,
+              repo: args.repo,
+              module: args.module,
+              tags: [`caller_agent:${args.caller_agent}`],
+              source_agent: args.source_agent,
+            },
+          },
         );
         return okJson(data);
       } catch (e) {
