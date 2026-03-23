@@ -7,12 +7,31 @@ use mem::{
     domain::memory::{MemoryRecord, MemoryStatus, MemoryType, Scope, Visibility},
     http,
     service::MemoryService,
-    storage::{GraphStore, IndraDbGraphAdapter, LocalGraphAdapter},
+    storage::{GraphError, GraphStore, LocalGraphAdapter},
 };
 use serde_json::{json, Value};
-use std::sync::Arc;
+use std::{future::Future, pin::Pin, sync::Arc};
 use tempfile::tempdir;
 use tower::util::ServiceExt;
+
+type GraphFuture<'a, T> = Pin<Box<dyn Future<Output = Result<T, GraphError>> + Send + 'a>>;
+
+#[derive(Clone, Default)]
+struct UnavailableGraphAdapter;
+
+impl GraphStore for UnavailableGraphAdapter {
+    fn sync_memory<'a>(&'a self, _memory: &'a MemoryRecord) -> GraphFuture<'a, ()> {
+        Box::pin(async move { Err(GraphError::Unavailable("test unavailable graph")) })
+    }
+
+    fn neighbors<'a>(&'a self, _node_id: &'a str) -> GraphFuture<'a, Vec<mem::domain::memory::GraphEdge>> {
+        Box::pin(async move { Err(GraphError::Unavailable("test unavailable graph")) })
+    }
+
+    fn related_memory_ids<'a>(&'a self, _node_ids: &'a [String]) -> GraphFuture<'a, Vec<String>> {
+        Box::pin(async move { Err(GraphError::Unavailable("test unavailable graph")) })
+    }
+}
 
 fn sample_impl_memory(memory_id: &str, supersedes_memory_id: Option<&str>) -> MemoryRecord {
     MemoryRecord {
@@ -123,7 +142,7 @@ async fn test_app_with_unavailable_graph() -> TestApp {
         .await
         .unwrap();
     let state = AppState {
-        memory_service: MemoryService::with_graph(repository, Arc::new(IndraDbGraphAdapter::new())),
+        memory_service: MemoryService::with_graph(repository, Arc::new(UnavailableGraphAdapter)),
         config: mem::config::Config::local(),
     };
 

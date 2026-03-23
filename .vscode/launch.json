@@ -1,0 +1,162 @@
+{
+    // Use IntelliSense to learn about possible attributes.
+    // Hover to view descriptions of existing attributes.
+    // For more information, visit: https://go.microsoft.com/fwlink/?linkid=830387
+    "version": "0.2.0",
+    "configurations": [
+        {
+            "name": "Debug unit tests in library 'mem'",
+            "type": "lldb",
+            "request": "launch",
+            "cargo": {
+                "args": [
+                    "test"
+                ]
+            }
+        },
+        {
+            "name": "Debug executable 'mem'",
+            "type": "lldb",
+            "request": "launch",
+            "cargo": {
+                "args": [
+                    "run",
+                    "--bin=mem"
+                ]
+            },
+            "args": []
+        },
+        {
+            "name": "Debug unit tests in executable 'mem'",
+            "type": "lldb",
+            "request": "launch",
+            "cargo": {
+                "args": [
+                    "test",
+                    "--bin=mem"
+                ]
+            }
+        },
+        {
+            "name": "Debug integration test 'embedding_jobs'",
+            "type": "lldb",
+            "request": "launch",
+            "cargo": {
+                "args": [
+                    "test",
+                    "--test=embedding_jobs"
+                ]
+            }
+        },
+        {
+            "name": "Debug integration test 'embedding_worker'",
+            "type": "lldb",
+            "request": "launch",
+            "cargo": {
+                "args": [
+                    "test",
+                    "--test=embedding_worker"
+                ]
+            }
+        },
+        {
+            "name": "Debug integration test 'embeddings_api'",
+            "type": "lldb",
+            "request": "launch",
+            "cargo": {
+                "args": [
+                    "test",
+                    "--test=embeddings_api"
+                ]
+            }
+        },
+        {
+            "name": "Debug integration test 'graph_adapter'",
+            "type": "lldb",
+            "request": "launch",
+            "cargo": {
+                "args": [
+                    "test",
+                    "--test=graph_adapter"
+                ]
+            }
+        },
+        {
+            "name": "Debug integration test 'health_api'",
+            "type": "lldb",
+            "request": "launch",
+            "cargo": {
+                "args": [
+                    "test",
+                    "--test=health_api"
+                ]
+            }
+        },
+        {
+            "name": "Debug integration test 'hybrid_search'",
+            "type": "lldb",
+            "request": "launch",
+            "cargo": {
+                "args": [
+                    "test",
+                    "--test=hybrid_search"
+                ]
+            }
+        },
+        {
+            "name": "Debug integration test 'ingest_api'",
+            "type": "lldb",
+            "request": "launch",
+            "cargo": {
+                "args": [
+                    "test",
+                    "--test=ingest_api"
+                ]
+            }
+        },
+        {
+            "name": "Debug integration test 'review_api'",
+            "type": "lldb",
+            "request": "launch",
+            "cargo": {
+                "args": [
+                    "test",
+                    "--test=review_api"
+                ]
+            }
+        },
+        {
+            "name": "Debug integration test 'schema_embeddings'",
+            "type": "lldb",
+            "request": "launch",
+            "cargo": {
+                "args": [
+                    "test",
+                    "--test=schema_embeddings"
+                ]
+            }
+        },
+        {
+            "name": "Debug integration test 'search_api'",
+            "type": "lldb",
+            "request": "launch",
+            "cargo": {
+                "args": [
+                    "test",
+                    "--test=search_api"
+                ]
+            }
+        },
+        {
+            "name": "Debug integration test 'workflow_pipeline'",
+            "type": "lldb",
+            "request": "launch",
+            "cargo": {
+                "args": [
+                    "test",
+                    "--test=workflow_pipeline"
+                ]
+            }
+        }
+    ]
+}

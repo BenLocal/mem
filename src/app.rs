@@ -3,10 +3,10 @@ use std::sync::Arc;
 use axum::Router;
 
 use crate::{
-    config::Config,
+    config::{Config, GraphBackendKind},
     http,
     service::MemoryService,
-    storage::{DuckDbRepository, LocalGraphAdapter},
+    storage::{DuckDbRepository, GraphStore, IndraDbGraphAdapter, LocalGraphAdapter},
 };
 
 #[derive(Clone)]
@@ -30,9 +30,13 @@ impl AppState {
         });
 
         let embedding_provider = config.embedding.job_provider_id().to_string();
+        let graph: Arc<dyn GraphStore> = match config.graph_backend {
+            GraphBackendKind::Local => Arc::new(LocalGraphAdapter::default()),
+            GraphBackendKind::IndraDb => Arc::new(IndraDbGraphAdapter::with_path(config.indradb_path.clone())),
+        };
         let memory_service = MemoryService::with_graph_and_embedding_providers(
             repository,
-            Arc::new(LocalGraphAdapter::default()),
+            graph,
             embedding_provider,
             Some(provider_search),
         );

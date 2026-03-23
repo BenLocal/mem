@@ -13,6 +13,12 @@ pub enum EmbeddingProviderKind {
     Real,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GraphBackendKind {
+    Local,
+    IndraDb,
+}
+
 #[derive(Debug, Clone)]
 pub struct EmbeddingSettings {
     pub provider: EmbeddingProviderKind,
@@ -28,6 +34,8 @@ pub struct EmbeddingSettings {
 pub struct Config {
     pub bind_addr: String,
     pub db_path: PathBuf,
+    pub graph_backend: GraphBackendKind,
+    pub indradb_path: Option<PathBuf>,
     pub embedding: EmbeddingSettings,
 }
 
@@ -45,6 +53,8 @@ pub enum ConfigError {
     InvalidMaxRetries(String),
     #[error("invalid EMBEDDING_BATCH_SIZE: {0}")]
     InvalidBatchSize(String),
+    #[error("invalid GRAPH_BACKEND: {0} (expected local or indradb)")]
+    InvalidGraphBackend(String),
 }
 
 impl EmbeddingSettings {
@@ -144,15 +154,32 @@ impl Config {
         Self {
             bind_addr: "127.0.0.1:3000".to_string(),
             db_path: default_db_path(),
+            graph_backend: GraphBackendKind::IndraDb,
+            indradb_path: None,
             embedding: EmbeddingSettings::development_defaults(),
         }
     }
 
     pub fn from_env() -> Result<Self, ConfigError> {
         let bind_addr = std::env::var("BIND_ADDR").unwrap_or_else(|_| "127.0.0.1:3000".to_string());
+        let graph_backend = match std::env::var("GRAPH_BACKEND")
+            .unwrap_or_else(|_| "indradb".to_string())
+            .to_ascii_lowercase()
+            .as_str()
+        {
+            "local" => GraphBackendKind::Local,
+            "indradb" => GraphBackendKind::IndraDb,
+            other => return Err(ConfigError::InvalidGraphBackend(other.to_string())),
+        };
+        let indradb_path = std::env::var("INDRADB_PATH")
+            .ok()
+            .filter(|v| !v.is_empty())
+            .map(PathBuf::from);
         Ok(Self {
             bind_addr,
             db_path: default_db_path(),
+            graph_backend,
+            indradb_path,
             embedding: EmbeddingSettings::from_env_vars(|k| std::env::var(k).ok())?,
         })
     }
