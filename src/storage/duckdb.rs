@@ -50,6 +50,34 @@ pub struct EmbeddingJobInsert {
 }
 
 #[derive(Debug, Clone)]
+struct EmbeddingJobRow {
+    job_id: String,
+    tenant: String,
+    memory_id: String,
+    target_content_hash: String,
+    provider: String,
+    status: String,
+    attempt_count: i64,
+    last_error: Option<String>,
+    available_at: String,
+    created_at: String,
+    updated_at: String,
+}
+
+#[derive(Debug, Clone)]
+struct MemoryEmbeddingRow {
+    memory_id: String,
+    tenant: String,
+    embedding_model: String,
+    embedding_dim: i64,
+    embedding: Vec<u8>,
+    content_hash: String,
+    source_updated_at: String,
+    created_at: String,
+    updated_at: String,
+}
+
+#[derive(Debug, Clone)]
 pub struct DuckDbRepository {
     conn: Arc<Mutex<Connection>>,
 }
@@ -795,10 +823,11 @@ impl DuckDbRepository {
     ) -> Result<MemoryRecord, StorageError> {
         {
             let updated_at = current_timestamp();
-            let mut conn = self.conn()?;
-            let tx = conn.transaction()?;
+            let conn = self.conn()?;
+            let (jobs, embedding) = load_embedding_references(&conn, original_memory_id)?;
+            delete_embedding_references(&conn, original_memory_id)?;
             let stored = successor.clone();
-            let rows_updated = tx.execute(
+            let rows_updated = conn.execute(
                 "update memories
                  set status = ?1, updated_at = ?2
                  where tenant = ?3 and memory_id = ?4 and status = ?5",
@@ -812,10 +841,11 @@ impl DuckDbRepository {
             )?;
 
             if rows_updated == 0 {
+                restore_embedding_references(&conn, &jobs, embedding.as_ref())?;
                 return Err(StorageError::InvalidData("pending memory not found"));
             }
 
-            tx.execute(
+            conn.execute(
                 "insert into memories (
                     memory_id, tenant, memory_type, status, scope, visibility, version, summary,
                     content, evidence_json, code_refs_json, project, repo, module, task_type,
@@ -855,7 +885,7 @@ impl DuckDbRepository {
                     stored.last_validated_at,
                 ],
             )?;
-            tx.commit()?;
+            restore_embedding_references(&conn, &jobs, embedding.as_ref())?;
         }
 
         Ok(successor)
@@ -1158,6 +1188,8 @@ impl DuckDbRepository {
         let updated_at = current_timestamp();
         {
             let conn = self.conn()?;
+            let (jobs, embedding) = load_embedding_references(&conn, memory_id)?;
+            delete_embedding_references(&conn, memory_id)?;
             let rows_updated = conn.execute(
                 "update memories
                  set status = ?1, updated_at = ?2
@@ -1172,14 +1204,139 @@ impl DuckDbRepository {
             )?;
 
             if rows_updated == 0 {
+                restore_embedding_references(&conn, &jobs, embedding.as_ref())?;
                 return Err(StorageError::InvalidData("pending memory not found"));
             }
+            restore_embedding_references(&conn, &jobs, embedding.as_ref())?;
         }
 
         self.get_memory(memory_id.to_string())
             .await?
             .ok_or(StorageError::InvalidData("updated memory not found"))
     }
+}
+
+fn load_embedding_references(
+    conn: &Connection,
+    memory_id: &str,
+) -> Result<(Vec<EmbeddingJobRow>, Option<MemoryEmbeddingRow>), StorageError> {
+    let mut jobs_stmt = conn.prepare(
+        "select
+            job_id, tenant, memory_id, target_content_hash, provider, status,
+            attempt_count, last_error, available_at, created_at, updated_at
+         from embedding_jobs
+         where memory_id = ?1",
+    )?;
+    let jobs_iter = jobs_stmt.query_map(params![memory_id], |row| {
+        Ok(EmbeddingJobRow {
+            job_id: row.get(0)?,
+            tenant: row.get(1)?,
+            memory_id: row.get(2)?,
+            target_content_hash: row.get(3)?,
+            provider: row.get(4)?,
+            status: row.get(5)?,
+            attempt_count: row.get(6)?,
+            last_error: row.get(7)?,
+            available_at: row.get(8)?,
+            created_at: row.get(9)?,
+            updated_at: row.get(10)?,
+        })
+    })?;
+    let jobs = jobs_iter.collect::<Result<Vec<_>, _>>()?;
+
+    let embedding = conn
+        .query_row(
+            "select
+                memory_id, tenant, embedding_model, embedding_dim, embedding,
+                content_hash, source_updated_at, created_at, updated_at
+             from memory_embeddings
+             where memory_id = ?1",
+            params![memory_id],
+            |row| {
+                Ok(MemoryEmbeddingRow {
+                    memory_id: row.get(0)?,
+                    tenant: row.get(1)?,
+                    embedding_model: row.get(2)?,
+                    embedding_dim: row.get(3)?,
+                    embedding: row.get(4)?,
+                    content_hash: row.get(5)?,
+                    source_updated_at: row.get(6)?,
+                    created_at: row.get(7)?,
+                    updated_at: row.get(8)?,
+                })
+            },
+        )
+        .optional()?;
+
+    Ok((jobs, embedding))
+}
+
+fn delete_embedding_references(
+    conn: &Connection,
+    memory_id: &str,
+) -> Result<(), StorageError> {
+    conn.execute(
+        "delete from embedding_jobs where memory_id = ?1",
+        params![memory_id],
+    )?;
+    conn.execute(
+        "delete from memory_embeddings where memory_id = ?1",
+        params![memory_id],
+    )?;
+    Ok(())
+}
+
+fn restore_embedding_references(
+    conn: &Connection,
+    jobs: &[EmbeddingJobRow],
+    embedding: Option<&MemoryEmbeddingRow>,
+) -> Result<(), StorageError> {
+    for job in jobs {
+        conn.execute(
+            "insert into embedding_jobs (
+                job_id, tenant, memory_id, target_content_hash, provider, status,
+                attempt_count, last_error, available_at, created_at, updated_at
+            ) values (
+                ?1, ?2, ?3, ?4, ?5, ?6,
+                ?7, ?8, ?9, ?10, ?11
+            )",
+            params![
+                &job.job_id,
+                &job.tenant,
+                &job.memory_id,
+                &job.target_content_hash,
+                &job.provider,
+                &job.status,
+                job.attempt_count,
+                &job.last_error,
+                &job.available_at,
+                &job.created_at,
+                &job.updated_at,
+            ],
+        )?;
+    }
+
+    if let Some(embedding) = embedding {
+        conn.execute(
+            "insert into memory_embeddings (
+                memory_id, tenant, embedding_model, embedding_dim, embedding,
+                content_hash, source_updated_at, created_at, updated_at
+            ) values (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+            params![
+                &embedding.memory_id,
+                &embedding.tenant,
+                &embedding.embedding_model,
+                embedding.embedding_dim,
+                &embedding.embedding,
+                &embedding.content_hash,
+                &embedding.source_updated_at,
+                &embedding.created_at,
+                &embedding.updated_at,
+            ],
+        )?;
+    }
+
+    Ok(())
 }
 
 fn map_memory_with_blob(row: &duckdb::Row<'_>) -> Result<(MemoryRecord, Vec<u8>), duckdb::Error> {

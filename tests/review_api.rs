@@ -6,7 +6,7 @@ use mem::{
     app::AppState,
     domain::memory::{FeedbackSummary, MemoryRecord, MemoryStatus, MemoryType, Scope, Visibility},
     http,
-    storage::duckdb::DuckDbRepository,
+    storage::duckdb::{DuckDbRepository, EmbeddingJobInsert},
 };
 use serde_json::{json, Value};
 use tempfile::{tempdir, TempDir};
@@ -221,7 +221,7 @@ async fn listing_pending_memories_returns_pending_rows() {
 
     let response = app.get("/reviews/pending?tenant=local").await;
 
-    assert_eq!(response.status(), 200);
+    assert_eq!(response.status(), 200, "response body: {}", response.body);
     assert_eq!(response.json()[0]["memory_id"], "mem_123");
     assert_eq!(response.json()[0]["status"], "pending_confirmation");
 }
@@ -240,7 +240,41 @@ async fn accepting_pending_memory_marks_it_active() {
         )
         .await;
 
-    assert_eq!(response.status(), 200);
+    assert_eq!(response.status(), 200, "response body: {}", response.body);
+    assert_eq!(response.json()["status"], "active");
+}
+
+#[tokio::test]
+async fn accepting_pending_memory_with_embedding_job_marks_it_active() {
+    let app = seeded_app_with_pending_preference().await;
+    let now = "2026-03-21T00:00:10Z".to_string();
+    let enqueued = app
+        .repo
+        .try_enqueue_embedding_job(EmbeddingJobInsert {
+            job_id: "ej_00000000000000000001".into(),
+            tenant: "local".into(),
+            memory_id: "mem_123".into(),
+            target_content_hash: "hash-mem_123".into(),
+            provider: "fake".into(),
+            available_at: now.clone(),
+            created_at: now.clone(),
+            updated_at: now,
+        })
+        .await
+        .expect("embedding job insert should succeed");
+    assert!(enqueued);
+
+    let response = app
+        .post_json(
+            "/reviews/pending/accept",
+            json!({
+                "tenant": "local",
+                "memory_id": "mem_123"
+            }),
+        )
+        .await;
+
+    assert_eq!(response.status(), 200, "response body: {}", response.body);
     assert_eq!(response.json()["status"], "active");
 }
 
