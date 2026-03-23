@@ -12,7 +12,6 @@ use crate::config::EmbeddingSettings;
 
 use super::provider::{EmbeddingError, EmbeddingProvider};
 
-#[derive(Debug)]
 pub struct EmbedAnythingEmbeddingProvider {
     model: String,
     dim: usize,

@@ -24,7 +24,10 @@ impl GraphStore for UnavailableGraphAdapter {
         Box::pin(async move { Err(GraphError::Unavailable("test unavailable graph")) })
     }
 
-    fn neighbors<'a>(&'a self, _node_id: &'a str) -> GraphFuture<'a, Vec<mem::domain::memory::GraphEdge>> {
+    fn neighbors<'a>(
+        &'a self,
+        _node_id: &'a str,
+    ) -> GraphFuture<'a, Vec<mem::domain::memory::GraphEdge>> {
         Box::pin(async move { Err(GraphError::Unavailable("test unavailable graph")) })
     }
 

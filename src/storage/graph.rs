@@ -7,8 +7,8 @@ use std::{
 };
 
 use indradb::{
-    AllEdgeQuery, AllVertexQuery, Database, Edge, Identifier, Json, MemoryDatastore, QueryOutputValue,
-    QueryExt, SpecificVertexQuery, Vertex,
+    AllEdgeQuery, AllVertexQuery, Database, Edge, Identifier, Json, MemoryDatastore, QueryExt,
+    QueryOutputValue, SpecificVertexQuery, Vertex,
 };
 use serde_json::Value;
 use thiserror::Error;
