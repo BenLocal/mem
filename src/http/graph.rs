@@ -7,7 +7,7 @@ use axum::{
 use crate::{app::AppState, error::AppError};
 
 pub fn router() -> Router<AppState> {
-    Router::new().route("/graph/neighbors/:node_id", get(graph_neighbors))
+    Router::new().route("/graph/neighbors/{node_id}", get(graph_neighbors))
 }
 
 async fn graph_neighbors(

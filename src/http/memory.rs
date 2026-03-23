@@ -21,7 +21,7 @@ pub fn router() -> Router<AppState> {
         .route("/episodes", post(ingest_episode))
         .route("/memories/search", post(search_memory))
         .route("/memories/feedback", post(submit_feedback))
-        .route("/memories/:id", get(get_memory))
+        .route("/memories/{id}", get(get_memory))
 }
 
 #[derive(Debug, Deserialize)]
