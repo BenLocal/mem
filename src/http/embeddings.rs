@@ -71,7 +71,8 @@ async fn rebuild(
 async fn providers(State(app): State<AppState>) -> Json<EmbeddingProviderInfo> {
     let provider = match app.config.embedding.provider {
         EmbeddingProviderKind::Fake => "fake",
-        EmbeddingProviderKind::Real => "openai",
+        EmbeddingProviderKind::OpenAi => "openai",
+        EmbeddingProviderKind::EmbedAnything => "embedanything",
     };
     Json(EmbeddingProviderInfo {
         provider: provider.to_string(),

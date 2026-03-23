@@ -10,7 +10,8 @@ static APP_DB_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EmbeddingProviderKind {
     Fake,
-    Real,
+    OpenAi,
+    EmbedAnything,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -41,9 +42,9 @@ pub struct Config {
 
 #[derive(Debug, Error)]
 pub enum ConfigError {
-    #[error("invalid EMBEDDING_PROVIDER: {0} (expected fake or real)")]
+    #[error("invalid EMBEDDING_PROVIDER: {0} (expected fake, openai, or embedanything)")]
     InvalidEmbeddingProvider(String),
-    #[error("OPENAI_API_KEY is required when EMBEDDING_PROVIDER=real")]
+    #[error("OPENAI_API_KEY is required when EMBEDDING_PROVIDER=openai (or real alias)")]
     MissingOpenAiApiKey,
     #[error("invalid EMBEDDING_DIM: {0}")]
     InvalidEmbeddingDim(String),
@@ -77,7 +78,8 @@ impl EmbeddingSettings {
         if let Some(value) = get("EMBEDDING_PROVIDER") {
             s.provider = match value.to_ascii_lowercase().as_str() {
                 "fake" => EmbeddingProviderKind::Fake,
-                "real" => EmbeddingProviderKind::Real,
+                "real" | "openai" => EmbeddingProviderKind::OpenAi,
+                "embedanything" | "embed_anything" => EmbeddingProviderKind::EmbedAnything,
                 other => return Err(ConfigError::InvalidEmbeddingProvider(other.to_string())),
             };
         }
@@ -131,7 +133,7 @@ impl EmbeddingSettings {
             }
         }
 
-        if s.provider == EmbeddingProviderKind::Real
+        if s.provider == EmbeddingProviderKind::OpenAi
             && s.openai_api_key.as_deref().unwrap_or("").is_empty()
         {
             return Err(ConfigError::MissingOpenAiApiKey);
@@ -144,7 +146,8 @@ impl EmbeddingSettings {
     pub fn job_provider_id(&self) -> &'static str {
         match self.provider {
             EmbeddingProviderKind::Fake => "fake",
-            EmbeddingProviderKind::Real => "openai",
+            EmbeddingProviderKind::OpenAi => "openai",
+            EmbeddingProviderKind::EmbedAnything => "embedanything",
         }
     }
 }
@@ -225,12 +228,12 @@ mod tests {
     #[test]
     fn embedding_real_with_key_ok() {
         let s = EmbeddingSettings::from_env_vars(env(&[
-            ("EMBEDDING_PROVIDER", "real"),
+            ("EMBEDDING_PROVIDER", "openai"),
             ("OPENAI_API_KEY", "sk-test"),
             ("EMBEDDING_MODEL", "text-embedding-3-small"),
         ]))
         .unwrap();
-        assert_eq!(s.provider, EmbeddingProviderKind::Real);
+        assert_eq!(s.provider, EmbeddingProviderKind::OpenAi);
         assert_eq!(s.model, "text-embedding-3-small");
         assert_eq!(s.openai_api_key.as_deref(), Some("sk-test"));
     }
@@ -244,5 +247,18 @@ mod tests {
         .unwrap();
         assert_eq!(s.provider, EmbeddingProviderKind::Fake);
         assert_eq!(s.openai_api_key, None);
+    }
+
+    #[test]
+    fn embedding_embedanything_ok_without_openai_key() {
+        let s = EmbeddingSettings::from_env_vars(env(&[
+            ("EMBEDDING_PROVIDER", "embedanything"),
+            ("EMBEDDING_MODEL", "sentence-transformers/all-MiniLM-L6-v2"),
+            ("EMBEDDING_DIM", "384"),
+        ]))
+        .unwrap();
+        assert_eq!(s.provider, EmbeddingProviderKind::EmbedAnything);
+        assert_eq!(s.openai_api_key, None);
+        assert_eq!(s.job_provider_id(), "embedanything");
     }
 }
