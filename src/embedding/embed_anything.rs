@@ -7,6 +7,7 @@ use embed_anything::{
     embeddings::embed::{Embedder, EmbedderBuilder},
 };
 use tokio::sync::Mutex;
+use tracing::info;
 
 use crate::config::EmbeddingSettings;
 
@@ -39,6 +40,7 @@ impl EmbedAnythingEmbeddingProvider {
         }
 
         let model = self.model.clone();
+        info!(model = %model, "embedanything loading model from HF");
         let embedder = tokio::task::spawn_blocking(move || {
             EmbedderBuilder::new()
                 .model_id(Some(model.as_str()))
@@ -49,6 +51,7 @@ impl EmbedAnythingEmbeddingProvider {
         .map_err(|e| EmbeddingError::Internal(format!("embedanything init: {e}")))?;
 
         let embedder = Arc::new(embedder);
+        info!("embedanything model ready");
         *guard = Some(embedder.clone());
         Ok(embedder)
     }

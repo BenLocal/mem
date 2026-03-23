@@ -3,19 +3,27 @@ use std::sync::Arc;
 use crate::config::EmbeddingSettings;
 use crate::embedding::EmbeddingProvider;
 use crate::storage::{DuckDbRepository, StorageError};
+use tracing::{error, info, warn};
 
 pub async fn run(
     repo: DuckDbRepository,
     provider: Arc<dyn EmbeddingProvider>,
     settings: EmbeddingSettings,
 ) {
+    info!(
+        provider = provider.name(),
+        model = provider.model(),
+        dim = provider.dim(),
+        poll_interval_ms = settings.worker_poll_interval_ms,
+        "embedding worker started"
+    );
     let mut interval = tokio::time::interval(std::time::Duration::from_millis(
         settings.worker_poll_interval_ms.max(1),
     ));
     loop {
         interval.tick().await;
         if let Err(err) = tick(&repo, provider.as_ref(), &settings).await {
-            eprintln!("embedding worker: {err}");
+            error!(error = %err, "embedding worker tick failed");
         }
     }
 }
@@ -32,6 +40,13 @@ pub async fn tick(
     else {
         return Ok(());
     };
+    info!(
+        job_id = %job.job_id,
+        tenant = %job.tenant,
+        memory_id = %job.memory_id,
+        attempt = job.attempt_count,
+        "embedding worker claimed job"
+    );
 
     if job.provider != settings.job_provider_id() {
         let now = current_timestamp();
@@ -129,6 +144,11 @@ pub async fn tick(
     )
     .await?;
     repo.complete_embedding_job(&job.job_id, &now).await?;
+    info!(
+        job_id = %job.job_id,
+        memory_id = %job.memory_id,
+        "embedding worker completed job"
+    );
     Ok(())
 }
 
@@ -141,6 +161,12 @@ async fn record_failure(
     let now = current_timestamp();
     let next = job.attempt_count + 1;
     let err = truncate_error(message);
+    warn!(
+        job_id = %job.job_id,
+        attempt = next,
+        error = %err,
+        "embedding worker job failure"
+    );
     if next >= i64::from(settings.max_retries) {
         repo.permanently_fail_embedding_job(&job.job_id, next, &err, &now)
             .await?;

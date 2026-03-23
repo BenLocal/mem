@@ -1,6 +1,7 @@
 use std::sync::Arc;
 
 use axum::Router;
+use tracing::info;
 
 use crate::{
     config::{Config, GraphBackendKind},
@@ -18,8 +19,15 @@ pub struct AppState {
 impl AppState {
     pub async fn from_config(config: Config) -> anyhow::Result<Self> {
         let repository = DuckDbRepository::open(&config.db_path).await?;
+        info!(duckdb = %config.db_path.display(), "storage initialized");
         let provider = crate::embedding::arc_embedding_provider(&config.embedding)
             .map_err(|e| anyhow::anyhow!("embedding provider: {e}"))?;
+        info!(
+            provider = provider.name(),
+            model = provider.model(),
+            dim = provider.dim(),
+            "embedding provider initialized"
+        );
         let provider_worker = provider.clone();
         let provider_search = provider.clone();
         let repo_worker = repository.clone();
@@ -31,8 +39,19 @@ impl AppState {
 
         let embedding_provider = config.embedding.job_provider_id().to_string();
         let graph: Arc<dyn GraphStore> = match config.graph_backend {
-            GraphBackendKind::Local => Arc::new(LocalGraphAdapter::default()),
+            GraphBackendKind::Local => {
+                info!("graph backend: local in-memory adapter");
+                Arc::new(LocalGraphAdapter::default())
+            }
             GraphBackendKind::IndraDb => {
+                info!(
+                    indradb_path = %config
+                        .indradb_path
+                        .as_ref()
+                        .map(|p| p.display().to_string())
+                        .unwrap_or_else(|| "<in-memory>".to_string()),
+                    "graph backend: indradb"
+                );
                 Arc::new(IndraDbGraphAdapter::with_path(config.indradb_path.clone()))
             }
         };
