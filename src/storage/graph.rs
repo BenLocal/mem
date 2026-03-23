@@ -177,8 +177,8 @@ impl GraphStore for IndraDbGraphAdapter {
                 let from_uuid = node_uuid(&edge.from_node_id);
                 let to_uuid = node_uuid(&edge.to_node_id);
 
-                let from_vertex = Vertex::with_id(from_uuid, node_type.clone());
-                let to_vertex = Vertex::with_id(to_uuid, node_type.clone());
+                let from_vertex = Vertex::with_id(from_uuid, node_type);
+                let to_vertex = Vertex::with_id(to_uuid, node_type);
                 db.create_vertex(&from_vertex)
                     .map_err(|e| GraphError::Backend(e.to_string()))?;
                 db.create_vertex(&to_vertex)
@@ -186,13 +186,13 @@ impl GraphStore for IndraDbGraphAdapter {
 
                 db.set_properties(
                     SpecificVertexQuery::single(from_uuid),
-                    node_id_prop.clone(),
+                    node_id_prop,
                     &Json::new(Value::String(edge.from_node_id.clone())),
                 )
                 .map_err(|e| GraphError::Backend(e.to_string()))?;
                 db.set_properties(
                     SpecificVertexQuery::single(to_uuid),
-                    node_id_prop.clone(),
+                    node_id_prop,
                     &Json::new(Value::String(edge.to_node_id.clone())),
                 )
                 .map_err(|e| GraphError::Backend(e.to_string()))?;
