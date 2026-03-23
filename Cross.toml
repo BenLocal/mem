@@ -18,7 +18,7 @@ default-target = "x86_64-unknown-linux-gnu"
 
 [target.x86_64-unknown-linux-gnu]
 # 与 Dockerfile builder 阶段使用同一套镜像，避免本机 cross 与镜像行为漂移
-image = ":edge"
+image = "ghcr.io/cross-rs/x86_64-unknown-linux-gnu:edge"
 
 [target.x86_64-unknown-linux-musl]
-image = ":edge"
+image = "ghcr.io/cross-rs/x86_64-unknown-linux-musl:edge"
