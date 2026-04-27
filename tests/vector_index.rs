@@ -122,3 +122,55 @@ async fn save_writes_both_files_atomically() {
     assert_eq!(meta.id_map.len(), 1);
     assert_eq!(meta.id_map.values().next().unwrap(), "mem_alpha");
 }
+
+#[tokio::test]
+async fn load_round_trips_save() {
+    let dir = tempdir().unwrap();
+    let idx_path = dir.path().join("rt.usearch");
+    let meta_path = dir.path().join("rt.usearch.meta.json");
+
+    let original = VectorIndex::new_in_memory(256, "fake", "fake", 8);
+    original.upsert("mem_a", &unit_vector(256, 1)).await.unwrap();
+    original.upsert("mem_b", &unit_vector(256, 2)).await.unwrap();
+    original.save_to(&idx_path, &meta_path).await.unwrap();
+
+    let loaded = VectorIndex::load_from(
+        &idx_path,
+        &meta_path,
+        &mem::storage::VectorIndexFingerprint {
+            provider: "fake".into(),
+            model: "fake".into(),
+            dim: 256,
+        },
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(loaded.size(), 2);
+    let hits = loaded.search(&unit_vector(256, 2), 1).await.unwrap();
+    assert_eq!(hits[0].0, "mem_b");
+}
+
+#[tokio::test]
+async fn load_rejects_fingerprint_mismatch() {
+    let dir = tempdir().unwrap();
+    let idx_path = dir.path().join("fp.usearch");
+    let meta_path = dir.path().join("fp.usearch.meta.json");
+
+    let original = VectorIndex::new_in_memory(256, "fake", "fake", 4);
+    original.upsert("mem_a", &unit_vector(256, 1)).await.unwrap();
+    original.save_to(&idx_path, &meta_path).await.unwrap();
+
+    let err = VectorIndex::load_from(
+        &idx_path,
+        &meta_path,
+        &mem::storage::VectorIndexFingerprint {
+            provider: "fake".into(),
+            model: "fake".into(),
+            dim: 128,
+        },
+    )
+    .await
+    .unwrap_err();
+    matches!(err, mem::storage::VectorIndexError::FingerprintMismatch { .. });
+}

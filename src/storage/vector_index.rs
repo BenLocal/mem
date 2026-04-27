@@ -95,6 +95,14 @@ pub struct VectorIndex {
     fingerprint: VectorIndexFingerprint,
 }
 
+impl std::fmt::Debug for VectorIndex {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("VectorIndex")
+            .field("fingerprint", &self.fingerprint)
+            .finish_non_exhaustive()
+    }
+}
+
 /// Hash a memory_id string to a u64 key using the first 8 bytes of SHA-256.
 fn memory_id_to_u64(memory_id: &str) -> u64 {
     let digest = Sha256::digest(memory_id.as_bytes());
@@ -340,5 +348,79 @@ impl VectorIndex {
         fs::rename(&tmp_meta, meta_path)?;
 
         Ok(())
+    }
+
+    /// Load a previously saved index from disk, validating the fingerprint.
+    ///
+    /// Returns `VectorIndexError::FingerprintMismatch` if the stored metadata
+    /// does not match `expected_fp` (provider, model, or dim) or if `meta.dim == 0`
+    /// (corrupted / hand-edited meta that would silently accept any query).
+    pub async fn load_from(
+        index_path: &Path,
+        meta_path: &Path,
+        expected_fp: &VectorIndexFingerprint,
+    ) -> Result<Self, VectorIndexError> {
+        let meta_bytes = fs::read(meta_path)?;
+        let meta: VectorIndexMeta = serde_json::from_slice(&meta_bytes)?;
+
+        // Fingerprint validation: provider, model, and dim must all match.
+        if meta.provider != expected_fp.provider
+            || meta.model != expected_fp.model
+            || meta.dim != expected_fp.dim
+        {
+            return Err(VectorIndexError::FingerprintMismatch {
+                stored: VectorIndexFingerprint {
+                    provider: meta.provider.clone(),
+                    model: meta.model.clone(),
+                    dim: meta.dim,
+                },
+                current: expected_fp.clone(),
+            });
+        }
+
+        // Task 2 carryover: guard against dim == 0 (corrupted / hand-edited meta).
+        // A zero-dim index would silently accept any query, so we reject it early.
+        if meta.dim == 0 {
+            return Err(VectorIndexError::FingerprintMismatch {
+                stored: VectorIndexFingerprint {
+                    provider: meta.provider.clone(),
+                    model: meta.model.clone(),
+                    dim: meta.dim,
+                },
+                current: expected_fp.clone(),
+            });
+        }
+
+        let opts = IndexOptions {
+            dimensions: meta.dim,
+            metric: MetricKind::Cos,
+            quantization: ScalarKind::F32,
+            connectivity: 0,
+            expansion_add: 0,
+            expansion_search: 0,
+            multi: false,
+        };
+        let index = Index::new(&opts).map_err(|e| VectorIndexError::UsearchOp(e.to_string()))?;
+        index
+            .reserve(meta.row_count.max(8))
+            .map_err(|e| VectorIndexError::UsearchOp(e.to_string()))?;
+
+        // Non-UTF8 path: return typed error rather than panic.
+        let index_path_str = index_path
+            .to_str()
+            .ok_or_else(|| VectorIndexError::UsearchOp("non-utf8 sidecar path".to_string()))?;
+        index
+            .load(index_path_str)
+            .map_err(|e| VectorIndexError::UsearchOp(e.to_string()))?;
+
+        Ok(Self {
+            index: Arc::new(RwLock::new(index)),
+            id_map: Arc::new(RwLock::new(meta.id_map)),
+            fingerprint: VectorIndexFingerprint {
+                provider: meta.provider,
+                model: meta.model,
+                dim: meta.dim,
+            },
+        })
     }
 }
