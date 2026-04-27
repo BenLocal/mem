@@ -17,6 +17,7 @@ use crate::domain::{
 use crate::pipeline::ingest::{compute_content_hash_from_record, CONTENT_HASH_LEN};
 
 use super::schema;
+use super::vector_index::EmbeddingRowSource;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FeedbackEvent {
@@ -240,6 +241,56 @@ impl DuckDbRepository {
             |row| row.get(0),
         )?;
         Ok(count)
+    }
+
+    pub async fn count_total_memory_embeddings(&self) -> Result<i64, StorageError> {
+        let conn = self.conn()?;
+        let count: i64 = conn.query_row(
+            "select count(*) from memory_embeddings",
+            params![],
+            |row| row.get(0),
+        )?;
+        Ok(count)
+    }
+
+    /// Test-only seed used by integration tests that bypass the worker.
+    #[doc(hidden)]
+    pub async fn seed_memory_embedding_for_test(
+        &self,
+        memory_id: &str,
+        tenant: &str,
+        vec: &[f32],
+    ) -> Result<(), StorageError> {
+        let conn = self.conn()?;
+        let now = current_timestamp();
+        // Insert a minimal placeholder memories row first to satisfy the FK constraint
+        // on memory_embeddings.memory_id references memories(memory_id).
+        conn.execute(
+            "insert or ignore into memories (
+                memory_id, tenant, memory_type, status, scope, visibility, version, summary,
+                content, evidence_json, code_refs_json, project, repo, module, task_type,
+                tags_json, confidence, decay_score, content_hash, idempotency_key,
+                supersedes_memory_id, source_agent, created_at, updated_at, last_validated_at
+            ) values (
+                ?1, ?2, 'implementation', 'active', 'repo', 'shared', 1, 'seed',
+                'seed', '[]', '[]', null, null, null, null,
+                '[]', 1.0, 0.0, 'seed', null,
+                null, 'test', ?3, ?3, null
+            )",
+            params![memory_id, tenant, now],
+        )?;
+        let mut blob = Vec::with_capacity(vec.len() * 4);
+        for v in vec {
+            blob.extend_from_slice(&v.to_ne_bytes());
+        }
+        conn.execute(
+            "insert or replace into memory_embeddings (
+                memory_id, tenant, embedding_model, embedding_dim, embedding,
+                content_hash, source_updated_at, created_at, updated_at
+            ) values (?1, ?2, 'fake', ?3, ?4, 'seed', ?5, ?5, ?5)",
+            params![memory_id, tenant, vec.len() as i64, blob, now],
+        )?;
+        Ok(())
     }
 
     pub async fn first_embedding_job_id_for_memory(
@@ -1221,6 +1272,36 @@ impl DuckDbRepository {
         self.get_memory(memory_id.to_string())
             .await?
             .ok_or(StorageError::InvalidData("updated memory not found"))
+    }
+}
+
+impl EmbeddingRowSource for DuckDbRepository {
+    fn count_total_memory_embeddings(&self) -> Result<i64, StorageError> {
+        let conn = self.conn()?;
+        let count: i64 = conn.query_row(
+            "select count(*) from memory_embeddings",
+            params![],
+            |row| row.get(0),
+        )?;
+        Ok(count)
+    }
+
+    fn for_each_embedding(
+        &self,
+        _batch: usize,
+        f: &mut dyn FnMut(&str, &[u8]) -> Result<(), StorageError>,
+    ) -> Result<(), StorageError> {
+        let conn = self.conn()?;
+        let mut stmt = conn.prepare(
+            "select memory_id, embedding from memory_embeddings order by memory_id",
+        )?;
+        let mut rows = stmt.query(params![])?;
+        while let Some(row) = rows.next()? {
+            let id: String = row.get(0)?;
+            let blob: Vec<u8> = row.get(1)?;
+            f(&id, &blob)?;
+        }
+        Ok(())
     }
 }
 

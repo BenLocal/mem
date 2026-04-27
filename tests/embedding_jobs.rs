@@ -195,3 +195,41 @@ async fn http_ingest_creates_embedding_job() {
         1
     );
 }
+
+#[tokio::test]
+async fn count_total_memory_embeddings_returns_zero_for_empty_db() {
+    use tempfile::tempdir;
+    let dir = tempdir().unwrap();
+    let db = dir.path().join("count-empty.duckdb");
+    let repo = mem::storage::DuckDbRepository::open(&db).await.unwrap();
+    assert_eq!(repo.count_total_memory_embeddings().await.unwrap(), 0);
+}
+
+#[tokio::test]
+async fn iter_memory_embeddings_visits_each_row() {
+    use mem::storage::EmbeddingRowSource;
+    use tempfile::tempdir;
+    let dir = tempdir().unwrap();
+    let db = dir.path().join("iter.duckdb");
+    let repo = mem::storage::DuckDbRepository::open(&db).await.unwrap();
+    repo.seed_memory_embedding_for_test("mem_a", "tenant-x", &[1.0, 0.0])
+        .await
+        .unwrap();
+    repo.seed_memory_embedding_for_test("mem_b", "tenant-x", &[0.0, 1.0])
+        .await
+        .unwrap();
+
+    let mut seen = Vec::new();
+    repo.for_each_embedding(
+        100,
+        &mut |id, blob| {
+            seen.push((id.to_string(), blob.to_vec()));
+            Ok(())
+        },
+    )
+    .unwrap();
+    assert_eq!(seen.len(), 2);
+    let ids: std::collections::HashSet<_> = seen.iter().map(|(id, _)| id.as_str()).collect();
+    assert!(ids.contains("mem_a"));
+    assert!(ids.contains("mem_b"));
+}
