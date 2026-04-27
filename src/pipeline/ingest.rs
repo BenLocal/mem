@@ -1,13 +1,14 @@
-use std::{
-    collections::hash_map::DefaultHasher,
-    hash::{Hash, Hasher},
-};
-
-use serde_json::json;
+use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
 
 use crate::domain::memory::{
     GraphEdge, IngestMemoryRequest, MemoryRecord, MemoryStatus, MemoryType, WriteMode,
 };
+
+/// Length of `compute_content_hash` output (sha256 hex). Used by the storage
+/// migration to identify legacy rows that still hold the old DefaultHasher
+/// 16-char hash.
+pub const CONTENT_HASH_LEN: usize = 64;
 
 pub fn initial_status(memory_type: &MemoryType, write_mode: &WriteMode) -> MemoryStatus {
     match (memory_type, write_mode) {
@@ -18,7 +19,17 @@ pub fn initial_status(memory_type: &MemoryType, write_mode: &WriteMode) -> Memor
 }
 
 pub fn compute_content_hash(request: &IngestMemoryRequest) -> String {
-    let mut hasher = DefaultHasher::new();
+    hash_canonical(&canonical_request_json(request))
+}
+
+/// Recompute the content hash from a stored `MemoryRecord`. Equivalent to
+/// hashing the original `IngestMemoryRequest`, used by the migration that
+/// upgrades pre-sha256 rows.
+pub fn compute_content_hash_from_record(record: &MemoryRecord) -> String {
+    hash_canonical(&canonical_record_json(record))
+}
+
+fn canonical_request_json(request: &IngestMemoryRequest) -> Value {
     json!({
         "tenant": request.tenant,
         "memory_type": request.memory_type,
@@ -34,9 +45,30 @@ pub fn compute_content_hash(request: &IngestMemoryRequest) -> String {
         "tags": request.tags,
         "source_agent": request.source_agent,
     })
-    .to_string()
-    .hash(&mut hasher);
-    format!("{:016x}", hasher.finish())
+}
+
+fn canonical_record_json(record: &MemoryRecord) -> Value {
+    json!({
+        "tenant": record.tenant,
+        "memory_type": record.memory_type,
+        "content": record.content,
+        "evidence": record.evidence,
+        "code_refs": record.code_refs,
+        "scope": record.scope,
+        "visibility": record.visibility,
+        "project": record.project,
+        "repo": record.repo,
+        "module": record.module,
+        "task_type": record.task_type,
+        "tags": record.tags,
+        "source_agent": record.source_agent,
+    })
+}
+
+fn hash_canonical(value: &Value) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(value.to_string().as_bytes());
+    format!("{:x}", hasher.finalize())
 }
 
 pub fn memory_node_id(memory_id: &str) -> String {

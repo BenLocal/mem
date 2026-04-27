@@ -247,7 +247,7 @@ MemPalace 第一原则是 "Verbatim always"——**永不改写用户内容**。
 
 | # | 项 | 价值 | 工作量 | 风险 | 触点 |
 |---|---|---|---|---|---|
-| 1 | `compute_content_hash` 改 sha2 | 🔴 修正确性 bug | S（1.5h） | 需迁移 | `pipeline/ingest.rs` |
+| 1 | ✅ `compute_content_hash` 改 sha2（含启动迁移）| 🔴 修正确性 bug | S（1.5h） | 需迁移 | `pipeline/ingest.rs`、`storage/{schema,duckdb}.rs` |
 | 2 | `embedding_jobs` dedupe 走事务 + 条件插入 | 🔴 修并发 bug | S（2h） | 低 | `storage/duckdb.rs` |
 | 3 | 引入 `usearch` sidecar ANN | 🟠 性能基础设施 | M（1–2 天） | 中（需要 repair 路径） | `storage/`、新增 `vector_index.rs` |
 | 4 | HNSW 健康度自检 + repair CLI | 🟠 配套 #3 | S（4h） | 低 | 新增 `bin/mem-repair` |

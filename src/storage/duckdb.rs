@@ -14,6 +14,7 @@ use crate::domain::{
     episode::EpisodeRecord,
     memory::{FeedbackKind, FeedbackSummary, MemoryRecord, MemoryStatus, MemoryVersionLink},
 };
+use crate::pipeline::ingest::{compute_content_hash_from_record, CONTENT_HASH_LEN};
 
 use super::schema;
 
@@ -1370,6 +1371,53 @@ fn cosine_similarity(a: &[f32], b: &[f32]) -> f32 {
         return 0.0;
     }
     dot / (na * nb)
+}
+
+/// Recompute `memories.content_hash` for any row whose hash predates the
+/// sha256 switch (closes mempalace-diff §8 #1). Old rows used a 16-char
+/// `DefaultHasher` digest with a per-process random seed — meaningful only
+/// within the writing process, useless for dedupe across restarts. Detected
+/// by `length(content_hash) != CONTENT_HASH_LEN`.
+///
+/// Also propagates the new hash to `memory_embeddings.content_hash` for the
+/// same `memory_id`. The embedding contents didn't change, only the hash
+/// function did, so we keep the existing vector and just refresh the staleness
+/// sentinel — otherwise every legacy embedding would look stale and trigger a
+/// pointless re-embed at next worker tick.
+///
+/// `embedding_jobs.target_content_hash` is intentionally left alone: pending
+/// jobs targeting old hashes will be marked `stale` by the worker on the next
+/// tick (it compares against the now-fresh `memories.content_hash`), which is
+/// exactly the desired outcome.
+pub(crate) fn migrate_content_hash_to_sha256(conn: &Connection) -> Result<usize, StorageError> {
+    let mut stmt = conn.prepare(
+        "select
+            memory_id, tenant, memory_type, status, scope, visibility, version, summary,
+            content, evidence_json, code_refs_json, project, repo, module, task_type,
+            tags_json, confidence, decay_score, content_hash, idempotency_key,
+            supersedes_memory_id, source_agent, created_at, updated_at, last_validated_at
+         from memories
+         where length(content_hash) != ?1",
+    )?;
+    let legacy: Vec<MemoryRecord> = stmt
+        .query_map(params![CONTENT_HASH_LEN as i64], map_memory_row)?
+        .collect::<Result<Vec<_>, _>>()?;
+    if legacy.is_empty() {
+        return Ok(0);
+    }
+    let n = legacy.len();
+    for record in legacy {
+        let new_hash = compute_content_hash_from_record(&record);
+        conn.execute(
+            "update memories set content_hash = ?1 where memory_id = ?2",
+            params![new_hash, record.memory_id],
+        )?;
+        conn.execute(
+            "update memory_embeddings set content_hash = ?1 where memory_id = ?2",
+            params![new_hash, record.memory_id],
+        )?;
+    }
+    Ok(n)
 }
 
 fn map_memory_row(row: &duckdb::Row<'_>) -> Result<MemoryRecord, duckdb::Error> {

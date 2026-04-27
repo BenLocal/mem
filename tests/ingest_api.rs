@@ -179,10 +179,18 @@ fn content_hash_is_deterministic_for_same_request() {
         write_mode: WriteMode::Auto,
     };
 
+    let hash = compute_content_hash(&request);
+    assert_eq!(hash, compute_content_hash(&request));
+    // Cross-process stability canary: literal sha256 of the canonical JSON
+    // for this exact fixture. Any change here means the hash function changed
+    // and existing palaces will need re-migration. Update only with a matching
+    // migration story.
     assert_eq!(
-        compute_content_hash(&request),
-        compute_content_hash(&request)
+        hash,
+        "5de20b10dba9788355a360cc8c7631c8f9f2df1a7b9afc807e2877923fbcc7d6",
+        "content_hash drifted — old palaces will silently fail dedupe"
     );
+    assert_eq!(hash.len(), 64, "expected sha256 hex, got: {hash}");
 }
 
 #[tokio::test]
