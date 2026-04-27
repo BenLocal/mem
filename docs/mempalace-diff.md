@@ -130,7 +130,7 @@ score =
 
 **MemPalace → mem 可借鉴的**：
 
-1. **真正的 ANN 索引**。当前 `memory_embeddings.embedding BLOB` 是**全表扫描算 cosine**——规模上去会跪。三个候选方案：
+1. **真正的 ANN 索引**。当前 `memory_embeddings.embedding BLOB` 是**全表扫描算 cosine**——规模上去会跪。**而且不只是慢**：`semantic_search_memories`（`src/storage/duckdb.rs:536`）SQL 里有硬编码 `limit 2000` + `order by updated_at desc`，意味着**老记忆会静默掉出语义召回窗口**——这不是单纯性能问题，是已经在悄悄发生的正确性边界。ANN 落地后这条截断一并消除。三个候选方案：
    - `usearch` crate（推荐）：单文件，支持持久化，和 DuckDB 共存；
    - `hnsw_rs` crate（纯 Rust，简单）；
    - DuckDB `vss` extension（与 bundled DuckDB 兼容性需测，PR 风险高）。
@@ -265,7 +265,7 @@ mem 的本性是 **"结构化记忆生命周期"**（status / supersedes / feedb
 | # | 层 | 项 | 价值 | 工作量 | 风险 | 触点 |
 |---|---|---|---|---|---|---|
 | 2 | ⚙️ | ✅ `embedding_jobs` dedupe 复核（实际已被 Mutex + 事务覆盖，仅修注释/文档）| 🔴 修并发 bug | S（0.5h） | 低 | `storage/duckdb.rs`、`db/schema/002_embeddings.sql` |
-| 3 | 🔍 | 引入 `usearch` sidecar ANN | 🟠 性能基础设施 | M（1–2 天） | 中（需要 repair 路径） | `storage/`、新增 `vector_index.rs` |
+| 3 | 🔍 | 引入 `usearch` sidecar ANN（同时消除 `semantic_search_memories` 的 `limit 2000` 隐式截断）| 🟠 性能基础设施 + 🔴 修隐式正确性边界 | M（1–2 天） | 中（需要 repair 路径） | `Cargo.toml`、`storage/`、新增 `vector_index.rs` |
 | 4 | ⚙️ | HNSW 健康度自检 + repair CLI | 🟠 配套 #3 | S（4h） | 低 | 新增 `bin/mem-repair` |
 | 5 | 🔍 | 图边时序化（valid_from/to） | 🟠 表达力 | M（4–6h） | 中 | `domain/memory.rs`、`storage/graph.rs`、`pipeline/ingest.rs` |
 | 6 | 🔍 | 检索分数归一化 / RRF | 🟡 排序质量 | S（3h） | 低 | `pipeline/retrieve.rs` |
