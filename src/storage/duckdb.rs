@@ -93,6 +93,8 @@ pub enum StorageError {
     Serde(#[from] serde_json::Error),
     #[error("invalid data: {0}")]
     InvalidData(&'static str),
+    #[error("vector index error: {0}")]
+    VectorIndex(String),
 }
 
 impl DuckDbRepository {
