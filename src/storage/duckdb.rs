@@ -161,6 +161,11 @@ impl DuckDbRepository {
     /// Enqueues a pending embedding job unless a live (`pending` or `processing`) job
     /// already exists for the same `(tenant, memory_id, target_content_hash, provider)`.
     /// Returns `true` if a new row was inserted.
+    ///
+    /// Concurrency: dedupe is enforced via the transactional count-then-insert below, atomic
+    /// w.r.t. concurrent callers because the underlying `Arc<Mutex<Connection>>` serializes
+    /// all DB access in this process. There is intentionally no DB-level partial unique
+    /// constraint (DuckDB bundled does not support one).
     pub async fn try_enqueue_embedding_job(
         &self,
         insert: EmbeddingJobInsert,

@@ -32,5 +32,8 @@ create table if not exists embedding_jobs (
 create index if not exists idx_embedding_jobs_poll on embedding_jobs (status, available_at);
 create index if not exists idx_embedding_jobs_tenant_memory on embedding_jobs (tenant, memory_id);
 
--- Live-job dedupe for (tenant, memory_id, target_content_hash, provider) is enforced in application
--- code: DuckDB (bundled) does not support partial unique indexes here.
+-- Live-job dedupe for (tenant, memory_id, target_content_hash, provider) is enforced in
+-- `DuckDbRepository::try_enqueue_embedding_job`: the connection is held behind an in-process
+-- `Arc<Mutex<Connection>>`, so the transactional count-then-insert is atomic w.r.t. any other
+-- enqueue caller. (DuckDB bundled does not support partial unique indexes, hence no DB-level
+-- constraint — this is intentional, not a TODO.)

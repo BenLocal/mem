@@ -166,10 +166,7 @@ mem 这块**比 MemPalace 强**，不需要借鉴。但需要修两个 bug：
    - 触点：`src/pipeline/ingest.rs:20-40`
    - 影响：现有 DB 中 `content_hash` 列要么全 reset，要么写一次性迁移。
    - 工作量：1 小时改 + 0.5 小时迁移脚本。
-2. **`embedding_jobs` 的 live-job dedupe 在应用层**（schema 002 注释承认 DuckDB bundled 不支持 partial unique index）——并发提交同一 memory 多个 job 会有竞态。
-   - 短期：在 `enqueue_embedding_job` 路径上加事务 + `INSERT ... WHERE NOT EXISTS (SELECT 1 FROM embedding_jobs WHERE tenant=? AND memory_id=? AND target_content_hash=? AND provider=? AND status IN ('pending','processing'))`。
-   - 触点：`src/storage/duckdb.rs`（`enqueue_embedding_job` 实现）。
-   - 工作量：2 小时。
+2. ~~**`embedding_jobs` 的 live-job dedupe 在应用层**（schema 002 注释承认 DuckDB bundled 不支持 partial unique index）——并发提交同一 memory 多个 job 会有竞态。~~ ✅ **复核后无 bug**：`try_enqueue_embedding_job` 已是 transaction + count-then-insert，且 `DuckDbRepository.conn` 是 `Arc<Mutex<Connection>>`（`src/storage/duckdb.rs:83`），整个进程内所有 DB 访问串行化，并发 caller 不可能撞上竞态。已更新 schema 注释（`db/schema/002_embeddings.sql`）和函数 doc（`try_enqueue_embedding_job`）澄清这一点，把 phantom bug 从待修列表撤掉。
 
 ---
 
@@ -267,8 +264,7 @@ mem 的本性是 **"结构化记忆生命周期"**（status / supersedes / feedb
 
 | # | 层 | 项 | 价值 | 工作量 | 风险 | 触点 |
 |---|---|---|---|---|---|---|
-| 1 | ⚙️ | ✅ `compute_content_hash` 改 sha2（含启动迁移）| 🔴 修正确性 bug | S（1.5h） | 需迁移 | `pipeline/ingest.rs`、`storage/{schema,duckdb}.rs` |
-| 2 | ⚙️ | `embedding_jobs` dedupe 走事务 + 条件插入 | 🔴 修并发 bug | S（2h） | 低 | `storage/duckdb.rs` |
+| 2 | ⚙️ | ✅ `embedding_jobs` dedupe 复核（实际已被 Mutex + 事务覆盖，仅修注释/文档）| 🔴 修并发 bug | S（0.5h） | 低 | `storage/duckdb.rs`、`db/schema/002_embeddings.sql` |
 | 3 | 🔍 | 引入 `usearch` sidecar ANN | 🟠 性能基础设施 | M（1–2 天） | 中（需要 repair 路径） | `storage/`、新增 `vector_index.rs` |
 | 4 | ⚙️ | HNSW 健康度自检 + repair CLI | 🟠 配套 #3 | S（4h） | 低 | 新增 `bin/mem-repair` |
 | 5 | 🔍 | 图边时序化（valid_from/to） | 🟠 表达力 | M（4–6h） | 中 | `domain/memory.rs`、`storage/graph.rs`、`pipeline/ingest.rs` |
@@ -286,7 +282,7 @@ mem 的本性是 **"结构化记忆生命周期"**（status / supersedes / feedb
 > **工作量**：S ≤ 4h，M = 0.5–2 天，L > 2 天。
 
 > **建议批次**：
-> - **批 A（修 bug，3.5h）** ✅#1 已完成；#2 — 实际已被单 Mutex 保护，改"修注释"。
+> - **批 A（修 bug）** ✅ 完成（#1 sha2 迁移 + #2 dedupe 复核 / 注释澄清）。
 > - **批 B（Verbatim 纪律落地，3h）** #10 + #7 + 文档化 — 把上面"设计原则"刻进代码。
 > - **批 C（数据模型扩展，1 天）** #5 + #11 同期做，省一次 schema 迁移阵痛。
 > - **批 D（检索现代化，2–3 天）** #3 + #4 + #6 → **#12**。前三项是 #12 的前置条件（先有 HNSW 召回 + RRF，再做三段式重构）。
