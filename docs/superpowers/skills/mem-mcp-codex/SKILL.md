@@ -9,7 +9,7 @@ When the **mem** MCP server is enabled, use its tools to read and write the same
 
 If other tools fail with connection errors, call **`mem_health`** first to confirm `MEM_BASE_URL` is correct and `cargo run` (or your deployment) is up.
 
-## Environment (host of `node …/mem-mcp/dist/index.js`)
+## Environment (host of `mem mcp`)
 
 | Variable | Default | Meaning |
 |----------|---------|---------|
@@ -17,7 +17,7 @@ If other tools fail with connection errors, call **`mem_health`** first to confi
 | `MEM_TENANT` | `local` | Default `tenant` when a tool omits it. |
 | `MEM_MCP_EXPOSE_EMBEDDINGS` | unset | Set to `1` to register `embeddings_*` admin tools. |
 
-Run **`cargo run`** (or your deploy) for mem before starting the MCP server. See repo root [README.md](../../../../README.md) §「Codex / MCP」for links to spec, plan, and this skill.
+Start the HTTP service in one terminal (`mem serve` / `cargo run`), then run **`mem mcp`** as the stdio MCP server (same binary, separate process). See repo root [README.md](../../../../README.md) §「Codex / MCP」.
 
 ## Default autopilot workflow (every user turn)
 
@@ -87,6 +87,6 @@ Use this stricter policy when memory quality matters more than recall volume:
 6. **Episode rule**:
    - `episode_ingest` only after a truly completed multi-step task (not partial progress)
 
-**Spec:** `docs/superpowers/specs/2026-03-21-codex-mem-mcp-integration-design.md`  
-**Plan:** `docs/superpowers/plans/2026-03-21-codex-mem-mcp-integration.md`  
-**Package:** `integrations/mem-mcp/README.md`
+**Server:** `mem mcp` (Rust binary, replaces the historical Node `integrations/mem-mcp/`)  
+**Spec (historical):** `docs/superpowers/specs/2026-03-21-codex-mem-mcp-integration-design.md`  
+**Plan (historical):** `docs/superpowers/plans/2026-03-21-codex-mem-mcp-integration.md`

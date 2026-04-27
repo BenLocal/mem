@@ -4,6 +4,7 @@ pub mod domain;
 pub mod embedding;
 pub mod error;
 pub mod http;
+pub mod mcp;
 pub mod pipeline;
 pub mod service;
 pub mod storage;

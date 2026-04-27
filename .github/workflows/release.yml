@@ -54,25 +54,6 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
-  publish-npm:
-    if: startsWith(github.ref, 'refs/tags/v') && secrets.NPM_TOKEN != ''
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v6
-        with:
-          node-version: "20"
-          registry-url: https://registry.npmjs.org
-      - name: Install and align version with tag
-        working-directory: integrations/mem-mcp
-        env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
-        run: |
-          npm ci
-          VERSION="${GITHUB_REF_NAME#v}"
-          npm version "$VERSION" --no-git-tag-version
-          npm publish
-
   docker-mem:
     if: startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest

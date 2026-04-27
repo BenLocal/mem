@@ -10,7 +10,10 @@ doctest = false
 anyhow = "1"
 async-trait = "0.1"
 axum = "0.8"
+clap = { version = "4", features = ["derive"] }
 duckdb = { version = "1", features = ["bundled"] }
+rmcp = { version = "1.5", features = ["server", "macros", "transport-io"] }
+schemars = "0.8"
 indradb-lib = "5"
 embed_anything = { git = "https://github.com/StarlightSearch/EmbedAnything" }
 serde = { version = "1.0.228", features = ["derive"] }

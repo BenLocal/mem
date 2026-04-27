@@ -12,11 +12,27 @@ The server binds to `127.0.0.1:3000` by default. Set `MEM_DB_PATH` to point at a
 
 ## Codex / MCP (shared memory)
 
-- **Spec:** [docs/superpowers/specs/2026-03-21-codex-mem-mcp-integration-design.md](docs/superpowers/specs/2026-03-21-codex-mem-mcp-integration-design.md)
-- **Implementation plan:** [docs/superpowers/plans/2026-03-21-codex-mem-mcp-integration.md](docs/superpowers/plans/2026-03-21-codex-mem-mcp-integration.md)
-- **MCP package:** [integrations/mem-mcp](integrations/mem-mcp) — publishable npm package `mem-mcp` (`npm install -g mem-mcp` or `npx mem-mcp`; stdio)
+`mem` ships its own MCP stdio server in the same binary — no Node, no npm.
+
+```bash
+# In one terminal: run the HTTP service.
+mem serve
+
+# In another (or wired into Codex / Cursor): run the MCP stdio server.
+mem mcp
+```
+
+The MCP server forwards 20 tools to the HTTP service over `MEM_BASE_URL` (default `http://127.0.0.1:3000`). Configuration env vars:
+
+| Variable | Default | Meaning |
+|----------|---------|---------|
+| `MEM_BASE_URL` | `http://127.0.0.1:3000` | `mem serve` HTTP root |
+| `MEM_TENANT` | `local` | Default tenant when a tool omits it |
+| `MEM_MCP_EXPOSE_EMBEDDINGS` | unset | Set to `1` to enable admin `embeddings_*` tools |
+
 - **Agent skill (workflow):** [docs/superpowers/skills/mem-mcp-codex/SKILL.md](docs/superpowers/skills/mem-mcp-codex/SKILL.md)
 - **CI without MCP:** [docs/superpowers/examples/ci-mem-http-snippet.md](docs/superpowers/examples/ci-mem-http-snippet.md)
+- **Historical context** (now superseded by the Rust implementation): [spec](docs/superpowers/specs/2026-03-21-codex-mem-mcp-integration-design.md), [plan](docs/superpowers/plans/2026-03-21-codex-mem-mcp-integration.md)
 
 ## Cross-compile server (Linux binary)
 
@@ -52,13 +68,12 @@ Example compose (build context is repo root): [deploy/docker-compose.yml](deploy
 
 Default in the image: `BIND_ADDR=0.0.0.0:3000`, `MEM_DB_PATH=/data/mem.duckdb`. Point MCP clients at the same host with `MEM_BASE_URL` (for example `http://127.0.0.1:3000`).
 
-## Release (npm + GHCR)
+## Release (GHCR + binaries)
 
-1. （可选）若要发布 npm：在仓库 Secrets 中配置 **`NPM_TOKEN`**（npm Automation token）。未配置时 Release 工作流会**跳过** `publish-npm`，其余 job 仍会执行。
-2. Push a semver tag: `git tag v0.1.0 && git push origin v0.1.0`（会同时触发 **CI** 与 **Release**；Docker 镜像构建使用 GitHub Actions 缓存加速重复构建）。
-3. Workflow [`.github/workflows/release.yml`](.github/workflows/release.yml) 在有 token 时将 **`mem-mcp`** 发布到 npm（版本号与 tag 一致，不含前缀 `v`），推送 **`ghcr.io/<lowercase-owner>/mem:<tag>`** 与 **`:latest`**，并在 GitHub Release 上附带 **`mem-<tag>-x86_64-unknown-linux-gnu`**、**`mem-<tag>-x86_64-unknown-linux-musl`** 以及 **`mem-<tag>-SHA256SUMS`**（`sha256sum` 校验文件）。
+1. Push a semver tag: `git tag v0.1.0 && git push origin v0.1.0`（同时触发 **CI** 与 **Release**；Docker 镜像构建使用 GitHub Actions 缓存加速重复构建）。
+2. Workflow [`.github/workflows/release.yml`](.github/workflows/release.yml) 推送 **`ghcr.io/<lowercase-owner>/mem:<tag>`** 与 **`:latest`**，并在 GitHub Release 上附带 **`mem-<tag>-x86_64-unknown-linux-gnu`**、**`mem-<tag>-x86_64-unknown-linux-musl`** 以及 **`mem-<tag>-SHA256SUMS`**（`sha256sum` 校验文件）。MCP server 已合入二进制，无需单独发布。
 
-Plan: [docs/superpowers/plans/2026-03-22-mem-publish-docker-actions.md](docs/superpowers/plans/2026-03-22-mem-publish-docker-actions.md).
+Plan (历史): [docs/superpowers/plans/2026-03-22-mem-publish-docker-actions.md](docs/superpowers/plans/2026-03-22-mem-publish-docker-actions.md).
 
 Point every client at the same `MEM_BASE_URL` and `tenant` so multiple Codex or Cursor processes share one store.
 

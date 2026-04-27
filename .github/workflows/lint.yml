@@ -19,18 +19,3 @@ jobs:
       - name: cargo clippy
         run: cargo clippy --all-targets -- -D warnings
 
-  mem-mcp-lint:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v6
-        with:
-          node-version: "20"
-          cache: npm
-          cache-dependency-path: integrations/mem-mcp/package-lock.json
-      - name: npm ci
-        working-directory: integrations/mem-mcp
-        run: npm ci
-      - name: npm run lint
-        working-directory: integrations/mem-mcp
-        run: npm run lint
