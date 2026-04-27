@@ -86,7 +86,9 @@ mempalace/
 
 | MemPalace 概念 | 是否值得引入 mem | 切入点 |
 |---|---|---|
-| Wing/Room/Drawer 三层结构 | ❌ 与现有 typed memory 冲突，不必引入 | — |
+| **Wing**（实体分组） | ❌ 已有等价物 | `project` / `repo` / `module` 字段 + `applies_to` 图边 |
+| **Drawer**（原子单元） | ❌ 已有等价物 | `memories` 行就是 |
+| **Room**（时间桶/会话容器） | ✅ **建议加**（mem 真没有） | 新增 `sessions` 表，`memories` / `episodes` 加 `session_id` FK；与 `episodes`（目标键）正交，不重复 — 详见 §11 |
 | 时序图（valid_from / valid_to） | ✅ **强烈建议** | `storage/graph.rs` 的 `GraphEdge` 加 `valid_from / valid_to`，`extract_graph_edges` 写当前时间，`supersedes` 路径上把旧边 `valid_to` 关闭 |
 | Entity registry（人/项目消歧） | ⚠️ 可选 | `domain/` 加 `entity.rs`，`memories.project / repo / module` 改成外键，避免拼写漂移 |
 | AAAK 索引层 | ❌ 与 token-budgeted 输出重复定位 | — |
@@ -255,6 +257,7 @@ MemPalace 第一原则是 "Verbatim always"——**永不改写用户内容**。
 | 8 | `decay_score` 后台衰减 worker | 🟡 生命周期闭环 | S（3h） | 低 | `service/`、新增 `decay_worker.rs` |
 | 9 | Entity registry（可选） | 🟢 数据卫生 | M（半天） | 中（迁移） | `domain/entity.rs`、schema |
 | 10 | Verbatim 守护（content vs summary 校验） | 🟢 哲学一致性 | S（1h） | 低 | `pipeline/ingest.rs` |
+| 11 | **Sessions**（时间桶容器，对齐 MemPalace 的 Room） | 🟠 表达力 | M（半天） | 中（schema 迁移）| 新增 `sessions` 表 + `memories.session_id` + auto-bucket on ingest，详见 §11 |
 
 > 🔴 = 修 bug；🟠 = 架构升级；🟡 = 体验优化；🟢 = nice-to-have。
 > S ≤ 4h，M = 0.5–2 天，L > 2 天。
@@ -263,7 +266,7 @@ MemPalace 第一原则是 "Verbatim always"——**永不改写用户内容**。
 
 ## 9. 不建议引入的 MemPalace 概念
 
-- **Wing / Room / Drawer 隐喻**：和 mem 已有的 typed memory + scope 模型概念冲突，引入只会增加心智负担。
+- **Wing / Drawer 隐喻**：mem 已有等价物（`project`/`repo`/`module` 字段做 Wing，`memories` 行做 Drawer）；改名只会增加心智负担。**Room 单独例外，见 §11。**
 - **AAAK 压缩索引层**：mem 已经用 token-budgeted 输出解决了相同问题（让 LLM 看到的内容受控），AAAK 是对 BM25/向量的补充，不是替代。
 - **Hooks 驱动的后台归档**：mem 是 HTTP 服务模型，不绑定具体编辑器；类比物是 caller agent 主动 POST，不需要 hook。
 - **L0–L3 唤醒栈**：MemPalace 的 layered context 设计是为对话开场注入服务的；mem 的客户端（Codex/Cursor 等）有自己的开场注入逻辑，不应在服务端重做。
@@ -277,3 +280,104 @@ MemPalace 第一原则是 "Verbatim always"——**永不改写用户内容**。
 - 凡是 README 没明说但代码里有的（如 `merge_and_rank_hybrid` 的具体权重、`embedding_jobs` 状态机），按本地代码为准；本文档与代码不一致时**以代码为权威**。
 
 > 维护建议：每完成路线图中的一项，回来更新对应行的状态（✅ done / 🚧 in progress），并在 git commit message 里引用本文档章节号（例如 `feat(ingest): switch content_hash to sha2 (closes mempalace-diff §8 #1)`）。
+
+---
+
+## 11. Sessions（对齐 MemPalace 的 Room，但和 episodes 正交）
+
+### 为什么 mem 现在缺这个
+
+mem 的时间维度只是 `created_at` / `updated_at` 时间戳，**没有"会话/工作时段"这个一等容器**。下面这些查询当前都答不出来：
+
+- "我今天工作了什么" — 勉强（`WHERE date(created_at)=today`），但跨午夜或多 agent 并行就乱
+- "上次调 invoice retry 那波我都记了什么" — 没有 session ID 可锚，只能时间范围 + repo 双过滤瞎猜
+- "刚才那个搞砸的 session 全删掉" — 完全答不出来
+
+### 和 `episodes` 的关系
+
+不是替代，是**正交**：
+
+| | `episodes` | `sessions` |
+|---|---|---|
+| 主键 | **目标**（goal） | **时间** |
+| 边界 | 任务完成时收尾 | 静默超过 N 分钟自动新开 |
+| 跨度 | 可跨多个时间段 | 一个连续工作时段 |
+
+8 小时调试 = 1 episode + 2 session（中间睡了一觉）；
+一上午 = 1 session + 5 个小 episode。
+
+每条 `memories` 同时拥有 `session_id`（自动）和**可选的** `episode_id`。
+
+### Schema
+
+```sql
+create table sessions (
+  session_id text primary key,
+  tenant text not null,
+  caller_agent text not null,        -- "codex-cli", "cursor", "ci:job-42"
+  started_at text not null,
+  ended_at text,
+  goal text,                         -- 自由文本，可选
+  memory_count integer not null default 0
+);
+
+create index if not exists idx_sessions_agent_active
+  on sessions(tenant, caller_agent, ended_at);
+
+alter table memories  add column session_id text references sessions(session_id);
+alter table episodes  add column session_id text references sessions(session_id);
+
+create index if not exists idx_memories_session on memories(session_id);
+create index if not exists idx_episodes_session on episodes(session_id);
+```
+
+### 写入路径（auto-bucket）
+
+`memory_service::ingest` 在写 memory 之前先解析 session：
+
+```rust
+async fn resolve_session(
+    repo: &DuckDbRepository,
+    tenant: &str,
+    caller_agent: &str,
+    now: &str,
+    idle_minutes: u64,             // 默认 30
+) -> Result<String, StorageError> {
+    if let Some(s) = repo.latest_active_session(tenant, caller_agent).await? {
+        let last_activity = s.ended_at.as_deref().unwrap_or(&s.started_at);
+        if minutes_since(last_activity, now) < idle_minutes {
+            return Ok(s.session_id);   // 续用
+        }
+        repo.close_session(&s.session_id, now).await?;
+    }
+    repo.open_session(tenant, caller_agent, now).await
+}
+```
+
+（一个 caller_agent 上一次活动 < 30 分钟 → 续用；否则关旧、开新。）
+
+### 检索 / 公共面
+
+- `memory_search` 加可选 `session_id` 过滤
+- `GET /sessions?tenant=...&agent=...&since=...` 列表
+- `GET /sessions/{id}` 返回会话 + 其下 memory_id 列表 + episode_id 列表
+- `DELETE /sessions/{id}` 撤销整段记录（用 `supersedes_memory_id` 软删，不真删）
+
+### 不做什么
+
+- ❌ **不**自动给 episode 派生 session（episode 是 caller 主动调用的）
+- ❌ **不**做"跨 caller_agent 合并 session"（每个 agent 独立桶）
+- ❌ **不**让 `goal` 在写入时强制必填（不是 episode）
+- ❌ **不**复用 MemPalace 的 Wing/Drawer 命名（保留 mem 现有术语）
+
+### 风险
+
+- **schema 迁移**：DuckDB 1.x 的 `alter table` 在大表上是全表重写。建议在低活时段执行，或通过 export/reload 路径。
+- **`session_id` 历史空值**：迁移后老 memory 的 `session_id` 为 NULL，检索时按"NULL 视为独立伪 session"处理；不要回填假 session。
+- **idle_minutes 怎么定**：默认 30 分钟够 90% 场景；CI/批处理可能需要更短（例如 `MEM_SESSION_IDLE_MINUTES=5`）。环境变量化。
+
+### 工作量
+
+M（半天）= schema 迁移 + `resolve_session` + ingest 路径接线 + 一个 `/sessions` 路由 + 单元测试。
+
+> commit 时引用：`feat(sessions): auto-bucket memories into time-based sessions (closes mempalace-diff §8 #11)`
