@@ -98,3 +98,27 @@ fn meta_round_trips_through_json() {
     assert_eq!(back.id_map.len(), 2);
     assert_eq!(back.id_map.get(&123u64).unwrap(), "mem_alpha");
 }
+
+use tempfile::tempdir;
+
+#[tokio::test]
+async fn save_writes_both_files_atomically() {
+    let dir = tempdir().unwrap();
+    let idx_path = dir.path().join("test.usearch");
+    let meta_path = dir.path().join("test.usearch.meta.json");
+
+    let idx = VectorIndex::new_in_memory(256, "fake", "fake", 8);
+    idx.upsert("mem_alpha", &unit_vector(256, 1)).await.unwrap();
+    idx.save_to(&idx_path, &meta_path).await.unwrap();
+
+    assert!(idx_path.exists());
+    assert!(meta_path.exists());
+
+    let meta_str = std::fs::read_to_string(&meta_path).unwrap();
+    let meta: mem::storage::VectorIndexMeta = serde_json::from_str(&meta_str).unwrap();
+    assert_eq!(meta.row_count, 1);
+    assert_eq!(meta.dim, 256);
+    assert_eq!(meta.provider, "fake");
+    assert_eq!(meta.id_map.len(), 1);
+    assert_eq!(meta.id_map.values().next().unwrap(), "mem_alpha");
+}

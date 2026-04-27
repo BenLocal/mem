@@ -1,4 +1,6 @@
 use std::collections::HashMap;
+use std::fs;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock, RwLockReadGuard, RwLockWriteGuard};
 
 use serde::{Deserialize, Serialize};
@@ -282,5 +284,61 @@ impl VectorIndex {
             }
         }
         Ok(out)
+    }
+
+    /// Atomically persist the binary index and its meta JSON to disk.
+    ///
+    /// Writes to `.tmp` siblings first, then renames both into place so that a
+    /// crash mid-write cannot leave partial files at the final paths.
+    ///
+    /// Lock acquisition order: `id_map` read first, then `index` read
+    /// (consistent with the rest of the codebase).
+    pub async fn save_to(
+        &self,
+        index_path: &Path,
+        meta_path: &Path,
+    ) -> Result<(), VectorIndexError> {
+        // Acquire locks in id_map-first order to capture a consistent snapshot.
+        let id_map = self.lock_id_map_read()?;
+        let index = self.lock_index_read()?;
+
+        let row_count = index.size();
+        let meta = VectorIndexMeta {
+            schema_version: 1,
+            provider: self.fingerprint.provider.clone(),
+            model: self.fingerprint.model.clone(),
+            dim: self.fingerprint.dim,
+            row_count,
+            id_map: id_map.clone(),
+        };
+
+        let parent = index_path.parent().unwrap_or_else(|| Path::new("."));
+        fs::create_dir_all(parent)?;
+
+        // Build temp paths by appending ".tmp" to avoid surprising behaviour
+        // from Path::with_extension which replaces (not appends) the extension.
+        let tmp_index: PathBuf = {
+            let mut s = index_path.as_os_str().to_owned();
+            s.push(".tmp");
+            PathBuf::from(s)
+        };
+        let tmp_meta: PathBuf = {
+            let mut s = meta_path.as_os_str().to_owned();
+            s.push(".tmp");
+            PathBuf::from(s)
+        };
+
+        index
+            .save(tmp_index.to_str().ok_or_else(|| {
+                VectorIndexError::UsearchOp("non-utf8 sidecar path".to_string())
+            })?)
+            .map_err(|e| VectorIndexError::UsearchOp(e.to_string()))?;
+
+        fs::write(&tmp_meta, serde_json::to_vec_pretty(&meta)?)?;
+
+        fs::rename(&tmp_index, index_path)?;
+        fs::rename(&tmp_meta, meta_path)?;
+
+        Ok(())
     }
 }
