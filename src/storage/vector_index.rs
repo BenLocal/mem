@@ -199,15 +199,18 @@ impl VectorIndex {
         // Acquire id_map first (consistent lock ordering).
         let id_map = self.lock_id_map_read()?;
 
-        // Acquire index second.
-        let index = self.lock_index_read()?;
-        if index.size() == 0 {
-            return Ok(vec![]);
-        }
-
-        let matches = index
-            .search(query, k)
-            .map_err(|e| VectorIndexError::UsearchOp(e.to_string()))?;
+        // Acquire index second, but drop it as soon as search() returns so
+        // concurrent writers aren't blocked during the id_map iteration.
+        let matches = {
+            let index = self.lock_index_read()?;
+            if index.size() == 0 {
+                return Ok(vec![]);
+            }
+            index
+                .search(query, k)
+                .map_err(|e| VectorIndexError::UsearchOp(e.to_string()))?
+        };
+        // index lock dropped here
 
         let mut out = Vec::with_capacity(matches.keys.len());
         for (i, key) in matches.keys.iter().enumerate() {
