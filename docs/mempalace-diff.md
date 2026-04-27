@@ -245,22 +245,50 @@ MemPalace 第一原则是 "Verbatim always"——**永不改写用户内容**。
 
 ## 8. 改造路线图（建议优先级）
 
-| # | 项 | 价值 | 工作量 | 风险 | 触点 |
-|---|---|---|---|---|---|
-| 1 | ✅ `compute_content_hash` 改 sha2（含启动迁移）| 🔴 修正确性 bug | S（1.5h） | 需迁移 | `pipeline/ingest.rs`、`storage/{schema,duckdb}.rs` |
-| 2 | `embedding_jobs` dedupe 走事务 + 条件插入 | 🔴 修并发 bug | S（2h） | 低 | `storage/duckdb.rs` |
-| 3 | 引入 `usearch` sidecar ANN | 🟠 性能基础设施 | M（1–2 天） | 中（需要 repair 路径） | `storage/`、新增 `vector_index.rs` |
-| 4 | HNSW 健康度自检 + repair CLI | 🟠 配套 #3 | S（4h） | 低 | 新增 `bin/mem-repair` |
-| 5 | 图边时序化（valid_from/to） | 🟠 表达力 | M（4–6h） | 中 | `domain/memory.rs`、`storage/graph.rs`、`pipeline/ingest.rs` |
-| 6 | 检索分数归一化 / RRF | 🟡 排序质量 | S（3h） | 低 | `pipeline/retrieve.rs` |
-| 7 | `compress_text` 改 token 计数 | 🟡 输出准确性 | S（2h） | 低 | `pipeline/compress.rs` |
-| 8 | `decay_score` 后台衰减 worker | 🟡 生命周期闭环 | S（3h） | 低 | `service/`、新增 `decay_worker.rs` |
-| 9 | Entity registry（可选） | 🟢 数据卫生 | M（半天） | 中（迁移） | `domain/entity.rs`、schema |
-| 10 | Verbatim 守护（content vs summary 校验） | 🟢 哲学一致性 | S（1h） | 低 | `pipeline/ingest.rs` |
-| 11 | **Sessions**（时间桶容器，对齐 MemPalace 的 Room） | 🟠 表达力 | M（半天） | 中（schema 迁移）| 新增 `sessions` 表 + `memories.session_id` + auto-bucket on ingest，详见 §11 |
+### 设计原则（先确立，再排路线）
 
-> 🔴 = 修 bug；🟠 = 架构升级；🟡 = 体验优化；🟢 = nice-to-have。
-> S ≤ 4h，M = 0.5–2 天，L > 2 天。
+mem 的本性是 **"结构化记忆生命周期"**（status / supersedes / feedback / decay），这条路线**保留并强化**。同时借用 MemPalace 的 **"Verbatim 永不改写"** 纪律——但**只约束存储与原文对外的呈现层**。两条原则按层叠加，**不冲突**：
+
+```
+存储层（memories.content）             ← 📦 Verbatim 不改写、不丢话（借 MemPalace 纪律）
+输出/索引层（compress / 排序 / 元数据） ← 🔍 Structured 加权 / lifecycle / 索引（保 mem 路线）
+基础设施（持久化、性能、修 bug）       ← ⚙️ 不归入上面任一项
+```
+
+判定一项改造能不能做，就按这套套：
+
+- **会改写或丢失原话**（无论存储还是输出）→ **禁止**，即便能省 token 或加快检索
+- **只改排序/打分/元数据**（不动 `content` 也不裸奔截断） → **允许**，feedback / decay / status / supersedes 都属此类
+- **修存储层使其更 verbatim** → **优先**（如 #10 守护、#7 token 截断）
+
+并明确文档化：**`memories.content` 是事实源（fact source），`memories.summary` 只用于索引/提示**——任何对外承诺、引用、链接、回答必须基于 `content`，不能基于 `summary`。这条规约会随 §8 #10 一并落到 ingest 校验里。
+
+### 路线图
+
+| # | 层 | 项 | 价值 | 工作量 | 风险 | 触点 |
+|---|---|---|---|---|---|---|
+| 1 | ⚙️ | ✅ `compute_content_hash` 改 sha2（含启动迁移）| 🔴 修正确性 bug | S（1.5h） | 需迁移 | `pipeline/ingest.rs`、`storage/{schema,duckdb}.rs` |
+| 2 | ⚙️ | `embedding_jobs` dedupe 走事务 + 条件插入 | 🔴 修并发 bug | S（2h） | 低 | `storage/duckdb.rs` |
+| 3 | 🔍 | 引入 `usearch` sidecar ANN | 🟠 性能基础设施 | M（1–2 天） | 中（需要 repair 路径） | `storage/`、新增 `vector_index.rs` |
+| 4 | ⚙️ | HNSW 健康度自检 + repair CLI | 🟠 配套 #3 | S（4h） | 低 | 新增 `bin/mem-repair` |
+| 5 | 🔍 | 图边时序化（valid_from/to） | 🟠 表达力 | M（4–6h） | 中 | `domain/memory.rs`、`storage/graph.rs`、`pipeline/ingest.rs` |
+| 6 | 🔍 | 检索分数归一化 / RRF | 🟡 排序质量 | S（3h） | 低 | `pipeline/retrieve.rs` |
+| 7 | 📦 | `compress_text` 改 token 计数（CJK 不再按词裸奔截断）| 🟡 输出 verbatim 纪律 | S（2h） | 低 | `pipeline/compress.rs` |
+| 8 | 🔍 | `decay_score` 后台衰减 worker | 🟡 生命周期闭环 | S（3h） | 低 | `service/`、新增 `decay_worker.rs` |
+| 9 | 🔍 | Entity registry（可选） | 🟢 数据卫生 | M（半天） | 中（迁移） | `domain/entity.rs`、schema |
+| 10 | 📦 | **Verbatim 守护**（ingest 校验 `summary != content`，禁止把提炼版塞 `content`；同时把"`content` 是事实源、`summary` 只做索引"写进 `AGENTS.md` / `README.md`） | 🟢 哲学一致性 | S（1h） | 低 | `pipeline/ingest.rs`、`AGENTS.md`、`README.md` |
+| 11 | 🔍 | **Sessions**（时间桶容器，对齐 MemPalace 的 Room） | 🟠 表达力 | M（半天） | 中（schema 迁移）| 新增 `sessions` 表 + `memories.session_id` + auto-bucket on ingest，详见 §11 |
+
+> **层（Layer）**：📦 = Verbatim 存储/输出纪律；🔍 = Structured 检索/排序/元数据；⚙️ = 基础设施 / 修 bug。
+> **价值**：🔴 = 修 bug；🟠 = 架构升级；🟡 = 体验优化；🟢 = nice-to-have。
+> **工作量**：S ≤ 4h，M = 0.5–2 天，L > 2 天。
+
+> **建议批次**：
+> - **批 A（修 bug，3.5h）** ✅#1 已完成；#2 — 实际已被单 Mutex 保护，改"修注释"。
+> - **批 B（Verbatim 纪律落地，3h）** #10 + #7 + 文档化 — 把上面"设计原则"刻进代码。
+> - **批 C（数据模型扩展，1 天）** #5 + #11 同期做，省一次 schema 迁移阵痛。
+> - **批 D（性能/排序，1.5–2 天）** #3 + #4 + #6。
+> - **批 E（生命周期 / 卫生，半天–1 天）** #8 + #9。
 
 ---
 
