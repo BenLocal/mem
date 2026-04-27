@@ -180,6 +180,25 @@ impl VectorIndex {
         Ok(())
     }
 
+    /// Remove the embedding for `memory_id` from the index.
+    ///
+    /// If `memory_id` was never inserted this is a no-op (returns `Ok`).
+    ///
+    /// Lock acquisition order: `id_map` write first, then `index` write.
+    pub async fn remove(&self, memory_id: &str) -> Result<(), VectorIndexError> {
+        let key = memory_id_to_u64(memory_id);
+        let mut id_map = self.lock_id_map_write()?;
+        let index = self.lock_index_write()?;
+        // usearch::Index::remove returns Result<usize, cxx::Exception> where
+        // the usize is the count of entries removed (0 or 1).  We treat both
+        // outcomes as success; a "not found" is simply a no-op.
+        let _ = index
+            .remove(key)
+            .map_err(|e| VectorIndexError::UsearchOp(e.to_string()))?;
+        id_map.remove(&key);
+        Ok(())
+    }
+
     /// Search for the `k` nearest neighbours of `query`.
     ///
     /// Returns an empty vec if `query` dimensions don't match, `k == 0`, or the

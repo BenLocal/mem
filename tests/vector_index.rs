@@ -40,3 +40,38 @@ async fn upsert_then_search_returns_inserted_memory_id() {
     assert_eq!(hits[0].0, "mem_b");
     assert!(hits[0].1 > 0.99);
 }
+
+#[tokio::test]
+async fn upsert_overwrites_previous_vector_for_same_memory_id() {
+    let idx = VectorIndex::new_in_memory(256, "fake", "fake", 8);
+    idx.upsert("mem_x", &unit_vector(256, 1)).await.unwrap();
+    idx.upsert("mem_x", &unit_vector(256, 5)).await.unwrap();
+
+    let hit_old = idx.search(&unit_vector(256, 1), 1).await.unwrap();
+    let hit_new = idx.search(&unit_vector(256, 5), 1).await.unwrap();
+    // After overwrite, the "old" query should still find mem_x (it's the only row)
+    // but with low similarity; the "new" query should match strongly.
+    assert_eq!(hit_new[0].0, "mem_x");
+    assert!(hit_new[0].1 > 0.99);
+    assert!(hit_old[0].1 < 0.5);
+    assert_eq!(idx.size(), 1);
+}
+
+#[tokio::test]
+async fn remove_makes_search_skip_the_id() {
+    let idx = VectorIndex::new_in_memory(256, "fake", "fake", 8);
+    idx.upsert("mem_keep", &unit_vector(256, 1)).await.unwrap();
+    idx.upsert("mem_drop", &unit_vector(256, 2)).await.unwrap();
+    idx.remove("mem_drop").await.unwrap();
+
+    let hits = idx.search(&unit_vector(256, 2), 5).await.unwrap();
+    assert!(hits.iter().all(|(id, _)| id != "mem_drop"));
+    assert_eq!(idx.size(), 1);
+}
+
+#[tokio::test]
+async fn remove_unknown_id_is_noop() {
+    let idx = VectorIndex::new_in_memory(256, "fake", "fake", 4);
+    idx.remove("never_inserted").await.unwrap();
+    assert_eq!(idx.size(), 0);
+}
