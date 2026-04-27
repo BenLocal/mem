@@ -279,6 +279,7 @@ mem 的本性是 **"结构化记忆生命周期"**（status / supersedes / feedb
 | 10 | 📦 | **Verbatim 守护**（ingest 校验 `summary != content`，禁止把提炼版塞 `content`；同时把"`content` 是事实源、`summary` 只做索引"写进 `AGENTS.md` / `README.md`） | 🟢 哲学一致性 | S（1h） | 低 | `pipeline/ingest.rs`、`AGENTS.md`、`README.md` |
 | 11 | 🔍 | **Sessions**（时间桶容器，对齐 MemPalace 的 Room） | 🟠 表达力 | M（半天） | 中（schema 迁移）| 新增 `sessions` 表 + `memories.session_id` + auto-bucket on ingest，详见 §11 |
 | 12 | 🔍 | **检索流水线三段式重构**（召回 → 结构化过滤 → caller 端 LLM 精排）| 🟠 架构升级 | M（1 天） | 中（依赖 #3 + #6） | `pipeline/retrieve.rs` 重构、`pipeline/compress.rs` 输出层调整，详见 §12 |
+| 13 | 🔍 | **Claude Code / Codex 无感集成包**（Stop/PreCompact/SessionStart hooks + `mem mine` 离线 miner + `mem wake-up`）| 🟠 用户体验代际升级 | M（1.5 天） | 中（hook 脚本跨平台、跨 agent runtime） | 新增 `hooks/`、`src/cli/{mine,wake_up}.rs`、`README.md` 集成章节，详见 §13 |
 
 > **层（Layer）**：📦 = Verbatim 存储/输出纪律；🔍 = Structured 检索/排序/元数据；⚙️ = 基础设施 / 修 bug。
 > **价值**：🔴 = 修 bug；🟠 = 架构升级；🟡 = 体验优化；🟢 = nice-to-have。
@@ -290,6 +291,7 @@ mem 的本性是 **"结构化记忆生命周期"**（status / supersedes / feedb
 > - **批 C（数据模型扩展，1 天）** #5 + #11 同期做，省一次 schema 迁移阵痛。
 > - **批 D（检索现代化，2–3 天）** #3 + #4 + #6 → **#12**。前三项是 #12 的前置条件（先有 HNSW 召回 + RRF，再做三段式重构）。
 > - **批 E（生命周期 / 卫生，半天–1 天）** #8 + #9。
+> - **批 F（无感集成，1.5 天）** **#13**。前置依赖批 C（#11 Sessions），因为 wake-up 的 essential story 必须按 session 切片才不混乱。
 
 ---
 
@@ -528,3 +530,130 @@ M（1 天，**前提是 #3 + #6 已完成**）：
 - **联动**：批 D 走完 #3/#4/#6 后再评估；如果 #3 落地后召回质量已经够好，#12 可降级为只做 Stage 2 拆分（半天）
 
 > commit 时引用：`refactor(retrieve): split into recall + filter + rerank stages (closes mempalace-diff §8 #12)`
+
+---
+
+## 13. Claude Code / Codex 无感集成包（让"用户毫无察觉"成为产品特性）
+
+### 现状对比
+
+MemPalace 在 Claude Code 里实现了真正的"无感"：用户写消息 → AI 自然回答 → 后台无声 mine → 下次会话开始 AI 已经"记得"。这个体验**不是来自 mempalace Python 包本身**，而是来自三类 Claude Code/Codex hook 脚本 + 一个离线 miner + 一个 wake-up CLI 的组合。
+
+mem 当前依赖 SKILL.md 提示 caller agent 主动调 `memory_search` / `memory_ingest`——能跑但**不无感**：依赖 prompt 遵守，且 agent 的 CoT 会泄漏 "I'll save this to mem"。
+
+### 三个组件
+
+#### 1. Hook 脚本（`hooks/mem_save_hook.sh` 等）
+
+**Stop hook** — 每 N 轮触发一次背景 mine：
+```bash
+# 简化版逻辑（仿 mempal_save_hook.sh）
+INPUT=$(cat)                          # Claude Code 传入 {session_id, transcript_path, ...}
+EXCHANGE_COUNT=$(...)                 # 从 transcript JSONL 数 user 消息
+if [ $((EXCHANGE_COUNT - LAST_SAVE)) -ge 15 ]; then
+    mem mine "$TRANSCRIPT_PATH" --mode convo &   # 后台 fork，立即返回
+    echo "$EXCHANGE_COUNT" > "$LAST_SAVE_FILE"
+fi
+echo '{}'                              # 空 JSON → AI 自然 stop，用户无感
+```
+
+**PreCompact hook** — 上下文压缩前最后一次 mine：
+```bash
+mem mine "$TRANSCRIPT_PATH" --mode convo --include-pending &
+echo '{}'
+```
+
+**SessionStart hook** — 会话开始注入 wake-up：
+```bash
+WAKEUP=$(mem wake-up --tenant local --token-budget 800)
+cat <<EOF
+{"hookSpecificOutput":{"hookEventName":"SessionStart","additionalContext":"$WAKEUP"}}
+EOF
+```
+
+三个脚本都跨平台（bash + Python 解析 stdin）+ 跨 agent runtime（Claude Code `.claude/settings.local.json` / Codex `.codex/hooks.json` 安装路径都覆盖）。
+
+#### 2. `mem mine` 离线 transcript miner
+
+**新子命令**（`src/cli/mine.rs`）：
+
+```bash
+mem mine <transcript-path-or-dir> [--mode convo|projects] \
+         [--tenant local] [--since <iso8601>] [--include-pending]
+```
+
+**convo 模式**：
+- 读 Claude Code / Codex 的 JSONL transcript
+- 按消息切分：user 消息 → 不入库（用户的话归用户）；assistant 消息中**显式标记保存的事实**（"I'll remember:" 模式或 `<mem-save>` 标签）→ POST 到 `/memories`
+- 多步任务完成 → POST 到 `/episodes`
+- 每条记录带上 `session_id`（来自 transcript 的 session_id 字段，对齐 #11）
+
+**projects 模式**：
+- 扫描代码/笔记目录，提取标题/decision 类的标记（README、CHANGELOG、`docs/decisions/*.md`）
+- POST 到 `/memories` 作为 `memory_type=implementation`
+
+**核心设计选择**：
+- ❌ **不**自动保存 user 消息原文（违反 verbatim 边界——user 的话在 transcript 里就是原始事实）
+- ✅ **只**保存 assistant 显式承诺保存的内容（`<mem-save>...</mem-save>` 标签或 SKILL.md 教 agent 用的模式）
+- ✅ **idempotency_key** 用 `transcript_path:line_no` —— 同一段转录跑多次 mine 不重复入库
+
+#### 3. `mem wake-up` 子命令
+
+**新子命令**（`src/cli/wake_up.rs`）：
+
+```bash
+mem wake-up [--tenant local] [--token-budget 800] [--session-id <last>]
+```
+
+**输出**（注入到 SessionStart hook 的 `additionalContext`）：
+- **L0**（~100 tokens）：从 `~/.mem/identity.txt` 读"用户身份"
+- **L1**（~700 tokens）：调内部 `memory_search` 拿 top-K facts/preferences/patterns，按 #12 三段式格式压缩
+- 总长度受 `token_budget` 硬约束
+
+**关键差异 vs 已有 `memory_bootstrap` MCP tool**：
+- `memory_bootstrap` 是 MCP 工具，**caller agent 必须主动调**——SKILL.md 提示但不强制
+- `mem wake-up` 是 CLI，**SessionStart hook 自动调**——绕过 caller，**真无感**
+
+### 与已有组件的关系
+
+| 已有 | 升级为 |
+|---|---|
+| `memory_bootstrap` MCP tool | 保留（caller 主动调）；`mem wake-up` CLI 是 hook-driven 的封装 |
+| `memory_ingest` MCP tool | 保留（caller 主动调）；`mem mine` 是 transcript-driven 的封装，背后还是同一 HTTP API |
+| SKILL.md "autopilot workflow" | 保留作为 prompt-level 指引；hooks 是 enforcement-level 兜底 |
+
+**没有任何旧能力被替换**——hooks 是叠加层，prompt-level 调用仍然有效（只是不再是唯一保险）。
+
+### 不做什么
+
+- ❌ **不**截获 user 原话保存（user 的话留在 transcript，不进 memory）
+- ❌ **不**做"实时 streaming mine"（hook 触发的 batch mine 已经够用，streaming 增加复杂度）
+- ❌ **不**绑定单一 agent runtime（hook 脚本自己适配 Claude Code + Codex；其他 runtime 加适配文档即可）
+- ❌ **不**强制启用（hook 注册仍然是 opt-in，README 给安装说明，用户不装也能跑）
+
+### 风险
+
+1. **跨平台 shell 兼容**：bash/zsh、macOS/Linux/Windows-WSL 都得测。**MemPalace 的脚本里有大量 macOS GUI launch 兜底逻辑（`MEMPAL_PYTHON` 环境变量绕开 PATH 问题），mem 抄一份**
+2. **transcript 格式漂移**：Claude Code 和 Codex 的 JSONL schema 不同，且各自版本会演进。`mem mine --mode convo` 必须有 schema 探测 + 容错，遇到不认识的字段跳过不报错
+3. **`mem wake-up` 的 token_budget 漂移**：注入到 SessionStart 后 caller LLM 的 context 减少了 ~800 tokens；要监控 caller 抱怨"context 不够用"的情况，提供 `MEM_WAKEUP_DISABLE=1` 一键关闭
+4. **与 #11 (Sessions) 的依赖**：wake-up 的 L1 essential story 应该按 "上一个 session" 加权——否则 100 个会话的 fact 一锅捞出，user 体验是"AI 记得乱七八糟的东西"。**不做完 #11 不要做 #13**
+
+### 工作量
+
+M（1.5 天，前提是 #11 完成）：
+
+- 4h：`mem mine --mode convo` 实现（解析 Claude Code JSONL + 提取 `<mem-save>` 标签）
+- 2h：`mem mine --mode projects` 实现（扫描 docs/ 目录提 decision 类标记）
+- 2h：`mem wake-up` 实现（L0 读文件 + L1 调内部 search + 压缩到 budget）
+- 3h：三个 hook 脚本（Stop/PreCompact/SessionStart）+ 跨平台测试
+- 1h：README 集成章节 + 注册到 `.claude/settings.local.json` / `.codex/hooks.json` 的步骤指引
+
+### 决策点（later choose）
+
+加这个 #13 不是承诺立刻做。建议：
+
+- **必做时机**：mem 第一个真实用户问"为什么我每次开会话都得手动调用 memory_search"
+- **可跳条件**：mem 永远只服务程序化 caller（CI/批处理），没有交互式 agent 用户 → 不需要"无感"
+- **联动**：必须先做完 #11；如果 #11 推迟，#13 也跟着推迟
+
+> commit 时引用：`feat(integration): add Claude Code / Codex hook bundle and offline miner (closes mempalace-diff §8 #13)`
