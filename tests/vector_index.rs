@@ -172,5 +172,36 @@ async fn load_rejects_fingerprint_mismatch() {
     )
     .await
     .unwrap_err();
-    matches!(err, mem::storage::VectorIndexError::FingerprintMismatch { .. });
+    assert!(matches!(err, mem::storage::VectorIndexError::FingerprintMismatch { .. }));
+}
+
+#[tokio::test]
+async fn load_rejects_zero_dim_meta() {
+    let dir = tempdir().unwrap();
+    let idx_path = dir.path().join("zero.usearch");
+    let meta_path = dir.path().join("zero.usearch.meta.json");
+    // Write a hand-crafted meta with dim=0 (no real usearch file needed — load_from
+    // reads meta first and must reject it before touching the index file).
+    let meta = mem::storage::VectorIndexMeta {
+        schema_version: 1,
+        provider: "fake".into(),
+        model: "fake".into(),
+        dim: 0,
+        row_count: 0,
+        id_map: std::collections::HashMap::new(),
+    };
+    std::fs::write(&meta_path, serde_json::to_vec(&meta).unwrap()).unwrap();
+    std::fs::write(&idx_path, b"unused").unwrap();
+    let err = mem::storage::VectorIndex::load_from(
+        &idx_path,
+        &meta_path,
+        &mem::storage::VectorIndexFingerprint {
+            provider: "fake".into(),
+            model: "fake".into(),
+            dim: 0,
+        },
+    )
+    .await
+    .unwrap_err();
+    assert!(matches!(err, mem::storage::VectorIndexError::FingerprintMismatch { .. }));
 }

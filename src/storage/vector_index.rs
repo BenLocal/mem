@@ -363,11 +363,10 @@ impl VectorIndex {
         let meta_bytes = fs::read(meta_path)?;
         let meta: VectorIndexMeta = serde_json::from_slice(&meta_bytes)?;
 
-        // Fingerprint validation: provider, model, and dim must all match.
-        if meta.provider != expected_fp.provider
-            || meta.model != expected_fp.model
-            || meta.dim != expected_fp.dim
-        {
+        // Sanity guard: dim == 0 means corrupted or hand-edited meta.
+        // Must be checked first, before the fingerprint comparison, so it fires
+        // even when expected_fp.dim == 0 (which the fingerprint check would pass).
+        if meta.dim == 0 {
             return Err(VectorIndexError::FingerprintMismatch {
                 stored: VectorIndexFingerprint {
                     provider: meta.provider.clone(),
@@ -378,9 +377,11 @@ impl VectorIndex {
             });
         }
 
-        // Task 2 carryover: guard against dim == 0 (corrupted / hand-edited meta).
-        // A zero-dim index would silently accept any query, so we reject it early.
-        if meta.dim == 0 {
+        // Fingerprint validation: provider, model, and dim must all match.
+        if meta.provider != expected_fp.provider
+            || meta.model != expected_fp.model
+            || meta.dim != expected_fp.dim
+        {
             return Err(VectorIndexError::FingerprintMismatch {
                 stored: VectorIndexFingerprint {
                     provider: meta.provider.clone(),
