@@ -7,4 +7,6 @@ pub use duckdb::{
     ClaimedEmbeddingJob, DuckDbRepository, EmbeddingJobInsert, FeedbackEvent, StorageError,
 };
 pub use graph::{GraphError, GraphStore, IndraDbGraphAdapter, LocalGraphAdapter};
-pub use vector_index::{EmbeddingRowSource, VectorIndex, VectorIndexError, VectorIndexFingerprint};
+pub use vector_index::{
+    EmbeddingRowSource, VectorIndex, VectorIndexError, VectorIndexFingerprint, VectorIndexMeta,
+};

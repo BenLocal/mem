@@ -1,11 +1,52 @@
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock, RwLockReadGuard, RwLockWriteGuard};
 
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 use usearch::{Index, IndexOptions, MetricKind, ScalarKind};
 
 use super::StorageError;
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct VectorIndexMeta {
+    pub schema_version: u32,
+    pub provider: String,
+    pub model: String,
+    pub dim: usize,
+    pub row_count: usize,
+    /// Stored as `{ "<u64-as-decimal-string>": "<memory_id>" }` to satisfy JSON object key rules.
+    #[serde(with = "u64_keyed_map")]
+    pub id_map: HashMap<u64, String>,
+}
+
+mod u64_keyed_map {
+    use std::collections::HashMap;
+    use serde::{Deserialize, Deserializer, Serializer};
+
+    pub fn serialize<S: Serializer>(
+        m: &HashMap<u64, String>,
+        s: S,
+    ) -> Result<S::Ok, S::Error> {
+        let stringy: HashMap<String, &String> =
+            m.iter().map(|(k, v)| (k.to_string(), v)).collect();
+        serde::Serialize::serialize(&stringy, s)
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(
+        d: D,
+    ) -> Result<HashMap<u64, String>, D::Error> {
+        let stringy: HashMap<String, String> = HashMap::deserialize(d)?;
+        stringy
+            .into_iter()
+            .map(|(k, v)| {
+                k.parse::<u64>()
+                    .map(|key| (key, v))
+                    .map_err(serde::de::Error::custom)
+            })
+            .collect()
+    }
+}
 
 #[derive(Debug, Clone)]
 pub struct VectorIndexFingerprint {

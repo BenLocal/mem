@@ -75,3 +75,26 @@ async fn remove_unknown_id_is_noop() {
     idx.remove("never_inserted").await.unwrap();
     assert_eq!(idx.size(), 0);
 }
+
+use mem::storage::vector_index::VectorIndexMeta;
+
+#[test]
+fn meta_round_trips_through_json() {
+    let meta = VectorIndexMeta {
+        schema_version: 1,
+        provider: "openai".into(),
+        model: "text-embedding-3-small".into(),
+        dim: 1536,
+        row_count: 42,
+        id_map: vec![(123u64, "mem_alpha".into()), (456u64, "mem_beta".into())]
+            .into_iter()
+            .collect(),
+    };
+    let s = serde_json::to_string(&meta).unwrap();
+    let back: VectorIndexMeta = serde_json::from_str(&s).unwrap();
+    assert_eq!(back.schema_version, 1);
+    assert_eq!(back.provider, "openai");
+    assert_eq!(back.row_count, 42);
+    assert_eq!(back.id_map.len(), 2);
+    assert_eq!(back.id_map.get(&123u64).unwrap(), "mem_alpha");
+}
