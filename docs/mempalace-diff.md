@@ -278,6 +278,7 @@ mem 的本性是 **"结构化记忆生命周期"**（status / supersedes / feedb
 | 9 | 🔍 | Entity registry（可选） | 🟢 数据卫生 | M（半天） | 中（迁移） | `domain/entity.rs`、schema |
 | 10 | 📦 | **Verbatim 守护**（ingest 校验 `summary != content`，禁止把提炼版塞 `content`；同时把"`content` 是事实源、`summary` 只做索引"写进 `AGENTS.md` / `README.md`） | 🟢 哲学一致性 | S（1h） | 低 | `pipeline/ingest.rs`、`AGENTS.md`、`README.md` |
 | 11 | 🔍 | **Sessions**（时间桶容器，对齐 MemPalace 的 Room） | 🟠 表达力 | M（半天） | 中（schema 迁移）| 新增 `sessions` 表 + `memories.session_id` + auto-bucket on ingest，详见 §11 |
+| 12 | 🔍 | **检索流水线三段式重构**（召回 → 结构化过滤 → caller 端 LLM 精排）| 🟠 架构升级 | M（1 天） | 中（依赖 #3 + #6） | `pipeline/retrieve.rs` 重构、`pipeline/compress.rs` 输出层调整，详见 §12 |
 
 > **层（Layer）**：📦 = Verbatim 存储/输出纪律；🔍 = Structured 检索/排序/元数据；⚙️ = 基础设施 / 修 bug。
 > **价值**：🔴 = 修 bug；🟠 = 架构升级；🟡 = 体验优化；🟢 = nice-to-have。
@@ -287,7 +288,7 @@ mem 的本性是 **"结构化记忆生命周期"**（status / supersedes / feedb
 > - **批 A（修 bug，3.5h）** ✅#1 已完成；#2 — 实际已被单 Mutex 保护，改"修注释"。
 > - **批 B（Verbatim 纪律落地，3h）** #10 + #7 + 文档化 — 把上面"设计原则"刻进代码。
 > - **批 C（数据模型扩展，1 天）** #5 + #11 同期做，省一次 schema 迁移阵痛。
-> - **批 D（性能/排序，1.5–2 天）** #3 + #4 + #6。
+> - **批 D（检索现代化，2–3 天）** #3 + #4 + #6 → **#12**。前三项是 #12 的前置条件（先有 HNSW 召回 + RRF，再做三段式重构）。
 > - **批 E（生命周期 / 卫生，半天–1 天）** #8 + #9。
 
 ---
@@ -295,7 +296,7 @@ mem 的本性是 **"结构化记忆生命周期"**（status / supersedes / feedb
 ## 9. 不建议引入的 MemPalace 概念
 
 - **Wing / Drawer 隐喻**：mem 已有等价物（`project`/`repo`/`module` 字段做 Wing，`memories` 行做 Drawer）；改名只会增加心智负担。**Room 单独例外，见 §11。**
-- **AAAK 压缩索引层**：mem 已经用 token-budgeted 输出解决了相同问题（让 LLM 看到的内容受控），AAAK 是对 BM25/向量的补充，不是替代。
+- **AAAK 在服务端烧 LLM 的实现**：MemPalace 自己烧 LLM 因为它没有外部调用方；mem 是 HTTP 服务，**调用方已经有自己的 LLM**（Codex/Cursor/CI agent），服务端再烧一次是双重计算 + 双重账单。**精神可借鉴（"两段式 + LLM 精排"），但实现上 mem 应通过更丰富的候选包让 caller 自己精排，见 §12 #12。**
 - **Hooks 驱动的后台归档**：mem 是 HTTP 服务模型，不绑定具体编辑器；类比物是 caller agent 主动 POST，不需要 hook。
 - **L0–L3 唤醒栈**：MemPalace 的 layered context 设计是为对话开场注入服务的；mem 的客户端（Codex/Cursor 等）有自己的开场注入逻辑，不应在服务端重做。
 
@@ -409,3 +410,121 @@ async fn resolve_session(
 M（半天）= schema 迁移 + `resolve_session` + ingest 路径接线 + 一个 `/sessions` 路由 + 单元测试。
 
 > commit 时引用：`feat(sessions): auto-bucket memories into time-based sessions (closes mempalace-diff §8 #11)`
+
+---
+
+## 12. 检索流水线三段式重构（取 mem 之结构化、借 MemPalace 之分层）
+
+### 当前状态：两边都不全
+
+| | mem 现状 | MemPalace 现状 |
+|---|---|---|
+| 召回（recall） | ❌ 全表线性扫 + cosine | ✅ HNSW + BM25 倒排 |
+| 多信号融合 | ✅ 一锅加性求和 | ⚠️ RRF（无 lifecycle） |
+| 生命周期感知 | ✅ decay/status/confidence/intent | ❌ 无 |
+| LLM 兜底精排 | ❌ 无 | ✅ AAAK |
+| 可扩展性 | ❌ O(N) | ✅ O(log N) |
+| Verbatim 一致 | ⚠️ summary 权重 > content | ✅ 完全 verbatim |
+| 延迟/成本 | ✅ 零 LLM 调用 | ❌ 每查询 1 次 LLM |
+
+### 核心洞察
+
+mem 的**生命周期信号**（`decay/status/confidence/intent`）和 MemPalace 的**分层流水线 + LLM 精排****正交、不冲突**。两边强项的并集就是最优解。
+
+### 目标架构
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│ Stage 1（召回 / Recall）  sublinear，零 LLM                   │
+│   BM25 + 向量（HNSW）→ top-K 候选（K=50–100）                 │
+│   ↑ 借 MemPalace：HNSW + RRF 融合                             │
+│   ↑ 前置：§8 #3（usearch sidecar）+ §8 #6（RRF）              │
+├─────────────────────────────────────────────────────────────┤
+│ Stage 2（结构化过滤 / Filter）  零 LLM                        │
+│   按 mem 现有信号重排 top-K → top-N（N=5–10）                 │
+│   - scope_filters / status / pending 惩罚                     │
+│   - decay_score、confidence、validation                       │
+│   - intent × memory_type                                      │
+│   - graph_boost（图邻居）                                     │
+│   ↑ 保 mem 路线：把 lifecycle 从"线性求和的一项"              │
+│     改为"召回后的 rerank 过滤层"                              │
+├─────────────────────────────────────────────────────────────┤
+│ Stage 3（精排 / Rerank）  调用方做，服务端不烧 LLM            │
+│   返回更丰富的候选包（top-N 含元数据）                        │
+│   caller agent 用自己的 LLM + 当前对话上下文做最终挑选        │
+│   ↑ AAAK 的精神：让 LLM 兜底；                                │
+│     但**实现位置在 caller**，避免双重计算 + 双重账单          │
+└─────────────────────────────────────────────────────────────┘
+```
+
+### 与现有代码的对应关系
+
+| 阶段 | 现 in mem | 改造后 |
+|---|---|---|
+| Stage 1 召回 | `merge_and_rank_hybrid` 一次过 + cosine 全扫 | 拆出 `recall_candidates(query, k=100)`，调 #3 的 ANN 索引 + BM25 |
+| Stage 2 过滤 | 加性求和混在一起 | 拆出 `apply_lifecycle_filters(candidates, query)`，把 decay/status/intent/graph_boost 单独算 |
+| Stage 3 精排 | `compress.rs` 已有半截（token_budget 切分） | 输出层不再做粗暴截断，改为返回**结构化候选包**，让 caller 决定 |
+
+### 输出格式调整（compress.rs）
+
+现在 `compress.rs` 强行把候选切成 `directives / relevant_facts / reusable_patterns / suggested_workflow` 四桶 + 词截断。三段式重构后，**Stage 3 的输入应该是更丰富的元数据，让 caller LLM 自己分类**：
+
+```jsonc
+{
+  "candidates": [
+    {
+      "memory_id": "mem_...",
+      "memory_type": "implementation",
+      "content": "...",                    // verbatim, 不截断
+      "summary": "...",                    // index hint, 不当事实源
+      "score_breakdown": {
+        "recall": {"bm25": 12.3, "vector_sim": 0.82},
+        "lifecycle": {"confidence": 0.9, "decay": 0.0, "validated": true},
+        "context": {"scope_match": true, "intent_boost": 8, "graph_neighbor": false}
+      },
+      "code_refs": [...], "tags": [...], "graph_links": [...],
+      "session_id": "...", "version_chain": [...]
+    },
+    ...
+  ],
+  "stage_1_recall_size": 87,
+  "stage_2_filter_size": 8,
+  "token_budget_hint": 400              // caller 可选择压缩到此预算
+}
+```
+
+`token_budget` 从"硬截断"降级为"提示"，**caller 可选择性压缩**（compress.rs 仍可作为可选 helper 暴露给老调用方）。
+
+### 不做什么
+
+- ❌ **不**在服务端调 LLM（成本 + 延迟 + API 依赖）
+- ❌ **不**抛弃 mem 已有的所有信号（intent / decay / scope / graph_boost 全保留，只是搬到 Stage 2）
+- ❌ **不**把 `compress.rs` 的旧契约一刀切（保留 `/memories/search` 旧响应形状作为 deprecated 兼容路径，至少一个 minor 版本）
+- ❌ **不**强制 caller 用 LLM 精排（caller 可只用 Stage 1+2 结果直接答；Stage 3 是 opt-in）
+
+### 风险
+
+1. **行为漂移**：Stage 2 用 rerank 替代加性求和，**排序可能与现在不同**。需要：
+   - 保留旧 `merge_and_rank_hybrid` 实现作为 `legacy_rank` 路径，加 `MEM_RANKER=legacy` 环境变量做 A/B 切换
+   - 跑 `tests/search_api.rs` 的所有现有用例，确认 top-1 不退化（允许 top-5 内顺序变动）
+2. **召回参数调优**：K=50–100 的选择直接影响 Stage 2 输入质量。先用 100 作为保守起点，加指标观察 Stage 1→Stage 2 的过滤率
+3. **响应体变大**：Stage 3 返回更多元数据，`/memories/search` 响应体可能从几 KB 涨到几十 KB。加 `?compact=1` 兼容老 caller
+4. **依赖前置**：#3（HNSW）和 #6（RRF）必须先做，否则 Stage 1 还是线性扫，三段式没意义
+
+### 工作量
+
+M（1 天，**前提是 #3 + #6 已完成**）：
+
+- 4h：拆 `merge_and_rank_hybrid` → `recall_candidates` + `apply_lifecycle_filters`
+- 2h：响应格式扩展 + `compact=1` 兼容
+- 2h：A/B 切换（`MEM_RANKER=legacy|three_stage`） + 测试
+
+### 决策点（later choose）
+
+加这个 #12 是**记录设计意图**，不是承诺立刻做。建议：
+
+- **必做时机**：当数据量增长到 `tests/search_api.rs` 出现 P95 延迟报警，或 caller 反馈"压缩输出失真"时
+- **可跳条件**：mem 永远小规模（<1000 memories/tenant）+ 调用方满意现在的输出 → 不需要重构
+- **联动**：批 D 走完 #3/#4/#6 后再评估；如果 #3 落地后召回质量已经够好，#12 可降级为只做 Stage 2 拆分（半天）
+
+> commit 时引用：`refactor(retrieve): split into recall + filter + rerank stages (closes mempalace-diff §8 #12)`
