@@ -274,3 +274,52 @@ async fn diagnose_reports_fingerprint_mismatch_on_zero_dim_meta() {
     assert_eq!(report.status, "corrupt");
     assert!(matches!(report.details, DiagnosticStatus::FingerprintMismatch { .. }));
 }
+
+#[tokio::test]
+async fn diagnose_reports_index_corrupt_when_binary_is_garbage() {
+    let dir = tempdir().unwrap();
+    let db = dir.path().join("ic.duckdb");
+    let (repo, _idx) = seed_one_row_with_index(&db).await;
+    let (idx_path, _) = sidecar_paths(&db);
+    std::fs::write(&idx_path, b"GARBAGE_NOT_USEARCH_BINARY").unwrap();
+
+    let settings = EmbeddingSettings::development_defaults();
+    let fp = VectorIndexFingerprint {
+        provider: settings.job_provider_id().to_string(),
+        model: settings.model.clone(),
+        dim: settings.dim,
+    };
+    let report = diagnose(&repo, &db, &fp).await.unwrap();
+    assert_eq!(report.status, "corrupt");
+    assert!(matches!(report.details, DiagnosticStatus::IndexCorrupt { .. }));
+}
+
+#[tokio::test]
+async fn diagnose_reports_index_meta_drift_when_meta_lies_about_count() {
+    let dir = tempdir().unwrap();
+    let db = dir.path().join("imd.duckdb");
+    let (repo, _idx) = seed_one_row_with_index(&db).await;
+    let (_, meta_path) = sidecar_paths(&db);
+
+    // Read meta, bump row_count by 5 (meta lies about count), write back
+    let raw = std::fs::read(&meta_path).unwrap();
+    let mut meta: mem::storage::VectorIndexMeta = serde_json::from_slice(&raw).unwrap();
+    meta.row_count = meta.row_count + 5;
+    std::fs::write(&meta_path, serde_json::to_vec(&meta).unwrap()).unwrap();
+
+    let settings = EmbeddingSettings::development_defaults();
+    let fp = VectorIndexFingerprint {
+        provider: settings.job_provider_id().to_string(),
+        model: settings.model.clone(),
+        dim: settings.dim,
+    };
+    let report = diagnose(&repo, &db, &fp).await.unwrap();
+    assert_eq!(report.status, "drift");
+    match report.details {
+        DiagnosticStatus::IndexMetaDrift { index_size, meta_count } => {
+            assert_eq!(index_size, 1);
+            assert_eq!(meta_count, 6);
+        }
+        other => panic!("expected IndexMetaDrift, got {other:?}"),
+    }
+}
