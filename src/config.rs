@@ -29,6 +29,9 @@ pub struct EmbeddingSettings {
     pub max_retries: u32,
     pub batch_size: usize,
     pub openai_api_key: Option<String>,
+    pub vector_index_flush_every: usize,
+    pub vector_index_oversample: usize,
+    pub vector_index_use_legacy: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -69,6 +72,9 @@ impl EmbeddingSettings {
             max_retries: 4,
             batch_size: 1,
             openai_api_key: None,
+            vector_index_flush_every: 100,
+            vector_index_oversample: 4,
+            vector_index_use_legacy: false,
         }
     }
 
@@ -137,6 +143,28 @@ impl EmbeddingSettings {
             && s.openai_api_key.as_deref().unwrap_or("").is_empty()
         {
             return Err(ConfigError::MissingOpenAiApiKey);
+        }
+
+        if let Some(raw) = get("MEM_VECTOR_INDEX_FLUSH_EVERY") {
+            let n: usize = raw.parse().map_err(|_| {
+                ConfigError::InvalidEmbeddingDim(format!("flush_every: {raw}"))
+            })?;
+            if n == 0 {
+                return Err(ConfigError::InvalidEmbeddingDim("flush_every=0".into()));
+            }
+            s.vector_index_flush_every = n;
+        }
+        if let Some(raw) = get("MEM_VECTOR_INDEX_OVERSAMPLE") {
+            let n: usize = raw.parse().map_err(|_| {
+                ConfigError::InvalidEmbeddingDim(format!("oversample: {raw}"))
+            })?;
+            if n == 0 {
+                return Err(ConfigError::InvalidEmbeddingDim("oversample=0".into()));
+            }
+            s.vector_index_oversample = n;
+        }
+        if let Some(raw) = get("MEM_VECTOR_INDEX_USE_LEGACY") {
+            s.vector_index_use_legacy = matches!(raw.as_str(), "1" | "true" | "yes");
         }
 
         Ok(s)
@@ -260,5 +288,26 @@ mod tests {
         assert_eq!(s.provider, EmbeddingProviderKind::EmbedAnything);
         assert_eq!(s.openai_api_key, None);
         assert_eq!(s.job_provider_id(), "embedanything");
+    }
+
+    #[test]
+    fn vector_index_settings_have_defaults() {
+        let s = EmbeddingSettings::from_env_vars(|_| None).unwrap();
+        assert_eq!(s.vector_index_flush_every, 100);
+        assert_eq!(s.vector_index_oversample, 4);
+        assert!(!s.vector_index_use_legacy);
+    }
+
+    #[test]
+    fn vector_index_settings_read_from_env() {
+        let s = EmbeddingSettings::from_env_vars(env(&[
+            ("MEM_VECTOR_INDEX_FLUSH_EVERY", "50"),
+            ("MEM_VECTOR_INDEX_OVERSAMPLE", "8"),
+            ("MEM_VECTOR_INDEX_USE_LEGACY", "1"),
+        ]))
+        .unwrap();
+        assert_eq!(s.vector_index_flush_every, 50);
+        assert_eq!(s.vector_index_oversample, 8);
+        assert!(s.vector_index_use_legacy);
     }
 }
