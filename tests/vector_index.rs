@@ -322,3 +322,36 @@ async fn open_or_rebuild_recovers_from_missing_meta_file() {
     let idx = VectorIndex::open_or_rebuild(&repo, &db, &fp).await.unwrap();
     assert_eq!(idx.size(), 1);
 }
+
+#[tokio::test]
+async fn concurrent_search_and_upsert_does_not_panic() {
+    let idx = std::sync::Arc::new(VectorIndex::new_in_memory(256, "fake", "fake", 64));
+    // Pre-populate
+    for i in 0..32u8 {
+        idx.upsert(&format!("seed_{i}"), &unit_vector(256, i)).await.unwrap();
+    }
+
+    let mut handles = Vec::new();
+    for q in 0..10u8 {
+        let idx_c = idx.clone();
+        handles.push(tokio::spawn(async move {
+            for _ in 0..50 {
+                let _ = idx_c.search(&unit_vector(256, q), 5).await.unwrap();
+            }
+        }));
+    }
+    let idx_w = idx.clone();
+    handles.push(tokio::spawn(async move {
+        for i in 100..150u8 {
+            idx_w
+                .upsert(&format!("hot_{i}"), &unit_vector(256, i))
+                .await
+                .unwrap();
+        }
+    }));
+
+    for h in handles {
+        h.await.unwrap();
+    }
+    assert!(idx.size() >= 32);
+}
