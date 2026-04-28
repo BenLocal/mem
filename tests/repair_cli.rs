@@ -1,4 +1,5 @@
 use mem::storage::{DiagnosticReport, DiagnosticStatus, PathInfo, SidecarFile, VectorIndexFingerprint, sidecar_paths, rebuild_index};
+use mem::cli::repair::format_check_text;
 use std::path::PathBuf;
 
 // ── imports used by the async integration tests ───────────────────────────────
@@ -383,4 +384,60 @@ async fn rebuild_index_recovers_from_drift() {
         DiagnosticStatus::Healthy { rows } => assert_eq!(rows, 2),
         other => panic!("expected Healthy after rebuild, got {other:?}"),
     }
+}
+
+#[test]
+fn format_check_text_for_healthy() {
+    let report = DiagnosticReport {
+        status: "healthy",
+        details: DiagnosticStatus::Healthy { rows: 1247 },
+        paths: paths(),
+        elapsed_ms: 18,
+    };
+    let s = format_check_text(&report);
+    assert!(s.contains("Healthy"), "{s}");
+    assert!(s.contains("1247"), "{s}");
+    assert!(s.contains("18ms"), "{s}");
+}
+
+#[test]
+fn format_check_text_for_db_drift() {
+    let report = DiagnosticReport {
+        status: "drift",
+        details: DiagnosticStatus::DbDrift { meta_count: 1247, db_count: 1250 },
+        paths: paths(),
+        elapsed_ms: 12,
+    };
+    let s = format_check_text(&report);
+    assert!(s.contains("Drift detected"), "{s}");
+    assert!(s.contains("1247"), "{s}");
+    assert!(s.contains("1250"), "{s}");
+    assert!(s.contains("mem repair --rebuild"), "should suggest rebuild: {s}");
+}
+
+#[test]
+fn format_check_text_for_index_corrupt() {
+    let report = DiagnosticReport {
+        status: "corrupt",
+        details: DiagnosticStatus::IndexCorrupt { reason: "boom".into() },
+        paths: paths(),
+        elapsed_ms: 8,
+    };
+    let s = format_check_text(&report);
+    assert!(s.contains("Index file is corrupt"), "{s}");
+    assert!(s.contains("boom"), "{s}");
+    assert!(s.contains("mem repair --rebuild"), "{s}");
+}
+
+#[test]
+fn format_check_text_for_db_unavailable() {
+    let report = DiagnosticReport {
+        status: "db_unavailable",
+        details: DiagnosticStatus::DbUnavailable { reason: "file is locked".into() },
+        paths: paths(),
+        elapsed_ms: 2,
+    };
+    let s = format_check_text(&report);
+    assert!(s.contains("Could not open DB"), "{s}");
+    assert!(s.contains("mem serve"), "should hint at running service: {s}");
 }
