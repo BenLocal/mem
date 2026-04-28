@@ -265,7 +265,7 @@ mem 的本性是 **"结构化记忆生命周期"**（status / supersedes / feedb
 | # | 层 | 项 | 价值 | 工作量 | 风险 | 触点 |
 |---|---|---|---|---|---|---|
 | 2 | ⚙️ | ✅ `embedding_jobs` dedupe 复核（实际已被 Mutex + 事务覆盖，仅修注释/文档）| 🔴 修并发 bug | S（0.5h） | 低 | `storage/duckdb.rs`、`db/schema/002_embeddings.sql` |
-| 3 | 🔍 | 引入 `usearch` sidecar ANN（同时消除 `semantic_search_memories` 的 `limit 2000` 隐式截断）| 🟠 性能基础设施 + 🔴 修隐式正确性边界 | M（1–2 天） | 中（需要 repair 路径） | `Cargo.toml`、`storage/`、新增 `vector_index.rs` |
+| 3 | 🔍 | ✅ 引入 `usearch` sidecar ANN（消除 `semantic_search_memories` 的 `limit 2000` 隐式截断）| 🟠 性能基础设施 + 🔴 修隐式正确性边界 | M（1–2 天） | 中（需要 repair 路径） | `Cargo.toml`、`storage/`、新增 `vector_index.rs` |
 | 4 | ⚙️ | HNSW 健康度自检 + repair CLI | 🟠 配套 #3 | S（4h） | 低 | 新增 `bin/mem-repair` |
 | 5 | 🔍 | 图边时序化（valid_from/to） | 🟠 表达力 | M（4–6h） | 中 | `domain/memory.rs`、`storage/graph.rs`、`pipeline/ingest.rs` |
 | 6 | 🔍 | 检索分数归一化 / RRF | 🟡 排序质量 | S（3h） | 低 | `pipeline/retrieve.rs` |
