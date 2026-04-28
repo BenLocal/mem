@@ -160,6 +160,26 @@ impl DuckDbGraphStore {
         }
         Ok(out)
     }
+
+    pub async fn all_edges_for_memory(
+        &self,
+        memory_id: &str,
+    ) -> Result<Vec<GraphEdge>, DuckDbGraphError> {
+        let from = format!("memory:{memory_id}");
+        let conn = self.repo.conn()?;
+        let mut stmt = conn.prepare(
+            "select from_node_id, to_node_id, relation, valid_from, valid_to
+               from graph_edges
+              where from_node_id = ?1
+              order by valid_from",
+        )?;
+        let rows = stmt.query_map(duckdb::params![&from], map_row_to_edge)?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row?);
+        }
+        Ok(out)
+    }
 }
 
 fn current_timestamp() -> String {

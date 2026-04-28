@@ -193,3 +193,44 @@ async fn related_memory_ids_excludes_superseded() {
     assert_eq!(one.len(), 1, "only v2 should remain: {one:?}");
     assert_eq!(one[0], r2.memory_id);
 }
+
+#[tokio::test]
+async fn all_edges_for_memory_returns_history_including_closed() {
+    let dir = tempdir().unwrap();
+    let db = dir.path().join("hist.duckdb");
+    let (repo, graph) = open_repo_and_graph(&db).await;
+    let svc = MemoryService::new((*repo).clone());
+    let r = ingest_one(&svc, "epsilon", Some("foo"), Some("mem")).await;
+    let memory = repo.get_memory_for_tenant("t", &r.memory_id).await.unwrap().unwrap();
+    graph.sync_memory(&memory).await.unwrap();
+    graph.close_edges_for_memory(&r.memory_id).await.unwrap();
+
+    let all = graph.all_edges_for_memory(&r.memory_id).await.unwrap();
+    assert!(!all.is_empty(), "history should include the now-closed edges");
+    for edge in &all {
+        assert!(edge.valid_to.is_some(), "every edge in history should be closed");
+    }
+}
+
+#[tokio::test]
+async fn reopened_edge_creates_new_row() {
+    let dir = tempdir().unwrap();
+    let db = dir.path().join("reopen.duckdb");
+    let (repo, graph) = open_repo_and_graph(&db).await;
+    let svc = MemoryService::new((*repo).clone());
+    let r = ingest_one(&svc, "zeta", Some("foo"), Some("mem")).await;
+    let memory = repo.get_memory_for_tenant("t", &r.memory_id).await.unwrap().unwrap();
+
+    graph.sync_memory(&memory).await.unwrap();
+    graph.close_edges_for_memory(&r.memory_id).await.unwrap();
+    tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+    graph.sync_memory(&memory).await.unwrap();
+
+    let history = graph.all_edges_for_memory(&r.memory_id).await.unwrap();
+    let applies_to: Vec<_> = history.iter().filter(|e| e.relation == "applies_to").collect();
+    assert_eq!(applies_to.len(), 2, "expect closed + active rows for same triple");
+    let closed_count = applies_to.iter().filter(|e| e.valid_to.is_some()).count();
+    let active_count = applies_to.iter().filter(|e| e.valid_to.is_none()).count();
+    assert_eq!(closed_count, 1);
+    assert_eq!(active_count, 1);
+}
