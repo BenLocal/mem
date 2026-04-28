@@ -34,25 +34,40 @@ pub enum SidecarFile {
 #[derive(Debug, Clone, Serialize)]
 #[serde(tag = "kind")]
 pub enum DiagnosticStatus {
-    Healthy { rows: i64 },
-    SidecarMissing { which: SidecarFile },
-    MetaCorrupt { reason: String },
+    Healthy {
+        rows: i64,
+    },
+    SidecarMissing {
+        which: SidecarFile,
+    },
+    MetaCorrupt {
+        reason: String,
+    },
     FingerprintMismatch {
         stored: VectorIndexFingerprint,
         current: VectorIndexFingerprint,
     },
-    IndexCorrupt { reason: String },
-    IndexMetaDrift { index_size: usize, meta_count: usize },
-    DbDrift { meta_count: usize, db_count: i64 },
-    DbUnavailable { reason: String },
+    IndexCorrupt {
+        reason: String,
+    },
+    IndexMetaDrift {
+        index_size: usize,
+        meta_count: usize,
+    },
+    DbDrift {
+        meta_count: usize,
+        db_count: i64,
+    },
+    DbUnavailable {
+        reason: String,
+    },
 }
 
 impl DiagnosticStatus {
     pub fn coarse_status(&self) -> &'static str {
         match self {
             DiagnosticStatus::Healthy { .. } => "healthy",
-            DiagnosticStatus::IndexMetaDrift { .. }
-            | DiagnosticStatus::DbDrift { .. } => "drift",
+            DiagnosticStatus::IndexMetaDrift { .. } | DiagnosticStatus::DbDrift { .. } => "drift",
             DiagnosticStatus::SidecarMissing { .. }
             | DiagnosticStatus::MetaCorrupt { .. }
             | DiagnosticStatus::FingerprintMismatch { .. }
@@ -93,14 +108,18 @@ pub async fn diagnose(
 
     if !idx_path.exists() {
         return Ok(report_for(
-            DiagnosticStatus::SidecarMissing { which: SidecarFile::Index },
+            DiagnosticStatus::SidecarMissing {
+                which: SidecarFile::Index,
+            },
             path_info,
             started,
         ));
     }
     if !meta_path.exists() {
         return Ok(report_for(
-            DiagnosticStatus::SidecarMissing { which: SidecarFile::Meta },
+            DiagnosticStatus::SidecarMissing {
+                which: SidecarFile::Meta,
+            },
             path_info,
             started,
         ));
@@ -110,7 +129,9 @@ pub async fn diagnose(
         Ok(b) => b,
         Err(e) => {
             return Ok(report_for(
-                DiagnosticStatus::MetaCorrupt { reason: e.to_string() },
+                DiagnosticStatus::MetaCorrupt {
+                    reason: e.to_string(),
+                },
                 path_info,
                 started,
             ));
@@ -120,7 +141,9 @@ pub async fn diagnose(
         Ok(m) => m,
         Err(e) => {
             return Ok(report_for(
-                DiagnosticStatus::MetaCorrupt { reason: e.to_string() },
+                DiagnosticStatus::MetaCorrupt {
+                    reason: e.to_string(),
+                },
                 path_info,
                 started,
             ));
@@ -174,14 +197,20 @@ pub async fn diagnose(
     let index_size = index.size();
     if index_size != meta.row_count {
         return Ok(report_for(
-            DiagnosticStatus::IndexMetaDrift { index_size, meta_count: meta.row_count },
+            DiagnosticStatus::IndexMetaDrift {
+                index_size,
+                meta_count: meta.row_count,
+            },
             path_info,
             started,
         ));
     }
     if (meta.row_count as i64) != live_count {
         return Ok(report_for(
-            DiagnosticStatus::DbDrift { meta_count: meta.row_count, db_count: live_count },
+            DiagnosticStatus::DbDrift {
+                meta_count: meta.row_count,
+                db_count: live_count,
+            },
             path_info,
             started,
         ));
@@ -194,11 +223,7 @@ pub async fn diagnose(
     ))
 }
 
-fn report_for(
-    status: DiagnosticStatus,
-    paths: PathInfo,
-    started: Instant,
-) -> DiagnosticReport {
+fn report_for(status: DiagnosticStatus, paths: PathInfo, started: Instant) -> DiagnosticReport {
     let coarse = status.coarse_status();
     DiagnosticReport {
         status: coarse,
@@ -231,12 +256,16 @@ pub async fn rebuild_index(
     // Best-effort delete; NotFound is fine.
     if let Err(e) = std::fs::remove_file(&idx_path) {
         if e.kind() != std::io::ErrorKind::NotFound {
-            return Err(StorageError::VectorIndex(format!("failed to remove old index: {e}")));
+            return Err(StorageError::VectorIndex(format!(
+                "failed to remove old index: {e}"
+            )));
         }
     }
     if let Err(e) = std::fs::remove_file(&meta_path) {
         if e.kind() != std::io::ErrorKind::NotFound {
-            return Err(StorageError::VectorIndex(format!("failed to remove old meta: {e}")));
+            return Err(StorageError::VectorIndex(format!(
+                "failed to remove old meta: {e}"
+            )));
         }
     }
     let idx = VectorIndex::open_or_rebuild(repo, db_path, expected_fp)

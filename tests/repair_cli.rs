@@ -1,12 +1,15 @@
-use mem::storage::{DiagnosticReport, DiagnosticStatus, PathInfo, SidecarFile, VectorIndexFingerprint, sidecar_paths, rebuild_index};
-use mem::cli::repair::{format_check_text, format_check_json, format_rebuild_json, format_rebuild_text, RebuildOutcome};
+use mem::cli::repair::{
+    format_check_json, format_check_text, format_rebuild_json, format_rebuild_text, RebuildOutcome,
+};
+use mem::storage::{
+    rebuild_index, sidecar_paths, DiagnosticReport, DiagnosticStatus, PathInfo, SidecarFile,
+    VectorIndexFingerprint,
+};
 use std::path::PathBuf;
 
 // ── imports used by the async integration tests ───────────────────────────────
 use mem::config::EmbeddingSettings;
-use mem::domain::memory::{
-    IngestMemoryRequest, MemoryType, Scope, Visibility, WriteMode,
-};
+use mem::domain::memory::{IngestMemoryRequest, MemoryType, Scope, Visibility, WriteMode};
 use mem::embedding::arc_embedding_provider;
 use mem::service::{embedding_worker, MemoryService};
 use mem::storage::{diagnose, DuckDbRepository, VectorIndex};
@@ -14,7 +17,11 @@ use std::sync::Arc;
 use tempfile::tempdir;
 
 fn fp(dim: usize) -> VectorIndexFingerprint {
-    VectorIndexFingerprint { provider: "fake".into(), model: "fake".into(), dim }
+    VectorIndexFingerprint {
+        provider: "fake".into(),
+        model: "fake".into(),
+        dim,
+    }
 }
 
 fn paths() -> PathInfo {
@@ -28,43 +35,56 @@ fn paths() -> PathInfo {
 #[test]
 fn diagnostic_report_serializes_with_status_string_and_kind_field() {
     let cases = vec![
+        (DiagnosticStatus::Healthy { rows: 42 }, "healthy", "Healthy"),
         (
-            DiagnosticStatus::Healthy { rows: 42 },
-            "healthy",
-            "Healthy",
-        ),
-        (
-            DiagnosticStatus::SidecarMissing { which: SidecarFile::Index },
+            DiagnosticStatus::SidecarMissing {
+                which: SidecarFile::Index,
+            },
             "corrupt",
             "SidecarMissing",
         ),
         (
-            DiagnosticStatus::MetaCorrupt { reason: "parse fail".into() },
+            DiagnosticStatus::MetaCorrupt {
+                reason: "parse fail".into(),
+            },
             "corrupt",
             "MetaCorrupt",
         ),
         (
-            DiagnosticStatus::FingerprintMismatch { stored: fp(128), current: fp(256) },
+            DiagnosticStatus::FingerprintMismatch {
+                stored: fp(128),
+                current: fp(256),
+            },
             "corrupt",
             "FingerprintMismatch",
         ),
         (
-            DiagnosticStatus::IndexCorrupt { reason: "load fail".into() },
+            DiagnosticStatus::IndexCorrupt {
+                reason: "load fail".into(),
+            },
             "corrupt",
             "IndexCorrupt",
         ),
         (
-            DiagnosticStatus::IndexMetaDrift { index_size: 5, meta_count: 6 },
+            DiagnosticStatus::IndexMetaDrift {
+                index_size: 5,
+                meta_count: 6,
+            },
             "drift",
             "IndexMetaDrift",
         ),
         (
-            DiagnosticStatus::DbDrift { meta_count: 7, db_count: 8 },
+            DiagnosticStatus::DbDrift {
+                meta_count: 7,
+                db_count: 8,
+            },
             "drift",
             "DbDrift",
         ),
         (
-            DiagnosticStatus::DbUnavailable { reason: "locked".into() },
+            DiagnosticStatus::DbUnavailable {
+                reason: "locked".into(),
+            },
             "db_unavailable",
             "DbUnavailable",
         ),
@@ -78,8 +98,14 @@ fn diagnostic_report_serializes_with_status_string_and_kind_field() {
             elapsed_ms: 12,
         };
         let v = serde_json::to_value(&report).unwrap();
-        assert_eq!(v["status"], expected_status, "status string for {expected_kind}");
-        assert_eq!(v["details"]["kind"], expected_kind, "details.kind for {expected_kind}");
+        assert_eq!(
+            v["status"], expected_status,
+            "status string for {expected_kind}"
+        );
+        assert_eq!(
+            v["details"]["kind"], expected_kind,
+            "details.kind for {expected_kind}"
+        );
         assert!(v["paths"]["db"].is_string(), "paths.db present");
         assert!(v["paths"]["index"].is_string(), "paths.index present");
         assert!(v["paths"]["meta"].is_string(), "paths.meta present");
@@ -99,7 +125,9 @@ fn expected_status_to_static(s: &str) -> &'static str {
 
 // ── integration helpers ───────────────────────────────────────────────────────
 
-async fn seed_one_row_with_index(db_path: &std::path::Path) -> (DuckDbRepository, Arc<VectorIndex>) {
+async fn seed_one_row_with_index(
+    db_path: &std::path::Path,
+) -> (DuckDbRepository, Arc<VectorIndex>) {
     let repo = DuckDbRepository::open(db_path).await.unwrap();
     let settings = EmbeddingSettings::development_defaults();
     let provider = arc_embedding_provider(&settings).unwrap();
@@ -108,7 +136,11 @@ async fn seed_one_row_with_index(db_path: &std::path::Path) -> (DuckDbRepository
         model: settings.model.clone(),
         dim: settings.dim,
     };
-    let idx = Arc::new(VectorIndex::open_or_rebuild(&repo, db_path, &fp).await.unwrap());
+    let idx = Arc::new(
+        VectorIndex::open_or_rebuild(&repo, db_path, &fp)
+            .await
+            .unwrap(),
+    );
     repo.attach_vector_index(idx.clone());
     let svc = MemoryService::new(repo.clone());
     svc.ingest(IngestMemoryRequest {
@@ -130,7 +162,9 @@ async fn seed_one_row_with_index(db_path: &std::path::Path) -> (DuckDbRepository
     })
     .await
     .unwrap();
-    embedding_worker::tick(&repo, provider.as_ref(), &settings).await.unwrap();
+    embedding_worker::tick(&repo, provider.as_ref(), &settings)
+        .await
+        .unwrap();
     // Force a save so the meta.row_count is durable on disk.
     idx.save_at_default_paths().await.unwrap();
     (repo, idx)
@@ -151,7 +185,10 @@ async fn diagnose_healthy_db_returns_healthy() {
 
     let report = diagnose(&repo, &db, &fp).await.unwrap();
     assert_eq!(report.status, "healthy");
-    assert!(matches!(report.details, DiagnosticStatus::Healthy { rows: 1 }));
+    assert!(matches!(
+        report.details,
+        DiagnosticStatus::Healthy { rows: 1 }
+    ));
     assert_eq!(report.details.exit_code(), 0);
 }
 
@@ -218,7 +255,10 @@ async fn diagnose_reports_meta_corrupt_when_meta_is_invalid_json() {
     };
     let report = diagnose(&repo, &db, &fp).await.unwrap();
     assert_eq!(report.status, "corrupt");
-    assert!(matches!(report.details, DiagnosticStatus::MetaCorrupt { .. }));
+    assert!(matches!(
+        report.details,
+        DiagnosticStatus::MetaCorrupt { .. }
+    ));
 }
 
 #[tokio::test]
@@ -234,7 +274,7 @@ async fn diagnose_reports_fingerprint_mismatch_on_dim_change() {
         model: settings.model.clone(),
         dim: settings.dim,
     };
-    fp.dim = 128;  // disk has 256 (development default)
+    fp.dim = 128; // disk has 256 (development default)
 
     let report = diagnose(&repo, &db, &fp).await.unwrap();
     assert_eq!(report.status, "corrupt");
@@ -269,11 +309,14 @@ async fn diagnose_reports_fingerprint_mismatch_on_zero_dim_meta() {
     let fp = VectorIndexFingerprint {
         provider: settings.job_provider_id().to_string(),
         model: settings.model.clone(),
-        dim: 0,  // matches stored — but the dim==0 guard fires regardless
+        dim: 0, // matches stored — but the dim==0 guard fires regardless
     };
     let report = diagnose(&repo, &db, &fp).await.unwrap();
     assert_eq!(report.status, "corrupt");
-    assert!(matches!(report.details, DiagnosticStatus::FingerprintMismatch { .. }));
+    assert!(matches!(
+        report.details,
+        DiagnosticStatus::FingerprintMismatch { .. }
+    ));
 }
 
 #[tokio::test]
@@ -292,7 +335,10 @@ async fn diagnose_reports_index_corrupt_when_binary_is_garbage() {
     };
     let report = diagnose(&repo, &db, &fp).await.unwrap();
     assert_eq!(report.status, "corrupt");
-    assert!(matches!(report.details, DiagnosticStatus::IndexCorrupt { .. }));
+    assert!(matches!(
+        report.details,
+        DiagnosticStatus::IndexCorrupt { .. }
+    ));
 }
 
 #[tokio::test]
@@ -317,7 +363,10 @@ async fn diagnose_reports_index_meta_drift_when_meta_lies_about_count() {
     let report = diagnose(&repo, &db, &fp).await.unwrap();
     assert_eq!(report.status, "drift");
     match report.details {
-        DiagnosticStatus::IndexMetaDrift { index_size, meta_count } => {
+        DiagnosticStatus::IndexMetaDrift {
+            index_size,
+            meta_count,
+        } => {
             assert_eq!(index_size, 1);
             assert_eq!(meta_count, 6);
         }
@@ -346,7 +395,10 @@ async fn diagnose_reports_db_drift_when_db_has_extra_rows() {
     let report = diagnose(&repo, &db, &fp).await.unwrap();
     assert_eq!(report.status, "drift");
     match report.details {
-        DiagnosticStatus::DbDrift { meta_count, db_count } => {
+        DiagnosticStatus::DbDrift {
+            meta_count,
+            db_count,
+        } => {
             assert_eq!(meta_count, 1);
             assert_eq!(db_count, 2);
         }
@@ -404,7 +456,10 @@ fn format_check_text_for_healthy() {
 fn format_check_text_for_db_drift() {
     let report = DiagnosticReport {
         status: "drift",
-        details: DiagnosticStatus::DbDrift { meta_count: 1247, db_count: 1250 },
+        details: DiagnosticStatus::DbDrift {
+            meta_count: 1247,
+            db_count: 1250,
+        },
         paths: paths(),
         elapsed_ms: 12,
     };
@@ -412,14 +467,19 @@ fn format_check_text_for_db_drift() {
     assert!(s.contains("Drift detected"), "{s}");
     assert!(s.contains("1247"), "{s}");
     assert!(s.contains("1250"), "{s}");
-    assert!(s.contains("mem repair --rebuild"), "should suggest rebuild: {s}");
+    assert!(
+        s.contains("mem repair --rebuild"),
+        "should suggest rebuild: {s}"
+    );
 }
 
 #[test]
 fn format_check_text_for_index_corrupt() {
     let report = DiagnosticReport {
         status: "corrupt",
-        details: DiagnosticStatus::IndexCorrupt { reason: "boom".into() },
+        details: DiagnosticStatus::IndexCorrupt {
+            reason: "boom".into(),
+        },
         paths: paths(),
         elapsed_ms: 8,
     };
@@ -433,20 +493,28 @@ fn format_check_text_for_index_corrupt() {
 fn format_check_text_for_db_unavailable() {
     let report = DiagnosticReport {
         status: "db_unavailable",
-        details: DiagnosticStatus::DbUnavailable { reason: "file is locked".into() },
+        details: DiagnosticStatus::DbUnavailable {
+            reason: "file is locked".into(),
+        },
         paths: paths(),
         elapsed_ms: 2,
     };
     let s = format_check_text(&report);
     assert!(s.contains("Could not open DB"), "{s}");
-    assert!(s.contains("mem serve"), "should hint at running service: {s}");
+    assert!(
+        s.contains("mem serve"),
+        "should hint at running service: {s}"
+    );
 }
 
 #[test]
 fn format_check_json_emits_top_level_status_and_exit_code() {
     let report = DiagnosticReport {
         status: "drift",
-        details: DiagnosticStatus::DbDrift { meta_count: 5, db_count: 7 },
+        details: DiagnosticStatus::DbDrift {
+            meta_count: 5,
+            db_count: 7,
+        },
         paths: paths(),
         elapsed_ms: 10,
     };
@@ -465,7 +533,9 @@ fn format_check_json_emits_top_level_status_and_exit_code() {
 fn format_check_json_unavailable_uses_exit_code_two() {
     let report = DiagnosticReport {
         status: "db_unavailable",
-        details: DiagnosticStatus::DbUnavailable { reason: "locked".into() },
+        details: DiagnosticStatus::DbUnavailable {
+            reason: "locked".into(),
+        },
         paths: paths(),
         elapsed_ms: 1,
     };
@@ -475,7 +545,11 @@ fn format_check_json_unavailable_uses_exit_code_two() {
 
 #[test]
 fn format_rebuild_text_for_success() {
-    let outcome = RebuildOutcome::Rebuilt { rows: 1247, paths: paths(), elapsed_ms: 832 };
+    let outcome = RebuildOutcome::Rebuilt {
+        rows: 1247,
+        paths: paths(),
+        elapsed_ms: 832,
+    };
     let s = format_rebuild_text(&outcome);
     assert!(s.contains("1247"), "{s}");
     assert!(s.contains("832"), "{s}");
@@ -484,7 +558,11 @@ fn format_rebuild_text_for_success() {
 
 #[test]
 fn format_rebuild_json_for_success() {
-    let outcome = RebuildOutcome::Rebuilt { rows: 1247, paths: paths(), elapsed_ms: 832 };
+    let outcome = RebuildOutcome::Rebuilt {
+        rows: 1247,
+        paths: paths(),
+        elapsed_ms: 832,
+    };
     let v = format_rebuild_json(&outcome);
     assert_eq!(v["command"], "rebuild");
     assert_eq!(v["status"], "rebuilt");
@@ -495,7 +573,10 @@ fn format_rebuild_json_for_success() {
 
 #[test]
 fn format_rebuild_json_for_db_unavailable() {
-    let outcome = RebuildOutcome::DbUnavailable { reason: "locked".into(), paths: paths() };
+    let outcome = RebuildOutcome::DbUnavailable {
+        reason: "locked".into(),
+        paths: paths(),
+    };
     let v = format_rebuild_json(&outcome);
     assert_eq!(v["status"], "db_unavailable");
     assert_eq!(v["exit_code"], 2);
@@ -503,7 +584,10 @@ fn format_rebuild_json_for_db_unavailable() {
 
 #[test]
 fn format_rebuild_json_for_failed() {
-    let outcome = RebuildOutcome::Failed { reason: "disk full".into(), paths: paths() };
+    let outcome = RebuildOutcome::Failed {
+        reason: "disk full".into(),
+        paths: paths(),
+    };
     let v = format_rebuild_json(&outcome);
     assert_eq!(v["status"], "rebuild_failed");
     assert_eq!(v["exit_code"], 2);

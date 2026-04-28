@@ -1,9 +1,9 @@
-use clap::Args;
 use crate::config::Config;
 use crate::storage::{
     diagnose, rebuild_index, sidecar_paths, DiagnosticReport, DiagnosticStatus, DuckDbRepository,
     PathInfo, SidecarFile, VectorIndexFingerprint,
 };
+use clap::Args;
 
 #[derive(Debug, Args)]
 pub struct RepairArgs {
@@ -136,9 +136,19 @@ use serde_json::{json, Value};
 
 #[derive(Debug, Clone)]
 pub enum RebuildOutcome {
-    Rebuilt { rows: usize, paths: PathInfo, elapsed_ms: u64 },
-    DbUnavailable { reason: String, paths: PathInfo },
-    Failed { reason: String, paths: PathInfo },
+    Rebuilt {
+        rows: usize,
+        paths: PathInfo,
+        elapsed_ms: u64,
+    },
+    DbUnavailable {
+        reason: String,
+        paths: PathInfo,
+    },
+    Failed {
+        reason: String,
+        paths: PathInfo,
+    },
 }
 
 impl RebuildOutcome {
@@ -173,18 +183,41 @@ pub fn format_rebuild_text(outcome: &RebuildOutcome) -> String {
     use std::fmt::Write;
     let mut s = String::new();
     match outcome {
-        RebuildOutcome::Rebuilt { rows, paths, elapsed_ms } => {
-            writeln!(&mut s, "🔨 Rebuilding vector index from {}...", paths.db.display()).unwrap();
+        RebuildOutcome::Rebuilt {
+            rows,
+            paths,
+            elapsed_ms,
+        } => {
+            writeln!(
+                &mut s,
+                "🔨 Rebuilding vector index from {}...",
+                paths.db.display()
+            )
+            .unwrap();
             writeln!(&mut s, "✅ Rebuilt: {rows} rows in {elapsed_ms}ms.").unwrap();
             writeln!(&mut s, "   New sidecar at {}", paths.index.display()).unwrap();
         }
         RebuildOutcome::DbUnavailable { reason, paths } => {
-            writeln!(&mut s, "❌ Could not open DB at {}: {reason}", paths.db.display()).unwrap();
-            writeln!(&mut s, "   Is `mem serve` running? Stop the service before running this command.").unwrap();
+            writeln!(
+                &mut s,
+                "❌ Could not open DB at {}: {reason}",
+                paths.db.display()
+            )
+            .unwrap();
+            writeln!(
+                &mut s,
+                "   Is `mem serve` running? Stop the service before running this command."
+            )
+            .unwrap();
         }
         RebuildOutcome::Failed { reason, paths } => {
             writeln!(&mut s, "❌ Rebuild failed: {reason}").unwrap();
-            writeln!(&mut s, "   DB at {} is unchanged; sidecar may be partially deleted.", paths.db.display()).unwrap();
+            writeln!(
+                &mut s,
+                "   DB at {} is unchanged; sidecar may be partially deleted.",
+                paths.db.display()
+            )
+            .unwrap();
         }
     }
     s
@@ -192,7 +225,11 @@ pub fn format_rebuild_text(outcome: &RebuildOutcome) -> String {
 
 pub fn format_rebuild_json(outcome: &RebuildOutcome) -> Value {
     match outcome {
-        RebuildOutcome::Rebuilt { rows, paths, elapsed_ms } => json!({
+        RebuildOutcome::Rebuilt {
+            rows,
+            paths,
+            elapsed_ms,
+        } => json!({
             "command": "rebuild",
             "status": "rebuilt",
             "exit_code": 0,
@@ -240,11 +277,7 @@ pub async fn run(args: RepairArgs) -> i32 {
     }
 }
 
-async fn run_check(
-    config: &Config,
-    fp: &VectorIndexFingerprint,
-    as_json: bool,
-) -> i32 {
+async fn run_check(config: &Config, fp: &VectorIndexFingerprint, as_json: bool) -> i32 {
     let started = std::time::Instant::now();
     let repo = match DuckDbRepository::open(&config.db_path).await {
         Ok(r) => r,
@@ -252,7 +285,9 @@ async fn run_check(
             let (idx_path, meta_path) = sidecar_paths(&config.db_path);
             let report = DiagnosticReport {
                 status: "db_unavailable",
-                details: DiagnosticStatus::DbUnavailable { reason: e.to_string() },
+                details: DiagnosticStatus::DbUnavailable {
+                    reason: e.to_string(),
+                },
                 paths: PathInfo {
                     db: config.db_path.clone(),
                     index: idx_path,
@@ -270,7 +305,9 @@ async fn run_check(
             let (idx_path, meta_path) = sidecar_paths(&config.db_path);
             DiagnosticReport {
                 status: "db_unavailable",
-                details: DiagnosticStatus::DbUnavailable { reason: e.to_string() },
+                details: DiagnosticStatus::DbUnavailable {
+                    reason: e.to_string(),
+                },
                 paths: PathInfo {
                     db: config.db_path.clone(),
                     index: idx_path,
@@ -283,11 +320,7 @@ async fn run_check(
     emit_check(&report, as_json)
 }
 
-async fn run_rebuild(
-    config: &Config,
-    fp: &VectorIndexFingerprint,
-    as_json: bool,
-) -> i32 {
+async fn run_rebuild(config: &Config, fp: &VectorIndexFingerprint, as_json: bool) -> i32 {
     let (idx_path, meta_path) = sidecar_paths(&config.db_path);
     let paths = PathInfo {
         db: config.db_path.clone(),
@@ -299,7 +332,10 @@ async fn run_rebuild(
         Ok(r) => r,
         Err(e) => {
             return emit_rebuild(
-                &RebuildOutcome::DbUnavailable { reason: e.to_string(), paths },
+                &RebuildOutcome::DbUnavailable {
+                    reason: e.to_string(),
+                    paths,
+                },
                 as_json,
             );
         }
@@ -315,12 +351,13 @@ async fn run_rebuild(
             };
             emit_rebuild(&outcome, as_json)
         }
-        Err(e) => {
-            emit_rebuild(
-                &RebuildOutcome::Failed { reason: e.to_string(), paths },
-                as_json,
-            )
-        }
+        Err(e) => emit_rebuild(
+            &RebuildOutcome::Failed {
+                reason: e.to_string(),
+                paths,
+            },
+            as_json,
+        ),
     }
 }
 
