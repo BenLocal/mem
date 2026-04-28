@@ -632,16 +632,21 @@ impl DuckDbRepository {
 
         let Some(idx) = self.vector_index() else {
             // No index attached: behave as the legacy linear scan would.
+            tracing::warn!("vector index not attached; falling back to legacy linear-scan search (deprecated)");
             return self
                 .legacy_semantic_search_memories(tenant, query_embedding, limit)
                 .await;
         };
 
+        // Config fields `vector_index_use_legacy` / `vector_index_oversample` exist on
+        // `EmbeddingSettings` but are not plumbed into this struct (Option A decision: env-var
+        // reads here provide runtime-override flexibility without requiring a repo rebuild).
         let use_legacy = std::env::var("MEM_VECTOR_INDEX_USE_LEGACY")
             .ok()
             .map(|v| matches!(v.as_str(), "1" | "true" | "yes"))
             .unwrap_or(false);
         if use_legacy {
+            tracing::warn!("MEM_VECTOR_INDEX_USE_LEGACY=1; routing to deprecated legacy linear-scan search");
             return self
                 .legacy_semantic_search_memories(tenant, query_embedding, limit)
                 .await;

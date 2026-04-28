@@ -7,7 +7,7 @@ use crate::{
     config::{Config, GraphBackendKind},
     http,
     service::MemoryService,
-    storage::{DuckDbRepository, GraphStore, IndraDbGraphAdapter, LocalGraphAdapter},
+    storage::{DuckDbRepository, GraphStore, IndraDbGraphAdapter, LocalGraphAdapter, VectorIndex, VectorIndexFingerprint},
 };
 
 #[derive(Clone)]
@@ -20,6 +20,24 @@ impl AppState {
     pub async fn from_config(config: Config) -> anyhow::Result<Self> {
         let repository = DuckDbRepository::open(&config.db_path).await?;
         info!(duckdb = %config.db_path.display(), "storage initialized");
+
+        let fp = VectorIndexFingerprint {
+            provider: config.embedding.job_provider_id().to_string(),
+            model: config.embedding.model.clone(),
+            dim: config.embedding.dim,
+        };
+        let vector_index = Arc::new(
+            VectorIndex::open_or_rebuild(&repository, &config.db_path, &fp).await?,
+        );
+        repository.attach_vector_index(vector_index.clone());
+        info!(
+            size = vector_index.size(),
+            provider = %fp.provider,
+            model = %fp.model,
+            dim = fp.dim,
+            "vector index ready"
+        );
+
         let provider = crate::embedding::arc_embedding_provider(&config.embedding)
             .map_err(|e| anyhow::anyhow!("embedding provider: {e}"))?;
         info!(
