@@ -8,7 +8,6 @@ pub async fn run() -> error::Result<()> {
     info!(
         bind_addr = %config.bind_addr,
         db_path = %config.db_path.display(),
-        graph_backend = ?config.graph_backend,
         embedding_provider = ?config.embedding.provider,
         embedding_model = %config.embedding.model,
         "mem starting"

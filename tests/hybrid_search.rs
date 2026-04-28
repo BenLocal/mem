@@ -8,7 +8,7 @@ use mem::{
     },
     embedding::{arc_embedding_provider, deterministic_embedding},
     service::MemoryService,
-    storage::DuckDbRepository,
+    storage::{DuckDbGraphStore, DuckDbRepository},
 };
 use tempfile::tempdir;
 
@@ -119,9 +119,10 @@ async fn hybrid_search_surfaces_semantic_match_without_lexical_overlap() {
     .await
     .unwrap();
 
+    let graph = Arc::new(DuckDbGraphStore::new(Arc::new(repo.clone())));
     let service = MemoryService::with_graph_and_embedding_providers(
         repo,
-        Arc::new(mem::storage::LocalGraphAdapter::default()),
+        graph,
         "fake".into(),
         Some(provider),
     );
@@ -156,4 +157,78 @@ async fn hybrid_search_surfaces_semantic_match_without_lexical_overlap() {
         ids.contains(&"mem_hit"),
         "expected semantic hit mem_hit in compressed response, got {ids:?}"
     );
+}
+
+// ---------------------------------------------------------------------------
+// Helper shared by graph_boost test below
+// ---------------------------------------------------------------------------
+
+async fn ingest_for_e2e(
+    svc: &MemoryService,
+    content: &str,
+    project: Option<&str>,
+    repo_name: Option<&str>,
+) -> mem::service::IngestMemoryResponse {
+    use mem::domain::memory::{IngestMemoryRequest, MemoryType, Scope, Visibility, WriteMode};
+    svc.ingest(IngestMemoryRequest {
+        tenant: "t".into(),
+        memory_type: MemoryType::Implementation,
+        content: content.into(),
+        evidence: vec![],
+        code_refs: vec![],
+        scope: Scope::Repo,
+        visibility: Visibility::Shared,
+        project: project.map(String::from),
+        repo: repo_name.map(String::from),
+        module: None,
+        task_type: None,
+        tags: vec![],
+        source_agent: "test".into(),
+        idempotency_key: None,
+        write_mode: WriteMode::Auto,
+    })
+    .await
+    .unwrap()
+}
+
+#[tokio::test]
+async fn graph_boost_excludes_superseded_memory_from_related_memory_ids() {
+    let dir = tempdir().unwrap();
+    let db = dir.path().join("graph-boost.duckdb");
+    let repo = Arc::new(DuckDbRepository::open(&db).await.unwrap());
+    let graph = Arc::new(DuckDbGraphStore::new(repo.clone()));
+    let svc = MemoryService::new_with_graph((*repo).clone(), graph.clone());
+
+    // Ingest two memories sharing project=foo so graph edges link them via
+    // the project:foo node.
+    let r1 = ingest_for_e2e(&svc, "alpha", Some("foo"), Some("mem")).await;
+    let r2 = ingest_for_e2e(&svc, "beta", Some("foo"), Some("mem")).await;
+
+    // Pre-condition: both memories are reachable from the shared project node.
+    let pre = graph
+        .related_memory_ids(&["project:foo".into()])
+        .await
+        .unwrap();
+    let mut pre_sorted = pre.clone();
+    pre_sorted.sort();
+    assert_eq!(
+        pre_sorted.len(),
+        2,
+        "both memories should be related before close: {pre_sorted:?}"
+    );
+
+    // Simulate the supersede side-effect: close r1's outbound edges.
+    graph.close_edges_for_memory(&r1.memory_id).await.unwrap();
+
+    // Post-condition: only r2 is reachable — r1 is excluded by graph_boost.
+    let post = graph
+        .related_memory_ids(&["project:foo".into()])
+        .await
+        .unwrap();
+    assert_eq!(
+        post.len(),
+        1,
+        "after close_edges_for_memory, only r2 should be related: {post:?}"
+    );
+    assert_eq!(post[0], r2.memory_id);
 }

@@ -10,7 +10,7 @@
 | 1 | ⚙️ | ✅ `embedding_jobs` dedupe 复核（实际已被 Mutex + 事务覆盖，仅修注释/文档）| 🔴 修并发 bug | S（0.5h） | 低 | `storage/duckdb.rs`、`db/schema/002_embeddings.sql` |
 | 2 | 🔍 | ✅ 引入 `usearch` sidecar ANN（消除 `semantic_search_memories` 的 `limit 2000` 隐式截断）| 🟠 性能基础设施 + 🔴 修隐式正确性边界 | M（1–2 天） | 中（需要 repair 路径） | `Cargo.toml`、`storage/`、新增 `vector_index.rs` |
 | 3 | ⚙️ | ✅ HNSW 健康度自检 + repair 子命令（`mem repair --check` / `--rebuild`，JSON 输出可选）| 🟠 配套 #2 | S（4h） | 低 | `src/cli/repair.rs`、`src/storage/vector_index_diagnose.rs` |
-| 4 | 🔍 | 图边时序化（valid_from/to） | 🟠 表达力 | M（4–6h） | 中 | `domain/memory.rs`、`storage/graph.rs`、`pipeline/ingest.rs` |
+| 4 | 🔍 | ✅ 图边时序化（valid_from/to）+ 全量迁到 DuckDB（删 IndraDB 依赖与 GraphStore trait）| 🟠 表达力 | L（实际 ~1.5 天，scope 比原 M 大）| 中 | `domain/memory.rs`、`storage/graph_store.rs`、`db/schema/003_graph.sql`、`pipeline/ingest.rs` |
 | 5 | 🔍 | 检索分数归一化 / RRF | 🟡 排序质量 | S（3h） | 低 | `pipeline/retrieve.rs` |
 | 6 | 📦 | `compress_text` 改 token 计数（CJK 不再按词裸奔截断）| 🟡 输出 verbatim 纪律 | S（2h） | 低 | `pipeline/compress.rs` |
 | 7 | 🔍 | `decay_score` 后台衰减 worker | 🟡 生命周期闭环 | S（3h） | 低 | `service/`、新增 `decay_worker.rs` |

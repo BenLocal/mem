@@ -229,6 +229,8 @@ pub struct GraphEdge {
     pub from_node_id: String,
     pub to_node_id: String,
     pub relation: String,
+    pub valid_from: String,
+    pub valid_to: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
