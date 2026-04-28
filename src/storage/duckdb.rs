@@ -448,11 +448,22 @@ impl DuckDbRepository {
     }
 
     pub async fn delete_memory_embedding(&self, memory_id: &str) -> Result<(), StorageError> {
-        let conn = self.conn()?;
-        conn.execute(
-            "delete from memory_embeddings where memory_id = ?1",
-            params![memory_id],
-        )?;
+        {
+            let conn = self.conn()?;
+            conn.execute(
+                "delete from memory_embeddings where memory_id = ?1",
+                params![memory_id],
+            )?;
+        } // drop conn (MutexGuard) before the async remove call
+        if let Some(idx) = self.vector_index() {
+            if let Err(err) = idx.remove(memory_id).await {
+                tracing::warn!(
+                    memory_id,
+                    error = %err,
+                    "vector_index.remove failed (best-effort)"
+                );
+            }
+        }
         Ok(())
     }
 
