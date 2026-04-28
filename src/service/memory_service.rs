@@ -161,10 +161,7 @@ impl MemoryService {
         };
 
         let stored = self.repository.insert_memory(memory).await?;
-        self.graph
-            .sync_memory(&stored)
-            .await
-            .map_err(|e| GraphError::Backend(e.to_string()))?;
+        self.graph.sync_memory(&stored).await?;
         self.enqueue_embedding_job_for_memory(&stored).await?;
         Ok(stored.into())
     }
@@ -429,12 +426,8 @@ impl MemoryService {
         // Close v1's graph edges, then open v2's — order matters.
         self.graph
             .close_edges_for_memory(&original.memory_id)
-            .await
-            .map_err(|e| GraphError::Backend(e.to_string()))?;
-        self.graph
-            .sync_memory(&superseding)
-            .await
-            .map_err(|e| GraphError::Backend(e.to_string()))?;
+            .await?;
+        self.graph.sync_memory(&superseding).await?;
 
         self.enqueue_embedding_job_for_memory(&superseding).await?;
 
@@ -520,10 +513,7 @@ impl MemoryService {
     }
 
     pub async fn graph_neighbors(&self, node_id: &str) -> Result<Vec<GraphEdge>, ServiceError> {
-        self.graph
-            .neighbors(node_id)
-            .await
-            .map_err(|e| GraphError::Backend(e.to_string()).into())
+        Ok(self.graph.neighbors(node_id).await?)
     }
 
     pub async fn search(
@@ -555,7 +545,8 @@ impl MemoryService {
         .await
         {
             Ok(ranked) => ranked,
-            Err(GraphError::Unavailable(_)) => {
+            Err(e) => {
+                tracing::warn!(error = %e, "graph backend error during rank_with_graph_hybrid; falling back to no graph boost");
                 let lex2 = self.repository.search_candidates(tenant).await?;
                 if semantic.is_empty() {
                     retrieve::rank_candidates(lex2, &query)
@@ -563,7 +554,6 @@ impl MemoryService {
                     retrieve::merge_and_rank_hybrid(lex2, semantic, &query, &HashSet::new(), 0)
                 }
             }
-            Err(error) => return Err(error.into()),
         };
 
         Ok(compress::compress(&ranked, query.token_budget))

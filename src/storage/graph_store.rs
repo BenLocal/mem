@@ -8,8 +8,6 @@ use crate::pipeline::ingest::extract_graph_edges;
 
 #[derive(Debug, Error)]
 pub enum GraphError {
-    #[error("graph backend unavailable: {0}")]
-    Unavailable(&'static str),
     #[error("graph backend error: {0}")]
     Backend(String),
 }
