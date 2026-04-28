@@ -1,7 +1,7 @@
 use std::{
     collections::{HashMap, HashSet, VecDeque},
     path::Path,
-    sync::{Arc, Mutex, MutexGuard},
+    sync::{Arc, Mutex, MutexGuard, RwLock},
     time::{SystemTime, UNIX_EPOCH},
 };
 
@@ -17,7 +17,7 @@ use crate::domain::{
 use crate::pipeline::ingest::{compute_content_hash_from_record, CONTENT_HASH_LEN};
 
 use super::schema;
-use super::vector_index::EmbeddingRowSource;
+use super::vector_index::{EmbeddingRowSource, VectorIndex};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FeedbackEvent {
@@ -82,6 +82,7 @@ struct MemoryEmbeddingRow {
 #[derive(Debug, Clone)]
 pub struct DuckDbRepository {
     conn: Arc<Mutex<Connection>>,
+    vector_index: Arc<RwLock<Option<Arc<VectorIndex>>>>,
 }
 
 #[derive(Debug, Error)]
@@ -111,7 +112,26 @@ impl DuckDbRepository {
 
         Ok(Self {
             conn: Arc::new(Mutex::new(conn)),
+            vector_index: Arc::new(RwLock::new(None)),
         })
+    }
+
+    pub fn attach_vector_index(&self, idx: Arc<VectorIndex>) {
+        *self.vector_index.write().expect("vector_index lock poisoned") = Some(idx);
+    }
+
+    pub fn has_vector_index(&self) -> bool {
+        self.vector_index
+            .read()
+            .expect("vector_index lock poisoned")
+            .is_some()
+    }
+
+    pub(crate) fn vector_index(&self) -> Option<Arc<VectorIndex>> {
+        self.vector_index
+            .read()
+            .expect("vector_index lock poisoned")
+            .clone()
     }
 
     pub async fn insert_memory(&self, memory: MemoryRecord) -> Result<MemoryRecord, StorageError> {

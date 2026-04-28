@@ -265,6 +265,21 @@ fn unit_vector_owned(dim: usize, seed: u8) -> Vec<f32> {
 }
 
 #[tokio::test]
+async fn duckdb_repository_accepts_vector_index_injection() {
+    let dir = tempdir().unwrap();
+    let db = dir.path().join("inject.duckdb");
+    let repo = DuckDbRepository::open(&db).await.unwrap();
+    let fp = mem::storage::VectorIndexFingerprint {
+        provider: "fake".into(),
+        model: "fake".into(),
+        dim: 256,
+    };
+    let idx = std::sync::Arc::new(VectorIndex::open_or_rebuild(&repo, &db, &fp).await.unwrap());
+    repo.attach_vector_index(idx.clone());
+    assert!(repo.has_vector_index());
+}
+
+#[tokio::test]
 async fn open_or_rebuild_recovers_from_corrupt_index_file() {
     let dir = tempdir().unwrap();
     let db = dir.path().join("corrupt.duckdb");
