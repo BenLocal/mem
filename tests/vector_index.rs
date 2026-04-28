@@ -1,4 +1,5 @@
 use mem::storage::vector_index::{EmbeddingRowSource, VectorIndex};
+use mem::storage::DuckDbRepository;
 
 #[allow(dead_code)]
 struct EmptySource;
@@ -204,4 +205,61 @@ async fn load_rejects_zero_dim_meta() {
     .await
     .unwrap_err();
     assert!(matches!(err, mem::storage::VectorIndexError::FingerprintMismatch { .. }));
+}
+
+#[tokio::test]
+async fn open_or_rebuild_returns_empty_against_fresh_db() {
+    let dir = tempdir().unwrap();
+    let db = dir.path().join("open-empty.duckdb");
+    let repo = DuckDbRepository::open(&db).await.unwrap();
+    let fp = mem::storage::VectorIndexFingerprint {
+        provider: "fake".into(),
+        model: "fake".into(),
+        dim: 256,
+    };
+    let idx = VectorIndex::open_or_rebuild(&repo, &db, &fp).await.unwrap();
+    assert_eq!(idx.size(), 0);
+}
+
+#[tokio::test]
+async fn open_or_rebuild_rebuilds_when_no_sidecar_files_exist() {
+    let dir = tempdir().unwrap();
+    let db = dir.path().join("rebuild.duckdb");
+    let repo = DuckDbRepository::open(&db).await.unwrap();
+    repo.seed_memory_embedding_for_test("m1", "t", &unit_vector_owned(256, 1)).await.unwrap();
+    repo.seed_memory_embedding_for_test("m2", "t", &unit_vector_owned(256, 2)).await.unwrap();
+
+    let fp = mem::storage::VectorIndexFingerprint {
+        provider: "fake".into(),
+        model: "fake".into(),
+        dim: 256,
+    };
+    let idx = VectorIndex::open_or_rebuild(&repo, &db, &fp).await.unwrap();
+    assert_eq!(idx.size(), 2);
+}
+
+#[tokio::test]
+async fn open_or_rebuild_rebuilds_on_row_count_drift() {
+    let dir = tempdir().unwrap();
+    let db = dir.path().join("drift.duckdb");
+    let repo = DuckDbRepository::open(&db).await.unwrap();
+    repo.seed_memory_embedding_for_test("m1", "t", &unit_vector_owned(256, 1)).await.unwrap();
+
+    let fp = mem::storage::VectorIndexFingerprint {
+        provider: "fake".into(),
+        model: "fake".into(),
+        dim: 256,
+    };
+    let idx_a = VectorIndex::open_or_rebuild(&repo, &db, &fp).await.unwrap();
+    assert_eq!(idx_a.size(), 1);
+    drop(idx_a);
+
+    repo.seed_memory_embedding_for_test("m2", "t", &unit_vector_owned(256, 2)).await.unwrap();
+
+    let idx_b = VectorIndex::open_or_rebuild(&repo, &db, &fp).await.unwrap();
+    assert_eq!(idx_b.size(), 2);
+}
+
+fn unit_vector_owned(dim: usize, seed: u8) -> Vec<f32> {
+    unit_vector(dim, seed)
 }

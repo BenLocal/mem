@@ -8,5 +8,6 @@ pub use duckdb::{
 };
 pub use graph::{GraphError, GraphStore, IndraDbGraphAdapter, LocalGraphAdapter};
 pub use vector_index::{
-    EmbeddingRowSource, VectorIndex, VectorIndexError, VectorIndexFingerprint, VectorIndexMeta,
+    sidecar_paths, EmbeddingRowSource, VectorIndex, VectorIndexError, VectorIndexFingerprint,
+    VectorIndexMeta,
 };

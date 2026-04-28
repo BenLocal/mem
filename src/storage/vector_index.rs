@@ -2,6 +2,7 @@ use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock, RwLockReadGuard, RwLockWriteGuard};
+use std::ffi::OsString;
 
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -423,5 +424,143 @@ impl VectorIndex {
                 dim: meta.dim,
             },
         })
+    }
+
+    /// Open the sidecar index from disk if it exists and is consistent with the
+    /// database row count and fingerprint; otherwise rebuild from scratch by
+    /// iterating every embedding row in `source`.
+    ///
+    /// Consistency checks (in order):
+    /// 1. Both sidecar files (`<db>.usearch` and `<db>.usearch.meta.json`) must exist.
+    /// 2. The stored fingerprint must match `expected_fp`.
+    /// 3. The index row count must equal `source.count_total_memory_embeddings()`.
+    ///
+    /// Any failure triggers a full rebuild; the rebuilt index is persisted to the
+    /// sidecar paths before returning so the next call can load directly.
+    ///
+    /// Lock strategy during rebuild: both write guards are acquired *per row*
+    /// inside the `for_each_embedding` closure (id_map first, then index — same
+    /// order as `upsert` and `remove`). No other thread touches `fresh` at this
+    /// point, so per-row acquisition is safe and keeps the pattern consistent.
+    pub async fn open_or_rebuild<S: EmbeddingRowSource>(
+        source: &S,
+        db_path: &Path,
+        expected_fp: &VectorIndexFingerprint,
+    ) -> Result<Self, VectorIndexError> {
+        let (idx_path, meta_path) = sidecar_paths(db_path);
+
+        let live_count = source
+            .count_total_memory_embeddings()
+            .map_err(|e| VectorIndexError::UsearchOp(format!("count failed: {e}")))?;
+
+        if idx_path.exists() && meta_path.exists() {
+            match Self::load_from(&idx_path, &meta_path, expected_fp).await {
+                Ok(loaded) => {
+                    let idx_count = loaded.size();
+                    if idx_count as i64 == live_count {
+                        tracing::info!(rows = idx_count, "loaded vector index from sidecar");
+                        return Ok(loaded);
+                    }
+                    tracing::warn!(
+                        index = idx_count,
+                        db = live_count,
+                        "vector index row count drift; rebuilding"
+                    );
+                }
+                Err(VectorIndexError::FingerprintMismatch { stored, current }) => {
+                    tracing::warn!(?stored, ?current, "vector index fingerprint mismatch; rebuilding");
+                }
+                Err(other) => {
+                    tracing::warn!(error = %other, "vector index load failed; rebuilding");
+                }
+            }
+        }
+
+        let started = std::time::Instant::now();
+        let fresh = VectorIndex::new_in_memory(
+            expected_fp.dim,
+            &expected_fp.provider,
+            &expected_fp.model,
+            (live_count as usize).max(8),
+        );
+
+        source
+            .for_each_embedding(512, &mut |memory_id, blob| {
+                let vec = decode_f32_blob(blob, expected_fp.dim)
+                    .map_err(|e| super::StorageError::VectorIndex(format!("rebuild decode: {e}")))?;
+                let key = memory_id_to_u64(memory_id);
+                // Acquire id_map write first, then index write — consistent lock ordering.
+                let mut id_map = fresh
+                    .lock_id_map_write()
+                    .map_err(|e| super::StorageError::VectorIndex(e.to_string()))?;
+                let index = fresh
+                    .lock_index_write()
+                    .map_err(|e| super::StorageError::VectorIndex(e.to_string()))?;
+                index
+                    .add(key, &vec)
+                    .map_err(|e| super::StorageError::VectorIndex(e.to_string()))?;
+                id_map.insert(key, memory_id.to_string());
+                Ok(())
+            })
+            .map_err(|e| VectorIndexError::UsearchOp(format!("rebuild iter: {e}")))?;
+
+        if let Err(e) = fresh.save_to(&idx_path, &meta_path).await {
+            try_cleanup_tmp_paths(&idx_path, &meta_path);
+            return Err(e);
+        }
+
+        tracing::info!(
+            rows = fresh.size(),
+            elapsed_ms = started.elapsed().as_millis() as u64,
+            "rebuilt vector index"
+        );
+        Ok(fresh)
+    }
+}
+
+/// Compute the sidecar file paths for a given DuckDB path.
+///
+/// `<db>.usearch` holds the binary index; `<db>.usearch.meta.json` holds the
+/// metadata (fingerprint, id_map, row_count). Both are written atomically via
+/// `.tmp` siblings in `save_to`.
+pub fn sidecar_paths(db_path: &Path) -> (PathBuf, PathBuf) {
+    let mut idx: OsString = db_path.as_os_str().to_owned();
+    idx.push(".usearch");
+    let mut meta: OsString = db_path.as_os_str().to_owned();
+    meta.push(".usearch.meta.json");
+    (PathBuf::from(idx), PathBuf::from(meta))
+}
+
+/// Decode a raw little-endian (native-endian) f32 blob into a `Vec<f32>`.
+///
+/// Returns an error if `blob.len() != expected_len * 4`.
+fn decode_f32_blob(blob: &[u8], expected_len: usize) -> Result<Vec<f32>, String> {
+    let expected_bytes = expected_len.checked_mul(4).ok_or("dim overflow")?;
+    if blob.len() != expected_bytes {
+        return Err(format!("blob length {} expected {}", blob.len(), expected_bytes));
+    }
+    let mut out = Vec::with_capacity(expected_len);
+    for chunk in blob.chunks_exact(4) {
+        out.push(f32::from_ne_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]));
+    }
+    Ok(out)
+}
+
+/// Best-effort removal of the `.tmp` sidecar files left behind by a failed
+/// `save_to`. Logs warnings on unexpected errors but never propagates them.
+fn try_cleanup_tmp_paths(idx_path: &Path, meta_path: &Path) {
+    let mut idx_tmp: OsString = idx_path.as_os_str().to_owned();
+    idx_tmp.push(".tmp");
+    let mut meta_tmp: OsString = meta_path.as_os_str().to_owned();
+    meta_tmp.push(".tmp");
+    if let Err(e) = std::fs::remove_file(&idx_tmp) {
+        if e.kind() != std::io::ErrorKind::NotFound {
+            tracing::warn!(path = ?idx_tmp, error = %e, "failed to clean up tmp index");
+        }
+    }
+    if let Err(e) = std::fs::remove_file(&meta_tmp) {
+        if e.kind() != std::io::ErrorKind::NotFound {
+            tracing::warn!(path = ?meta_tmp, error = %e, "failed to clean up tmp meta");
+        }
     }
 }
