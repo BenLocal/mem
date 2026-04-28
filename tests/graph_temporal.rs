@@ -3,9 +3,9 @@ use mem::storage::{DuckDbGraphStore, DuckDbRepository};
 use std::sync::Arc;
 use tempfile::tempdir;
 
-async fn open_repo_and_graph(db_path: &std::path::Path)
-    -> (Arc<DuckDbRepository>, DuckDbGraphStore)
-{
+async fn open_repo_and_graph(
+    db_path: &std::path::Path,
+) -> (Arc<DuckDbRepository>, DuckDbGraphStore) {
     let repo = Arc::new(DuckDbRepository::open(db_path).await.unwrap());
     let graph = DuckDbGraphStore::new(repo.clone());
     (repo, graph)
@@ -25,9 +25,12 @@ use mem::domain::memory::{
 };
 use mem::service::MemoryService;
 
-async fn ingest_one(svc: &MemoryService, content: &str, project: Option<&str>, repo: Option<&str>)
-    -> mem::service::IngestMemoryResponse
-{
+async fn ingest_one(
+    svc: &MemoryService,
+    content: &str,
+    project: Option<&str>,
+    repo: Option<&str>,
+) -> mem::service::IngestMemoryResponse {
     svc.ingest(IngestMemoryRequest {
         tenant: "t".into(),
         memory_type: MemoryType::Implementation,
@@ -44,7 +47,9 @@ async fn ingest_one(svc: &MemoryService, content: &str, project: Option<&str>, r
         source_agent: "test".into(),
         idempotency_key: None,
         write_mode: WriteMode::Auto,
-    }).await.unwrap()
+    })
+    .await
+    .unwrap()
 }
 
 /// Ingest a Workflow memory (always PendingConfirmation) so that
@@ -83,11 +88,18 @@ async fn sync_creates_active_edges_for_simple_memory() {
     let (repo, graph) = open_repo_and_graph(&db).await;
     let svc = MemoryService::new((*repo).clone());
     let r = ingest_one(&svc, "alpha", Some("foo"), Some("mem")).await;
-    let memory = repo.get_memory_for_tenant("t", &r.memory_id).await.unwrap().unwrap();
+    let memory = repo
+        .get_memory_for_tenant("t", &r.memory_id)
+        .await
+        .unwrap()
+        .unwrap();
 
     graph.sync_memory(&memory).await.unwrap();
 
-    let edges = graph.neighbors(&format!("memory:{}", r.memory_id)).await.unwrap();
+    let edges = graph
+        .neighbors(&format!("memory:{}", r.memory_id))
+        .await
+        .unwrap();
     let relations: std::collections::HashSet<_> =
         edges.iter().map(|e| e.relation.as_str()).collect();
     assert!(relations.contains("applies_to"), "edges: {edges:?}");
@@ -105,18 +117,31 @@ async fn sync_is_idempotent_when_called_twice() {
     let (repo, graph) = open_repo_and_graph(&db).await;
     let svc = MemoryService::new((*repo).clone());
     let r = ingest_one(&svc, "beta", Some("foo"), Some("mem")).await;
-    let memory = repo.get_memory_for_tenant("t", &r.memory_id).await.unwrap().unwrap();
+    let memory = repo
+        .get_memory_for_tenant("t", &r.memory_id)
+        .await
+        .unwrap()
+        .unwrap();
 
     graph.sync_memory(&memory).await.unwrap();
-    let first = graph.neighbors(&format!("memory:{}", r.memory_id)).await.unwrap();
+    let first = graph
+        .neighbors(&format!("memory:{}", r.memory_id))
+        .await
+        .unwrap();
     graph.sync_memory(&memory).await.unwrap();
-    let second = graph.neighbors(&format!("memory:{}", r.memory_id)).await.unwrap();
+    let second = graph
+        .neighbors(&format!("memory:{}", r.memory_id))
+        .await
+        .unwrap();
 
     assert_eq!(first.len(), second.len(), "edge count must not grow");
     for (a, b) in first.iter().zip(second.iter()) {
         assert_eq!(a.from_node_id, b.from_node_id);
         assert_eq!(a.relation, b.relation);
-        assert_eq!(a.valid_from, b.valid_from, "valid_from must not be refreshed");
+        assert_eq!(
+            a.valid_from, b.valid_from,
+            "valid_from must not be refreshed"
+        );
     }
 }
 
@@ -145,16 +170,26 @@ async fn close_edges_for_memory_sets_valid_to() {
     let (repo, graph) = open_repo_and_graph(&db).await;
     let svc = MemoryService::new((*repo).clone());
     let r = ingest_one(&svc, "gamma", Some("foo"), Some("mem")).await;
-    let memory = repo.get_memory_for_tenant("t", &r.memory_id).await.unwrap().unwrap();
+    let memory = repo
+        .get_memory_for_tenant("t", &r.memory_id)
+        .await
+        .unwrap()
+        .unwrap();
     graph.sync_memory(&memory).await.unwrap();
 
-    let pre = graph.neighbors(&format!("memory:{}", r.memory_id)).await.unwrap();
+    let pre = graph
+        .neighbors(&format!("memory:{}", r.memory_id))
+        .await
+        .unwrap();
     assert!(!pre.is_empty(), "should have active edges before close");
 
     let closed = graph.close_edges_for_memory(&r.memory_id).await.unwrap();
     assert!(closed > 0, "should report at least one closed row");
 
-    let post = graph.neighbors(&format!("memory:{}", r.memory_id)).await.unwrap();
+    let post = graph
+        .neighbors(&format!("memory:{}", r.memory_id))
+        .await
+        .unwrap();
     assert!(post.is_empty(), "no active edges after close");
 }
 
@@ -231,7 +266,11 @@ async fn neighbors_at_filters_by_timestamp() {
     let (repo, graph) = open_repo_and_graph(&db).await;
     let svc = MemoryService::new((*repo).clone());
     let r = ingest_one(&svc, "delta", Some("foo"), Some("mem")).await;
-    let memory = repo.get_memory_for_tenant("t", &r.memory_id).await.unwrap().unwrap();
+    let memory = repo
+        .get_memory_for_tenant("t", &r.memory_id)
+        .await
+        .unwrap()
+        .unwrap();
     graph.sync_memory(&memory).await.unwrap();
     let active = graph.neighbors("project:foo").await.unwrap();
     assert!(!active.is_empty());
@@ -246,7 +285,10 @@ async fn neighbors_at_filters_by_timestamp() {
     let then = graph.neighbors_at("project:foo", &mid).await.unwrap();
     assert!(!then.is_empty(), "edge should be active at mid timestamp");
 
-    let later = graph.neighbors_at("project:foo", &after_close).await.unwrap();
+    let later = graph
+        .neighbors_at("project:foo", &after_close)
+        .await
+        .unwrap();
     assert!(later.is_empty(), "edge must be excluded at later timestamp");
 }
 
@@ -258,12 +300,23 @@ async fn related_memory_ids_excludes_superseded() {
     let svc = MemoryService::new((*repo).clone());
     let r1 = ingest_one(&svc, "v1", Some("foo"), Some("mem")).await;
     let r2 = ingest_one(&svc, "v2", Some("foo"), Some("mem")).await;
-    let m1 = repo.get_memory_for_tenant("t", &r1.memory_id).await.unwrap().unwrap();
-    let m2 = repo.get_memory_for_tenant("t", &r2.memory_id).await.unwrap().unwrap();
+    let m1 = repo
+        .get_memory_for_tenant("t", &r1.memory_id)
+        .await
+        .unwrap()
+        .unwrap();
+    let m2 = repo
+        .get_memory_for_tenant("t", &r2.memory_id)
+        .await
+        .unwrap()
+        .unwrap();
     graph.sync_memory(&m1).await.unwrap();
     graph.sync_memory(&m2).await.unwrap();
 
-    let mut both = graph.related_memory_ids(&["project:foo".into()]).await.unwrap();
+    let mut both = graph
+        .related_memory_ids(&["project:foo".into()])
+        .await
+        .unwrap();
     both.sort();
     assert_eq!(both.len(), 2, "both memories should be present: {both:?}");
     assert!(both.contains(&r1.memory_id));
@@ -271,7 +324,10 @@ async fn related_memory_ids_excludes_superseded() {
 
     graph.close_edges_for_memory(&r1.memory_id).await.unwrap();
 
-    let one = graph.related_memory_ids(&["project:foo".into()]).await.unwrap();
+    let one = graph
+        .related_memory_ids(&["project:foo".into()])
+        .await
+        .unwrap();
     assert_eq!(one.len(), 1, "only v2 should remain: {one:?}");
     assert_eq!(one[0], r2.memory_id);
 }
@@ -283,14 +339,24 @@ async fn all_edges_for_memory_returns_history_including_closed() {
     let (repo, graph) = open_repo_and_graph(&db).await;
     let svc = MemoryService::new((*repo).clone());
     let r = ingest_one(&svc, "epsilon", Some("foo"), Some("mem")).await;
-    let memory = repo.get_memory_for_tenant("t", &r.memory_id).await.unwrap().unwrap();
+    let memory = repo
+        .get_memory_for_tenant("t", &r.memory_id)
+        .await
+        .unwrap()
+        .unwrap();
     graph.sync_memory(&memory).await.unwrap();
     graph.close_edges_for_memory(&r.memory_id).await.unwrap();
 
     let all = graph.all_edges_for_memory(&r.memory_id).await.unwrap();
-    assert!(!all.is_empty(), "history should include the now-closed edges");
+    assert!(
+        !all.is_empty(),
+        "history should include the now-closed edges"
+    );
     for edge in &all {
-        assert!(edge.valid_to.is_some(), "every edge in history should be closed");
+        assert!(
+            edge.valid_to.is_some(),
+            "every edge in history should be closed"
+        );
     }
 }
 
@@ -301,7 +367,11 @@ async fn reopened_edge_creates_new_row() {
     let (repo, graph) = open_repo_and_graph(&db).await;
     let svc = MemoryService::new((*repo).clone());
     let r = ingest_one(&svc, "zeta", Some("foo"), Some("mem")).await;
-    let memory = repo.get_memory_for_tenant("t", &r.memory_id).await.unwrap().unwrap();
+    let memory = repo
+        .get_memory_for_tenant("t", &r.memory_id)
+        .await
+        .unwrap()
+        .unwrap();
 
     graph.sync_memory(&memory).await.unwrap();
     graph.close_edges_for_memory(&r.memory_id).await.unwrap();
@@ -309,8 +379,15 @@ async fn reopened_edge_creates_new_row() {
     graph.sync_memory(&memory).await.unwrap();
 
     let history = graph.all_edges_for_memory(&r.memory_id).await.unwrap();
-    let applies_to: Vec<_> = history.iter().filter(|e| e.relation == "applies_to").collect();
-    assert_eq!(applies_to.len(), 2, "expect closed + active rows for same triple");
+    let applies_to: Vec<_> = history
+        .iter()
+        .filter(|e| e.relation == "applies_to")
+        .collect();
+    assert_eq!(
+        applies_to.len(),
+        2,
+        "expect closed + active rows for same triple"
+    );
     let closed_count = applies_to.iter().filter(|e| e.valid_to.is_some()).count();
     let active_count = applies_to.iter().filter(|e| e.valid_to.is_none()).count();
     assert_eq!(closed_count, 1);

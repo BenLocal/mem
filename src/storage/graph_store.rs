@@ -2,9 +2,9 @@ use std::sync::Arc;
 
 use thiserror::Error;
 
+use super::{DuckDbRepository, StorageError};
 use crate::domain::memory::{GraphEdge, MemoryRecord};
 use crate::pipeline::ingest::extract_graph_edges;
-use super::{DuckDbRepository, StorageError};
 
 #[derive(Debug, Error)]
 pub enum GraphError {
@@ -97,10 +97,7 @@ impl DuckDbGraphStore {
         Ok(count)
     }
 
-    pub async fn related_memory_ids(
-        &self,
-        node_ids: &[String],
-    ) -> Result<Vec<String>, GraphError> {
+    pub async fn related_memory_ids(&self, node_ids: &[String]) -> Result<Vec<String>, GraphError> {
         if node_ids.is_empty() {
             return Ok(vec![]);
         }
@@ -124,11 +121,8 @@ impl DuckDbGraphStore {
                 params_vec.push(Box::new(n.clone()));
             }
         }
-        let params_refs: Vec<&dyn duckdb::ToSql> =
-            params_vec.iter().map(|b| b.as_ref()).collect();
-        let rows = stmt.query_map(&params_refs[..], |row| {
-            row.get::<_, String>(0)
-        })?;
+        let params_refs: Vec<&dyn duckdb::ToSql> = params_vec.iter().map(|b| b.as_ref()).collect();
+        let rows = stmt.query_map(&params_refs[..], |row| row.get::<_, String>(0))?;
         let mut memory_ids = std::collections::HashSet::new();
         for row in rows {
             let adjacent: String = row?;
@@ -183,7 +177,6 @@ impl DuckDbGraphStore {
         Ok(out)
     }
 }
-
 
 fn current_timestamp() -> String {
     let millis = std::time::SystemTime::now()

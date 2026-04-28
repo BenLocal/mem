@@ -26,9 +26,7 @@ use crate::{
     pipeline::ingest::{compute_content_hash, initial_status, memory_node_id},
     pipeline::workflow,
     pipeline::{compress, retrieve},
-    storage::{
-        DuckDbGraphStore, DuckDbRepository, EmbeddingJobInsert, GraphError, StorageError,
-    },
+    storage::{DuckDbGraphStore, DuckDbRepository, EmbeddingJobInsert, GraphError, StorageError},
 };
 
 static EPISODE_SEQUENCE: AtomicU64 = AtomicU64::new(1);
@@ -90,10 +88,7 @@ impl MemoryService {
     }
 
     /// Constructor that accepts a pre-built `DuckDbGraphStore` (used by tests and `app.rs`).
-    pub fn new_with_graph(
-        repository: DuckDbRepository,
-        graph: Arc<DuckDbGraphStore>,
-    ) -> Self {
+    pub fn new_with_graph(repository: DuckDbRepository, graph: Arc<DuckDbGraphStore>) -> Self {
         Self::with_graph_and_embedding_providers(repository, graph, "fake".to_string(), None)
     }
 
