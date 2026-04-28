@@ -2,7 +2,8 @@ use std::sync::Arc;
 
 use thiserror::Error;
 
-use crate::domain::memory::GraphEdge;
+use crate::domain::memory::{GraphEdge, MemoryRecord};
+use crate::pipeline::ingest::extract_graph_edges;
 use super::{DuckDbRepository, StorageError};
 
 #[derive(Debug, Error)]
@@ -49,6 +50,44 @@ impl DuckDbGraphStore {
         }
         Ok(out)
     }
+
+    pub async fn sync_memory(&self, memory: &MemoryRecord) -> Result<(), DuckDbGraphError> {
+        let edges = extract_graph_edges(memory);
+        if edges.is_empty() {
+            return Ok(());
+        }
+        let now = current_timestamp();
+        let mut conn = self.repo.conn()?;
+        let tx = conn.transaction()?;
+        for edge in edges {
+            let exists: i64 = tx.query_row(
+                "select count(*) from graph_edges
+                  where from_node_id = ?1 and to_node_id = ?2
+                    and relation = ?3 and valid_to is null",
+                duckdb::params![&edge.from_node_id, &edge.to_node_id, &edge.relation],
+                |row| row.get(0),
+            )?;
+            if exists > 0 {
+                continue;
+            }
+            tx.execute(
+                "insert into graph_edges
+                   (from_node_id, to_node_id, relation, valid_from, valid_to)
+                 values (?1, ?2, ?3, ?4, NULL)",
+                duckdb::params![&edge.from_node_id, &edge.to_node_id, &edge.relation, &now],
+            )?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+}
+
+fn current_timestamp() -> String {
+    let millis = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("system time should be after unix epoch")
+        .as_millis();
+    format!("{millis:020}")
 }
 
 fn map_row_to_edge(row: &duckdb::Row<'_>) -> Result<GraphEdge, duckdb::Error> {
