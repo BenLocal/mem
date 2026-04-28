@@ -4,23 +4,25 @@ use thiserror::Error;
 
 use crate::domain::memory::{GraphEdge, MemoryRecord};
 use crate::pipeline::ingest::extract_graph_edges;
-use super::{DuckDbRepository, GraphError, GraphStore, StorageError};
+use super::{DuckDbRepository, StorageError};
 
 #[derive(Debug, Error)]
-pub enum DuckDbGraphError {
+pub enum GraphError {
+    #[error("graph backend unavailable: {0}")]
+    Unavailable(&'static str),
     #[error("graph backend error: {0}")]
     Backend(String),
 }
 
-impl From<StorageError> for DuckDbGraphError {
+impl From<StorageError> for GraphError {
     fn from(e: StorageError) -> Self {
-        DuckDbGraphError::Backend(e.to_string())
+        GraphError::Backend(e.to_string())
     }
 }
 
-impl From<duckdb::Error> for DuckDbGraphError {
+impl From<duckdb::Error> for GraphError {
     fn from(e: duckdb::Error) -> Self {
-        DuckDbGraphError::Backend(e.to_string())
+        GraphError::Backend(e.to_string())
     }
 }
 
@@ -34,7 +36,7 @@ impl DuckDbGraphStore {
     }
 
     /// Active-edge neighbors. Returns edges where (from = node OR to = node) AND valid_to IS NULL.
-    pub async fn neighbors(&self, node_id: &str) -> Result<Vec<GraphEdge>, DuckDbGraphError> {
+    pub async fn neighbors(&self, node_id: &str) -> Result<Vec<GraphEdge>, GraphError> {
         let conn = self.repo.conn()?;
         let mut stmt = conn.prepare(
             "select from_node_id, to_node_id, relation, valid_from, valid_to
@@ -51,7 +53,7 @@ impl DuckDbGraphStore {
         Ok(out)
     }
 
-    pub async fn sync_memory(&self, memory: &MemoryRecord) -> Result<(), DuckDbGraphError> {
+    pub async fn sync_memory(&self, memory: &MemoryRecord) -> Result<(), GraphError> {
         let edges = extract_graph_edges(memory);
         if edges.is_empty() {
             return Ok(());
@@ -81,7 +83,7 @@ impl DuckDbGraphStore {
         Ok(())
     }
 
-    pub async fn close_edges_for_memory(&self, memory_id: &str) -> Result<usize, DuckDbGraphError> {
+    pub async fn close_edges_for_memory(&self, memory_id: &str) -> Result<usize, GraphError> {
         let from = format!("memory:{memory_id}");
         let now = current_timestamp();
         let conn = self.repo.conn()?;
@@ -98,7 +100,7 @@ impl DuckDbGraphStore {
     pub async fn related_memory_ids(
         &self,
         node_ids: &[String],
-    ) -> Result<Vec<String>, DuckDbGraphError> {
+    ) -> Result<Vec<String>, GraphError> {
         if node_ids.is_empty() {
             return Ok(vec![]);
         }
@@ -143,7 +145,7 @@ impl DuckDbGraphStore {
         &self,
         node_id: &str,
         at: &str,
-    ) -> Result<Vec<GraphEdge>, DuckDbGraphError> {
+    ) -> Result<Vec<GraphEdge>, GraphError> {
         let conn = self.repo.conn()?;
         let mut stmt = conn.prepare(
             "select from_node_id, to_node_id, relation, valid_from, valid_to
@@ -164,7 +166,7 @@ impl DuckDbGraphStore {
     pub async fn all_edges_for_memory(
         &self,
         memory_id: &str,
-    ) -> Result<Vec<GraphEdge>, DuckDbGraphError> {
+    ) -> Result<Vec<GraphEdge>, GraphError> {
         let from = format!("memory:{memory_id}");
         let conn = self.repo.conn()?;
         let mut stmt = conn.prepare(
@@ -182,48 +184,6 @@ impl DuckDbGraphStore {
     }
 }
 
-/// Bridge: implement the legacy `GraphStore` trait so that `DuckDbGraphStore` can be
-/// used wherever `Arc<dyn GraphStore>` is expected (e.g. `retrieve::rank_with_graph_hybrid`).
-/// This bridge is removed in Task 11 when the `dyn GraphStore` trait is deleted.
-impl GraphStore for DuckDbGraphStore {
-    fn sync_memory<'a>(
-        &'a self,
-        memory: &'a MemoryRecord,
-    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), GraphError>> + Send + 'a>>
-    {
-        Box::pin(async move {
-            self.sync_memory(memory)
-                .await
-                .map_err(|e| GraphError::Backend(e.to_string()))
-        })
-    }
-
-    fn neighbors<'a>(
-        &'a self,
-        node_id: &'a str,
-    ) -> std::pin::Pin<
-        Box<dyn std::future::Future<Output = Result<Vec<GraphEdge>, GraphError>> + Send + 'a>,
-    > {
-        Box::pin(async move {
-            self.neighbors(node_id)
-                .await
-                .map_err(|e| GraphError::Backend(e.to_string()))
-        })
-    }
-
-    fn related_memory_ids<'a>(
-        &'a self,
-        node_ids: &'a [String],
-    ) -> std::pin::Pin<
-        Box<dyn std::future::Future<Output = Result<Vec<String>, GraphError>> + Send + 'a>,
-    > {
-        Box::pin(async move {
-            self.related_memory_ids(node_ids)
-                .await
-                .map_err(|e| GraphError::Backend(e.to_string()))
-        })
-    }
-}
 
 fn current_timestamp() -> String {
     let millis = std::time::SystemTime::now()

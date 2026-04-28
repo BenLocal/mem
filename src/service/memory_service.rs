@@ -551,7 +551,6 @@ impl MemoryService {
             vec![]
         };
 
-        // `DuckDbGraphStore` implements `GraphStore` via a bridge impl, so coercion works.
         let ranked = match retrieve::rank_with_graph_hybrid(
             lexical,
             semantic.clone(),
