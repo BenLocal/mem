@@ -167,3 +167,29 @@ async fn neighbors_at_filters_by_timestamp() {
     let later = graph.neighbors_at("project:foo", &after_close).await.unwrap();
     assert!(later.is_empty(), "edge must be excluded at later timestamp");
 }
+
+#[tokio::test]
+async fn related_memory_ids_excludes_superseded() {
+    let dir = tempdir().unwrap();
+    let db = dir.path().join("rel.duckdb");
+    let (repo, graph) = open_repo_and_graph(&db).await;
+    let svc = MemoryService::new((*repo).clone());
+    let r1 = ingest_one(&svc, "v1", Some("foo"), Some("mem")).await;
+    let r2 = ingest_one(&svc, "v2", Some("foo"), Some("mem")).await;
+    let m1 = repo.get_memory_for_tenant("t", &r1.memory_id).await.unwrap().unwrap();
+    let m2 = repo.get_memory_for_tenant("t", &r2.memory_id).await.unwrap().unwrap();
+    graph.sync_memory(&m1).await.unwrap();
+    graph.sync_memory(&m2).await.unwrap();
+
+    let mut both = graph.related_memory_ids(&["project:foo".into()]).await.unwrap();
+    both.sort();
+    assert_eq!(both.len(), 2, "both memories should be present: {both:?}");
+    assert!(both.contains(&r1.memory_id));
+    assert!(both.contains(&r2.memory_id));
+
+    graph.close_edges_for_memory(&r1.memory_id).await.unwrap();
+
+    let one = graph.related_memory_ids(&["project:foo".into()]).await.unwrap();
+    assert_eq!(one.len(), 1, "only v2 should remain: {one:?}");
+    assert_eq!(one[0], r2.memory_id);
+}

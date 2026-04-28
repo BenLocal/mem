@@ -95,6 +95,50 @@ impl DuckDbGraphStore {
         Ok(count)
     }
 
+    pub async fn related_memory_ids(
+        &self,
+        node_ids: &[String],
+    ) -> Result<Vec<String>, DuckDbGraphError> {
+        if node_ids.is_empty() {
+            return Ok(vec![]);
+        }
+        let placeholders = std::iter::repeat_n("?", node_ids.len())
+            .collect::<Vec<_>>()
+            .join(",");
+        let sql = format!(
+            "select distinct
+               case when from_node_id in ({0}) then to_node_id else from_node_id end as adjacent
+             from graph_edges
+             where (from_node_id in ({0}) or to_node_id in ({0}))
+               and valid_to is null",
+            placeholders
+        );
+        let conn = self.repo.conn()?;
+        let mut stmt = conn.prepare(&sql)?;
+        // Three IN clauses → bind the parameter list three times.
+        let mut params_vec: Vec<Box<dyn duckdb::ToSql>> = Vec::with_capacity(node_ids.len() * 3);
+        for _ in 0..3 {
+            for n in node_ids {
+                params_vec.push(Box::new(n.clone()));
+            }
+        }
+        let params_refs: Vec<&dyn duckdb::ToSql> =
+            params_vec.iter().map(|b| b.as_ref()).collect();
+        let rows = stmt.query_map(&params_refs[..], |row| {
+            row.get::<_, String>(0)
+        })?;
+        let mut memory_ids = std::collections::HashSet::new();
+        for row in rows {
+            let adjacent: String = row?;
+            if let Some(memory_id) = adjacent.strip_prefix("memory:") {
+                memory_ids.insert(memory_id.to_string());
+            }
+        }
+        let mut out: Vec<String> = memory_ids.into_iter().collect();
+        out.sort();
+        Ok(out)
+    }
+
     pub async fn neighbors_at(
         &self,
         node_id: &str,
