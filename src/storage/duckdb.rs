@@ -856,6 +856,53 @@ impl DuckDbRepository {
         Ok(candidates)
     }
 
+    /// Returns [`MemoryRecord`] rows for the given ids, filtered to a tenant and
+    /// the standard "live" status set (excludes `rejected` and `archived`).
+    /// Used by the rewritten `semantic_search_memories` (Task 14) as an ANN post-filter.
+    pub async fn fetch_memories_by_ids(
+        &self,
+        tenant: &str,
+        ids: &[&str],
+    ) -> Result<Vec<MemoryRecord>, StorageError> {
+        if ids.is_empty() {
+            return Ok(vec![]);
+        }
+        let conn = self.conn()?;
+
+        let placeholders = std::iter::repeat("?")
+            .take(ids.len())
+            .collect::<Vec<_>>()
+            .join(",");
+        let sql = format!(
+            "select
+                memory_id, tenant, memory_type, status, scope, visibility, version,
+                summary, content, evidence_json, code_refs_json, project, repo,
+                module, task_type, tags_json, confidence, decay_score, content_hash,
+                idempotency_key, supersedes_memory_id, source_agent, created_at,
+                updated_at, last_validated_at
+             from memories
+             where tenant = ?1
+               and status not in ('rejected', 'archived')
+               and memory_id in ({placeholders})"
+        );
+
+        let mut stmt = conn.prepare(&sql)?;
+        let mut params_vec: Vec<Box<dyn duckdb::ToSql>> =
+            vec![Box::new(tenant.to_string())];
+        for id in ids {
+            params_vec.push(Box::new(id.to_string()));
+        }
+        let params_refs: Vec<&dyn duckdb::ToSql> =
+            params_vec.iter().map(|b| b.as_ref()).collect();
+
+        let rows = stmt.query_map(&params_refs[..], map_memory_row)?;
+        let mut out = Vec::with_capacity(ids.len());
+        for row in rows {
+            out.push(row?);
+        }
+        Ok(out)
+    }
+
     pub async fn accept_pending(
         &self,
         tenant: &str,
