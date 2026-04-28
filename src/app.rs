@@ -47,10 +47,14 @@ impl AppState {
         let provider_worker = provider.clone();
         let provider_search = provider.clone();
         let repo_worker = repository.clone();
+        let repo_decay = repository.clone();
         let worker_settings = config.embedding.clone();
         tokio::spawn(async move {
             crate::service::embedding_worker::run(repo_worker, provider_worker, worker_settings)
                 .await;
+        });
+        tokio::spawn(async move {
+            crate::service::decay_worker::start_decay_worker(Arc::new(repo_decay)).await;
         });
 
         let embedding_provider = config.embedding.job_provider_id().to_string();
