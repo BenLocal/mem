@@ -7,6 +7,7 @@ use mem::{
     service::{embedding_worker, MemoryService},
     storage::{DuckDbRepository, EmbeddingJobInsert},
 };
+use std::sync::Arc;
 use tempfile::tempdir;
 
 #[tokio::test]
@@ -60,6 +61,68 @@ async fn worker_completes_job_and_writes_embedding_row() {
             .unwrap(),
         1
     );
+
+    // Vector index reflects the new row when one is attached.
+    let fp = mem::storage::VectorIndexFingerprint {
+        provider: settings.job_provider_id().to_string(),
+        model: settings.model.clone(),
+        dim: settings.dim,
+    };
+    let idx = Arc::new(
+        mem::storage::VectorIndex::open_or_rebuild(&repo, &db, &fp).await.unwrap(),
+    );
+    repo.attach_vector_index(idx.clone());
+    // open_or_rebuild's rebuild path populates from existing memory_embeddings
+    assert_eq!(idx.size(), 1);
+}
+
+#[tokio::test]
+async fn worker_writes_to_attached_vector_index() {
+    let dir = tempdir().unwrap();
+    let db = dir.path().join("worker-vec.duckdb");
+    let repo = DuckDbRepository::open(&db).await.unwrap();
+    let settings = EmbeddingSettings::development_defaults();
+    let provider = arc_embedding_provider(&settings).unwrap();
+
+    let fp = mem::storage::VectorIndexFingerprint {
+        provider: settings.job_provider_id().to_string(),
+        model: settings.model.clone(),
+        dim: settings.dim,
+    };
+    let idx = Arc::new(
+        mem::storage::VectorIndex::open_or_rebuild(&repo, &db, &fp).await.unwrap(),
+    );
+    repo.attach_vector_index(idx.clone());
+    assert_eq!(idx.size(), 0);
+
+    let service = MemoryService::new(repo.clone());
+    let response = service
+        .ingest(IngestMemoryRequest {
+            tenant: "t".into(),
+            memory_type: MemoryType::Implementation,
+            content: "wire-up content".into(),
+            evidence: vec![],
+            code_refs: vec![],
+            scope: Scope::Repo,
+            visibility: Visibility::Shared,
+            project: None,
+            repo: Some("mem".into()),
+            module: None,
+            task_type: None,
+            tags: vec![],
+            source_agent: "test".into(),
+            idempotency_key: None,
+            write_mode: WriteMode::Auto,
+        })
+        .await
+        .unwrap();
+
+    embedding_worker::tick(&repo, provider.as_ref(), &settings).await.unwrap();
+
+    assert_eq!(idx.size(), 1);
+    let q = provider.embed_text("wire-up content").await.unwrap();
+    let hits = idx.search(&q, 1).await.unwrap();
+    assert_eq!(hits[0].0, response.memory_id);
 }
 
 #[tokio::test]

@@ -2,6 +2,7 @@ use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock, RwLockReadGuard, RwLockWriteGuard};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::ffi::OsString;
 
 use serde::{Deserialize, Serialize};
@@ -94,6 +95,9 @@ pub struct VectorIndex {
     index: Arc<RwLock<Index>>,
     id_map: Arc<RwLock<HashMap<u64, String>>>,
     fingerprint: VectorIndexFingerprint,
+    dirty: AtomicUsize,
+    idx_path: Option<PathBuf>,
+    meta_path: Option<PathBuf>,
 }
 
 impl std::fmt::Debug for VectorIndex {
@@ -142,6 +146,9 @@ impl VectorIndex {
                 model: model.to_string(),
                 dim,
             },
+            dirty: AtomicUsize::new(0),
+            idx_path: None,
+            meta_path: None,
         }
     }
 
@@ -183,6 +190,33 @@ impl VectorIndex {
 
     pub fn fingerprint(&self) -> &VectorIndexFingerprint {
         &self.fingerprint
+    }
+
+    // ── Dirty-tracking and periodic save ────────────────────────────────────
+
+    /// Increment the dirty counter and return the new value.
+    pub fn dirty_count_increment(&self) -> usize {
+        self.dirty.fetch_add(1, Ordering::AcqRel) + 1
+    }
+
+    /// Reset the dirty counter to zero (call after a successful save).
+    pub fn dirty_count_reset(&self) {
+        self.dirty.store(0, Ordering::Release);
+    }
+
+    /// Save to the paths that were set when the index was opened or rebuilt.
+    ///
+    /// Returns an error if the paths are not set (i.e. the index is in-memory only).
+    pub async fn save_at_default_paths(&self) -> Result<(), VectorIndexError> {
+        let idx_path = self
+            .idx_path
+            .clone()
+            .ok_or_else(|| VectorIndexError::UsearchOp("save_at_default_paths needs known paths".into()))?;
+        let meta_path = self
+            .meta_path
+            .clone()
+            .ok_or_else(|| VectorIndexError::UsearchOp("save_at_default_paths needs known paths".into()))?;
+        self.save_to(&idx_path, &meta_path).await
     }
 
     // ── Core operations ─────────────────────────────────────────────────────
@@ -423,6 +457,9 @@ impl VectorIndex {
                 model: meta.model,
                 dim: meta.dim,
             },
+            dirty: AtomicUsize::new(0),
+            idx_path: Some(index_path.to_path_buf()),
+            meta_path: Some(meta_path.to_path_buf()),
         })
     }
 
@@ -477,7 +514,7 @@ impl VectorIndex {
         }
 
         let started = std::time::Instant::now();
-        let fresh = VectorIndex::new_in_memory(
+        let mut fresh = VectorIndex::new_in_memory(
             expected_fp.dim,
             &expected_fp.provider,
             &expected_fp.model,
@@ -508,6 +545,9 @@ impl VectorIndex {
             try_cleanup_tmp_paths(&idx_path, &meta_path);
             return Err(e);
         }
+        // save_to succeeded — record the paths so save_at_default_paths works.
+        fresh.idx_path = Some(idx_path);
+        fresh.meta_path = Some(meta_path);
 
         tracing::info!(
             rows = fresh.size(),

@@ -143,6 +143,40 @@ pub async fn tick(
         &now,
     )
     .await?;
+
+    if let Some(idx) = repo.vector_index() {
+        match idx.upsert(&job.memory_id, &embedding).await {
+            Ok(()) => {
+                let count = idx.dirty_count_increment();
+                if count >= settings.vector_index_flush_every {
+                    if let Err(err) = idx.save_at_default_paths().await {
+                        warn!(error = %err, "vector index periodic save failed");
+                    } else {
+                        idx.dirty_count_reset();
+                    }
+                }
+            }
+            Err(crate::storage::VectorIndexError::HashCollision { existing, incoming }) => {
+                // Per spec: hash collisions are catastrophic data integrity events.
+                // Permanently fail the job rather than retry.
+                let now = current_timestamp();
+                let msg = format!("vector_index hash collision: {existing} vs {incoming}");
+                error!(memory_id = %job.memory_id, error = %msg, "vector index hash collision; permanently failing job");
+                repo.permanently_fail_embedding_job(&job.job_id, job.attempt_count + 1, &msg, &now).await?;
+                return Ok(());
+            }
+            Err(err) => {
+                warn!(
+                    job_id = %job.job_id,
+                    memory_id = %job.memory_id,
+                    error = %err,
+                    "vector index upsert failed; embedding row already written"
+                );
+                // Best effort: do not fail the job. Row+index reconciliation happens on next startup.
+            }
+        }
+    }
+
     repo.complete_embedding_job(&job.job_id, &now).await?;
     info!(
         job_id = %job.job_id,
