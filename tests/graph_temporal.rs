@@ -128,3 +128,42 @@ async fn close_edges_for_memory_sets_valid_to() {
     let post = graph.neighbors(&format!("memory:{}", r.memory_id)).await.unwrap();
     assert!(post.is_empty(), "no active edges after close");
 }
+
+fn current_ts_str() -> String {
+    let millis = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis();
+    format!("{millis:020}")
+}
+
+fn bump_timestamp(s: &str, by_ms: u128) -> String {
+    let n: u128 = s.parse().unwrap();
+    format!("{:020}", n + by_ms)
+}
+
+#[tokio::test]
+async fn neighbors_at_filters_by_timestamp() {
+    let dir = tempdir().unwrap();
+    let db = dir.path().join("at.duckdb");
+    let (repo, graph) = open_repo_and_graph(&db).await;
+    let svc = MemoryService::new((*repo).clone());
+    let r = ingest_one(&svc, "delta", Some("foo"), Some("mem")).await;
+    let memory = repo.get_memory_for_tenant("t", &r.memory_id).await.unwrap().unwrap();
+    graph.sync_memory(&memory).await.unwrap();
+    let active = graph.neighbors("project:foo").await.unwrap();
+    assert!(!active.is_empty());
+    let valid_from_of_first = active[0].valid_from.clone();
+
+    tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    graph.close_edges_for_memory(&r.memory_id).await.unwrap();
+    let after_close = current_ts_str();
+
+    // mid timestamp = valid_from + 1ms (still active before close)
+    let mid = bump_timestamp(&valid_from_of_first, 1);
+    let then = graph.neighbors_at("project:foo", &mid).await.unwrap();
+    assert!(!then.is_empty(), "edge should be active at mid timestamp");
+
+    let later = graph.neighbors_at("project:foo", &after_close).await.unwrap();
+    assert!(later.is_empty(), "edge must be excluded at later timestamp");
+}

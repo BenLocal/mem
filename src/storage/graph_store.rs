@@ -94,6 +94,28 @@ impl DuckDbGraphStore {
         )?;
         Ok(count)
     }
+
+    pub async fn neighbors_at(
+        &self,
+        node_id: &str,
+        at: &str,
+    ) -> Result<Vec<GraphEdge>, DuckDbGraphError> {
+        let conn = self.repo.conn()?;
+        let mut stmt = conn.prepare(
+            "select from_node_id, to_node_id, relation, valid_from, valid_to
+               from graph_edges
+              where (from_node_id = ?1 or to_node_id = ?1)
+                and valid_from <= ?2
+                and (valid_to is null or valid_to > ?2)
+              order by relation, from_node_id, to_node_id",
+        )?;
+        let rows = stmt.query_map(duckdb::params![node_id, at], map_row_to_edge)?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row?);
+        }
+        Ok(out)
+    }
 }
 
 fn current_timestamp() -> String {
