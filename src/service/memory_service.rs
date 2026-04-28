@@ -83,6 +83,14 @@ impl MemoryService {
         )
     }
 
+    pub fn new_with_index(
+        repository: DuckDbRepository,
+        vector_index: Arc<crate::storage::VectorIndex>,
+    ) -> Self {
+        repository.attach_vector_index(vector_index);
+        Self::new(repository)
+    }
+
     pub fn with_graph(repository: DuckDbRepository, graph: Arc<dyn GraphStore>) -> Self {
         Self::with_graph_and_embedding_providers(repository, graph, "fake".to_string(), None)
     }
