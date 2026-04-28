@@ -91,6 +91,13 @@ pub fn workflow_node_id(workflow_id: &str) -> String {
     format!("workflow:{workflow_id}")
 }
 
+/// Extract graph edges derived from a memory's fields.
+///
+/// Returned `GraphEdge`s have `valid_from = String::new()` and `valid_to = None`
+/// as placeholders. The storage layer (`DuckDbGraphStore::sync_memory`, added in
+/// later tasks) overwrites `valid_from` with the current timestamp at write time.
+/// Keeping this function pure (no clock dependency) lets us test it without
+/// time mocking.
 pub fn extract_graph_edges(memory: &MemoryRecord) -> Vec<GraphEdge> {
     let mut edges = Vec::new();
     let from_node_id = memory_node_id(&memory.memory_id);
@@ -100,6 +107,8 @@ pub fn extract_graph_edges(memory: &MemoryRecord) -> Vec<GraphEdge> {
             from_node_id: from_node_id.clone(),
             to_node_id: project_node_id(project),
             relation: "applies_to".into(),
+            valid_from: String::new(),
+            valid_to: None,
         });
     }
 
@@ -108,6 +117,8 @@ pub fn extract_graph_edges(memory: &MemoryRecord) -> Vec<GraphEdge> {
             from_node_id: from_node_id.clone(),
             to_node_id: repo_node_id(repo),
             relation: "observed_in".into(),
+            valid_from: String::new(),
+            valid_to: None,
         });
     }
 
@@ -119,6 +130,8 @@ pub fn extract_graph_edges(memory: &MemoryRecord) -> Vec<GraphEdge> {
             from_node_id: from_node_id.clone(),
             to_node_id: module_node_id(repo, module),
             relation: "relevant_to".into(),
+            valid_from: String::new(),
+            valid_to: None,
         });
     }
 
@@ -131,12 +144,16 @@ pub fn extract_graph_edges(memory: &MemoryRecord) -> Vec<GraphEdge> {
             from_node_id: from_node_id.clone(),
             to_node_id: workflow_node_id(workflow_id),
             relation: "uses_workflow".into(),
+            valid_from: String::new(),
+            valid_to: None,
         });
     } else if matches!(memory.memory_type, MemoryType::Workflow) {
         edges.push(GraphEdge {
             from_node_id: from_node_id.clone(),
             to_node_id: workflow_node_id(&memory.memory_id),
             relation: "uses_workflow".into(),
+            valid_from: String::new(),
+            valid_to: None,
         });
     }
 
@@ -149,6 +166,8 @@ pub fn extract_graph_edges(memory: &MemoryRecord) -> Vec<GraphEdge> {
             from_node_id: from_node_id.clone(),
             to_node_id: memory_node_id(previous),
             relation: "supersedes".into(),
+            valid_from: String::new(),
+            valid_to: None,
         });
     }
 
@@ -162,6 +181,8 @@ pub fn extract_graph_edges(memory: &MemoryRecord) -> Vec<GraphEdge> {
             from_node_id: from_node_id.clone(),
             to_node_id: memory_node_id(contradicted),
             relation: "contradicts".into(),
+            valid_from: String::new(),
+            valid_to: None,
         });
     }
 

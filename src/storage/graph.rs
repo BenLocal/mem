@@ -234,6 +234,8 @@ impl GraphStore for IndraDbGraphAdapter {
                             from_node_id,
                             to_node_id,
                             relation: edge.t.as_str().to_string(),
+                            valid_from: String::new(),
+                            valid_to: None,
                         });
                     }
                 }
