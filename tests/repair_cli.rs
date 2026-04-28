@@ -1,5 +1,5 @@
 use mem::storage::{DiagnosticReport, DiagnosticStatus, PathInfo, SidecarFile, VectorIndexFingerprint, sidecar_paths, rebuild_index};
-use mem::cli::repair::format_check_text;
+use mem::cli::repair::{format_check_text, format_check_json, format_rebuild_json, format_rebuild_text, RebuildOutcome};
 use std::path::PathBuf;
 
 // ── imports used by the async integration tests ───────────────────────────────
@@ -440,4 +440,72 @@ fn format_check_text_for_db_unavailable() {
     let s = format_check_text(&report);
     assert!(s.contains("Could not open DB"), "{s}");
     assert!(s.contains("mem serve"), "should hint at running service: {s}");
+}
+
+#[test]
+fn format_check_json_emits_top_level_status_and_exit_code() {
+    let report = DiagnosticReport {
+        status: "drift",
+        details: DiagnosticStatus::DbDrift { meta_count: 5, db_count: 7 },
+        paths: paths(),
+        elapsed_ms: 10,
+    };
+    let v = format_check_json(&report);
+    assert_eq!(v["command"], "check");
+    assert_eq!(v["status"], "drift");
+    assert_eq!(v["exit_code"], 1);
+    assert_eq!(v["details"]["kind"], "DbDrift");
+    assert_eq!(v["details"]["meta_count"], 5);
+    assert_eq!(v["details"]["db_count"], 7);
+    assert!(v["paths"]["db"].is_string());
+    assert_eq!(v["elapsed_ms"], 10);
+}
+
+#[test]
+fn format_check_json_unavailable_uses_exit_code_two() {
+    let report = DiagnosticReport {
+        status: "db_unavailable",
+        details: DiagnosticStatus::DbUnavailable { reason: "locked".into() },
+        paths: paths(),
+        elapsed_ms: 1,
+    };
+    let v = format_check_json(&report);
+    assert_eq!(v["exit_code"], 2);
+}
+
+#[test]
+fn format_rebuild_text_for_success() {
+    let outcome = RebuildOutcome::Rebuilt { rows: 1247, paths: paths(), elapsed_ms: 832 };
+    let s = format_rebuild_text(&outcome);
+    assert!(s.contains("1247"), "{s}");
+    assert!(s.contains("832"), "{s}");
+    assert!(s.contains("Rebuilt"), "{s}");
+}
+
+#[test]
+fn format_rebuild_json_for_success() {
+    let outcome = RebuildOutcome::Rebuilt { rows: 1247, paths: paths(), elapsed_ms: 832 };
+    let v = format_rebuild_json(&outcome);
+    assert_eq!(v["command"], "rebuild");
+    assert_eq!(v["status"], "rebuilt");
+    assert_eq!(v["exit_code"], 0);
+    assert_eq!(v["rows"], 1247);
+    assert_eq!(v["elapsed_ms"], 832);
+}
+
+#[test]
+fn format_rebuild_json_for_db_unavailable() {
+    let outcome = RebuildOutcome::DbUnavailable { reason: "locked".into(), paths: paths() };
+    let v = format_rebuild_json(&outcome);
+    assert_eq!(v["status"], "db_unavailable");
+    assert_eq!(v["exit_code"], 2);
+}
+
+#[test]
+fn format_rebuild_json_for_failed() {
+    let outcome = RebuildOutcome::Failed { reason: "disk full".into(), paths: paths() };
+    let v = format_rebuild_json(&outcome);
+    assert_eq!(v["status"], "rebuild_failed");
+    assert_eq!(v["exit_code"], 2);
+    assert_eq!(v["details"]["reason"], "disk full");
 }

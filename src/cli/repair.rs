@@ -128,6 +128,92 @@ pub fn format_check_text(report: &DiagnosticReport) -> String {
     s
 }
 
+use serde_json::{json, Value};
+use crate::storage::PathInfo;
+
+#[derive(Debug, Clone)]
+pub enum RebuildOutcome {
+    Rebuilt { rows: usize, paths: PathInfo, elapsed_ms: u64 },
+    DbUnavailable { reason: String, paths: PathInfo },
+    Failed { reason: String, paths: PathInfo },
+}
+
+impl RebuildOutcome {
+    pub fn exit_code(&self) -> i32 {
+        match self {
+            RebuildOutcome::Rebuilt { .. } => 0,
+            _ => 2,
+        }
+    }
+    #[allow(dead_code)]
+    pub fn coarse_status(&self) -> &'static str {
+        match self {
+            RebuildOutcome::Rebuilt { .. } => "rebuilt",
+            RebuildOutcome::DbUnavailable { .. } => "db_unavailable",
+            RebuildOutcome::Failed { .. } => "rebuild_failed",
+        }
+    }
+}
+
+pub fn format_check_json(report: &DiagnosticReport) -> Value {
+    json!({
+        "command": "check",
+        "status": report.status,
+        "exit_code": report.details.exit_code(),
+        "details": serde_json::to_value(&report.details).unwrap(),
+        "paths": serde_json::to_value(&report.paths).unwrap(),
+        "elapsed_ms": report.elapsed_ms,
+    })
+}
+
+pub fn format_rebuild_text(outcome: &RebuildOutcome) -> String {
+    use std::fmt::Write;
+    let mut s = String::new();
+    match outcome {
+        RebuildOutcome::Rebuilt { rows, paths, elapsed_ms } => {
+            writeln!(&mut s, "🔨 Rebuilding vector index from {}...", paths.db.display()).unwrap();
+            writeln!(&mut s, "✅ Rebuilt: {rows} rows in {elapsed_ms}ms.").unwrap();
+            writeln!(&mut s, "   New sidecar at {}", paths.index.display()).unwrap();
+        }
+        RebuildOutcome::DbUnavailable { reason, paths } => {
+            writeln!(&mut s, "❌ Could not open DB at {}: {reason}", paths.db.display()).unwrap();
+            writeln!(&mut s, "   Is `mem serve` running? Stop the service before running this command.").unwrap();
+        }
+        RebuildOutcome::Failed { reason, paths } => {
+            writeln!(&mut s, "❌ Rebuild failed: {reason}").unwrap();
+            writeln!(&mut s, "   DB at {} is unchanged; sidecar may be partially deleted.", paths.db.display()).unwrap();
+        }
+    }
+    s
+}
+
+pub fn format_rebuild_json(outcome: &RebuildOutcome) -> Value {
+    match outcome {
+        RebuildOutcome::Rebuilt { rows, paths, elapsed_ms } => json!({
+            "command": "rebuild",
+            "status": "rebuilt",
+            "exit_code": 0,
+            "rows": rows,
+            "paths": serde_json::to_value(paths).unwrap(),
+            "elapsed_ms": elapsed_ms,
+        }),
+        RebuildOutcome::DbUnavailable { reason, paths } => json!({
+            "command": "rebuild",
+            "status": "db_unavailable",
+            "exit_code": 2,
+            "details": {"reason": reason},
+            "paths": serde_json::to_value(paths).unwrap(),
+        }),
+        RebuildOutcome::Failed { reason, paths } => json!({
+            "command": "rebuild",
+            "status": "rebuild_failed",
+            "exit_code": 2,
+            "details": {"reason": reason},
+            "paths": serde_json::to_value(paths).unwrap(),
+        }),
+    }
+}
+
 /// Entry point for `mem repair`. Returns the process exit code.
 pub async fn run(args: RepairArgs) -> i32 {
     // Subsequent tasks fill this in.
