@@ -1,5 +1,9 @@
 use clap::Args;
-use crate::storage::{DiagnosticReport, DiagnosticStatus, SidecarFile};
+use crate::config::Config;
+use crate::storage::{
+    diagnose, rebuild_index, sidecar_paths, DiagnosticReport, DiagnosticStatus, DuckDbRepository,
+    PathInfo, SidecarFile, VectorIndexFingerprint,
+};
 
 #[derive(Debug, Args)]
 pub struct RepairArgs {
@@ -129,7 +133,6 @@ pub fn format_check_text(report: &DiagnosticReport) -> String {
 }
 
 use serde_json::{json, Value};
-use crate::storage::PathInfo;
 
 #[derive(Debug, Clone)]
 pub enum RebuildOutcome {
@@ -216,12 +219,142 @@ pub fn format_rebuild_json(outcome: &RebuildOutcome) -> Value {
 
 /// Entry point for `mem repair`. Returns the process exit code.
 pub async fn run(args: RepairArgs) -> i32 {
-    // Subsequent tasks fill this in.
+    // Resolve config.
+    let config = match Config::from_env() {
+        Ok(c) => c,
+        Err(e) => {
+            return emit_config_error(&args, &e.to_string());
+        }
+    };
+
+    let fp = VectorIndexFingerprint {
+        provider: config.embedding.job_provider_id().to_string(),
+        model: config.embedding.model.clone(),
+        dim: config.embedding.dim,
+    };
+
     if args.mode.rebuild {
-        eprintln!("rebuild not yet implemented");
-        2
+        run_rebuild(&config, &fp, args.json).await
     } else {
-        eprintln!("check not yet implemented");
-        2
+        run_check(&config, &fp, args.json).await
     }
+}
+
+async fn run_check(
+    config: &Config,
+    fp: &VectorIndexFingerprint,
+    as_json: bool,
+) -> i32 {
+    let started = std::time::Instant::now();
+    let repo = match DuckDbRepository::open(&config.db_path).await {
+        Ok(r) => r,
+        Err(e) => {
+            let (idx_path, meta_path) = sidecar_paths(&config.db_path);
+            let report = DiagnosticReport {
+                status: "db_unavailable",
+                details: DiagnosticStatus::DbUnavailable { reason: e.to_string() },
+                paths: PathInfo {
+                    db: config.db_path.clone(),
+                    index: idx_path,
+                    meta: meta_path,
+                },
+                elapsed_ms: started.elapsed().as_millis() as u64,
+            };
+            return emit_check(&report, as_json);
+        }
+    };
+
+    let report = match diagnose(&repo, &config.db_path, fp).await {
+        Ok(r) => r,
+        Err(e) => {
+            let (idx_path, meta_path) = sidecar_paths(&config.db_path);
+            DiagnosticReport {
+                status: "db_unavailable",
+                details: DiagnosticStatus::DbUnavailable { reason: e.to_string() },
+                paths: PathInfo {
+                    db: config.db_path.clone(),
+                    index: idx_path,
+                    meta: meta_path,
+                },
+                elapsed_ms: started.elapsed().as_millis() as u64,
+            }
+        }
+    };
+    emit_check(&report, as_json)
+}
+
+async fn run_rebuild(
+    config: &Config,
+    fp: &VectorIndexFingerprint,
+    as_json: bool,
+) -> i32 {
+    let (idx_path, meta_path) = sidecar_paths(&config.db_path);
+    let paths = PathInfo {
+        db: config.db_path.clone(),
+        index: idx_path,
+        meta: meta_path,
+    };
+
+    let repo = match DuckDbRepository::open(&config.db_path).await {
+        Ok(r) => r,
+        Err(e) => {
+            return emit_rebuild(
+                &RebuildOutcome::DbUnavailable { reason: e.to_string(), paths },
+                as_json,
+            );
+        }
+    };
+
+    let started = std::time::Instant::now();
+    match rebuild_index(&repo, &config.db_path, fp).await {
+        Ok(idx) => {
+            let outcome = RebuildOutcome::Rebuilt {
+                rows: idx.size(),
+                paths,
+                elapsed_ms: started.elapsed().as_millis() as u64,
+            };
+            emit_rebuild(&outcome, as_json)
+        }
+        Err(e) => {
+            emit_rebuild(
+                &RebuildOutcome::Failed { reason: e.to_string(), paths },
+                as_json,
+            )
+        }
+    }
+}
+
+fn emit_check(report: &DiagnosticReport, as_json: bool) -> i32 {
+    if as_json {
+        let v = format_check_json(report);
+        println!("{}", serde_json::to_string_pretty(&v).unwrap());
+    } else {
+        print!("{}", format_check_text(report));
+    }
+    report.details.exit_code()
+}
+
+fn emit_rebuild(outcome: &RebuildOutcome, as_json: bool) -> i32 {
+    if as_json {
+        let v = format_rebuild_json(outcome);
+        println!("{}", serde_json::to_string_pretty(&v).unwrap());
+    } else {
+        print!("{}", format_rebuild_text(outcome));
+    }
+    outcome.exit_code()
+}
+
+fn emit_config_error(args: &RepairArgs, reason: &str) -> i32 {
+    if args.json {
+        let v = json!({
+            "command": if args.mode.rebuild { "rebuild" } else { "check" },
+            "status": "config_error",
+            "exit_code": 2,
+            "details": {"reason": reason},
+        });
+        println!("{}", serde_json::to_string_pretty(&v).unwrap());
+    } else {
+        eprintln!("❌ Invalid configuration: {reason}");
+    }
+    2
 }
