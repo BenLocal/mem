@@ -1,6 +1,17 @@
 use mem::storage::{DiagnosticReport, DiagnosticStatus, PathInfo, SidecarFile, VectorIndexFingerprint};
 use std::path::PathBuf;
 
+// ── imports used by the async integration tests ───────────────────────────────
+use mem::config::EmbeddingSettings;
+use mem::domain::memory::{
+    IngestMemoryRequest, MemoryType, Scope, Visibility, WriteMode,
+};
+use mem::embedding::arc_embedding_provider;
+use mem::service::{embedding_worker, MemoryService};
+use mem::storage::{diagnose, DuckDbRepository, VectorIndex};
+use std::sync::Arc;
+use tempfile::tempdir;
+
 fn fp(dim: usize) -> VectorIndexFingerprint {
     VectorIndexFingerprint { provider: "fake".into(), model: "fake".into(), dim }
 }
@@ -83,4 +94,62 @@ fn expected_status_to_static(s: &str) -> &'static str {
         "db_unavailable" => "db_unavailable",
         _ => unreachable!(),
     }
+}
+
+// ── integration helpers ───────────────────────────────────────────────────────
+
+async fn seed_one_row_with_index(db_path: &std::path::Path) -> (DuckDbRepository, Arc<VectorIndex>) {
+    let repo = DuckDbRepository::open(db_path).await.unwrap();
+    let settings = EmbeddingSettings::development_defaults();
+    let provider = arc_embedding_provider(&settings).unwrap();
+    let fp = VectorIndexFingerprint {
+        provider: settings.job_provider_id().to_string(),
+        model: settings.model.clone(),
+        dim: settings.dim,
+    };
+    let idx = Arc::new(VectorIndex::open_or_rebuild(&repo, db_path, &fp).await.unwrap());
+    repo.attach_vector_index(idx.clone());
+    let svc = MemoryService::new(repo.clone());
+    svc.ingest(IngestMemoryRequest {
+        tenant: "t".into(),
+        memory_type: MemoryType::Implementation,
+        content: "diag-target".into(),
+        evidence: vec![],
+        code_refs: vec![],
+        scope: Scope::Repo,
+        visibility: Visibility::Shared,
+        project: None,
+        repo: Some("mem".into()),
+        module: None,
+        task_type: None,
+        tags: vec![],
+        source_agent: "test".into(),
+        idempotency_key: None,
+        write_mode: WriteMode::Auto,
+    })
+    .await
+    .unwrap();
+    embedding_worker::tick(&repo, provider.as_ref(), &settings).await.unwrap();
+    // Force a save so the meta.row_count is durable on disk.
+    idx.save_at_default_paths().await.unwrap();
+    (repo, idx)
+}
+
+#[tokio::test]
+async fn diagnose_healthy_db_returns_healthy() {
+    let dir = tempdir().unwrap();
+    let db = dir.path().join("h.duckdb");
+    let (repo, _idx) = seed_one_row_with_index(&db).await;
+
+    let settings = EmbeddingSettings::development_defaults();
+    let fp = VectorIndexFingerprint {
+        provider: settings.job_provider_id().to_string(),
+        model: settings.model.clone(),
+        dim: settings.dim,
+    };
+
+    let report = diagnose(&repo, &db, &fp).await.unwrap();
+    assert_eq!(report.status, "healthy");
+    assert!(matches!(report.details, DiagnosticStatus::Healthy { rows: 1 }));
+    assert_eq!(report.details.exit_code(), 0);
 }

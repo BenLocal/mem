@@ -13,5 +13,5 @@ pub use vector_index::{
     VectorIndexMeta,
 };
 pub use vector_index_diagnose::{
-    DiagnosticReport, DiagnosticStatus, PathInfo, SidecarFile,
+    diagnose, DiagnosticReport, DiagnosticStatus, PathInfo, SidecarFile,
 };
