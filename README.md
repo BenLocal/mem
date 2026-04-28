@@ -137,3 +137,9 @@ cargo test -q
 cargo fmt --check
 cargo clippy --all-targets -- -D warnings
 ```
+
+## Design Principles
+
+- **Verbatim discipline**: `memories.content` is the **fact source** — never rewritten or truncated at storage. `memories.summary` is **index/hint only** — never used as the basis for answers or quotes. The ingest pipeline enforces that `summary` must not be identical to `content` to prevent agents from copying refined text into the content field.
+- **Lifecycle-aware**: memories have status (`Provisional`, `Active`, `PendingConfirmation`), confidence scores, decay, and feedback loops — not just CRUD operations.
+- **Graph-temporal**: edges carry `valid_from`/`valid_to` timestamps for point-in-time queries and supersede chains.

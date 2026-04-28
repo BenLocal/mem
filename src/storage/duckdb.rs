@@ -95,6 +95,8 @@ pub enum StorageError {
     Serde(#[from] serde_json::Error),
     #[error("invalid data: {0}")]
     InvalidData(&'static str),
+    #[error("invalid input: {0}")]
+    InvalidInput(String),
     #[error("vector index error: {0}")]
     VectorIndex(String),
 }

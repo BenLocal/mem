@@ -10,6 +10,17 @@ use crate::domain::memory::{
 /// 16-char hash.
 pub const CONTENT_HASH_LEN: usize = 64;
 
+/// Validate that the request follows verbatim discipline: `content` must not
+/// be identical to a non-empty `summary`. Returns `Err` if validation fails.
+pub fn validate_verbatim(request: &IngestMemoryRequest, summary: &str) -> Result<(), String> {
+    if !summary.is_empty()
+        && summary.len() > 80
+        && summary == request.content {
+        return Err("summary must not be identical to content (verbatim violation)".into());
+    }
+    Ok(())
+}
+
 pub fn initial_status(memory_type: &MemoryType, write_mode: &WriteMode) -> MemoryStatus {
     match (memory_type, write_mode) {
         (MemoryType::Preference | MemoryType::Workflow, _) => MemoryStatus::PendingConfirmation,

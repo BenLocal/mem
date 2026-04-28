@@ -132,6 +132,11 @@ impl MemoryService {
 
         let status = initial_status(&request.memory_type, &request.write_mode);
         let now = current_timestamp();
+        let summary = summarize(&request.content);
+
+        crate::pipeline::ingest::validate_verbatim(&request, &summary)
+            .map_err(|e| ServiceError::Storage(StorageError::InvalidInput(e)))?;
+
         let memory = MemoryRecord {
             memory_id: next_memory_id(),
             tenant: request.tenant,
@@ -140,7 +145,7 @@ impl MemoryService {
             scope: request.scope,
             visibility: request.visibility,
             version: 1,
-            summary: summarize(&request.content),
+            summary,
             content: request.content,
             evidence: request.evidence,
             code_refs: request.code_refs,
