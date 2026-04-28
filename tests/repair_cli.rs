@@ -1,4 +1,4 @@
-use mem::storage::{DiagnosticReport, DiagnosticStatus, PathInfo, SidecarFile, VectorIndexFingerprint};
+use mem::storage::{DiagnosticReport, DiagnosticStatus, PathInfo, SidecarFile, VectorIndexFingerprint, sidecar_paths};
 use std::path::PathBuf;
 
 // ── imports used by the async integration tests ───────────────────────────────
@@ -152,4 +152,70 @@ async fn diagnose_healthy_db_returns_healthy() {
     assert_eq!(report.status, "healthy");
     assert!(matches!(report.details, DiagnosticStatus::Healthy { rows: 1 }));
     assert_eq!(report.details.exit_code(), 0);
+}
+
+#[tokio::test]
+async fn diagnose_reports_sidecar_missing_when_index_file_deleted() {
+    let dir = tempdir().unwrap();
+    let db = dir.path().join("sm.duckdb");
+    let (repo, _idx) = seed_one_row_with_index(&db).await;
+    let (idx_path, _) = sidecar_paths(&db);
+    std::fs::remove_file(&idx_path).unwrap();
+
+    let settings = EmbeddingSettings::development_defaults();
+    let fp = VectorIndexFingerprint {
+        provider: settings.job_provider_id().to_string(),
+        model: settings.model.clone(),
+        dim: settings.dim,
+    };
+    let report = diagnose(&repo, &db, &fp).await.unwrap();
+    assert_eq!(report.status, "corrupt");
+    match report.details {
+        DiagnosticStatus::SidecarMissing { which } => {
+            assert_eq!(which, SidecarFile::Index);
+        }
+        other => panic!("expected SidecarMissing, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn diagnose_reports_sidecar_missing_when_meta_file_deleted() {
+    let dir = tempdir().unwrap();
+    let db = dir.path().join("smm.duckdb");
+    let (repo, _idx) = seed_one_row_with_index(&db).await;
+    let (_, meta_path) = sidecar_paths(&db);
+    std::fs::remove_file(&meta_path).unwrap();
+
+    let settings = EmbeddingSettings::development_defaults();
+    let fp = VectorIndexFingerprint {
+        provider: settings.job_provider_id().to_string(),
+        model: settings.model.clone(),
+        dim: settings.dim,
+    };
+    let report = diagnose(&repo, &db, &fp).await.unwrap();
+    match report.details {
+        DiagnosticStatus::SidecarMissing { which } => {
+            assert_eq!(which, SidecarFile::Meta);
+        }
+        other => panic!("expected SidecarMissing(Meta), got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn diagnose_reports_meta_corrupt_when_meta_is_invalid_json() {
+    let dir = tempdir().unwrap();
+    let db = dir.path().join("mc.duckdb");
+    let (repo, _idx) = seed_one_row_with_index(&db).await;
+    let (_, meta_path) = sidecar_paths(&db);
+    std::fs::write(&meta_path, b"{ this is not json").unwrap();
+
+    let settings = EmbeddingSettings::development_defaults();
+    let fp = VectorIndexFingerprint {
+        provider: settings.job_provider_id().to_string(),
+        model: settings.model.clone(),
+        dim: settings.dim,
+    };
+    let report = diagnose(&repo, &db, &fp).await.unwrap();
+    assert_eq!(report.status, "corrupt");
+    assert!(matches!(report.details, DiagnosticStatus::MetaCorrupt { .. }));
 }
