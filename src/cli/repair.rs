@@ -158,7 +158,6 @@ impl RebuildOutcome {
             _ => 2,
         }
     }
-    #[allow(dead_code)]
     pub fn coarse_status(&self) -> &'static str {
         match self {
             RebuildOutcome::Rebuilt { .. } => "rebuilt",
@@ -231,23 +230,23 @@ pub fn format_rebuild_json(outcome: &RebuildOutcome) -> Value {
             elapsed_ms,
         } => json!({
             "command": "rebuild",
-            "status": "rebuilt",
-            "exit_code": 0,
+            "status": outcome.coarse_status(),
+            "exit_code": outcome.exit_code(),
             "rows": rows,
             "paths": serde_json::to_value(paths).unwrap(),
             "elapsed_ms": elapsed_ms,
         }),
         RebuildOutcome::DbUnavailable { reason, paths } => json!({
             "command": "rebuild",
-            "status": "db_unavailable",
-            "exit_code": 2,
+            "status": outcome.coarse_status(),
+            "exit_code": outcome.exit_code(),
             "details": {"reason": reason},
             "paths": serde_json::to_value(paths).unwrap(),
         }),
         RebuildOutcome::Failed { reason, paths } => json!({
             "command": "rebuild",
-            "status": "rebuild_failed",
-            "exit_code": 2,
+            "status": outcome.coarse_status(),
+            "exit_code": outcome.exit_code(),
             "details": {"reason": reason},
             "paths": serde_json::to_value(paths).unwrap(),
         }),

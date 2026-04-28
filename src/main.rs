@@ -29,7 +29,7 @@ async fn main() -> error::Result<()> {
     let cli = Cli::parse();
     let command = cli.command.unwrap_or(Command::Serve);
 
-    init_tracing(matches!(command, Command::Mcp));
+    init_tracing(matches!(command, Command::Mcp | Command::Repair(_)));
 
     match command {
         Command::Serve => run_serve().await,
