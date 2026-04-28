@@ -219,3 +219,58 @@ async fn diagnose_reports_meta_corrupt_when_meta_is_invalid_json() {
     assert_eq!(report.status, "corrupt");
     assert!(matches!(report.details, DiagnosticStatus::MetaCorrupt { .. }));
 }
+
+#[tokio::test]
+async fn diagnose_reports_fingerprint_mismatch_on_dim_change() {
+    let dir = tempdir().unwrap();
+    let db = dir.path().join("fp.duckdb");
+    let (repo, _idx) = seed_one_row_with_index(&db).await;
+
+    // Pass a fingerprint with a different dim than what's on disk
+    let settings = EmbeddingSettings::development_defaults();
+    let mut fp = VectorIndexFingerprint {
+        provider: settings.job_provider_id().to_string(),
+        model: settings.model.clone(),
+        dim: settings.dim,
+    };
+    fp.dim = 128;  // disk has 256 (development default)
+
+    let report = diagnose(&repo, &db, &fp).await.unwrap();
+    assert_eq!(report.status, "corrupt");
+    match report.details {
+        DiagnosticStatus::FingerprintMismatch { stored, current } => {
+            assert_eq!(stored.dim, settings.dim);
+            assert_eq!(current.dim, 128);
+        }
+        other => panic!("expected FingerprintMismatch, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn diagnose_reports_fingerprint_mismatch_on_zero_dim_meta() {
+    let dir = tempdir().unwrap();
+    let db = dir.path().join("zd.duckdb");
+    let (repo, _idx) = seed_one_row_with_index(&db).await;
+    let (_, meta_path) = sidecar_paths(&db);
+
+    // Hand-edit meta to have dim=0
+    let settings = EmbeddingSettings::development_defaults();
+    let zero_meta = mem::storage::VectorIndexMeta {
+        schema_version: 1,
+        provider: settings.job_provider_id().to_string(),
+        model: settings.model.clone(),
+        dim: 0,
+        row_count: 1,
+        id_map: Default::default(),
+    };
+    std::fs::write(&meta_path, serde_json::to_vec(&zero_meta).unwrap()).unwrap();
+
+    let fp = VectorIndexFingerprint {
+        provider: settings.job_provider_id().to_string(),
+        model: settings.model.clone(),
+        dim: 0,  // matches stored — but the dim==0 guard fires regardless
+    };
+    let report = diagnose(&repo, &db, &fp).await.unwrap();
+    assert_eq!(report.status, "corrupt");
+    assert!(matches!(report.details, DiagnosticStatus::FingerprintMismatch { .. }));
+}
