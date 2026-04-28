@@ -1,9 +1,10 @@
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::Instant;
 
 use serde::Serialize;
 
-use super::vector_index::{sidecar_paths, VectorIndexMeta};
+use super::vector_index::{sidecar_paths, VectorIndex, VectorIndexMeta};
 use super::{DuckDbRepository, StorageError, VectorIndexFingerprint};
 
 #[derive(Debug, Clone, Serialize)]
@@ -217,4 +218,29 @@ fn usearch_options(meta: &VectorIndexMeta) -> usearch::IndexOptions {
         expansion_search: 0,
         multi: false,
     }
+}
+
+/// Force a fresh rebuild of the sidecar from DuckDB. Existing sidecar files are
+/// deleted (best-effort) so `open_or_rebuild` falls through to its rebuild branch.
+pub async fn rebuild_index(
+    repo: &DuckDbRepository,
+    db_path: &Path,
+    expected_fp: &VectorIndexFingerprint,
+) -> Result<Arc<VectorIndex>, StorageError> {
+    let (idx_path, meta_path) = sidecar_paths(db_path);
+    // Best-effort delete; NotFound is fine.
+    if let Err(e) = std::fs::remove_file(&idx_path) {
+        if e.kind() != std::io::ErrorKind::NotFound {
+            return Err(StorageError::VectorIndex(format!("failed to remove old index: {e}")));
+        }
+    }
+    if let Err(e) = std::fs::remove_file(&meta_path) {
+        if e.kind() != std::io::ErrorKind::NotFound {
+            return Err(StorageError::VectorIndex(format!("failed to remove old meta: {e}")));
+        }
+    }
+    let idx = VectorIndex::open_or_rebuild(repo, db_path, expected_fp)
+        .await
+        .map_err(|e| StorageError::VectorIndex(format!("rebuild failed: {e}")))?;
+    Ok(Arc::new(idx))
 }

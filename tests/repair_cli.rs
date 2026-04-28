@@ -1,4 +1,4 @@
-use mem::storage::{DiagnosticReport, DiagnosticStatus, PathInfo, SidecarFile, VectorIndexFingerprint, sidecar_paths};
+use mem::storage::{DiagnosticReport, DiagnosticStatus, PathInfo, SidecarFile, VectorIndexFingerprint, sidecar_paths, rebuild_index};
 use std::path::PathBuf;
 
 // ── imports used by the async integration tests ───────────────────────────────
@@ -304,7 +304,7 @@ async fn diagnose_reports_index_meta_drift_when_meta_lies_about_count() {
     // Read meta, bump row_count by 5 (meta lies about count), write back
     let raw = std::fs::read(&meta_path).unwrap();
     let mut meta: mem::storage::VectorIndexMeta = serde_json::from_slice(&raw).unwrap();
-    meta.row_count = meta.row_count + 5;
+    meta.row_count += 5;
     std::fs::write(&meta_path, serde_json::to_vec(&meta).unwrap()).unwrap();
 
     let settings = EmbeddingSettings::development_defaults();
@@ -350,5 +350,37 @@ async fn diagnose_reports_db_drift_when_db_has_extra_rows() {
             assert_eq!(db_count, 2);
         }
         other => panic!("expected DbDrift, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn rebuild_index_recovers_from_drift() {
+    let dir = tempdir().unwrap();
+    let db = dir.path().join("rb.duckdb");
+    let (repo, _idx) = seed_one_row_with_index(&db).await;
+
+    // Induce DbDrift by bypassing service
+    repo.seed_memory_embedding_for_test("orphan", "t", &vec![0.0f32; 256])
+        .await
+        .unwrap();
+
+    let settings = EmbeddingSettings::development_defaults();
+    let fp = VectorIndexFingerprint {
+        provider: settings.job_provider_id().to_string(),
+        model: settings.model.clone(),
+        dim: settings.dim,
+    };
+
+    let pre = diagnose(&repo, &db, &fp).await.unwrap();
+    assert!(matches!(pre.details, DiagnosticStatus::DbDrift { .. }));
+
+    let new_idx = rebuild_index(&repo, &db, &fp).await.unwrap();
+    assert_eq!(new_idx.size(), 2);
+
+    let post = diagnose(&repo, &db, &fp).await.unwrap();
+    assert_eq!(post.status, "healthy");
+    match post.details {
+        DiagnosticStatus::Healthy { rows } => assert_eq!(rows, 2),
+        other => panic!("expected Healthy after rebuild, got {other:?}"),
     }
 }
