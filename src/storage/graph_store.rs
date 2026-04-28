@@ -80,6 +80,20 @@ impl DuckDbGraphStore {
         tx.commit()?;
         Ok(())
     }
+
+    pub async fn close_edges_for_memory(&self, memory_id: &str) -> Result<usize, DuckDbGraphError> {
+        let from = format!("memory:{memory_id}");
+        let now = current_timestamp();
+        let conn = self.repo.conn()?;
+        let count = conn.execute(
+            "update graph_edges
+                set valid_to = ?1
+              where from_node_id = ?2
+                and valid_to is null",
+            duckdb::params![&now, &from],
+        )?;
+        Ok(count)
+    }
 }
 
 fn current_timestamp() -> String {

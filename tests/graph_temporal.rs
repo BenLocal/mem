@@ -108,3 +108,23 @@ fn graph_edge_carries_valid_from_and_valid_to() {
     assert_eq!(back.valid_to, None);
     assert_eq!(back.valid_from, "00000001761662918634");
 }
+
+#[tokio::test]
+async fn close_edges_for_memory_sets_valid_to() {
+    let dir = tempdir().unwrap();
+    let db = dir.path().join("close.duckdb");
+    let (repo, graph) = open_repo_and_graph(&db).await;
+    let svc = MemoryService::new((*repo).clone());
+    let r = ingest_one(&svc, "gamma", Some("foo"), Some("mem")).await;
+    let memory = repo.get_memory_for_tenant("t", &r.memory_id).await.unwrap().unwrap();
+    graph.sync_memory(&memory).await.unwrap();
+
+    let pre = graph.neighbors(&format!("memory:{}", r.memory_id)).await.unwrap();
+    assert!(!pre.is_empty(), "should have active edges before close");
+
+    let closed = graph.close_edges_for_memory(&r.memory_id).await.unwrap();
+    assert!(closed > 0, "should report at least one closed row");
+
+    let post = graph.neighbors(&format!("memory:{}", r.memory_id)).await.unwrap();
+    assert!(post.is_empty(), "no active edges after close");
+}
