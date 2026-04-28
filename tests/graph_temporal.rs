@@ -21,7 +21,7 @@ async fn duckdb_graph_store_constructs_against_fresh_db() {
 }
 
 use mem::domain::memory::{
-    IngestMemoryRequest, MemoryType, Scope, Visibility, WriteMode,
+    EditPendingRequest, IngestMemoryRequest, MemoryType, Scope, Visibility, WriteMode,
 };
 use mem::service::MemoryService;
 
@@ -45,6 +45,35 @@ async fn ingest_one(svc: &MemoryService, content: &str, project: Option<&str>, r
         idempotency_key: None,
         write_mode: WriteMode::Auto,
     }).await.unwrap()
+}
+
+/// Ingest a Workflow memory (always PendingConfirmation) so that
+/// edit_and_accept_pending can act on it.
+async fn ingest_pending(
+    svc: &MemoryService,
+    content: &str,
+    project: Option<&str>,
+    repo_name: Option<&str>,
+) -> mem::service::IngestMemoryResponse {
+    svc.ingest(IngestMemoryRequest {
+        tenant: "t".into(),
+        memory_type: MemoryType::Workflow,
+        content: content.into(),
+        evidence: vec![],
+        code_refs: vec![],
+        scope: Scope::Repo,
+        visibility: Visibility::Shared,
+        project: project.map(String::from),
+        repo: repo_name.map(String::from),
+        module: None,
+        task_type: None,
+        tags: vec![],
+        source_agent: "test".into(),
+        idempotency_key: None,
+        write_mode: WriteMode::Auto,
+    })
+    .await
+    .unwrap()
 }
 
 #[tokio::test]
@@ -129,35 +158,57 @@ async fn close_edges_for_memory_sets_valid_to() {
     assert!(post.is_empty(), "no active edges after close");
 }
 
+/// Drives the supersede flow through `MemoryService::edit_and_accept_pending`
+/// end-to-end.  This replaces the old `supersede_closes_v1_edges_via_memory_service`
+/// test which called `graph.close_edges_for_memory` directly and therefore would
+/// not have caught a breakage inside the service wiring.
 #[tokio::test]
-async fn supersede_closes_v1_edges_via_memory_service() {
+async fn edit_and_accept_pending_closes_v1_edges_and_opens_v2() {
     let dir = tempdir().unwrap();
-    let db = dir.path().join("supersede.duckdb");
+    let db = dir.path().join("supersede_e2e.duckdb");
     let repo = Arc::new(DuckDbRepository::open(&db).await.unwrap());
     let graph = Arc::new(DuckDbGraphStore::new(repo.clone()));
 
-    let svc = mem::service::MemoryService::new_with_graph((*repo).clone(), graph.clone());
+    let svc = MemoryService::new_with_graph((*repo).clone(), graph.clone());
 
-    // Ingest v1 with project=foo. ingest() calls graph.sync_memory internally.
-    let r1 = ingest_one(&svc, "v1-content", Some("foo"), Some("mem")).await;
+    // Ingest v1 as a Workflow memory (always PendingConfirmation) with
+    // project=foo. ingest() still calls graph.sync_memory, so v1 edges exist.
+    let r1 = ingest_pending(&svc, "v1-content", Some("foo"), Some("mem")).await;
+
     let pre = graph.neighbors("project:foo").await.unwrap();
     assert!(!pre.is_empty(), "v1 should have active edges after ingest");
 
-    // Drive the supersede flow via the service's graph operations.
-    // edit_and_accept_pending calls close_edges_for_memory(v1) then sync_memory(v2).
-    // Here we directly verify the graph-store side-effect that the service now performs.
-    graph.close_edges_for_memory(&r1.memory_id).await.unwrap();
+    // Drive the supersede via the public service API — this is the wiring under test.
+    let patch = EditPendingRequest {
+        memory_id: r1.memory_id.clone(),
+        summary: "v2 summary".into(),
+        content: "v2-content".into(),
+        evidence: vec![],
+        code_refs: vec![],
+        tags: vec![],
+    };
+    let resp = svc.edit_and_accept_pending("t", patch).await.unwrap();
 
-    let post = graph.neighbors("project:foo").await.unwrap();
-    let memory_ids: std::collections::HashSet<_> = post
-        .iter()
-        .filter(|e| e.from_node_id.starts_with("memory:"))
-        .map(|e| e.from_node_id.strip_prefix("memory:").unwrap().to_string())
-        .collect();
-    assert!(
-        !memory_ids.contains(&r1.memory_id),
-        "v1 should be excluded from active neighbors after close"
-    );
+    // v1's graph edges must all be closed (valid_to set).
+    let v1_history = graph.all_edges_for_memory(&r1.memory_id).await.unwrap();
+    assert!(!v1_history.is_empty(), "v1 should have edge history");
+    for edge in &v1_history {
+        assert!(
+            edge.valid_to.is_some(),
+            "v1 edge should be closed after supersede: {edge:?}"
+        );
+    }
+
+    // v2 (the successor) must have active edges.
+    let v2_id = &resp.memory.memory_id;
+    let v2_edges = graph.neighbors(&format!("memory:{v2_id}")).await.unwrap();
+    assert!(!v2_edges.is_empty(), "v2 should have active graph edges");
+    for edge in &v2_edges {
+        assert!(
+            edge.valid_to.is_none(),
+            "v2 edges should be open (active): {edge:?}"
+        );
+    }
 }
 
 fn current_ts_str() -> String {
