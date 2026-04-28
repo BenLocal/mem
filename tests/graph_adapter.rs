@@ -7,34 +7,12 @@ use mem::{
     domain::memory::{MemoryRecord, MemoryStatus, MemoryType, Scope, Visibility},
     http,
     service::MemoryService,
-    storage::{GraphError, GraphStore, LocalGraphAdapter},
+    storage::{DuckDbGraphStore, GraphStore, LocalGraphAdapter},
 };
 use serde_json::{json, Value};
-use std::{future::Future, pin::Pin, sync::Arc};
+use std::sync::Arc;
 use tempfile::tempdir;
 use tower::util::ServiceExt;
-
-type GraphFuture<'a, T> = Pin<Box<dyn Future<Output = Result<T, GraphError>> + Send + 'a>>;
-
-#[derive(Clone, Default)]
-struct UnavailableGraphAdapter;
-
-impl GraphStore for UnavailableGraphAdapter {
-    fn sync_memory<'a>(&'a self, _memory: &'a MemoryRecord) -> GraphFuture<'a, ()> {
-        Box::pin(async move { Err(GraphError::Unavailable("test unavailable graph")) })
-    }
-
-    fn neighbors<'a>(
-        &'a self,
-        _node_id: &'a str,
-    ) -> GraphFuture<'a, Vec<mem::domain::memory::GraphEdge>> {
-        Box::pin(async move { Err(GraphError::Unavailable("test unavailable graph")) })
-    }
-
-    fn related_memory_ids<'a>(&'a self, _node_ids: &'a [String]) -> GraphFuture<'a, Vec<String>> {
-        Box::pin(async move { Err(GraphError::Unavailable("test unavailable graph")) })
-    }
-}
 
 fn sample_impl_memory(memory_id: &str, supersedes_memory_id: Option<&str>) -> MemoryRecord {
     MemoryRecord {
@@ -138,20 +116,25 @@ async fn test_app() -> TestApp {
     }
 }
 
-async fn test_app_with_unavailable_graph() -> TestApp {
+/// Build a test app backed by a temporary DuckDb (same as production path).
+async fn test_app_with_duckdb_graph() -> (TestApp, tempfile::TempDir) {
     let temp_dir = tempdir().unwrap();
-    let db_path = temp_dir.path().join("graph-unavailable.duckdb");
+    let db_path = temp_dir.path().join("graph-duckdb.duckdb");
     let repository = mem::storage::DuckDbRepository::open(&db_path)
         .await
         .unwrap();
+    let graph = Arc::new(DuckDbGraphStore::new(Arc::new(repository.clone())));
     let state = AppState {
-        memory_service: MemoryService::with_graph(repository, Arc::new(UnavailableGraphAdapter)),
+        memory_service: MemoryService::new_with_graph(repository, graph),
         config: mem::config::Config::local(),
     };
 
-    TestApp {
-        router: http::router().with_state(state),
-    }
+    (
+        TestApp {
+            router: http::router().with_state(state),
+        },
+        temp_dir,
+    )
 }
 
 #[tokio::test]
@@ -234,9 +217,11 @@ async fn http_neighbors_returns_graph_edges_after_ingest() {
     }));
 }
 
+/// With `DuckDbGraphStore` as the sole backend, graph edges are always persisted.
+/// This test verifies that ingest + detail retrieval works correctly via the DuckDb graph path.
 #[tokio::test]
-async fn memory_routes_degrade_when_graph_backend_is_unavailable() {
-    let app = test_app_with_unavailable_graph().await;
+async fn memory_routes_use_duckdb_graph_backend() {
+    let (app, _temp_dir) = test_app_with_duckdb_graph().await;
 
     let created = app
         .post_json(
@@ -260,9 +245,16 @@ async fn memory_routes_degrade_when_graph_backend_is_unavailable() {
 
     let detail = app.get(&format!("/memories/{memory_id}")).await;
     assert_eq!(detail.status(), 200);
-    assert_eq!(detail.json()["graph_links"], json!([]));
+    // DuckDb graph is always available — graph_links should be populated after ingest.
+    assert!(
+        !detail.json()["graph_links"].as_array().unwrap().is_empty(),
+        "graph_links should be non-empty when DuckDb graph backend is used"
+    );
 
     let neighbors = app.get("/graph/neighbors/module:mem:invoice").await;
     assert_eq!(neighbors.status(), 200);
-    assert_eq!(neighbors.json(), json!([]));
+    assert!(
+        !neighbors.json().as_array().unwrap().is_empty(),
+        "neighbors should be non-empty after ingest"
+    );
 }

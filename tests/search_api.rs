@@ -13,7 +13,7 @@ use mem::{
     },
     http,
     service::MemoryService,
-    storage::{DuckDbRepository, GraphStore, LocalGraphAdapter},
+    storage::{DuckDbGraphStore, DuckDbRepository},
 };
 use serde_json::{json, Value};
 use tempfile::{tempdir, TempDir};
@@ -112,7 +112,7 @@ async fn seeded_search_app(memories: Vec<MemoryRecord>) -> TestApp {
     let temp_dir = tempdir().unwrap();
     let db_path = temp_dir.path().join("search-api.duckdb");
     let repo = DuckDbRepository::open(&db_path).await.unwrap();
-    let graph = Arc::new(LocalGraphAdapter::new());
+    let graph = Arc::new(DuckDbGraphStore::new(Arc::new(repo.clone())));
 
     for memory in memories {
         repo.insert_memory(memory.clone()).await.unwrap();
@@ -120,7 +120,7 @@ async fn seeded_search_app(memories: Vec<MemoryRecord>) -> TestApp {
     }
 
     let state = AppState {
-        memory_service: MemoryService::with_graph(repo, graph),
+        memory_service: MemoryService::new_with_graph(repo, graph),
         config: mem::config::Config::local(),
     };
 

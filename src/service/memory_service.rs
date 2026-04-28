@@ -27,8 +27,7 @@ use crate::{
     pipeline::workflow,
     pipeline::{compress, retrieve},
     storage::{
-        DuckDbRepository, EmbeddingJobInsert, GraphError, GraphStore, LocalGraphAdapter,
-        StorageError,
+        DuckDbGraphStore, DuckDbRepository, EmbeddingJobInsert, GraphError, StorageError,
     },
 };
 
@@ -66,7 +65,7 @@ impl From<MemoryRecord> for IngestMemoryResponse {
 #[derive(Clone)]
 pub struct MemoryService {
     repository: DuckDbRepository,
-    graph: Arc<dyn GraphStore>,
+    graph: Arc<DuckDbGraphStore>,
     /// Value stored on `embedding_jobs.provider` (e.g. `fake`, `openai`).
     embedding_job_provider: String,
     /// When set, search runs hybrid lexical + semantic retrieval.
@@ -74,15 +73,14 @@ pub struct MemoryService {
 }
 
 impl MemoryService {
+    /// Primary constructor. Creates a fresh `DuckDbGraphStore` backed by the same repository.
     pub fn new(repository: DuckDbRepository) -> Self {
-        Self::with_graph_and_embedding_providers(
-            repository,
-            Arc::new(LocalGraphAdapter::default()),
-            "fake".to_string(),
-            None,
-        )
+        let repo_arc = Arc::new(repository.clone());
+        let graph = Arc::new(DuckDbGraphStore::new(repo_arc));
+        Self::new_with_graph(repository, graph)
     }
 
+    /// Constructor that also attaches a vector index before building the service.
     pub fn new_with_index(
         repository: DuckDbRepository,
         vector_index: Arc<crate::storage::VectorIndex>,
@@ -91,21 +89,27 @@ impl MemoryService {
         Self::new(repository)
     }
 
-    pub fn with_graph(repository: DuckDbRepository, graph: Arc<dyn GraphStore>) -> Self {
+    /// Constructor that accepts a pre-built `DuckDbGraphStore` (used by tests and `app.rs`).
+    pub fn new_with_graph(
+        repository: DuckDbRepository,
+        graph: Arc<DuckDbGraphStore>,
+    ) -> Self {
         Self::with_graph_and_embedding_providers(repository, graph, "fake".to_string(), None)
     }
 
+    /// Kept for compatibility with call-sites that supply a graph and a provider id.
     pub fn with_graph_and_embedding_provider(
         repository: DuckDbRepository,
-        graph: Arc<dyn GraphStore>,
+        graph: Arc<DuckDbGraphStore>,
         embedding_job_provider: String,
     ) -> Self {
         Self::with_graph_and_embedding_providers(repository, graph, embedding_job_provider, None)
     }
 
+    /// Full constructor used by `app.rs`.
     pub fn with_graph_and_embedding_providers(
         repository: DuckDbRepository,
-        graph: Arc<dyn GraphStore>,
+        graph: Arc<DuckDbGraphStore>,
         embedding_job_provider: String,
         embedding_search_provider: Option<Arc<dyn EmbeddingProvider>>,
     ) -> Self {
@@ -162,7 +166,10 @@ impl MemoryService {
         };
 
         let stored = self.repository.insert_memory(memory).await?;
-        ignore_graph_unavailable(self.graph.sync_memory(&stored).await)?;
+        self.graph
+            .sync_memory(&stored)
+            .await
+            .map_err(|e| GraphError::Backend(e.to_string()))?;
         self.enqueue_embedding_job_for_memory(&stored).await?;
         Ok(stored.into())
     }
@@ -243,14 +250,18 @@ impl MemoryService {
 
         let embedding = self.embedding_meta_for_memory(&memory).await?;
 
+        let graph_links = self
+            .graph
+            .neighbors(&memory_node_id(memory_id))
+            .await
+            .unwrap_or_default();
+
         Ok(MemoryDetailResponse {
             version_chain: self
                 .repository
                 .list_memory_versions_for_tenant(&memory.tenant, memory_id)
                 .await?,
-            graph_links: ignore_graph_unavailable(
-                self.graph.neighbors(&memory_node_id(memory_id)).await,
-            )?,
+            graph_links,
             feedback_summary: self.repository.feedback_summary(memory_id).await?,
             memory,
             embedding,
@@ -394,6 +405,11 @@ impl MemoryService {
         Ok(self.repository.reject_pending(tenant, memory_id).await?)
     }
 
+    /// Supersede flow: accept a pending memory by replacing it with an edited active version.
+    ///
+    /// After storage is updated, the graph is kept consistent:
+    /// 1. v1's edges are closed (`close_edges_for_memory`)
+    /// 2. v2's edges are opened (`sync_memory`)
     pub async fn edit_and_accept_pending(
         &self,
         tenant: &str,
@@ -414,7 +430,17 @@ impl MemoryService {
                 self.superseding_active_version(&original, patch),
             )
             .await?;
-        ignore_graph_unavailable(self.graph.sync_memory(&superseding).await)?;
+
+        // Close v1's graph edges, then open v2's — order matters.
+        self.graph
+            .close_edges_for_memory(&original.memory_id)
+            .await
+            .map_err(|e| GraphError::Backend(e.to_string()))?;
+        self.graph
+            .sync_memory(&superseding)
+            .await
+            .map_err(|e| GraphError::Backend(e.to_string()))?;
+
         self.enqueue_embedding_job_for_memory(&superseding).await?;
 
         Ok(EditPendingResponse {
@@ -499,7 +525,10 @@ impl MemoryService {
     }
 
     pub async fn graph_neighbors(&self, node_id: &str) -> Result<Vec<GraphEdge>, ServiceError> {
-        ignore_graph_unavailable(self.graph.neighbors(node_id).await)
+        self.graph
+            .neighbors(node_id)
+            .await
+            .map_err(|e| GraphError::Backend(e.to_string()).into())
     }
 
     pub async fn search(
@@ -522,6 +551,7 @@ impl MemoryService {
             vec![]
         };
 
+        // `DuckDbGraphStore` implements `GraphStore` via a bridge impl, so coercion works.
         let ranked = match retrieve::rank_with_graph_hybrid(
             lexical,
             semantic.clone(),
@@ -562,17 +592,6 @@ impl MemoryService {
         };
         self.repository.try_enqueue_embedding_job(insert).await?;
         Ok(())
-    }
-}
-
-fn ignore_graph_unavailable<T>(result: Result<T, GraphError>) -> Result<T, ServiceError>
-where
-    T: Default,
-{
-    match result {
-        Ok(value) => Ok(value),
-        Err(GraphError::Unavailable(_)) => Ok(T::default()),
-        Err(error) => Err(error.into()),
     }
 }
 

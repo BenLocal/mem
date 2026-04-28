@@ -4,7 +4,7 @@ use thiserror::Error;
 
 use crate::domain::memory::{GraphEdge, MemoryRecord};
 use crate::pipeline::ingest::extract_graph_edges;
-use super::{DuckDbRepository, StorageError};
+use super::{DuckDbRepository, GraphError, GraphStore, StorageError};
 
 #[derive(Debug, Error)]
 pub enum DuckDbGraphError {
@@ -179,6 +179,49 @@ impl DuckDbGraphStore {
             out.push(row?);
         }
         Ok(out)
+    }
+}
+
+/// Bridge: implement the legacy `GraphStore` trait so that `DuckDbGraphStore` can be
+/// used wherever `Arc<dyn GraphStore>` is expected (e.g. `retrieve::rank_with_graph_hybrid`).
+/// This bridge is removed in Task 11 when the `dyn GraphStore` trait is deleted.
+impl GraphStore for DuckDbGraphStore {
+    fn sync_memory<'a>(
+        &'a self,
+        memory: &'a MemoryRecord,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), GraphError>> + Send + 'a>>
+    {
+        Box::pin(async move {
+            self.sync_memory(memory)
+                .await
+                .map_err(|e| GraphError::Backend(e.to_string()))
+        })
+    }
+
+    fn neighbors<'a>(
+        &'a self,
+        node_id: &'a str,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<Vec<GraphEdge>, GraphError>> + Send + 'a>,
+    > {
+        Box::pin(async move {
+            self.neighbors(node_id)
+                .await
+                .map_err(|e| GraphError::Backend(e.to_string()))
+        })
+    }
+
+    fn related_memory_ids<'a>(
+        &'a self,
+        node_ids: &'a [String],
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<Vec<String>, GraphError>> + Send + 'a>,
+    > {
+        Box::pin(async move {
+            self.related_memory_ids(node_ids)
+                .await
+                .map_err(|e| GraphError::Backend(e.to_string()))
+        })
     }
 }
 

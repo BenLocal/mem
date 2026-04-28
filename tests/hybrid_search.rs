@@ -8,7 +8,7 @@ use mem::{
     },
     embedding::{arc_embedding_provider, deterministic_embedding},
     service::MemoryService,
-    storage::DuckDbRepository,
+    storage::{DuckDbGraphStore, DuckDbRepository},
 };
 use tempfile::tempdir;
 
@@ -119,9 +119,10 @@ async fn hybrid_search_surfaces_semantic_match_without_lexical_overlap() {
     .await
     .unwrap();
 
+    let graph = Arc::new(DuckDbGraphStore::new(Arc::new(repo.clone())));
     let service = MemoryService::with_graph_and_embedding_providers(
         repo,
-        Arc::new(mem::storage::LocalGraphAdapter::default()),
+        graph,
         "fake".into(),
         Some(provider),
     );
