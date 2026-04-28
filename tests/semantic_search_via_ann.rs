@@ -62,11 +62,11 @@ async fn semantic_search_falls_back_to_legacy_when_no_index_attached() {
         .await
         .unwrap();
 
-    let hits = repo
-        .semantic_search_memories("t", &emb, 5)
-        .await
-        .unwrap();
-    assert!(!hits.is_empty(), "legacy path should return at least one hit");
+    let hits = repo.semantic_search_memories("t", &emb, 5).await.unwrap();
+    assert!(
+        !hits.is_empty(),
+        "legacy path should return at least one hit"
+    );
     assert_eq!(hits[0].0.memory_id, "legacy_mem");
 }
 
@@ -100,10 +100,7 @@ async fn semantic_search_respects_use_legacy_env_var() {
             .unwrap();
         idx.upsert("legacy_forced", &emb).await.unwrap();
 
-        let hits = repo
-            .semantic_search_memories("t", &emb, 5)
-            .await
-            .unwrap();
+        let hits = repo.semantic_search_memories("t", &emb, 5).await.unwrap();
         assert!(!hits.is_empty(), "USE_LEGACY=1 should still find results");
         assert_eq!(hits[0].0.memory_id, "legacy_forced");
     }
@@ -125,10 +122,7 @@ async fn semantic_search_empty_query_returns_empty() {
     let db = dir.path().join("empty_q.duckdb");
     let repo = DuckDbRepository::open(&db).await.unwrap();
 
-    let hits = repo
-        .semantic_search_memories("t", &[], 5)
-        .await
-        .unwrap();
+    let hits = repo.semantic_search_memories("t", &[], 5).await.unwrap();
     assert!(hits.is_empty());
 }
 
@@ -140,9 +134,6 @@ async fn semantic_search_limit_zero_returns_empty() {
     let repo = DuckDbRepository::open(&db).await.unwrap();
 
     let emb = unit_vector(256, 0);
-    let hits = repo
-        .semantic_search_memories("t", &emb, 0)
-        .await
-        .unwrap();
+    let hits = repo.semantic_search_memories("t", &emb, 0).await.unwrap();
     assert!(hits.is_empty());
 }

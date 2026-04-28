@@ -131,8 +131,14 @@ async fn load_round_trips_save() {
     let meta_path = dir.path().join("rt.usearch.meta.json");
 
     let original = VectorIndex::new_in_memory(256, "fake", "fake", 8);
-    original.upsert("mem_a", &unit_vector(256, 1)).await.unwrap();
-    original.upsert("mem_b", &unit_vector(256, 2)).await.unwrap();
+    original
+        .upsert("mem_a", &unit_vector(256, 1))
+        .await
+        .unwrap();
+    original
+        .upsert("mem_b", &unit_vector(256, 2))
+        .await
+        .unwrap();
     original.save_to(&idx_path, &meta_path).await.unwrap();
 
     let loaded = VectorIndex::load_from(
@@ -159,7 +165,10 @@ async fn load_rejects_fingerprint_mismatch() {
     let meta_path = dir.path().join("fp.usearch.meta.json");
 
     let original = VectorIndex::new_in_memory(256, "fake", "fake", 4);
-    original.upsert("mem_a", &unit_vector(256, 1)).await.unwrap();
+    original
+        .upsert("mem_a", &unit_vector(256, 1))
+        .await
+        .unwrap();
     original.save_to(&idx_path, &meta_path).await.unwrap();
 
     let err = VectorIndex::load_from(
@@ -173,7 +182,10 @@ async fn load_rejects_fingerprint_mismatch() {
     )
     .await
     .unwrap_err();
-    assert!(matches!(err, mem::storage::VectorIndexError::FingerprintMismatch { .. }));
+    assert!(matches!(
+        err,
+        mem::storage::VectorIndexError::FingerprintMismatch { .. }
+    ));
 }
 
 #[tokio::test]
@@ -204,7 +216,10 @@ async fn load_rejects_zero_dim_meta() {
     )
     .await
     .unwrap_err();
-    assert!(matches!(err, mem::storage::VectorIndexError::FingerprintMismatch { .. }));
+    assert!(matches!(
+        err,
+        mem::storage::VectorIndexError::FingerprintMismatch { .. }
+    ));
 }
 
 #[tokio::test]
@@ -226,8 +241,12 @@ async fn open_or_rebuild_rebuilds_when_no_sidecar_files_exist() {
     let dir = tempdir().unwrap();
     let db = dir.path().join("rebuild.duckdb");
     let repo = DuckDbRepository::open(&db).await.unwrap();
-    repo.seed_memory_embedding_for_test("m1", "t", &unit_vector_owned(256, 1)).await.unwrap();
-    repo.seed_memory_embedding_for_test("m2", "t", &unit_vector_owned(256, 2)).await.unwrap();
+    repo.seed_memory_embedding_for_test("m1", "t", &unit_vector_owned(256, 1))
+        .await
+        .unwrap();
+    repo.seed_memory_embedding_for_test("m2", "t", &unit_vector_owned(256, 2))
+        .await
+        .unwrap();
 
     let fp = mem::storage::VectorIndexFingerprint {
         provider: "fake".into(),
@@ -243,7 +262,9 @@ async fn open_or_rebuild_rebuilds_on_row_count_drift() {
     let dir = tempdir().unwrap();
     let db = dir.path().join("drift.duckdb");
     let repo = DuckDbRepository::open(&db).await.unwrap();
-    repo.seed_memory_embedding_for_test("m1", "t", &unit_vector_owned(256, 1)).await.unwrap();
+    repo.seed_memory_embedding_for_test("m1", "t", &unit_vector_owned(256, 1))
+        .await
+        .unwrap();
 
     let fp = mem::storage::VectorIndexFingerprint {
         provider: "fake".into(),
@@ -254,7 +275,9 @@ async fn open_or_rebuild_rebuilds_on_row_count_drift() {
     assert_eq!(idx_a.size(), 1);
     drop(idx_a);
 
-    repo.seed_memory_embedding_for_test("m2", "t", &unit_vector_owned(256, 2)).await.unwrap();
+    repo.seed_memory_embedding_for_test("m2", "t", &unit_vector_owned(256, 2))
+        .await
+        .unwrap();
 
     let idx_b = VectorIndex::open_or_rebuild(&repo, &db, &fp).await.unwrap();
     assert_eq!(idx_b.size(), 2);
@@ -284,7 +307,9 @@ async fn open_or_rebuild_recovers_from_corrupt_index_file() {
     let dir = tempdir().unwrap();
     let db = dir.path().join("corrupt.duckdb");
     let repo = DuckDbRepository::open(&db).await.unwrap();
-    repo.seed_memory_embedding_for_test("m1", "t", &unit_vector_owned(256, 1)).await.unwrap();
+    repo.seed_memory_embedding_for_test("m1", "t", &unit_vector_owned(256, 1))
+        .await
+        .unwrap();
 
     let fp = mem::storage::VectorIndexFingerprint {
         provider: "fake".into(),
@@ -308,7 +333,9 @@ async fn open_or_rebuild_recovers_from_missing_meta_file() {
     let dir = tempdir().unwrap();
     let db = dir.path().join("missing-meta.duckdb");
     let repo = DuckDbRepository::open(&db).await.unwrap();
-    repo.seed_memory_embedding_for_test("m1", "t", &unit_vector_owned(256, 1)).await.unwrap();
+    repo.seed_memory_embedding_for_test("m1", "t", &unit_vector_owned(256, 1))
+        .await
+        .unwrap();
 
     let fp = mem::storage::VectorIndexFingerprint {
         provider: "fake".into(),
@@ -328,7 +355,9 @@ async fn concurrent_search_and_upsert_does_not_panic() {
     let idx = std::sync::Arc::new(VectorIndex::new_in_memory(256, "fake", "fake", 64));
     // Pre-populate
     for i in 0..32u8 {
-        idx.upsert(&format!("seed_{i}"), &unit_vector(256, i)).await.unwrap();
+        idx.upsert(&format!("seed_{i}"), &unit_vector(256, i))
+            .await
+            .unwrap();
     }
 
     let mut handles = Vec::new();

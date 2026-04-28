@@ -56,7 +56,8 @@ impl MemHttpClient {
         path: &str,
         body: Option<&B>,
     ) -> Result<Value> {
-        self.request_json_with_query::<B>(method, path, body, &[]).await
+        self.request_json_with_query::<B>(method, path, body, &[])
+            .await
     }
 
     pub async fn request_json_with_query<B: Serialize>(

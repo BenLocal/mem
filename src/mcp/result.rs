@@ -2,8 +2,7 @@ use rmcp::model::{CallToolResult, Content};
 use serde_json::Value;
 
 pub fn ok_json(value: &Value) -> CallToolResult {
-    let text =
-        serde_json::to_string_pretty(value).unwrap_or_else(|_| value.to_string());
+    let text = serde_json::to_string_pretty(value).unwrap_or_else(|_| value.to_string());
     CallToolResult::success(vec![Content::text(text)])
 }
 

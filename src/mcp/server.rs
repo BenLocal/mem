@@ -39,7 +39,11 @@ impl MemMcpServer {
     }
 
     async fn post_json(&self, path: &str, body: &Value) -> Result<CallToolResult, McpError> {
-        match self.client.request_json(Method::POST, path, Some(body)).await {
+        match self
+            .client
+            .request_json(Method::POST, path, Some(body))
+            .await
+        {
             Ok(v) => Ok(ok_json(&v)),
             Err(e) => Ok(err_text(e.to_string())),
         }
@@ -412,7 +416,11 @@ impl MemMcpServer {
             "expand_graph": false,
             "tenant": args.tenant,
         });
-        match self.client.request_json(Method::POST, "memories/search", Some(&body)).await {
+        match self
+            .client
+            .request_json(Method::POST, "memories/search", Some(&body))
+            .await
+        {
             Ok(v) => Ok(ok_json(&pick_search_summary(&v))),
             Err(e) => Ok(err_text(e.to_string())),
         }
@@ -449,7 +457,11 @@ impl MemMcpServer {
             "expand_graph": true,
             "tenant": args.tenant,
         });
-        match self.client.request_json(Method::POST, "memories/search", Some(&body)).await {
+        match self
+            .client
+            .request_json(Method::POST, "memories/search", Some(&body))
+            .await
+        {
             Ok(v) => Ok(ok_json(&pick_search_summary(&v))),
             Err(e) => Ok(err_text(e.to_string())),
         }
@@ -464,11 +476,17 @@ impl MemMcpServer {
         Parameters(args): Parameters<MemoryIngestArgs>,
     ) -> Result<CallToolResult, McpError> {
         let mut body = Map::new();
-        body.insert("tenant".into(), json!(self.resolve_tenant(args.tenant.as_ref())));
+        body.insert(
+            "tenant".into(),
+            json!(self.resolve_tenant(args.tenant.as_ref())),
+        );
         body.insert("memory_type".into(), json!(args.memory_type));
         body.insert("content".into(), json!(args.content));
         body.insert("evidence".into(), json!(args.evidence.unwrap_or_default()));
-        body.insert("code_refs".into(), json!(args.code_refs.unwrap_or_default()));
+        body.insert(
+            "code_refs".into(),
+            json!(args.code_refs.unwrap_or_default()),
+        );
         body.insert("scope".into(), json!(args.scope));
         body.insert(
             "visibility".into(),
@@ -502,9 +520,7 @@ impl MemMcpServer {
     }
 
     // ------------------- memory_commit_fact -------------------
-    #[tool(
-        description = "Commit a verified project fact. Uses auto write mode and project scope."
-    )]
+    #[tool(description = "Commit a verified project fact. Uses auto write mode and project scope.")]
     async fn memory_commit_fact(
         &self,
         Parameters(args): Parameters<MemoryCommitFactArgs>,
@@ -512,7 +528,10 @@ impl MemMcpServer {
         let mut tags: Vec<String> = args.tags.unwrap_or_default();
         tags.push(format!("caller_agent:{}", args.caller_agent));
         let mut body = Map::new();
-        body.insert("tenant".into(), json!(self.resolve_tenant(args.tenant.as_ref())));
+        body.insert(
+            "tenant".into(),
+            json!(self.resolve_tenant(args.tenant.as_ref())),
+        );
         body.insert("memory_type".into(), json!("implementation"));
         body.insert(
             "content".into(),
@@ -546,7 +565,10 @@ impl MemMcpServer {
         Parameters(args): Parameters<MemoryProposePreferenceArgs>,
     ) -> Result<CallToolResult, McpError> {
         let mut body = Map::new();
-        body.insert("tenant".into(), json!(self.resolve_tenant(args.tenant.as_ref())));
+        body.insert(
+            "tenant".into(),
+            json!(self.resolve_tenant(args.tenant.as_ref())),
+        );
         body.insert("memory_type".into(), json!("preference"));
         body.insert(
             "content".into(),
@@ -581,7 +603,10 @@ impl MemMcpServer {
         Parameters(args): Parameters<MemoryProposeExperienceArgs>,
     ) -> Result<CallToolResult, McpError> {
         let mut body = Map::new();
-        body.insert("tenant".into(), json!(self.resolve_tenant(args.tenant.as_ref())));
+        body.insert(
+            "tenant".into(),
+            json!(self.resolve_tenant(args.tenant.as_ref())),
+        );
         body.insert("goal".into(), json!(args.summary));
         body.insert("steps".into(), json!(Vec::<String>::new()));
         body.insert("outcome".into(), json!(args.content));
@@ -653,7 +678,8 @@ impl MemMcpServer {
         Parameters(args): Parameters<TenantOnlyArgs>,
     ) -> Result<CallToolResult, McpError> {
         let tenant = self.resolve_tenant(args.tenant.as_ref());
-        self.get_with_query("reviews/pending", &[("tenant", tenant)]).await
+        self.get_with_query("reviews/pending", &[("tenant", tenant)])
+            .await
     }
 
     // ------------------- memory_review_accept -------------------
@@ -713,7 +739,10 @@ impl MemMcpServer {
         Parameters(args): Parameters<EpisodeIngestArgs>,
     ) -> Result<CallToolResult, McpError> {
         let mut body = Map::new();
-        body.insert("tenant".into(), json!(self.resolve_tenant(args.tenant.as_ref())));
+        body.insert(
+            "tenant".into(),
+            json!(self.resolve_tenant(args.tenant.as_ref())),
+        );
         body.insert("goal".into(), json!(args.goal));
         body.insert("steps".into(), json!(args.steps));
         body.insert("outcome".into(), json!(args.outcome));
@@ -759,9 +788,7 @@ impl MemMcpServer {
     }
 
     // ------------------- embeddings_list_jobs (admin) -------------------
-    #[tool(
-        description = "Admin: list embedding jobs (requires MEM_MCP_EXPOSE_EMBEDDINGS=1)."
-    )]
+    #[tool(description = "Admin: list embedding jobs (requires MEM_MCP_EXPOSE_EMBEDDINGS=1).")]
     async fn embeddings_list_jobs(
         &self,
         Parameters(args): Parameters<EmbeddingsListJobsArgs>,
@@ -802,9 +829,7 @@ impl MemMcpServer {
     }
 
     // ------------------- embeddings_providers (admin) -------------------
-    #[tool(
-        description = "Admin: describe configured embedding provider and dimension."
-    )]
+    #[tool(description = "Admin: describe configured embedding provider and dimension.")]
     async fn embeddings_providers(
         &self,
         Parameters(_): Parameters<EmptyArgs>,

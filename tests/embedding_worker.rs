@@ -69,7 +69,9 @@ async fn worker_completes_job_and_writes_embedding_row() {
         dim: settings.dim,
     };
     let idx = Arc::new(
-        mem::storage::VectorIndex::open_or_rebuild(&repo, &db, &fp).await.unwrap(),
+        mem::storage::VectorIndex::open_or_rebuild(&repo, &db, &fp)
+            .await
+            .unwrap(),
     );
     repo.attach_vector_index(idx.clone());
     // open_or_rebuild's rebuild path populates from existing memory_embeddings
@@ -90,7 +92,9 @@ async fn worker_writes_to_attached_vector_index() {
         dim: settings.dim,
     };
     let idx = Arc::new(
-        mem::storage::VectorIndex::open_or_rebuild(&repo, &db, &fp).await.unwrap(),
+        mem::storage::VectorIndex::open_or_rebuild(&repo, &db, &fp)
+            .await
+            .unwrap(),
     );
     repo.attach_vector_index(idx.clone());
     assert_eq!(idx.size(), 0);
@@ -117,7 +121,9 @@ async fn worker_writes_to_attached_vector_index() {
         .await
         .unwrap();
 
-    embedding_worker::tick(&repo, provider.as_ref(), &settings).await.unwrap();
+    embedding_worker::tick(&repo, provider.as_ref(), &settings)
+        .await
+        .unwrap();
 
     assert_eq!(idx.size(), 1);
     let q = provider.embed_text("wire-up content").await.unwrap();

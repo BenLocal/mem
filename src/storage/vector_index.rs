@@ -1,9 +1,9 @@
 use std::collections::HashMap;
+use std::ffi::OsString;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, RwLock, RwLockReadGuard, RwLockWriteGuard};
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::ffi::OsString;
+use std::sync::{Arc, RwLock, RwLockReadGuard, RwLockWriteGuard};
 
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -25,21 +25,15 @@ pub struct VectorIndexMeta {
 }
 
 mod u64_keyed_map {
-    use std::collections::HashMap;
     use serde::{Deserialize, Deserializer, Serializer};
+    use std::collections::HashMap;
 
-    pub fn serialize<S: Serializer>(
-        m: &HashMap<u64, String>,
-        s: S,
-    ) -> Result<S::Ok, S::Error> {
-        let stringy: HashMap<String, &String> =
-            m.iter().map(|(k, v)| (k.to_string(), v)).collect();
+    pub fn serialize<S: Serializer>(m: &HashMap<u64, String>, s: S) -> Result<S::Ok, S::Error> {
+        let stringy: HashMap<String, &String> = m.iter().map(|(k, v)| (k.to_string(), v)).collect();
         serde::Serialize::serialize(&stringy, s)
     }
 
-    pub fn deserialize<'de, D: Deserializer<'de>>(
-        d: D,
-    ) -> Result<HashMap<u64, String>, D::Error> {
+    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<HashMap<u64, String>, D::Error> {
         let stringy: HashMap<String, String> = HashMap::deserialize(d)?;
         stringy
             .into_iter()
@@ -75,10 +69,7 @@ pub enum VectorIndexError {
     #[error("row count mismatch: index={index}, db={db}")]
     RowCountMismatch { index: usize, db: i64 },
     #[error("u64 hash collision for keys {existing} and {incoming}")]
-    HashCollision {
-        existing: String,
-        incoming: String,
-    },
+    HashCollision { existing: String, incoming: String },
 }
 
 pub trait EmbeddingRowSource {
@@ -119,12 +110,7 @@ fn memory_id_to_u64(memory_id: &str) -> u64 {
 impl VectorIndex {
     /// Construct an empty in-memory index. Used by tests and by the rebuild path
     /// before populating from a repository.
-    pub fn new_in_memory(
-        dim: usize,
-        provider: &str,
-        model: &str,
-        capacity_hint: usize,
-    ) -> Self {
+    pub fn new_in_memory(dim: usize, provider: &str, model: &str, capacity_hint: usize) -> Self {
         let opts = IndexOptions {
             dimensions: dim,
             metric: MetricKind::Cos,
@@ -208,14 +194,12 @@ impl VectorIndex {
     ///
     /// Returns an error if the paths are not set (i.e. the index is in-memory only).
     pub async fn save_at_default_paths(&self) -> Result<(), VectorIndexError> {
-        let idx_path = self
-            .idx_path
-            .clone()
-            .ok_or_else(|| VectorIndexError::UsearchOp("save_at_default_paths needs known paths".into()))?;
-        let meta_path = self
-            .meta_path
-            .clone()
-            .ok_or_else(|| VectorIndexError::UsearchOp("save_at_default_paths needs known paths".into()))?;
+        let idx_path = self.idx_path.clone().ok_or_else(|| {
+            VectorIndexError::UsearchOp("save_at_default_paths needs known paths".into())
+        })?;
+        let meta_path = self.meta_path.clone().ok_or_else(|| {
+            VectorIndexError::UsearchOp("save_at_default_paths needs known paths".into())
+        })?;
         self.save_to(&idx_path, &meta_path).await
     }
 
@@ -228,11 +212,7 @@ impl VectorIndex {
     /// Deviation from original spec: a detected SHA-256 u64 hash collision
     /// between two *different* memory IDs returns `VectorIndexError::HashCollision`
     /// rather than panicking. This is safer and lets callers decide policy.
-    pub async fn upsert(
-        &self,
-        memory_id: &str,
-        embedding: &[f32],
-    ) -> Result<(), VectorIndexError> {
+    pub async fn upsert(&self, memory_id: &str, embedding: &[f32]) -> Result<(), VectorIndexError> {
         if embedding.len() != self.fingerprint.dim {
             return Err(VectorIndexError::UsearchOp(format!(
                 "embedding length {} does not match fingerprint dim {}",
@@ -372,9 +352,11 @@ impl VectorIndex {
         };
 
         index
-            .save(tmp_index.to_str().ok_or_else(|| {
-                VectorIndexError::UsearchOp("non-utf8 sidecar path".to_string())
-            })?)
+            .save(
+                tmp_index.to_str().ok_or_else(|| {
+                    VectorIndexError::UsearchOp("non-utf8 sidecar path".to_string())
+                })?,
+            )
             .map_err(|e| VectorIndexError::UsearchOp(e.to_string()))?;
 
         fs::write(&tmp_meta, serde_json::to_vec_pretty(&meta)?)?;
@@ -505,7 +487,11 @@ impl VectorIndex {
                     );
                 }
                 Err(VectorIndexError::FingerprintMismatch { stored, current }) => {
-                    tracing::warn!(?stored, ?current, "vector index fingerprint mismatch; rebuilding");
+                    tracing::warn!(
+                        ?stored,
+                        ?current,
+                        "vector index fingerprint mismatch; rebuilding"
+                    );
                 }
                 Err(other) => {
                     tracing::warn!(error = %other, "vector index load failed; rebuilding");
@@ -523,8 +509,9 @@ impl VectorIndex {
 
         source
             .for_each_embedding(512, &mut |memory_id, blob| {
-                let vec = decode_f32_blob(blob, expected_fp.dim)
-                    .map_err(|e| super::StorageError::VectorIndex(format!("rebuild decode: {e}")))?;
+                let vec = decode_f32_blob(blob, expected_fp.dim).map_err(|e| {
+                    super::StorageError::VectorIndex(format!("rebuild decode: {e}"))
+                })?;
                 let key = memory_id_to_u64(memory_id);
                 // Acquire id_map write first, then index write — consistent lock ordering.
                 let mut id_map = fresh
@@ -577,7 +564,11 @@ pub fn sidecar_paths(db_path: &Path) -> (PathBuf, PathBuf) {
 fn decode_f32_blob(blob: &[u8], expected_len: usize) -> Result<Vec<f32>, String> {
     let expected_bytes = expected_len.checked_mul(4).ok_or("dim overflow")?;
     if blob.len() != expected_bytes {
-        return Err(format!("blob length {} expected {}", blob.len(), expected_bytes));
+        return Err(format!(
+            "blob length {} expected {}",
+            blob.len(),
+            expected_bytes
+        ));
     }
     let mut out = Vec::with_capacity(expected_len);
     for chunk in blob.chunks_exact(4) {

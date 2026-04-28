@@ -146,18 +146,18 @@ impl EmbeddingSettings {
         }
 
         if let Some(raw) = get("MEM_VECTOR_INDEX_FLUSH_EVERY") {
-            let n: usize = raw.parse().map_err(|_| {
-                ConfigError::InvalidEmbeddingDim(format!("flush_every: {raw}"))
-            })?;
+            let n: usize = raw
+                .parse()
+                .map_err(|_| ConfigError::InvalidEmbeddingDim(format!("flush_every: {raw}")))?;
             if n == 0 {
                 return Err(ConfigError::InvalidEmbeddingDim("flush_every=0".into()));
             }
             s.vector_index_flush_every = n;
         }
         if let Some(raw) = get("MEM_VECTOR_INDEX_OVERSAMPLE") {
-            let n: usize = raw.parse().map_err(|_| {
-                ConfigError::InvalidEmbeddingDim(format!("oversample: {raw}"))
-            })?;
+            let n: usize = raw
+                .parse()
+                .map_err(|_| ConfigError::InvalidEmbeddingDim(format!("oversample: {raw}")))?;
             if n == 0 {
                 return Err(ConfigError::InvalidEmbeddingDim("oversample=0".into()));
             }

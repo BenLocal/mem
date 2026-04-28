@@ -220,13 +220,10 @@ async fn iter_memory_embeddings_visits_each_row() {
         .unwrap();
 
     let mut seen = Vec::new();
-    repo.for_each_embedding(
-        100,
-        &mut |id, blob| {
-            seen.push((id.to_string(), blob.to_vec()));
-            Ok(())
-        },
-    )
+    repo.for_each_embedding(100, &mut |id, blob| {
+        seen.push((id.to_string(), blob.to_vec()));
+        Ok(())
+    })
     .unwrap();
     assert_eq!(seen.len(), 2);
     let ids: std::collections::HashSet<_> = seen.iter().map(|(id, _)| id.as_str()).collect();

@@ -162,7 +162,8 @@ pub async fn tick(
                 let now = current_timestamp();
                 let msg = format!("vector_index hash collision: {existing} vs {incoming}");
                 error!(memory_id = %job.memory_id, error = %msg, "vector index hash collision; permanently failing job");
-                repo.permanently_fail_embedding_job(&job.job_id, job.attempt_count + 1, &msg, &now).await?;
+                repo.permanently_fail_embedding_job(&job.job_id, job.attempt_count + 1, &msg, &now)
+                    .await?;
                 return Ok(());
             }
             Err(err) => {

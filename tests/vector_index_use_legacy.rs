@@ -1,7 +1,5 @@
 use mem::config::EmbeddingSettings;
-use mem::domain::memory::{
-    IngestMemoryRequest, MemoryType, Scope, Visibility, WriteMode,
-};
+use mem::domain::memory::{IngestMemoryRequest, MemoryType, Scope, Visibility, WriteMode};
 use mem::embedding::arc_embedding_provider;
 use mem::service::{embedding_worker, MemoryService};
 use mem::storage::{DuckDbRepository, VectorIndex, VectorIndexFingerprint};
@@ -44,7 +42,9 @@ async fn use_legacy_env_skips_vector_index() {
         })
         .await
         .unwrap();
-    embedding_worker::tick(&repo, provider.as_ref(), &settings).await.unwrap();
+    embedding_worker::tick(&repo, provider.as_ref(), &settings)
+        .await
+        .unwrap();
 
     let q = provider.embed_text("legacy-target").await.unwrap();
 

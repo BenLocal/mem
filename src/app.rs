@@ -7,7 +7,10 @@ use crate::{
     config::{Config, GraphBackendKind},
     http,
     service::MemoryService,
-    storage::{DuckDbRepository, GraphStore, IndraDbGraphAdapter, LocalGraphAdapter, VectorIndex, VectorIndexFingerprint},
+    storage::{
+        DuckDbRepository, GraphStore, IndraDbGraphAdapter, LocalGraphAdapter, VectorIndex,
+        VectorIndexFingerprint,
+    },
 };
 
 #[derive(Clone)]
@@ -26,9 +29,8 @@ impl AppState {
             model: config.embedding.model.clone(),
             dim: config.embedding.dim,
         };
-        let vector_index = Arc::new(
-            VectorIndex::open_or_rebuild(&repository, &config.db_path, &fp).await?,
-        );
+        let vector_index =
+            Arc::new(VectorIndex::open_or_rebuild(&repository, &config.db_path, &fp).await?);
         repository.attach_vector_index(vector_index.clone());
         info!(
             size = vector_index.size(),

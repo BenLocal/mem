@@ -1,7 +1,5 @@
 use mem::config::EmbeddingSettings;
-use mem::domain::memory::{
-    IngestMemoryRequest, MemoryType, Scope, Visibility, WriteMode,
-};
+use mem::domain::memory::{IngestMemoryRequest, MemoryType, Scope, Visibility, WriteMode};
 use mem::embedding::arc_embedding_provider;
 use mem::service::{embedding_worker, MemoryService};
 use mem::storage::{DuckDbRepository, VectorIndex, VectorIndexFingerprint};
@@ -42,12 +40,16 @@ async fn delete_paths_mirror_into_vector_index() {
         write_mode: WriteMode::Auto,
     };
     let r = svc.ingest(req("first")).await.unwrap();
-    embedding_worker::tick(&repo, provider.as_ref(), &settings).await.unwrap();
+    embedding_worker::tick(&repo, provider.as_ref(), &settings)
+        .await
+        .unwrap();
     assert_eq!(idx.size(), 1);
 
     repo.delete_memory_embedding(&r.memory_id).await.unwrap();
     assert_eq!(
-        repo.count_memory_embeddings_for_memory(&r.memory_id).await.unwrap(),
+        repo.count_memory_embeddings_for_memory(&r.memory_id)
+            .await
+            .unwrap(),
         0,
     );
     assert_eq!(

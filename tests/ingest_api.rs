@@ -186,8 +186,7 @@ fn content_hash_is_deterministic_for_same_request() {
     // and existing palaces will need re-migration. Update only with a matching
     // migration story.
     assert_eq!(
-        hash,
-        "5de20b10dba9788355a360cc8c7631c8f9f2df1a7b9afc807e2877923fbcc7d6",
+        hash, "5de20b10dba9788355a360cc8c7631c8f9f2df1a7b9afc807e2877923fbcc7d6",
         "content_hash drifted — old palaces will silently fail dedupe"
     );
     assert_eq!(hash.len(), 64, "expected sha256 hex, got: {hash}");

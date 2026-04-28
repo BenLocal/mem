@@ -117,7 +117,10 @@ impl DuckDbRepository {
     }
 
     pub fn attach_vector_index(&self, idx: Arc<VectorIndex>) {
-        *self.vector_index.write().expect("vector_index lock poisoned") = Some(idx);
+        *self
+            .vector_index
+            .write()
+            .expect("vector_index lock poisoned") = Some(idx);
     }
 
     pub fn has_vector_index(&self) -> bool {
@@ -265,11 +268,10 @@ impl DuckDbRepository {
 
     pub async fn count_total_memory_embeddings(&self) -> Result<i64, StorageError> {
         let conn = self.conn()?;
-        let count: i64 = conn.query_row(
-            "select count(*) from memory_embeddings",
-            params![],
-            |row| row.get(0),
-        )?;
+        let count: i64 =
+            conn.query_row("select count(*) from memory_embeddings", params![], |row| {
+                row.get(0)
+            })?;
         Ok(count)
     }
 
@@ -632,7 +634,9 @@ impl DuckDbRepository {
 
         let Some(idx) = self.vector_index() else {
             // No index attached: behave as the legacy linear scan would.
-            tracing::warn!("vector index not attached; falling back to legacy linear-scan search (deprecated)");
+            tracing::warn!(
+                "vector index not attached; falling back to legacy linear-scan search (deprecated)"
+            );
             return self
                 .legacy_semantic_search_memories(tenant, query_embedding, limit)
                 .await;
@@ -646,7 +650,9 @@ impl DuckDbRepository {
             .map(|v| matches!(v.as_str(), "1" | "true" | "yes"))
             .unwrap_or(false);
         if use_legacy {
-            tracing::warn!("MEM_VECTOR_INDEX_USE_LEGACY=1; routing to deprecated legacy linear-scan search");
+            tracing::warn!(
+                "MEM_VECTOR_INDEX_USE_LEGACY=1; routing to deprecated legacy linear-scan search"
+            );
             return self
                 .legacy_semantic_search_memories(tenant, query_embedding, limit)
                 .await;
@@ -986,13 +992,11 @@ impl DuckDbRepository {
         );
 
         let mut stmt = conn.prepare(&sql)?;
-        let mut params_vec: Vec<Box<dyn duckdb::ToSql>> =
-            vec![Box::new(tenant.to_string())];
+        let mut params_vec: Vec<Box<dyn duckdb::ToSql>> = vec![Box::new(tenant.to_string())];
         for id in ids {
             params_vec.push(Box::new(id.to_string()));
         }
-        let params_refs: Vec<&dyn duckdb::ToSql> =
-            params_vec.iter().map(|b| b.as_ref()).collect();
+        let params_refs: Vec<&dyn duckdb::ToSql> = params_vec.iter().map(|b| b.as_ref()).collect();
 
         let rows = stmt.query_map(&params_refs[..], map_memory_row)?;
         let mut out = Vec::with_capacity(ids.len());
@@ -1424,11 +1428,10 @@ impl DuckDbRepository {
 impl EmbeddingRowSource for DuckDbRepository {
     fn count_total_memory_embeddings(&self) -> Result<i64, StorageError> {
         let conn = self.conn()?;
-        let count: i64 = conn.query_row(
-            "select count(*) from memory_embeddings",
-            params![],
-            |row| row.get(0),
-        )?;
+        let count: i64 =
+            conn.query_row("select count(*) from memory_embeddings", params![], |row| {
+                row.get(0)
+            })?;
         Ok(count)
     }
 
@@ -1438,9 +1441,8 @@ impl EmbeddingRowSource for DuckDbRepository {
         f: &mut dyn FnMut(&str, &[u8]) -> Result<(), StorageError>,
     ) -> Result<(), StorageError> {
         let conn = self.conn()?;
-        let mut stmt = conn.prepare(
-            "select memory_id, embedding from memory_embeddings order by memory_id",
-        )?;
+        let mut stmt =
+            conn.prepare("select memory_id, embedding from memory_embeddings order by memory_id")?;
         let mut rows = stmt.query(params![])?;
         while let Some(row) = rows.next()? {
             let id: String = row.get(0)?;
@@ -1506,10 +1508,7 @@ fn load_embedding_references(
     Ok((jobs, embedding))
 }
 
-fn delete_embedding_references(
-    conn: &Connection,
-    memory_id: &str,
-) -> Result<(), StorageError> {
+fn delete_embedding_references(conn: &Connection, memory_id: &str) -> Result<(), StorageError> {
     conn.execute(
         "delete from embedding_jobs where memory_id = ?1",
         params![memory_id],

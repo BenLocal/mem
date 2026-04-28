@@ -1,6 +1,4 @@
-use mem::domain::memory::{
-    IngestMemoryRequest, MemoryType, Scope, Visibility, WriteMode,
-};
+use mem::domain::memory::{IngestMemoryRequest, MemoryType, Scope, Visibility, WriteMode};
 use mem::service::MemoryService;
 use mem::storage::DuckDbRepository;
 use tempfile::tempdir;
@@ -33,11 +31,12 @@ async fn fetch_by_ids_filters_tenant_and_status() {
     let b = svc.ingest(make("ten-b", "beta")).await.unwrap();
     let c = svc.ingest(make("ten-a", "gamma")).await.unwrap();
 
-    let ids = vec![a.memory_id.as_str(), b.memory_id.as_str(), c.memory_id.as_str()];
-    let rows = repo
-        .fetch_memories_by_ids("ten-a", &ids)
-        .await
-        .unwrap();
+    let ids = vec![
+        a.memory_id.as_str(),
+        b.memory_id.as_str(),
+        c.memory_id.as_str(),
+    ];
+    let rows = repo.fetch_memories_by_ids("ten-a", &ids).await.unwrap();
 
     let returned: std::collections::HashSet<_> =
         rows.iter().map(|m| m.memory_id.as_str()).collect();
