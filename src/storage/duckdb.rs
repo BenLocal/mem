@@ -626,11 +626,6 @@ impl DuckDbRepository {
                 .await;
         };
 
-        let oversample = std::env::var("MEM_VECTOR_INDEX_OVERSAMPLE")
-            .ok()
-            .and_then(|s| s.parse::<usize>().ok())
-            .filter(|n| *n > 0)
-            .unwrap_or(4);
         let use_legacy = std::env::var("MEM_VECTOR_INDEX_USE_LEGACY")
             .ok()
             .map(|v| matches!(v.as_str(), "1" | "true" | "yes"))
@@ -640,6 +635,11 @@ impl DuckDbRepository {
                 .legacy_semantic_search_memories(tenant, query_embedding, limit)
                 .await;
         }
+        let oversample = std::env::var("MEM_VECTOR_INDEX_OVERSAMPLE")
+            .ok()
+            .and_then(|s| s.parse::<usize>().ok())
+            .filter(|n| *n > 0)
+            .unwrap_or(4);
 
         let k = limit.saturating_mul(oversample).max(limit);
         let hits = idx
@@ -659,7 +659,11 @@ impl DuckDbRepository {
             .into_iter()
             .filter_map(|m| by_id.get(m.memory_id.as_str()).map(|s| (m, *s)))
             .collect();
-        scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        scored.sort_by(|a, b| {
+            b.1.partial_cmp(&a.1)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| a.0.memory_id.cmp(&b.0.memory_id))
+        });
         scored.truncate(limit);
         Ok(scored)
     }
