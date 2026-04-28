@@ -323,3 +323,32 @@ async fn diagnose_reports_index_meta_drift_when_meta_lies_about_count() {
         other => panic!("expected IndexMetaDrift, got {other:?}"),
     }
 }
+
+#[tokio::test]
+async fn diagnose_reports_db_drift_when_db_has_extra_rows() {
+    let dir = tempdir().unwrap();
+    let db = dir.path().join("dd.duckdb");
+    let (repo, _idx) = seed_one_row_with_index(&db).await;
+
+    // Bypass the worker — add a memory_embeddings row directly so the index
+    // can't know about it. seed_memory_embedding_for_test from §3 Task 8.
+    repo.seed_memory_embedding_for_test("ghost_row", "t", &vec![0.0f32; 256])
+        .await
+        .unwrap();
+
+    let settings = EmbeddingSettings::development_defaults();
+    let fp = VectorIndexFingerprint {
+        provider: settings.job_provider_id().to_string(),
+        model: settings.model.clone(),
+        dim: settings.dim,
+    };
+    let report = diagnose(&repo, &db, &fp).await.unwrap();
+    assert_eq!(report.status, "drift");
+    match report.details {
+        DiagnosticStatus::DbDrift { meta_count, db_count } => {
+            assert_eq!(meta_count, 1);
+            assert_eq!(db_count, 2);
+        }
+        other => panic!("expected DbDrift, got {other:?}"),
+    }
+}
