@@ -20,6 +20,8 @@ enum Command {
     Serve,
     /// Run the MCP (Model Context Protocol) stdio server.
     Mcp,
+    /// Diagnose or rebuild the vector index sidecar.
+    Repair(mem::cli::repair::RepairArgs),
 }
 
 #[tokio::main]
@@ -27,11 +29,15 @@ async fn main() -> error::Result<()> {
     let cli = Cli::parse();
     let command = cli.command.unwrap_or(Command::Serve);
 
-    init_tracing(matches!(command, Command::Mcp));
+    init_tracing(matches!(command, Command::Mcp | Command::Repair(_)));
 
     match command {
         Command::Serve => run_serve().await,
         Command::Mcp => mcp::run().await,
+        Command::Repair(args) => {
+            let code = mem::cli::repair::run(args).await;
+            std::process::exit(code);
+        }
     }
 }
 
