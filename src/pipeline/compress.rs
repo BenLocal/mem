@@ -198,15 +198,17 @@ fn split_steps(text: &str) -> Vec<String> {
 
 fn compress_text(text: &str, budget: usize) -> String {
     let limit = budget.max(8);
-    let mut words = text
-        .split_whitespace()
-        .take(limit)
-        .collect::<Vec<_>>()
-        .join(" ");
-    if words.is_empty() {
-        words = text.chars().take(limit).collect();
+    let char_limit = limit * 3;
+
+    let truncated: String = text.chars().take(char_limit).collect();
+    if truncated.len() < text.len() {
+        if let Some(last_space) = truncated.rfind(char::is_whitespace) {
+            if last_space > char_limit / 2 {
+                return truncated[..last_space].trim().to_string();
+            }
+        }
     }
-    words
+    truncated
 }
 
 fn max_items(budget: usize) -> usize {
