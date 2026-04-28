@@ -1,4 +1,24 @@
 use mem::domain::memory::GraphEdge;
+use mem::storage::{DuckDbGraphStore, DuckDbRepository};
+use std::sync::Arc;
+use tempfile::tempdir;
+
+async fn open_repo_and_graph(db_path: &std::path::Path)
+    -> (Arc<DuckDbRepository>, DuckDbGraphStore)
+{
+    let repo = Arc::new(DuckDbRepository::open(db_path).await.unwrap());
+    let graph = DuckDbGraphStore::new(repo.clone());
+    (repo, graph)
+}
+
+#[tokio::test]
+async fn duckdb_graph_store_constructs_against_fresh_db() {
+    let dir = tempdir().unwrap();
+    let db = dir.path().join("ctor.duckdb");
+    let (_repo, graph) = open_repo_and_graph(&db).await;
+    let edges = graph.neighbors("memory:does-not-exist").await.unwrap();
+    assert!(edges.is_empty());
+}
 
 #[test]
 fn graph_edge_carries_valid_from_and_valid_to() {

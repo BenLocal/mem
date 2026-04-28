@@ -1382,7 +1382,7 @@ impl DuckDbRepository {
         Ok(summary)
     }
 
-    fn conn(&self) -> Result<MutexGuard<'_, Connection>, StorageError> {
+    pub(crate) fn conn(&self) -> Result<MutexGuard<'_, Connection>, StorageError> {
         self.conn
             .lock()
             .map_err(|_| StorageError::InvalidData("duckdb connection mutex poisoned"))
