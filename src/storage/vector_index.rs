@@ -46,7 +46,7 @@ mod u64_keyed_map {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct VectorIndexFingerprint {
     pub provider: String,
     pub model: String,
