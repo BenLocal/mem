@@ -607,7 +607,67 @@ impl DuckDbRepository {
     }
 
     /// Joins `memories` with valid `memory_embeddings` (hash match), scores by cosine similarity in Rust.
+    /// Uses the attached `VectorIndex` (ANN path) when available; falls back to the legacy linear scan
+    /// when no index is attached or `MEM_VECTOR_INDEX_USE_LEGACY=1` is set.
     pub async fn semantic_search_memories(
+        &self,
+        tenant: &str,
+        query_embedding: &[f32],
+        limit: usize,
+    ) -> Result<Vec<(MemoryRecord, f32)>, StorageError> {
+        if query_embedding.is_empty() || limit == 0 {
+            return Ok(vec![]);
+        }
+
+        let Some(idx) = self.vector_index() else {
+            // No index attached: behave as the legacy linear scan would.
+            return self
+                .legacy_semantic_search_memories(tenant, query_embedding, limit)
+                .await;
+        };
+
+        let oversample = std::env::var("MEM_VECTOR_INDEX_OVERSAMPLE")
+            .ok()
+            .and_then(|s| s.parse::<usize>().ok())
+            .filter(|n| *n > 0)
+            .unwrap_or(4);
+        let use_legacy = std::env::var("MEM_VECTOR_INDEX_USE_LEGACY")
+            .ok()
+            .map(|v| matches!(v.as_str(), "1" | "true" | "yes"))
+            .unwrap_or(false);
+        if use_legacy {
+            return self
+                .legacy_semantic_search_memories(tenant, query_embedding, limit)
+                .await;
+        }
+
+        let k = limit.saturating_mul(oversample).max(limit);
+        let hits = idx
+            .search(query_embedding, k)
+            .await
+            .map_err(|e| StorageError::VectorIndex(format!("vector_index search: {e}")))?;
+        if hits.is_empty() {
+            return Ok(vec![]);
+        }
+
+        let id_strs: Vec<&str> = hits.iter().map(|(id, _)| id.as_str()).collect();
+        let rows = self.fetch_memories_by_ids(tenant, &id_strs).await?;
+
+        let by_id: std::collections::HashMap<&str, f32> =
+            hits.iter().map(|(i, s)| (i.as_str(), *s)).collect();
+        let mut scored: Vec<(MemoryRecord, f32)> = rows
+            .into_iter()
+            .filter_map(|m| by_id.get(m.memory_id.as_str()).map(|s| (m, *s)))
+            .collect();
+        scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        scored.truncate(limit);
+        Ok(scored)
+    }
+
+    /// Legacy linear-scan implementation of semantic search.
+    /// Preserved verbatim from before Task 14; activated by `MEM_VECTOR_INDEX_USE_LEGACY=1`
+    /// or when no `VectorIndex` is attached.
+    async fn legacy_semantic_search_memories(
         &self,
         tenant: &str,
         query_embedding: &[f32],
@@ -889,8 +949,7 @@ impl DuckDbRepository {
         }
         let conn = self.conn()?;
 
-        let placeholders = std::iter::repeat("?")
-            .take(ids.len())
+        let placeholders = std::iter::repeat_n("?", ids.len())
             .collect::<Vec<_>>()
             .join(",");
         let sql = format!(
