@@ -79,7 +79,9 @@ async fn semantic_search_respects_use_legacy_env_var() {
     // a single test function provided no other thread mutates the same var concurrently.
     // We restore the value on exit.
     let prior = std::env::var("MEM_VECTOR_INDEX_USE_LEGACY").ok();
-    std::env::set_var("MEM_VECTOR_INDEX_USE_LEGACY", "1");
+    unsafe {
+        std::env::set_var("MEM_VECTOR_INDEX_USE_LEGACY", "1");
+    }
 
     let result = async {
         let dir = tempdir().unwrap();
@@ -108,8 +110,12 @@ async fn semantic_search_respects_use_legacy_env_var() {
 
     // Restore env var.
     match prior {
-        Some(v) => std::env::set_var("MEM_VECTOR_INDEX_USE_LEGACY", v),
-        None => std::env::remove_var("MEM_VECTOR_INDEX_USE_LEGACY"),
+        Some(v) => unsafe {
+            std::env::set_var("MEM_VECTOR_INDEX_USE_LEGACY", v);
+        },
+        None => unsafe {
+            std::env::remove_var("MEM_VECTOR_INDEX_USE_LEGACY");
+        },
     }
 
     result

@@ -30,7 +30,15 @@ pub struct EmbeddingSettings {
     pub batch_size: usize,
     pub openai_api_key: Option<String>,
     pub vector_index_flush_every: usize,
+    /// Read directly via `std::env::var` in `DuckDbRepository::semantic_search_memories`.
+    /// This struct field is populated for diagnostic/logging visibility but is not the
+    /// source of truth at search time. See `mempalace-diff §8 #3` Task 14 carryover.
+    #[allow(dead_code)]
     pub vector_index_oversample: usize,
+    /// Read directly via `std::env::var` in `DuckDbRepository::semantic_search_memories`.
+    /// This struct field is populated for diagnostic/logging visibility but is not the
+    /// source of truth at search time. See `mempalace-diff §8 #3` Task 14 carryover.
+    #[allow(dead_code)]
     pub vector_index_use_legacy: bool,
 }
 
@@ -59,6 +67,10 @@ pub enum ConfigError {
     InvalidBatchSize(String),
     #[error("invalid GRAPH_BACKEND: {0} (expected local or indradb)")]
     InvalidGraphBackend(String),
+    #[error("invalid MEM_VECTOR_INDEX_FLUSH_EVERY: {0}")]
+    InvalidVectorIndexFlushEvery(String),
+    #[error("invalid MEM_VECTOR_INDEX_OVERSAMPLE: {0}")]
+    InvalidVectorIndexOversample(String),
 }
 
 impl EmbeddingSettings {
@@ -148,18 +160,18 @@ impl EmbeddingSettings {
         if let Some(raw) = get("MEM_VECTOR_INDEX_FLUSH_EVERY") {
             let n: usize = raw
                 .parse()
-                .map_err(|_| ConfigError::InvalidEmbeddingDim(format!("flush_every: {raw}")))?;
+                .map_err(|_| ConfigError::InvalidVectorIndexFlushEvery(raw.clone()))?;
             if n == 0 {
-                return Err(ConfigError::InvalidEmbeddingDim("flush_every=0".into()));
+                return Err(ConfigError::InvalidVectorIndexFlushEvery(raw));
             }
             s.vector_index_flush_every = n;
         }
         if let Some(raw) = get("MEM_VECTOR_INDEX_OVERSAMPLE") {
             let n: usize = raw
                 .parse()
-                .map_err(|_| ConfigError::InvalidEmbeddingDim(format!("oversample: {raw}")))?;
+                .map_err(|_| ConfigError::InvalidVectorIndexOversample(raw.clone()))?;
             if n == 0 {
-                return Err(ConfigError::InvalidEmbeddingDim("oversample=0".into()));
+                return Err(ConfigError::InvalidVectorIndexOversample(raw));
             }
             s.vector_index_oversample = n;
         }
