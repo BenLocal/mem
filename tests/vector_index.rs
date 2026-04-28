@@ -263,3 +263,47 @@ async fn open_or_rebuild_rebuilds_on_row_count_drift() {
 fn unit_vector_owned(dim: usize, seed: u8) -> Vec<f32> {
     unit_vector(dim, seed)
 }
+
+#[tokio::test]
+async fn open_or_rebuild_recovers_from_corrupt_index_file() {
+    let dir = tempdir().unwrap();
+    let db = dir.path().join("corrupt.duckdb");
+    let repo = DuckDbRepository::open(&db).await.unwrap();
+    repo.seed_memory_embedding_for_test("m1", "t", &unit_vector_owned(256, 1)).await.unwrap();
+
+    let fp = mem::storage::VectorIndexFingerprint {
+        provider: "fake".into(),
+        model: "fake".into(),
+        dim: 256,
+    };
+    // First open: writes sidecar
+    let _ = VectorIndex::open_or_rebuild(&repo, &db, &fp).await.unwrap();
+
+    // Corrupt the index file
+    let (idx_path, _) = mem::storage::sidecar_paths(&db);
+    std::fs::write(&idx_path, b"GARBAGE").unwrap();
+
+    // Second open: detects corruption, rebuilds from DuckDB
+    let idx = VectorIndex::open_or_rebuild(&repo, &db, &fp).await.unwrap();
+    assert_eq!(idx.size(), 1);
+}
+
+#[tokio::test]
+async fn open_or_rebuild_recovers_from_missing_meta_file() {
+    let dir = tempdir().unwrap();
+    let db = dir.path().join("missing-meta.duckdb");
+    let repo = DuckDbRepository::open(&db).await.unwrap();
+    repo.seed_memory_embedding_for_test("m1", "t", &unit_vector_owned(256, 1)).await.unwrap();
+
+    let fp = mem::storage::VectorIndexFingerprint {
+        provider: "fake".into(),
+        model: "fake".into(),
+        dim: 256,
+    };
+    let _ = VectorIndex::open_or_rebuild(&repo, &db, &fp).await.unwrap();
+    let (_, meta_path) = mem::storage::sidecar_paths(&db);
+    std::fs::remove_file(&meta_path).unwrap();
+
+    let idx = VectorIndex::open_or_rebuild(&repo, &db, &fp).await.unwrap();
+    assert_eq!(idx.size(), 1);
+}
