@@ -132,10 +132,16 @@ impl MemoryService {
 
         let status = initial_status(&request.memory_type, &request.write_mode);
         let now = current_timestamp();
-        let summary = summarize(&request.content);
 
-        crate::pipeline::ingest::validate_verbatim(&request, &summary)
+        crate::pipeline::ingest::validate_verbatim(&request.content, request.summary.as_deref())
             .map_err(|e| ServiceError::Storage(StorageError::InvalidInput(e)))?;
+
+        let summary = request
+            .summary
+            .as_deref()
+            .filter(|s| !s.is_empty())
+            .map(|s| s.to_string())
+            .unwrap_or_else(|| summarize(&request.content));
 
         let memory = MemoryRecord {
             memory_id: next_memory_id(),
