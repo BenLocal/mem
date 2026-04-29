@@ -234,12 +234,12 @@ MemPalace 第一原则是 "Verbatim always"——**永不改写用户内容**。
 
 - ✅ `memories.content` 列存原文，`compress.rs` 只在**输出层**截断
 - ⚠️ `memories.summary` 是调用方提供的——如果 agent 写入时已经"提炼"了，那就脱离 verbatim 了
-- ⚠️ `compress_text` 按**词数**截断不是 token，容易在 CJK 文本上偏离 token_budget 很多
+- ✅ `compress_text` 按真实 token 截断（tiktoken-rs::o200k_base，2026-04-29 落地，ROADMAP #6）；之前按 `chars × 3` 估算，CJK 实际 ~3× 超预算的 bug 已修
 
 ### 建议
 
 1. 在 ingest 路径加一个 `assert!(content.len() > 0)`，**禁止 `summary` 与 `content` 完全相同时写入**——这是 agent 偷懒抄过去的信号。
-2. 把 `compress_text` 的"按词截断"换成 `tiktoken-rs` 之类的 token 计数器，对中英文都靠谱。
+2. ✅ 把 `compress_text` 的"按词截断"换成 `tiktoken-rs` 之类的 token 计数器，对中英文都靠谱。（2026-04-29 落地：tiktoken-rs 0.11 + o200k_base，6 个单测覆盖 CJK / ASCII / 混合 / 边界。）
 3. 文档化：`summary` 是**索引/提示用**，`content` 是**事实源**——任何输出都必须基于 `content` 而不是 `summary`。
 
 ---
