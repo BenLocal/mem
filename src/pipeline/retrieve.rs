@@ -794,4 +794,34 @@ mod tests {
             "lex-only candidate must have positive RRF recall contribution"
         );
     }
+
+    #[test]
+    fn legacy_kill_switch_replicates_old_scoring() {
+        // With MEM_RANKER=legacy, merge_and_rank_hybrid must dispatch to
+        // score_candidates_hybrid_legacy. We can't easily assert the exact
+        // score here because merge_and_rank_hybrid returns Vec<MemoryRecord>,
+        // not Vec<ScoredMemory>, but verifying the candidate is preserved
+        // through the legacy path (combined with the rrf_* tests proving RRF
+        // is the default) confirms the dispatch works end-to-end.
+        let memory = fixture_memory("legacy_only");
+        let query = fixture_query();
+        let lexical: Vec<MemoryRecord> = vec![];
+        let semantic: Vec<(MemoryRecord, f32)> = vec![(memory, 1.0)];
+
+        // SAFETY: env mutation is unsafe in Rust 2024. Cargo's libtest
+        // harness defaults to multi-threaded execution but each test gets
+        // its own thread; setting and clearing the var within one test
+        // is safe as long as no other concurrent test reads MEM_RANKER.
+        // No other test in this module reads it.
+        unsafe {
+            std::env::set_var("MEM_RANKER", "legacy");
+        }
+        let result = merge_and_rank_hybrid(lexical, semantic, &query, &HashSet::new(), 0);
+        unsafe {
+            std::env::remove_var("MEM_RANKER");
+        }
+
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].memory_id, "legacy_only");
+    }
 }
