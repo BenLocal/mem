@@ -293,6 +293,12 @@ mem 的本性是 **"结构化记忆生命周期"**（status / supersedes / feedb
 
 ## 11. Sessions（对齐 MemPalace 的 Room，但和 episodes 正交）
 
+> **2026-04-29 落地**：✅ schema (`db/schema/004_sessions.sql`) + auto-bucket (`pipeline/session.rs::resolve_session`) + `memories.session_id` 落地。`MEM_SESSION_IDLE_MINUTES` 环境变量化（默认 30）。HTTP 端点（`GET /sessions` 等）、`episodes.session_id` 列、`DELETE /sessions/{id}` 软删均延后到后续 PR。详见 `docs/superpowers/specs/2026-04-29-sessions-design.md`。
+>
+> **本次落地的两点偏离原设计**：
+> 1. `last_seen_at` 单独成列（原 §11 用 `ended_at.unwrap_or(started_at)`，对长 session 不 work）。
+> 2. `memories.session_id` 没有 inline FK 约束 —— DuckDB 的 parser 不支持 `ALTER TABLE ADD COLUMN ... REFERENCES`。等价的写入序保证由 `resolve_session()` 提供（先 open_session，再 create_memory）。
+
 ### 为什么 mem 现在缺这个
 
 mem 的时间维度只是 `created_at` / `updated_at` 时间戳，**没有"会话/工作时段"这个一等容器**。下面这些查询当前都答不出来：
