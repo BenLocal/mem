@@ -400,6 +400,10 @@ M（半天）= schema 迁移 + `resolve_session` + ingest 路径接线 + 一个 
 
 ## 12. 检索流水线三段式重构（取 mem 之结构化、借 MemPalace 之分层）
 
+> **2026-04-29 落地**：✅ 按 line 513 的 "可降级为只做 Stage 2 拆分（半天）" 路径执行。`pipeline/retrieve.rs::apply_lifecycle_score` 抽出共享 helper（9 个普适信号），三个 scorer 都调它复用 lifecycle 加性层；evidence bonus 在两个 hybrid scorer 内联（`score_candidates` 非 hybrid 路径历史上没这个 bonus，保持原样）。3 个新单测 + 全套现有测试零 assertion 改动通过 —— 行为完全等价。**Stage 3 仍未做**：响应形状变更（暴露 `score_breakdown`）、`compress.rs` 解构、A/B `MEM_RANKER=three_stage` 切换均延后。详见 `docs/superpowers/specs/2026-04-29-lifecycle-score-extraction-design.md`。
+>
+> **触发完整 §12 重构的条件**：当 `tests/search_api.rs` 出现 P95 延迟报警 OR caller 反馈 token 截断失真 OR caller-side LLM rerank 真的接进来。
+
 ### 当前状态：两边都不全
 
 | | mem 现状 | MemPalace 现状 |
