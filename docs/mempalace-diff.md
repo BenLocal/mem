@@ -136,7 +136,9 @@ score =
    - DuckDB `vss` extension（与 bundled DuckDB 兼容性需测，PR 风险高）。
    - 选型建议：**`usearch` sidecar 索引文件 + DuckDB 行做权威源**，HNSW 损坏时可从 DuckDB 重建（对照 MemPalace 的 `mempalace repair --mode rebuild`）。
 2. **HNSW 健康度自检**。MemPalace `backends/chroma.py::hnsw_capacity_status` 在每次启动比对 `sqlite_count` vs `hnsw_count`，超阈值就提示 repair。我们落 sidecar 索引后照搬这套自检 + 修复 CLI。
-3. **混合检索的归一化打分**。当前 `score_candidates_hybrid` 是加性整数，semantic_sim×64 vs scope×18 量级失衡。建议改成两路 RRF（reciprocal rank fusion）或先归一到 [0,1] 再加权——对齐 MemPalace 的 BM25 + 向量混合写法。
+3. **混合检索的归一化打分**。当前 `score_candidates_hybrid`（`pipeline/retrieve.rs:149`）是加性整数，semantic_sim×64 vs scope×18 量级失衡。建议改成两路 RRF（reciprocal rank fusion）或先归一到 [0,1] 再加权——对齐 MemPalace 的 BM25 + 向量混合写法。
+
+   **2026-04-29 复核**：仍未做。code 是 `let mut score = 0i64;` 起步加性串接 7+ 个维度（lexical∩semantic +26、evidence +2、text_match、scope -4..+18、memory_type×intent、confidence ×10、validated +3、freshness、decay ×12、graph_boost ±12、provisional -4）。唯一一处线性 rescale 是 semantic：`((cos+1)/2)*64`（[0, 64]）。**没有 RRF**，整个文件查不到 `reciprocal_rank` / `rank_fusion` 痕迹。失衡问题描述准确。
 
 ---
 
