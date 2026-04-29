@@ -2999,6 +2999,7 @@ dependencies = [
  "clap",
  "duckdb",
  "embed_anything",
+ "regex",
  "reqwest",
  "rmcp",
  "schemars 0.8.22",
