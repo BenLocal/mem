@@ -165,6 +165,7 @@ fn content_hash_is_deterministic_for_same_request() {
         tenant: "tenant-a".into(),
         memory_type: MemoryType::Implementation,
         content: "invalidate cache when schema changes".into(),
+        summary: None,
         evidence: vec!["notes".into()],
         code_refs: vec!["src/cache.rs".into()],
         scope: Scope::Repo,

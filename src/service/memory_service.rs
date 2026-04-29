@@ -473,6 +473,7 @@ impl MemoryService {
             tenant: original.tenant.clone(),
             memory_type: original.memory_type.clone(),
             content: patch.content.clone(),
+            summary: None,
             evidence: patch.evidence.clone(),
             code_refs: patch.code_refs.clone(),
             scope: original.scope.clone(),

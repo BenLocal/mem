@@ -14,6 +14,7 @@ async fn fetch_by_ids_filters_tenant_and_status() {
         tenant: tenant.into(),
         memory_type: MemoryType::Implementation,
         content: content.into(),
+        summary: None,
         evidence: vec![],
         code_refs: vec![],
         scope: Scope::Repo,

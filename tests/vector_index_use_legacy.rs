@@ -27,6 +27,7 @@ async fn use_legacy_env_skips_vector_index() {
             tenant: "t".into(),
             memory_type: MemoryType::Implementation,
             content: "legacy-target".into(),
+            summary: None,
             evidence: vec![],
             code_refs: vec![],
             scope: Scope::Repo,

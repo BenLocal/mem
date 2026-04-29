@@ -65,6 +65,7 @@ pub fn workflow_memory_request(
         tenant: episode.tenant.clone(),
         memory_type: MemoryType::Workflow,
         content: workflow_content(candidate),
+        summary: None,
         evidence: candidate.evidence.clone(),
         code_refs: Vec::new(),
         scope: candidate.scope.clone(),

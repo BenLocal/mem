@@ -147,6 +147,7 @@ async fn seed_one_row_with_index(
         tenant: "t".into(),
         memory_type: MemoryType::Implementation,
         content: "diag-target".into(),
+        summary: None,
         evidence: vec![],
         code_refs: vec![],
         scope: Scope::Repo,

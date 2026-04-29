@@ -62,6 +62,7 @@ impl From<HttpIngestMemoryRequest> for IngestMemoryRequest {
             tenant: request.tenant,
             memory_type: request.memory_type,
             content: request.content,
+            summary: None,
             evidence: request.evidence,
             code_refs: request.code_refs,
             scope: request.scope,

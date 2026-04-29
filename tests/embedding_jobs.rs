@@ -131,6 +131,7 @@ async fn ingest_creates_one_embedding_job() {
         tenant: "tenant-embed".into(),
         memory_type: MemoryType::Implementation,
         content: "use tokio for async boundaries".into(),
+        summary: None,
         evidence: vec![],
         code_refs: vec![],
         scope: Scope::Repo,
