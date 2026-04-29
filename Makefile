@@ -2,7 +2,7 @@
 # 运行 `make help` 看所有可用目标。
 
 .DEFAULT_GOAL := help
-.PHONY: help build release run serve mcp repair-check repair-rebuild \
+.PHONY: help build release install run serve mcp repair-check repair-rebuild \
         test test-unit test-fast fmt fmt-check clippy lint check \
         cross cross-linux-gnu cross-linux-musl cross-arm64 \
         clean
@@ -19,6 +19,9 @@ build: ## 调试构建
 
 release: ## release 构建
 	$(CARGO) build --release
+
+install: release ## 安装到 ~/.cargo/bin
+	$(CARGO) install --path .
 
 # ==== 运行（与 AGENTS.md 列出的子命令一致） ====
 

@@ -9,7 +9,7 @@ use serde_json::{json, Map, Value};
 
 use super::client::{encode_segment, MemHttpClient};
 use super::config::McpConfig;
-use super::result::{err_text, ok_json};
+use super::result::{err_text, ok_json, ok_json_with_notice};
 
 #[derive(Clone)]
 pub struct MemMcpServer {
@@ -516,7 +516,14 @@ impl MemMcpServer {
         if let Some(v) = args.idempotency_key {
             body.insert("idempotency_key".into(), json!(v));
         }
-        self.post_json("memories", &Value::Object(body)).await
+        match self
+            .client
+            .request_json(Method::POST, "memories", Some(&Value::Object(body)))
+            .await
+        {
+            Ok(v) => Ok(ok_json_with_notice("✅ 已保存到记忆中", &v)),
+            Err(e) => Ok(err_text(e.to_string())),
+        }
     }
 
     // ------------------- memory_commit_fact -------------------
@@ -553,7 +560,14 @@ impl MemMcpServer {
         if let Some(v) = args.idempotency_key {
             body.insert("idempotency_key".into(), json!(v));
         }
-        self.post_json("memories", &Value::Object(body)).await
+        match self
+            .client
+            .request_json(Method::POST, "memories", Some(&Value::Object(body)))
+            .await
+        {
+            Ok(v) => Ok(ok_json_with_notice("✅ 已保存事实到记忆中", &v)),
+            Err(e) => Ok(err_text(e.to_string())),
+        }
     }
 
     // ------------------- memory_propose_preference -------------------
@@ -591,7 +605,14 @@ impl MemMcpServer {
         );
         body.insert("source_agent".into(), json!(args.source_agent));
         body.insert("write_mode".into(), json!("propose"));
-        self.post_json("memories", &Value::Object(body)).await
+        match self
+            .client
+            .request_json(Method::POST, "memories", Some(&Value::Object(body)))
+            .await
+        {
+            Ok(v) => Ok(ok_json_with_notice("✅ 已提议偏好，等待确认", &v)),
+            Err(e) => Ok(err_text(e.to_string())),
+        }
     }
 
     // ------------------- memory_propose_experience -------------------
