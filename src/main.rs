@@ -23,6 +23,8 @@ enum Command {
     Repair(mem::cli::repair::RepairArgs),
     /// Mine memories from Claude Code transcript.
     Mine(mem::cli::mine::MineArgs),
+    /// Query and format memories for session start injection.
+    WakeUp(mem::cli::wake_up::WakeUpArgs),
 }
 
 #[tokio::main]
@@ -43,6 +45,16 @@ async fn main() -> error::Result<()> {
             let code = mem::cli::mine::run(args).await;
             std::process::exit(code);
         }
+        Command::WakeUp(args) => match mem::cli::wake_up::run(args).await {
+            Ok(output) => {
+                print!("{}", output);
+                Ok(())
+            }
+            Err(e) => {
+                eprintln!("Failed to wake up: {}", e);
+                std::process::exit(1);
+            }
+        },
     }
 }
 
