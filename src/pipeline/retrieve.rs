@@ -247,7 +247,7 @@ fn score_candidates_hybrid_legacy(
 }
 
 const RRF_K: usize = 60;
-const RRF_SCALE: i64 = 1000;
+const RRF_SCALE: f64 = 1000.0;
 
 fn score_candidates_hybrid_rrf(
     candidates: Vec<MemoryRecord>,
@@ -273,15 +273,15 @@ fn score_candidates_hybrid_rrf(
 
             let rrf_lex = lexical_ranks
                 .get(&memory.memory_id)
-                .map(|r| 1.0_f64 / (RRF_K as f64 + *r as f64))
+                .map(|&r| 1.0_f64 / (RRF_K as f64 + r as f64))
                 .unwrap_or(0.0);
             let rrf_sem = semantic_ranks
                 .get(&memory.memory_id)
-                .map(|r| 1.0_f64 / (RRF_K as f64 + *r as f64))
+                .map(|&r| 1.0_f64 / (RRF_K as f64 + r as f64))
                 .unwrap_or(0.0);
-            score += ((rrf_lex + rrf_sem) * RRF_SCALE as f64).round() as i64;
+            score += ((rrf_lex + rrf_sem) * RRF_SCALE).round() as i64;
 
-            // Lifecycle additive layer — identical to _legacy.
+            // Lifecycle additive layer — same scoring axes as _legacy; duplication is intentional (legacy will be removed).
             if !memory.evidence.is_empty() {
                 score += 2;
             }
@@ -634,18 +634,6 @@ mod tests {
     use crate::domain::query::SearchMemoryRequest;
 
     fn fixture_memory(id: &str) -> MemoryRecord {
-        // lifecycle additive layer contributions with this fixture:
-        //   evidence: empty → 0
-        //   text_match_score: query="" → 0
-        //   scope_score: no filters, Scope::Global → 0
-        //   memory_type_score: MemoryType::Implementation, intent="" → 5
-        //   confidence_score(0.0) → 0
-        //   validation_score(false) → 0
-        //   freshness_score(0, 0): newest==current → 6
-        //   staleness_penalty(decay_score): (11.0/12.0 * 12.0).round() = 11 → cancels 5+6
-        //   status: Active → 0
-        //   graph: empty related_ids, graph_boost=0 → 0
-        // net lifecycle = 5 + 6 - 11 = 0
         MemoryRecord {
             memory_id: id.to_string(),
             tenant: "t".to_string(),
@@ -664,7 +652,7 @@ mod tests {
             task_type: None,
             tags: vec![],
             confidence: 0.0,
-            decay_score: 11.0 / 12.0,
+            decay_score: 0.0,
             content_hash: String::new(),
             idempotency_key: None,
             supersedes_memory_id: None,
@@ -691,6 +679,13 @@ mod tests {
     fn rrf_recall_only_lexical() {
         let memory = fixture_memory("mem_a");
         let query = fixture_query();
+
+        let lifecycle_baseline: i64 = {
+            let newest = timestamp_score(&memory.updated_at);
+            memory_type_score(&memory.memory_type, &query.intent) + freshness_score(newest, newest)
+                - staleness_penalty(memory.decay_score)
+        };
+
         let mut lex_ranks = HashMap::new();
         lex_ranks.insert("mem_a".into(), 1usize);
         let sem_ranks: HashMap<String, usize> = HashMap::new();
@@ -705,7 +700,6 @@ mod tests {
         );
 
         // RRF contribution: 1000/(60+1) = 16.39 → round → 16.
-        // Lifecycle additive layer evaluates to zero for this fixture.
-        assert_eq!(scored[0].score, 16);
+        assert_eq!(scored[0].score - lifecycle_baseline, 16);
     }
 }
