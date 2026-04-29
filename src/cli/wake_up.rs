@@ -34,7 +34,11 @@ pub async fn run(args: WakeUpArgs) -> Result<String> {
     let payload = serde_json::json!({
         "tenant": args.tenant,
         "query": "",
-        "limit": 10,
+        "intent": "wake_up",
+        "scope_filters": [],
+        "token_budget": args.token_budget,
+        "caller_agent": "claude-code",
+        "expand_graph": false,
     });
 
     let resp = client
@@ -45,11 +49,35 @@ pub async fn run(args: WakeUpArgs) -> Result<String> {
 
     if resp.status().is_success() {
         let data: serde_json::Value = resp.json().await?;
-        if let Some(memories) = data["memories"].as_array() {
-            for memory in memories {
-                if let Some(content) = memory["content"].as_str() {
+
+        // Extract from directives
+        if let Some(directives) = data["directives"].as_array() {
+            for directive in directives {
+                if let Some(text) = directive["text"].as_str() {
                     output.push_str("- ");
-                    output.push_str(&content.chars().take(200).collect::<String>());
+                    output.push_str(text);
+                    output.push('\n');
+                }
+            }
+        }
+
+        // Extract from relevant_facts
+        if let Some(facts) = data["relevant_facts"].as_array() {
+            for fact in facts {
+                if let Some(text) = fact["text"].as_str() {
+                    output.push_str("- ");
+                    output.push_str(text);
+                    output.push('\n');
+                }
+            }
+        }
+
+        // Extract from reusable_patterns
+        if let Some(patterns) = data["reusable_patterns"].as_array() {
+            for pattern in patterns {
+                if let Some(text) = pattern["text"].as_str() {
+                    output.push_str("- ");
+                    output.push_str(text);
                     output.push('\n');
                 }
             }
