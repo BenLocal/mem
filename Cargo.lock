@@ -2999,6 +2999,7 @@ dependencies = [
  "clap",
  "duckdb",
  "embed_anything",
+ "http-body-util",
  "once_cell",
  "regex",
  "reqwest",
@@ -3012,7 +3013,6 @@ dependencies = [
  "tiktoken-rs",
  "tokio",
  "tower",
- "tower-http",
  "tracing",
  "tracing-subscriber",
  "usearch",
@@ -5300,7 +5300,6 @@ dependencies = [
  "tower",
  "tower-layer",
  "tower-service",
- "tracing",
 ]
 
 [[package]]
