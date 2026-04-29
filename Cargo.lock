@@ -2999,6 +2999,7 @@ dependencies = [
  "clap",
  "duckdb",
  "embed_anything",
+ "once_cell",
  "regex",
  "reqwest",
  "rmcp",
