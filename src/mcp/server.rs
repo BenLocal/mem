@@ -9,7 +9,7 @@ use serde_json::{json, Map, Value};
 
 use super::client::{encode_segment, MemHttpClient};
 use super::config::McpConfig;
-use super::result::{err_text, ok_json, ok_json_with_notice};
+use super::result::{err_text, ok_json, ok_json_with_content};
 
 #[derive(Clone)]
 pub struct MemMcpServer {
@@ -516,12 +516,13 @@ impl MemMcpServer {
         if let Some(v) = args.idempotency_key {
             body.insert("idempotency_key".into(), json!(v));
         }
+        let content = args.content.clone();
         match self
             .client
             .request_json(Method::POST, "memories", Some(&Value::Object(body)))
             .await
         {
-            Ok(v) => Ok(ok_json_with_notice("✓ Memory saved", &v)),
+            Ok(v) => Ok(ok_json_with_content("✓ Memory saved", &content, &v)),
             Err(e) => Ok(err_text(e.to_string())),
         }
     }
@@ -560,12 +561,13 @@ impl MemMcpServer {
         if let Some(v) = args.idempotency_key {
             body.insert("idempotency_key".into(), json!(v));
         }
+        let content = format!("{}\n\n{}", args.summary, args.content);
         match self
             .client
             .request_json(Method::POST, "memories", Some(&Value::Object(body)))
             .await
         {
-            Ok(v) => Ok(ok_json_with_notice("✓ Fact committed", &v)),
+            Ok(v) => Ok(ok_json_with_content("✓ Fact committed", &content, &v)),
             Err(e) => Ok(err_text(e.to_string())),
         }
     }
@@ -605,12 +607,13 @@ impl MemMcpServer {
         );
         body.insert("source_agent".into(), json!(args.source_agent));
         body.insert("write_mode".into(), json!("propose"));
+        let content = format!("{}\n\n{}", args.summary, args.content);
         match self
             .client
             .request_json(Method::POST, "memories", Some(&Value::Object(body)))
             .await
         {
-            Ok(v) => Ok(ok_json_with_notice("✓ Preference proposed", &v)),
+            Ok(v) => Ok(ok_json_with_content("✓ Preference proposed", &content, &v)),
             Err(e) => Ok(err_text(e.to_string())),
         }
     }
@@ -646,12 +649,13 @@ impl MemMcpServer {
             json!(vec![format!("caller_agent:{}", args.caller_agent)]),
         );
         body.insert("source_agent".into(), json!(args.source_agent));
+        let content = args.content.clone();
         match self
             .client
             .request_json(Method::POST, "episodes", Some(&Value::Object(body)))
             .await
         {
-            Ok(v) => Ok(ok_json_with_notice("✓ Experience proposed", &v)),
+            Ok(v) => Ok(ok_json_with_content("✓ Experience proposed", &content, &v)),
             Err(e) => Ok(err_text(e.to_string())),
         }
     }
@@ -800,12 +804,13 @@ impl MemMcpServer {
         if let Some(v) = args.idempotency_key {
             body.insert("idempotency_key".into(), json!(v));
         }
+        let content = format!("Goal: {}\nOutcome: {}", args.goal, args.outcome);
         match self
             .client
             .request_json(Method::POST, "episodes", Some(&Value::Object(body)))
             .await
         {
-            Ok(v) => Ok(ok_json_with_notice("✓ Episode recorded", &v)),
+            Ok(v) => Ok(ok_json_with_content("✓ Episode recorded", &content, &v)),
             Err(e) => Ok(err_text(e.to_string())),
         }
     }
