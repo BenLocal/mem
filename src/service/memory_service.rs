@@ -143,6 +143,16 @@ impl MemoryService {
             .map(|s| s.to_string())
             .unwrap_or_else(|| summarize(&request.content));
 
+        let session_id = crate::pipeline::session::resolve_session(
+            &self.repository,
+            &request.tenant,
+            &request.source_agent,
+            &now,
+            crate::pipeline::session::idle_minutes_from_env(),
+        )
+        .await
+        .map_err(ServiceError::Storage)?;
+
         let memory = MemoryRecord {
             memory_id: next_memory_id(),
             tenant: request.tenant,
@@ -164,17 +174,21 @@ impl MemoryService {
             decay_score: 0.0,
             content_hash,
             idempotency_key: request.idempotency_key,
-            session_id: None,
+            session_id: Some(session_id.clone()),
             supersedes_memory_id: None,
             source_agent: request.source_agent,
             created_at: now.clone(),
-            updated_at: now,
+            updated_at: now.clone(),
             last_validated_at: None,
         };
 
         let stored = self.repository.insert_memory(memory).await?;
         self.graph.sync_memory(&stored).await?;
         self.enqueue_embedding_job_for_memory(&stored).await?;
+        self.repository
+            .touch_session(&session_id, &now)
+            .await
+            .map_err(ServiceError::Storage)?;
         Ok(stored.into())
     }
 
