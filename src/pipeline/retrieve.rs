@@ -245,27 +245,20 @@ fn score_candidates_hybrid_legacy(
             {
                 score += 26;
             }
+            // Lifecycle additive layer — extracted to apply_lifecycle_score for shared math.
+            // Evidence bonus stays inline because score_candidates (non-hybrid) doesn't have it.
             if !memory.evidence.is_empty() {
                 score += 2;
             }
-            score += text_match_score(&memory, &query_terms);
-            score += scope_score(&memory, &scope_filters);
-            score += memory_type_score(&memory.memory_type, &query.intent);
-            score += confidence_score(memory.confidence);
-            score += validation_score(memory.last_validated_at.is_some());
-            score += freshness_score(newest, timestamp_score(&memory.updated_at));
-            score -= staleness_penalty(memory.decay_score);
-
-            if related_memory_ids.contains(&memory.memory_id) {
-                score += graph_boost;
-            }
-
-            if matches!(
-                memory.status,
-                MemoryStatus::Provisional | MemoryStatus::PendingConfirmation
-            ) {
-                score -= 4;
-            }
+            score += apply_lifecycle_score(
+                &memory,
+                query,
+                &query_terms,
+                &scope_filters,
+                newest,
+                related_memory_ids,
+                graph_boost,
+            );
 
             ScoredMemory { memory, score }
         })
