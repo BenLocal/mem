@@ -13,6 +13,7 @@ use thiserror::Error;
 use crate::domain::{
     episode::EpisodeRecord,
     memory::{FeedbackKind, FeedbackSummary, MemoryRecord, MemoryStatus, MemoryVersionLink},
+    session::Session,
 };
 use crate::pipeline::ingest::{compute_content_hash_from_record, CONTENT_HASH_LEN};
 
@@ -1436,6 +1437,97 @@ impl DuckDbRepository {
         self.get_memory(memory_id.to_string())
             .await?
             .ok_or(StorageError::InvalidData("updated memory not found"))
+    }
+
+    /// Return the most recently touched open session for `(tenant, caller_agent)`, or `None`.
+    pub async fn latest_active_session(
+        &self,
+        tenant: &str,
+        caller_agent: &str,
+    ) -> Result<Option<Session>, StorageError> {
+        let conn = self.conn()?;
+        let session = conn
+            .query_row(
+                "SELECT session_id, tenant, caller_agent, started_at, last_seen_at,
+                        ended_at, goal, memory_count
+                 FROM sessions
+                 WHERE tenant = ?1 AND caller_agent = ?2 AND ended_at IS NULL
+                 ORDER BY last_seen_at DESC
+                 LIMIT 1",
+                params![tenant, caller_agent],
+                |row| {
+                    let mc: i64 = row.get(7)?;
+                    Ok(Session {
+                        session_id: row.get(0)?,
+                        tenant: row.get(1)?,
+                        caller_agent: row.get(2)?,
+                        started_at: row.get(3)?,
+                        last_seen_at: row.get(4)?,
+                        ended_at: row.get(5)?,
+                        goal: row.get(6)?,
+                        memory_count: mc as u32,
+                    })
+                },
+            )
+            .optional()?;
+        Ok(session)
+    }
+
+    /// Insert a new session row and return it.
+    pub async fn open_session(
+        &self,
+        session_id: &str,
+        tenant: &str,
+        caller_agent: &str,
+        now: &str,
+    ) -> Result<Session, StorageError> {
+        let conn = self.conn()?;
+        conn.execute(
+            "INSERT INTO sessions
+                (session_id, tenant, caller_agent, started_at, last_seen_at, memory_count)
+             VALUES (?1, ?2, ?3, ?4, ?5, 0)",
+            params![session_id, tenant, caller_agent, now, now],
+        )?;
+        Ok(Session {
+            session_id: session_id.to_string(),
+            tenant: tenant.to_string(),
+            caller_agent: caller_agent.to_string(),
+            started_at: now.to_string(),
+            last_seen_at: now.to_string(),
+            ended_at: None,
+            goal: None,
+            memory_count: 0,
+        })
+    }
+
+    /// Close an open session by setting `ended_at`.  No-op if already closed.
+    pub async fn close_session(
+        &self,
+        session_id: &str,
+        ended_at: &str,
+    ) -> Result<(), StorageError> {
+        let conn = self.conn()?;
+        conn.execute(
+            "UPDATE sessions SET ended_at = ?1 WHERE session_id = ?2 AND ended_at IS NULL",
+            params![ended_at, session_id],
+        )?;
+        Ok(())
+    }
+
+    /// Bump `last_seen_at` and increment `memory_count` for an open session.
+    pub async fn touch_session(
+        &self,
+        session_id: &str,
+        last_seen_at: &str,
+    ) -> Result<(), StorageError> {
+        let conn = self.conn()?;
+        conn.execute(
+            "UPDATE sessions
+             SET last_seen_at = ?1, memory_count = memory_count + 1
+             WHERE session_id = ?2",
+            params![last_seen_at, session_id],
+        )?;
+        Ok(())
     }
 }
 
