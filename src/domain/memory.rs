@@ -156,6 +156,8 @@ pub struct MemoryRecord {
     #[serde(skip_serializing_if = "skip_none")]
     pub idempotency_key: Option<String>,
     #[serde(skip_serializing_if = "skip_none")]
+    pub session_id: Option<String>,
+    #[serde(skip_serializing_if = "skip_none")]
     pub supersedes_memory_id: Option<String>,
     pub source_agent: String,
     pub created_at: String,
@@ -187,6 +189,7 @@ impl Default for MemoryRecord {
             decay_score: 0.0,
             content_hash: String::new(),
             idempotency_key: None,
+            session_id: None,
             supersedes_memory_id: None,
             source_agent: String::new(),
             created_at: String::new(),

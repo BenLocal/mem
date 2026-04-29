@@ -162,6 +162,7 @@ async fn worker_marks_stale_when_job_target_hash_mismatches_memory() {
         decay_score: 0.0,
         content_hash: "actual-hash".into(),
         idempotency_key: None,
+        session_id: None,
         supersedes_memory_id: None,
         source_agent: "test".into(),
         created_at: "1".into(),

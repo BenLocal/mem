@@ -655,6 +655,7 @@ mod tests {
             decay_score: 0.0,
             content_hash: String::new(),
             idempotency_key: None,
+            session_id: None,
             supersedes_memory_id: None,
             source_agent: String::new(),
             created_at: String::new(),

@@ -34,6 +34,7 @@ fn sample_memory(memory_id: &str, status: MemoryStatus) -> MemoryRecord {
         decay_score: 0.2,
         content_hash: format!("hash-{memory_id}"),
         idempotency_key: None,
+        session_id: None,
         supersedes_memory_id: None,
         source_agent: "codex-worker".into(),
         created_at: format!("2026-03-21T00:00:{memory_id}Z"),

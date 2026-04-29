@@ -100,6 +100,7 @@ fn memory(spec: MemorySpec<'_>) -> MemoryRecord {
         decay_score: spec.decay_score,
         content_hash: format!("hash-{}", spec.memory_id),
         idempotency_key: None,
+        session_id: None,
         supersedes_memory_id: None,
         source_agent: "codex-worker".into(),
         created_at: spec.updated_at.into(),
