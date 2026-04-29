@@ -140,6 +140,8 @@ score =
 
    **2026-04-29 复核**：仍未做。code 是 `let mut score = 0i64;` 起步加性串接 7+ 个维度（lexical∩semantic +26、evidence +2、text_match、scope -4..+18、memory_type×intent、confidence ×10、validated +3、freshness、decay ×12、graph_boost ±12、provisional -4）。唯一一处线性 rescale 是 semantic：`((cos+1)/2)*64`（[0, 64]）。**没有 RRF**，整个文件查不到 `reciprocal_rank` / `rank_fusion` 痕迹。失衡问题描述准确。
 
+   **2026-04-29 落地**：✅ 改为两路 RRF（k=60, 缩放×1000），保留 lifecycle 加性分作为微调；新增 `score_candidates_hybrid_rrf` 与 `score_candidates_hybrid_legacy` 共存，`MEM_RANKER=legacy` 一档兜底；仅修 `pipeline/retrieve.rs`，无 schema 变更，无新依赖；4 个 RRF 单测 + 1 个 kill-switch smoke + 全套集成测试通过，clippy/fmt 净。see ROADMAP #5。
+
 ---
 
 ## 4. 嵌入管线差异
