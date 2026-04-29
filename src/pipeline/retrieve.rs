@@ -43,7 +43,7 @@ pub fn merge_and_rank_hybrid(
     }
 
     let candidates: Vec<MemoryRecord> = by_id.into_values().collect();
-    score_candidates_hybrid(
+    score_candidates_hybrid_legacy(
         candidates,
         query,
         related_memory_ids,
@@ -146,7 +146,7 @@ fn graph_anchor_nodes_from_records(memories: &[MemoryRecord]) -> Vec<String> {
     graph_anchor_nodes(&wrap)
 }
 
-fn score_candidates_hybrid(
+fn score_candidates_hybrid_legacy(
     candidates: Vec<MemoryRecord>,
     query: &SearchMemoryRequest,
     related_memory_ids: &HashSet<String>,
