@@ -1,3 +1,5 @@
+use tiktoken_rs::{o200k_base_singleton, CoreBPE};
+
 use crate::domain::{
     memory::{MemoryRecord, MemoryType},
     query::{DirectiveItem, FactItem, PatternItem, SearchMemoryResponse},
@@ -196,16 +198,21 @@ fn split_steps(text: &str) -> Vec<String> {
         .collect()
 }
 
+fn tokenizer() -> &'static CoreBPE {
+    o200k_base_singleton()
+}
+
 fn compress_text(text: &str, budget: usize) -> String {
     let limit = budget.max(8);
-    let char_limit = limit * 3;
-
-    let truncated: String = text.chars().take(char_limit).collect();
-    if truncated.len() < text.len() {
-        if let Some(last_space) = truncated.rfind(char::is_whitespace) {
-            if last_space > char_limit / 2 {
-                return truncated[..last_space].trim().to_string();
-            }
+    let bpe = tokenizer();
+    let tokens = bpe.encode_with_special_tokens(text);
+    if tokens.len() <= limit {
+        return text.to_string();
+    }
+    let truncated = bpe.decode(&tokens[..limit]).unwrap_or_default();
+    if let Some(last_space) = truncated.rfind(char::is_whitespace) {
+        if last_space > truncated.len() / 2 {
+            return truncated[..last_space].trim_end().to_string();
         }
     }
     truncated
@@ -217,5 +224,32 @@ fn max_items(budget: usize) -> usize {
         121..=250 => 2,
         251..=450 => 3,
         _ => 4,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn compress_text_cjk_respects_token_budget() {
+        // Long Chinese paragraph; o200k_base encodes CJK at roughly 1 token/char.
+        // Pre-fix `chars × 3` heuristic returns ~3× the budget for pure CJK.
+        let cjk: String =
+            "机器学习是一个广泛的研究领域涵盖了从统计学到神经网络的多种方法".repeat(20);
+        let budget = 50;
+
+        let result = compress_text(&cjk, budget);
+
+        let bpe = tokenizer();
+        let result_tokens = bpe.encode_with_special_tokens(&result).len();
+        assert!(
+            result_tokens <= budget,
+            "CJK budget violated: got {} tokens for budget {}",
+            result_tokens,
+            budget
+        );
+        assert!(!result.is_empty(), "expected nonempty truncation");
+        assert!(cjk.starts_with(&result), "result must be a prefix of input");
     }
 }
