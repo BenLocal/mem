@@ -175,12 +175,12 @@ fn graph_anchor_nodes_from_records(memories: &[MemoryRecord]) -> Vec<String> {
     graph_anchor_nodes(&wrap)
 }
 
-/// Computes the additive non-recall portion of a memory's score.
-///
-/// Used by all three scorers (`score_candidates_hybrid_rrf`,
-/// `score_candidates_hybrid_legacy`, `score_candidates`) so the lifecycle
-/// math has a single source of truth. Recall computation differs per
-/// scorer; this helper handles the common rest.
+/// Computes the additive non-recall portion of a memory's score, covering
+/// the 9 signals shared by all three scorers (`_rrf`, `_legacy`,
+/// `score_candidates`). The evidence bonus (`+2 when !evidence.is_empty()`)
+/// applies only to the hybrid scorers; callers add it inline before invoking
+/// this helper. Recall computation differs per scorer; this helper handles
+/// the common rest.
 #[allow(dead_code)] // callers are wired in subsequent Tasks 3-5
 fn apply_lifecycle_score(
     memory: &MemoryRecord,
@@ -193,9 +193,6 @@ fn apply_lifecycle_score(
 ) -> i64 {
     let mut score = 0i64;
 
-    if !memory.evidence.is_empty() {
-        score += 2;
-    }
     score += text_match_score(memory, query_terms);
     score += scope_score(memory, scope_filters);
     score += memory_type_score(&memory.memory_type, &query.intent);
@@ -324,28 +321,20 @@ fn score_candidates_hybrid_rrf(
                 .unwrap_or(0.0);
             score += ((rrf_lex + rrf_sem) * RRF_SCALE).round() as i64;
 
-            // Lifecycle additive layer — same scoring axes as _legacy; duplication is intentional (legacy will be removed).
+            // Lifecycle additive layer — extracted to apply_lifecycle_score for shared math.
+            // Evidence bonus stays inline because score_candidates (non-hybrid) doesn't have it.
             if !memory.evidence.is_empty() {
                 score += 2;
             }
-            score += text_match_score(&memory, &query_terms);
-            score += scope_score(&memory, &scope_filters);
-            score += memory_type_score(&memory.memory_type, &query.intent);
-            score += confidence_score(memory.confidence);
-            score += validation_score(memory.last_validated_at.is_some());
-            score += freshness_score(newest, timestamp_score(&memory.updated_at));
-            score -= staleness_penalty(memory.decay_score);
-
-            if related_memory_ids.contains(&memory.memory_id) {
-                score += graph_boost;
-            }
-
-            if matches!(
-                memory.status,
-                MemoryStatus::Provisional | MemoryStatus::PendingConfirmation
-            ) {
-                score -= 4;
-            }
+            score += apply_lifecycle_score(
+                &memory,
+                query,
+                &query_terms,
+                &scope_filters,
+                newest,
+                related_memory_ids,
+                graph_boost,
+            );
 
             ScoredMemory { memory, score }
         })
