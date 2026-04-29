@@ -675,16 +675,18 @@ mod tests {
         }
     }
 
+    fn lifecycle_baseline_for(memory: &MemoryRecord, query: &SearchMemoryRequest) -> i64 {
+        let newest = timestamp_score(&memory.updated_at);
+        memory_type_score(&memory.memory_type, &query.intent) + freshness_score(newest, newest)
+            - staleness_penalty(memory.decay_score)
+    }
+
     #[test]
     fn rrf_recall_only_lexical() {
         let memory = fixture_memory("mem_a");
         let query = fixture_query();
 
-        let lifecycle_baseline: i64 = {
-            let newest = timestamp_score(&memory.updated_at);
-            memory_type_score(&memory.memory_type, &query.intent) + freshness_score(newest, newest)
-                - staleness_penalty(memory.decay_score)
-        };
+        let lifecycle_baseline = lifecycle_baseline_for(&memory, &query);
 
         let mut lex_ranks = HashMap::new();
         lex_ranks.insert("mem_a".into(), 1usize);
@@ -701,5 +703,95 @@ mod tests {
 
         // RRF contribution: 1000/(60+1) = 16.39 → round → 16.
         assert_eq!(scored[0].score - lifecycle_baseline, 16);
+    }
+
+    #[test]
+    fn rrf_both_paths_top_rank() {
+        // A candidate at rank 1 in both lex and sem gets two RRF contributions.
+        // 2 * 1000/(60+1) = 32.787 → round → 33.
+        let memory = fixture_memory("mem_top");
+        let query = fixture_query();
+
+        let lifecycle_baseline = lifecycle_baseline_for(&memory, &query);
+
+        let mut lex_ranks = HashMap::new();
+        let mut sem_ranks = HashMap::new();
+        lex_ranks.insert("mem_top".into(), 1usize);
+        sem_ranks.insert("mem_top".into(), 1usize);
+
+        let scored = score_candidates_hybrid_rrf(
+            vec![memory],
+            &query,
+            &HashSet::new(),
+            0,
+            &lex_ranks,
+            &sem_ranks,
+        );
+
+        assert_eq!(scored[0].score - lifecycle_baseline, 33);
+    }
+
+    #[test]
+    fn rrf_rank_monotonic() {
+        // Three candidates with different semantic ranks must sort strictly
+        // score-descending after RRF scoring, since all share the same
+        // lifecycle baseline (identical fixture timestamps).
+        let m1 = fixture_memory("rank_1");
+        let m50 = fixture_memory("rank_50");
+        let m100 = fixture_memory("rank_100");
+        let query = fixture_query();
+
+        let mut sem_ranks = HashMap::new();
+        sem_ranks.insert("rank_1".into(), 1usize);
+        sem_ranks.insert("rank_50".into(), 50usize);
+        sem_ranks.insert("rank_100".into(), 100usize);
+        let lex_ranks: HashMap<String, usize> = HashMap::new();
+
+        let scored = score_candidates_hybrid_rrf(
+            vec![m1, m50, m100],
+            &query,
+            &HashSet::new(),
+            0,
+            &lex_ranks,
+            &sem_ranks,
+        );
+
+        // After sort: rank_1 (highest RRF), rank_50, rank_100.
+        // All share the same lifecycle baseline → ordering is determined by RRF alone.
+        assert_eq!(scored[0].memory.memory_id, "rank_1");
+        assert_eq!(scored[1].memory.memory_id, "rank_50");
+        assert_eq!(scored[2].memory.memory_id, "rank_100");
+        assert!(scored[0].score > scored[1].score);
+        assert!(scored[1].score > scored[2].score);
+    }
+
+    #[test]
+    fn lex_only_candidate_has_nonzero_recall_after_rrf() {
+        // Pre-RRF bug: lex-only candidates got zero recall contribution
+        // (only the intersect bonus +26 fired, which requires also being in
+        // semantic). RRF gives them 1000/(60+lex_rank) > 0, ensuring recall
+        // is always positive for any ranked candidate.
+        let memory = fixture_memory("lex_only");
+        let query = fixture_query();
+
+        let lifecycle_baseline = lifecycle_baseline_for(&memory, &query);
+
+        let mut lex_ranks = HashMap::new();
+        lex_ranks.insert("lex_only".into(), 1usize);
+        let sem_ranks: HashMap<String, usize> = HashMap::new();
+
+        let scored = score_candidates_hybrid_rrf(
+            vec![memory],
+            &query,
+            &HashSet::new(),
+            0,
+            &lex_ranks,
+            &sem_ranks,
+        );
+
+        assert!(
+            scored[0].score > lifecycle_baseline,
+            "lex-only candidate must have positive RRF recall contribution"
+        );
     }
 }
