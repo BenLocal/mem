@@ -29,6 +29,17 @@ pub fn merge_and_rank_hybrid(
     related_memory_ids: &HashSet<String>,
     graph_boost: i64,
 ) -> Vec<MemoryRecord> {
+    let lexical_ranks: HashMap<String, usize> = lexical
+        .iter()
+        .enumerate()
+        .map(|(i, m)| (m.memory_id.clone(), i + 1))
+        .collect();
+    let semantic_ranks: HashMap<String, usize> = semantic
+        .iter()
+        .enumerate()
+        .map(|(i, (m, _sim))| (m.memory_id.clone(), i + 1))
+        .collect();
+
     let lexical_ids: HashSet<String> = lexical.iter().map(|m| m.memory_id.clone()).collect();
     let mut semantic_sims: HashMap<String, f32> = HashMap::new();
     let mut by_id: HashMap<String, MemoryRecord> = HashMap::new();
@@ -43,17 +54,35 @@ pub fn merge_and_rank_hybrid(
     }
 
     let candidates: Vec<MemoryRecord> = by_id.into_values().collect();
-    score_candidates_hybrid_legacy(
-        candidates,
-        query,
-        related_memory_ids,
-        graph_boost,
-        &lexical_ids,
-        &semantic_sims,
-    )
-    .into_iter()
-    .map(|entry| entry.memory)
-    .collect()
+
+    let scored = if use_legacy_ranker() {
+        score_candidates_hybrid_legacy(
+            candidates,
+            query,
+            related_memory_ids,
+            graph_boost,
+            &lexical_ids,
+            &semantic_sims,
+        )
+    } else {
+        score_candidates_hybrid_rrf(
+            candidates,
+            query,
+            related_memory_ids,
+            graph_boost,
+            &lexical_ranks,
+            &semantic_ranks,
+        )
+    };
+
+    scored.into_iter().map(|entry| entry.memory).collect()
+}
+
+fn use_legacy_ranker() -> bool {
+    std::env::var("MEM_RANKER")
+        .ok()
+        .map(|v| v == "legacy")
+        .unwrap_or(false)
 }
 
 pub async fn rank_with_graph_hybrid(
@@ -176,6 +205,83 @@ fn score_candidates_hybrid_legacy(
             {
                 score += 26;
             }
+            if !memory.evidence.is_empty() {
+                score += 2;
+            }
+            score += text_match_score(&memory, &query_terms);
+            score += scope_score(&memory, &scope_filters);
+            score += memory_type_score(&memory.memory_type, &query.intent);
+            score += confidence_score(memory.confidence);
+            score += validation_score(memory.last_validated_at.is_some());
+            score += freshness_score(newest, timestamp_score(&memory.updated_at));
+            score -= staleness_penalty(memory.decay_score);
+
+            if related_memory_ids.contains(&memory.memory_id) {
+                score += graph_boost;
+            }
+
+            if matches!(
+                memory.status,
+                MemoryStatus::Provisional | MemoryStatus::PendingConfirmation
+            ) {
+                score -= 4;
+            }
+
+            ScoredMemory { memory, score }
+        })
+        .collect::<Vec<_>>();
+
+    scored.sort_by(|left, right| {
+        right
+            .score
+            .cmp(&left.score)
+            .then_with(|| {
+                timestamp_score(&right.memory.updated_at)
+                    .cmp(&timestamp_score(&left.memory.updated_at))
+            })
+            .then_with(|| right.memory.version.cmp(&left.memory.version))
+            .then_with(|| left.memory.memory_id.cmp(&right.memory.memory_id))
+    });
+
+    scored
+}
+
+const RRF_K: usize = 60;
+const RRF_SCALE: i64 = 1000;
+
+fn score_candidates_hybrid_rrf(
+    candidates: Vec<MemoryRecord>,
+    query: &SearchMemoryRequest,
+    related_memory_ids: &HashSet<String>,
+    graph_boost: i64,
+    lexical_ranks: &HashMap<String, usize>,
+    semantic_ranks: &HashMap<String, usize>,
+) -> Vec<ScoredMemory> {
+    let newest = candidates
+        .iter()
+        .map(|memory| timestamp_score(&memory.updated_at))
+        .max()
+        .unwrap_or(0);
+
+    let query_terms = tokenize(&query.query);
+    let scope_filters = parse_scope_filters(&query.scope_filters);
+
+    let mut scored = candidates
+        .into_iter()
+        .map(|memory| {
+            let mut score = 0i64;
+
+            let rrf_lex = lexical_ranks
+                .get(&memory.memory_id)
+                .map(|r| 1.0_f64 / (RRF_K as f64 + *r as f64))
+                .unwrap_or(0.0);
+            let rrf_sem = semantic_ranks
+                .get(&memory.memory_id)
+                .map(|r| 1.0_f64 / (RRF_K as f64 + *r as f64))
+                .unwrap_or(0.0);
+            score += ((rrf_lex + rrf_sem) * RRF_SCALE as f64).round() as i64;
+
+            // Lifecycle additive layer — identical to _legacy.
             if !memory.evidence.is_empty() {
                 score += 2;
             }
@@ -518,5 +624,88 @@ fn scope_name(scope: &Scope) -> &'static str {
         Scope::Project => "project",
         Scope::Repo => "repo",
         Scope::Workspace => "workspace",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::domain::memory::{MemoryRecord, MemoryStatus, MemoryType, Scope, Visibility};
+    use crate::domain::query::SearchMemoryRequest;
+
+    fn fixture_memory(id: &str) -> MemoryRecord {
+        // lifecycle additive layer contributions with this fixture:
+        //   evidence: empty → 0
+        //   text_match_score: query="" → 0
+        //   scope_score: no filters, Scope::Global → 0
+        //   memory_type_score: MemoryType::Implementation, intent="" → 5
+        //   confidence_score(0.0) → 0
+        //   validation_score(false) → 0
+        //   freshness_score(0, 0): newest==current → 6
+        //   staleness_penalty(decay_score): (11.0/12.0 * 12.0).round() = 11 → cancels 5+6
+        //   status: Active → 0
+        //   graph: empty related_ids, graph_boost=0 → 0
+        // net lifecycle = 5 + 6 - 11 = 0
+        MemoryRecord {
+            memory_id: id.to_string(),
+            tenant: "t".to_string(),
+            memory_type: MemoryType::Implementation,
+            status: MemoryStatus::Active,
+            scope: Scope::Global,
+            visibility: Visibility::Private,
+            version: 0,
+            summary: String::new(),
+            content: String::new(),
+            evidence: vec![],
+            code_refs: vec![],
+            project: None,
+            repo: None,
+            module: None,
+            task_type: None,
+            tags: vec![],
+            confidence: 0.0,
+            decay_score: 11.0 / 12.0,
+            content_hash: String::new(),
+            idempotency_key: None,
+            supersedes_memory_id: None,
+            source_agent: String::new(),
+            created_at: String::new(),
+            updated_at: String::new(),
+            last_validated_at: None,
+        }
+    }
+
+    fn fixture_query() -> SearchMemoryRequest {
+        SearchMemoryRequest {
+            query: String::new(),
+            intent: String::new(),
+            scope_filters: vec![],
+            token_budget: 0,
+            caller_agent: String::new(),
+            expand_graph: false,
+            tenant: None,
+        }
+    }
+
+    #[test]
+    fn rrf_recall_only_lexical() {
+        let memory = fixture_memory("mem_a");
+        let query = fixture_query();
+        let mut lex_ranks = HashMap::new();
+        lex_ranks.insert("mem_a".into(), 1usize);
+        let sem_ranks: HashMap<String, usize> = HashMap::new();
+
+        let scored = score_candidates_hybrid_rrf(
+            vec![memory],
+            &query,
+            &HashSet::new(),
+            0,
+            &lex_ranks,
+            &sem_ranks,
+        );
+
+        // RRF contribution: 1000/(60+1) = 16.39 → round → 16.
+        // Lifecycle additive layer evaluates to zero for this fixture.
+        assert_eq!(scored[0].score, 16);
     }
 }
