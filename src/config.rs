@@ -66,9 +66,9 @@ pub enum ConfigError {
 impl EmbeddingSettings {
     pub fn development_defaults() -> Self {
         Self {
-            provider: EmbeddingProviderKind::Fake,
-            model: "fake".to_string(),
-            dim: 256,
+            provider: EmbeddingProviderKind::EmbedAnything,
+            model: "Qwen/Qwen3-Embedding-0.6B".to_string(),
+            dim: 1024,
             worker_poll_interval_ms: 1000,
             // Failure attempts allowed before permanent `failed` (initial pending try + retries).
             max_retries: 4,

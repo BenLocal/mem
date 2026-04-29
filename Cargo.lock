@@ -3012,6 +3012,7 @@ dependencies = [
  "tiktoken-rs",
  "tokio",
  "tower",
+ "tower-http",
  "tracing",
  "tracing-subscriber",
  "usearch",
@@ -5299,6 +5300,7 @@ dependencies = [
  "tower",
  "tower-layer",
  "tower-service",
+ "tracing",
 ]
 
 [[package]]
