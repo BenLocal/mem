@@ -521,7 +521,7 @@ impl MemMcpServer {
             .request_json(Method::POST, "memories", Some(&Value::Object(body)))
             .await
         {
-            Ok(v) => Ok(ok_json_with_notice("✅ 已保存到记忆中", &v)),
+            Ok(v) => Ok(ok_json_with_notice("✓ Memory saved", &v)),
             Err(e) => Ok(err_text(e.to_string())),
         }
     }
@@ -565,7 +565,7 @@ impl MemMcpServer {
             .request_json(Method::POST, "memories", Some(&Value::Object(body)))
             .await
         {
-            Ok(v) => Ok(ok_json_with_notice("✅ 已保存事实到记忆中", &v)),
+            Ok(v) => Ok(ok_json_with_notice("✓ Fact committed", &v)),
             Err(e) => Ok(err_text(e.to_string())),
         }
     }
@@ -610,7 +610,7 @@ impl MemMcpServer {
             .request_json(Method::POST, "memories", Some(&Value::Object(body)))
             .await
         {
-            Ok(v) => Ok(ok_json_with_notice("✅ 已提议偏好，等待确认", &v)),
+            Ok(v) => Ok(ok_json_with_notice("✓ Preference proposed", &v)),
             Err(e) => Ok(err_text(e.to_string())),
         }
     }
@@ -646,7 +646,14 @@ impl MemMcpServer {
             json!(vec![format!("caller_agent:{}", args.caller_agent)]),
         );
         body.insert("source_agent".into(), json!(args.source_agent));
-        self.post_json("episodes", &Value::Object(body)).await
+        match self
+            .client
+            .request_json(Method::POST, "episodes", Some(&Value::Object(body)))
+            .await
+        {
+            Ok(v) => Ok(ok_json_with_notice("✓ Experience proposed", &v)),
+            Err(e) => Ok(err_text(e.to_string())),
+        }
     }
 
     // ------------------- memory_get -------------------
@@ -793,7 +800,14 @@ impl MemMcpServer {
         if let Some(v) = args.idempotency_key {
             body.insert("idempotency_key".into(), json!(v));
         }
-        self.post_json("episodes", &Value::Object(body)).await
+        match self
+            .client
+            .request_json(Method::POST, "episodes", Some(&Value::Object(body)))
+            .await
+        {
+            Ok(v) => Ok(ok_json_with_notice("✓ Episode recorded", &v)),
+            Err(e) => Ok(err_text(e.to_string())),
+        }
     }
 
     // ------------------- memory_graph_neighbors -------------------

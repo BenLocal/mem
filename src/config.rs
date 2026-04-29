@@ -206,6 +206,13 @@ fn default_db_path() -> PathBuf {
         return PathBuf::from(path);
     }
 
+    if let Some(home) = std::env::var_os("HOME") {
+        let mem_dir = PathBuf::from(home).join(".mem");
+        if std::fs::create_dir_all(&mem_dir).is_ok() {
+            return mem_dir.join("mem.duckdb");
+        }
+    }
+
     let sequence = APP_DB_SEQUENCE.fetch_add(1, Ordering::Relaxed);
     std::env::temp_dir().join(format!("mem-app-{}-{sequence}.duckdb", std::process::id()))
 }

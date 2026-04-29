@@ -7,8 +7,12 @@ pub fn ok_json(value: &Value) -> CallToolResult {
 }
 
 pub fn ok_json_with_notice(notice: &str, value: &Value) -> CallToolResult {
+    let content = value
+        .get("content")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
     let text = serde_json::to_string_pretty(value).unwrap_or_else(|_| value.to_string());
-    let message = format!("{}\n\n{}", notice, text);
+    let message = format!("{}: {}\n\n{}", notice, content, text);
     CallToolResult::success(vec![Content::text(message)])
 }
 
