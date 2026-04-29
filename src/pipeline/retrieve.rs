@@ -175,6 +175,49 @@ fn graph_anchor_nodes_from_records(memories: &[MemoryRecord]) -> Vec<String> {
     graph_anchor_nodes(&wrap)
 }
 
+/// Computes the additive non-recall portion of a memory's score.
+///
+/// Used by all three scorers (`score_candidates_hybrid_rrf`,
+/// `score_candidates_hybrid_legacy`, `score_candidates`) so the lifecycle
+/// math has a single source of truth. Recall computation differs per
+/// scorer; this helper handles the common rest.
+#[allow(dead_code)] // callers are wired in subsequent Tasks 3-5
+fn apply_lifecycle_score(
+    memory: &MemoryRecord,
+    query: &SearchMemoryRequest,
+    query_terms: &[String],
+    scope_filters: &HashMap<String, Vec<String>>,
+    newest: u128,
+    related_memory_ids: &HashSet<String>,
+    graph_boost: i64,
+) -> i64 {
+    let mut score = 0i64;
+
+    if !memory.evidence.is_empty() {
+        score += 2;
+    }
+    score += text_match_score(memory, query_terms);
+    score += scope_score(memory, scope_filters);
+    score += memory_type_score(&memory.memory_type, &query.intent);
+    score += confidence_score(memory.confidence);
+    score += validation_score(memory.last_validated_at.is_some());
+    score += freshness_score(newest, timestamp_score(&memory.updated_at));
+    score -= staleness_penalty(memory.decay_score);
+
+    if related_memory_ids.contains(&memory.memory_id) {
+        score += graph_boost;
+    }
+
+    if matches!(
+        memory.status,
+        MemoryStatus::Provisional | MemoryStatus::PendingConfirmation
+    ) {
+        score -= 4;
+    }
+
+    score
+}
+
 fn score_candidates_hybrid_legacy(
     candidates: Vec<MemoryRecord>,
     query: &SearchMemoryRequest,
@@ -793,6 +836,98 @@ mod tests {
         assert!(
             scored[0].score > lifecycle_baseline,
             "lex-only candidate must have positive RRF recall contribution"
+        );
+    }
+
+    #[test]
+    fn apply_lifecycle_score_neutral_input() {
+        let memory = fixture_memory("mem_neutral");
+        let query = fixture_query();
+        let newest = timestamp_score(&memory.updated_at);
+
+        let actual = apply_lifecycle_score(
+            &memory,
+            &query,
+            &[],
+            &HashMap::new(),
+            newest,
+            &HashSet::new(),
+            0,
+        );
+
+        let expected = memory_type_score(&memory.memory_type, &query.intent)
+            + freshness_score(newest, newest)
+            - staleness_penalty(memory.decay_score);
+        assert_eq!(
+            actual, expected,
+            "neutral fixture should produce only memory_type + freshness contributions"
+        );
+    }
+
+    #[test]
+    fn apply_lifecycle_score_provisional_status_penalty() {
+        let mut memory = fixture_memory("mem_provisional");
+        memory.status = MemoryStatus::Provisional;
+        let query = fixture_query();
+        let newest = timestamp_score(&memory.updated_at);
+
+        let baseline = {
+            let mut neutral = memory.clone();
+            neutral.status = MemoryStatus::Active;
+            apply_lifecycle_score(
+                &neutral,
+                &query,
+                &[],
+                &HashMap::new(),
+                newest,
+                &HashSet::new(),
+                0,
+            )
+        };
+
+        let actual = apply_lifecycle_score(
+            &memory,
+            &query,
+            &[],
+            &HashMap::new(),
+            newest,
+            &HashSet::new(),
+            0,
+        );
+
+        assert_eq!(
+            actual,
+            baseline - 4,
+            "Provisional status must subtract 4 from the baseline"
+        );
+    }
+
+    #[test]
+    fn apply_lifecycle_score_graph_neighbor_boost() {
+        let memory = fixture_memory("mem_with_neighbor");
+        let query = fixture_query();
+        let newest = timestamp_score(&memory.updated_at);
+
+        let baseline = apply_lifecycle_score(
+            &memory,
+            &query,
+            &[],
+            &HashMap::new(),
+            newest,
+            &HashSet::new(),
+            0,
+        );
+
+        let mut related = HashSet::new();
+        related.insert("mem_with_neighbor".to_string());
+
+        let actual =
+            apply_lifecycle_score(&memory, &query, &[], &HashMap::new(), newest, &related, 12);
+
+        assert_eq!(
+            actual,
+            baseline + 12,
+            "memory in related set must add graph_boost"
         );
     }
 
