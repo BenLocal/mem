@@ -182,6 +182,7 @@ fn sample_versioned_memory(
         decay_score: 0.2,
         content_hash: format!("hash-{memory_id}"),
         idempotency_key: None,
+        session_id: None,
         supersedes_memory_id: supersedes.map(str::to_string),
         source_agent: "codex-worker".into(),
         created_at: format!("2026-03-21T00:00:0{version}Z"),

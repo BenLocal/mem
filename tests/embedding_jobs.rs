@@ -33,6 +33,7 @@ fn sample_active_memory(memory_id: &str, tenant: &str, content_hash: &str) -> Me
         decay_score: 0.0,
         content_hash: content_hash.into(),
         idempotency_key: None,
+        session_id: None,
         supersedes_memory_id: None,
         source_agent: "test".into(),
         created_at: "1".into(),

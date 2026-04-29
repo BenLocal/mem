@@ -13,6 +13,7 @@ use thiserror::Error;
 use crate::domain::{
     episode::EpisodeRecord,
     memory::{FeedbackKind, FeedbackSummary, MemoryRecord, MemoryStatus, MemoryVersionLink},
+    session::Session,
 };
 use crate::pipeline::ingest::{compute_content_hash_from_record, CONTENT_HASH_LEN};
 
@@ -147,12 +148,14 @@ impl DuckDbRepository {
                 memory_id, tenant, memory_type, status, scope, visibility, version, summary,
                 content, evidence_json, code_refs_json, project, repo, module, task_type,
                 tags_json, confidence, decay_score, content_hash, idempotency_key,
-                supersedes_memory_id, source_agent, created_at, updated_at, last_validated_at
+                session_id, supersedes_memory_id, source_agent, created_at, updated_at,
+                last_validated_at
             ) values (
                 ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8,
                 ?9, ?10, ?11, ?12, ?13, ?14, ?15,
                 ?16, ?17, ?18, ?19, ?20,
-                ?21, ?22, ?23, ?24, ?25
+                ?21, ?22, ?23, ?24, ?25,
+                ?26
             )",
             params![
                 stored.memory_id,
@@ -175,6 +178,7 @@ impl DuckDbRepository {
                 f64::from(stored.decay_score),
                 stored.content_hash,
                 stored.idempotency_key,
+                stored.session_id,
                 stored.supersedes_memory_id,
                 stored.source_agent,
                 stored.created_at,
@@ -710,8 +714,8 @@ impl DuckDbRepository {
                 m.memory_id, m.tenant, m.memory_type, m.status, m.scope, m.visibility, m.version,
                 m.summary, m.content, m.evidence_json, m.code_refs_json, m.project, m.repo,
                 m.module, m.task_type, m.tags_json, m.confidence, m.decay_score, m.content_hash,
-                m.idempotency_key, m.supersedes_memory_id, m.source_agent, m.created_at,
-                m.updated_at, m.last_validated_at,
+                m.idempotency_key, m.session_id, m.supersedes_memory_id, m.source_agent,
+                m.created_at, m.updated_at, m.last_validated_at,
                 e.embedding
              from memories m
              inner join memory_embeddings e on m.memory_id = e.memory_id
@@ -825,7 +829,8 @@ impl DuckDbRepository {
                     memory_id, tenant, memory_type, status, scope, visibility, version, summary,
                     content, evidence_json, code_refs_json, project, repo, module, task_type,
                     tags_json, confidence, decay_score, content_hash, idempotency_key,
-                    supersedes_memory_id, source_agent, created_at, updated_at, last_validated_at
+                    session_id, supersedes_memory_id, source_agent, created_at, updated_at,
+                    last_validated_at
                  from memories
                  where memory_id = ?1",
                 params![memory_id],
@@ -848,7 +853,8 @@ impl DuckDbRepository {
                     memory_id, tenant, memory_type, status, scope, visibility, version, summary,
                     content, evidence_json, code_refs_json, project, repo, module, task_type,
                     tags_json, confidence, decay_score, content_hash, idempotency_key,
-                    supersedes_memory_id, source_agent, created_at, updated_at, last_validated_at
+                    session_id, supersedes_memory_id, source_agent, created_at, updated_at,
+                    last_validated_at
                  from memories
                  where tenant = ?1 and memory_id = ?2",
                 params![tenant, memory_id],
@@ -871,7 +877,8 @@ impl DuckDbRepository {
                     memory_id, tenant, memory_type, status, scope, visibility, version, summary,
                     content, evidence_json, code_refs_json, project, repo, module, task_type,
                     tags_json, confidence, decay_score, content_hash, idempotency_key,
-                    supersedes_memory_id, source_agent, created_at, updated_at, last_validated_at
+                    session_id, supersedes_memory_id, source_agent, created_at, updated_at,
+                    last_validated_at
                  from memories
                  where tenant = ?1 and memory_id = ?2 and status = ?3",
                 params![
@@ -899,7 +906,8 @@ impl DuckDbRepository {
                     memory_id, tenant, memory_type, status, scope, visibility, version, summary,
                     content, evidence_json, code_refs_json, project, repo, module, task_type,
                     tags_json, confidence, decay_score, content_hash, idempotency_key,
-                    supersedes_memory_id, source_agent, created_at, updated_at, last_validated_at
+                    session_id, supersedes_memory_id, source_agent, created_at, updated_at,
+                    last_validated_at
                  from memories
                  where tenant = ?1
                    and (((?2 is not null and idempotency_key = ?2) or content_hash = ?3))
@@ -925,7 +933,8 @@ impl DuckDbRepository {
                 memory_id, tenant, memory_type, status, scope, visibility, version, summary,
                 content, evidence_json, code_refs_json, project, repo, module, task_type,
                 tags_json, confidence, decay_score, content_hash, idempotency_key,
-                supersedes_memory_id, source_agent, created_at, updated_at, last_validated_at
+                session_id, supersedes_memory_id, source_agent, created_at, updated_at,
+                last_validated_at
              from memories
              where tenant = ?1 and status = ?2
              order by created_at desc",
@@ -945,7 +954,8 @@ impl DuckDbRepository {
                 memory_id, tenant, memory_type, status, scope, visibility, version, summary,
                 content, evidence_json, code_refs_json, project, repo, module, task_type,
                 tags_json, confidence, decay_score, content_hash, idempotency_key,
-                supersedes_memory_id, source_agent, created_at, updated_at, last_validated_at
+                session_id, supersedes_memory_id, source_agent, created_at, updated_at,
+                last_validated_at
              from memories
              where tenant = ?1
              order by updated_at desc, version desc, memory_id asc",
@@ -985,8 +995,8 @@ impl DuckDbRepository {
                 memory_id, tenant, memory_type, status, scope, visibility, version,
                 summary, content, evidence_json, code_refs_json, project, repo,
                 module, task_type, tags_json, confidence, decay_score, content_hash,
-                idempotency_key, supersedes_memory_id, source_agent, created_at,
-                updated_at, last_validated_at
+                idempotency_key, session_id, supersedes_memory_id, source_agent,
+                created_at, updated_at, last_validated_at
              from memories
              where tenant = ?1
                and status not in ('rejected', 'archived')
@@ -1061,12 +1071,14 @@ impl DuckDbRepository {
                     memory_id, tenant, memory_type, status, scope, visibility, version, summary,
                     content, evidence_json, code_refs_json, project, repo, module, task_type,
                     tags_json, confidence, decay_score, content_hash, idempotency_key,
-                    supersedes_memory_id, source_agent, created_at, updated_at, last_validated_at
+                    session_id, supersedes_memory_id, source_agent, created_at, updated_at,
+                    last_validated_at
                 ) values (
                     ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8,
                     ?9, ?10, ?11, ?12, ?13, ?14, ?15,
                     ?16, ?17, ?18, ?19, ?20,
-                    ?21, ?22, ?23, ?24, ?25
+                    ?21, ?22, ?23, ?24, ?25,
+                    ?26
                 )",
                 params![
                     stored.memory_id,
@@ -1089,6 +1101,7 @@ impl DuckDbRepository {
                     f64::from(stored.decay_score),
                     stored.content_hash,
                     stored.idempotency_key,
+                    stored.session_id,
                     stored.supersedes_memory_id,
                     stored.source_agent,
                     stored.created_at,
@@ -1425,6 +1438,97 @@ impl DuckDbRepository {
             .await?
             .ok_or(StorageError::InvalidData("updated memory not found"))
     }
+
+    /// Return the most recently touched open session for `(tenant, caller_agent)`, or `None`.
+    pub async fn latest_active_session(
+        &self,
+        tenant: &str,
+        caller_agent: &str,
+    ) -> Result<Option<Session>, StorageError> {
+        let conn = self.conn()?;
+        let session = conn
+            .query_row(
+                "SELECT session_id, tenant, caller_agent, started_at, last_seen_at,
+                        ended_at, goal, memory_count
+                 FROM sessions
+                 WHERE tenant = ?1 AND caller_agent = ?2 AND ended_at IS NULL
+                 ORDER BY last_seen_at DESC
+                 LIMIT 1",
+                params![tenant, caller_agent],
+                |row| {
+                    let mc: i64 = row.get(7)?;
+                    Ok(Session {
+                        session_id: row.get(0)?,
+                        tenant: row.get(1)?,
+                        caller_agent: row.get(2)?,
+                        started_at: row.get(3)?,
+                        last_seen_at: row.get(4)?,
+                        ended_at: row.get(5)?,
+                        goal: row.get(6)?,
+                        memory_count: mc as u32,
+                    })
+                },
+            )
+            .optional()?;
+        Ok(session)
+    }
+
+    /// Insert a new session row and return it.
+    pub async fn open_session(
+        &self,
+        session_id: &str,
+        tenant: &str,
+        caller_agent: &str,
+        now: &str,
+    ) -> Result<Session, StorageError> {
+        let conn = self.conn()?;
+        conn.execute(
+            "INSERT INTO sessions
+                (session_id, tenant, caller_agent, started_at, last_seen_at, memory_count)
+             VALUES (?1, ?2, ?3, ?4, ?5, 0)",
+            params![session_id, tenant, caller_agent, now, now],
+        )?;
+        Ok(Session {
+            session_id: session_id.to_string(),
+            tenant: tenant.to_string(),
+            caller_agent: caller_agent.to_string(),
+            started_at: now.to_string(),
+            last_seen_at: now.to_string(),
+            ended_at: None,
+            goal: None,
+            memory_count: 0,
+        })
+    }
+
+    /// Close an open session by setting `ended_at`.  No-op if already closed.
+    pub async fn close_session(
+        &self,
+        session_id: &str,
+        ended_at: &str,
+    ) -> Result<(), StorageError> {
+        let conn = self.conn()?;
+        conn.execute(
+            "UPDATE sessions SET ended_at = ?1 WHERE session_id = ?2 AND ended_at IS NULL",
+            params![ended_at, session_id],
+        )?;
+        Ok(())
+    }
+
+    /// Bump `last_seen_at` and increment `memory_count` for an open session.
+    pub async fn touch_session(
+        &self,
+        session_id: &str,
+        last_seen_at: &str,
+    ) -> Result<(), StorageError> {
+        let conn = self.conn()?;
+        conn.execute(
+            "UPDATE sessions
+             SET last_seen_at = ?1, memory_count = memory_count + 1
+             WHERE session_id = ?2",
+            params![last_seen_at, session_id],
+        )?;
+        Ok(())
+    }
 }
 
 impl EmbeddingRowSource for DuckDbRepository {
@@ -1577,7 +1681,7 @@ fn restore_embedding_references(
 
 fn map_memory_with_blob(row: &duckdb::Row<'_>) -> Result<(MemoryRecord, Vec<u8>), duckdb::Error> {
     let memory = map_memory_row(row)?;
-    let blob: Vec<u8> = row.get(25)?;
+    let blob: Vec<u8> = row.get(26)?;
     Ok((memory, blob))
 }
 
@@ -1630,7 +1734,8 @@ pub(crate) fn migrate_content_hash_to_sha256(conn: &Connection) -> Result<usize,
             memory_id, tenant, memory_type, status, scope, visibility, version, summary,
             content, evidence_json, code_refs_json, project, repo, module, task_type,
             tags_json, confidence, decay_score, content_hash, idempotency_key,
-            supersedes_memory_id, source_agent, created_at, updated_at, last_validated_at
+            session_id, supersedes_memory_id, source_agent, created_at, updated_at,
+            last_validated_at
          from memories
          where length(content_hash) != ?1",
     )?;
@@ -1677,11 +1782,12 @@ fn map_memory_row(row: &duckdb::Row<'_>) -> Result<MemoryRecord, duckdb::Error> 
         decay_score: row.get::<_, f64>(17)? as f32,
         content_hash: row.get(18)?,
         idempotency_key: row.get(19)?,
-        supersedes_memory_id: row.get(20)?,
-        source_agent: row.get(21)?,
-        created_at: row.get(22)?,
-        updated_at: row.get(23)?,
-        last_validated_at: row.get(24)?,
+        session_id: row.get(20)?,
+        supersedes_memory_id: row.get(21)?,
+        source_agent: row.get(22)?,
+        created_at: row.get(23)?,
+        updated_at: row.get(24)?,
+        last_validated_at: row.get(25)?,
     })
 }
 
