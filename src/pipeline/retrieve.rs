@@ -366,26 +366,15 @@ fn score_candidates(
     let mut scored = candidates
         .into_iter()
         .map(|memory| {
-            let mut score = 0i64;
-            score += text_match_score(&memory, &query_terms);
-            score += scope_score(&memory, &scope_filters);
-            score += memory_type_score(&memory.memory_type, &query.intent);
-            score += confidence_score(memory.confidence);
-            score += validation_score(memory.last_validated_at.is_some());
-            score += freshness_score(newest, timestamp_score(&memory.updated_at));
-            score -= staleness_penalty(memory.decay_score);
-
-            if related_memory_ids.contains(&memory.memory_id) {
-                score += graph_boost;
-            }
-
-            if matches!(
-                memory.status,
-                MemoryStatus::Provisional | MemoryStatus::PendingConfirmation
-            ) {
-                score -= 4;
-            }
-
+            let score = apply_lifecycle_score(
+                &memory,
+                query,
+                &query_terms,
+                &scope_filters,
+                newest,
+                related_memory_ids,
+                graph_boost,
+            );
             ScoredMemory { memory, score }
         })
         .collect::<Vec<_>>();
