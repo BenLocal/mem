@@ -252,4 +252,98 @@ mod tests {
         assert!(!result.is_empty(), "expected nonempty truncation");
         assert!(cjk.starts_with(&result), "result must be a prefix of input");
     }
+
+    #[test]
+    fn compress_text_ascii_within_budget() {
+        // Short input well under budget: must be returned verbatim.
+        let input = "Hello world";
+        let result = compress_text(input, 100);
+        assert_eq!(result, input);
+    }
+
+    #[test]
+    fn compress_text_ascii_exceeds_budget_breaks_at_whitespace() {
+        // ~600 tokens of English; budget of 30 forces truncation.
+        // The whitespace backstep in compress_text must ensure the result
+        // does not end mid-word.
+        let input: String = "The quick brown fox jumps over the lazy dog. ".repeat(60);
+        let budget = 30;
+
+        let result = compress_text(&input, budget);
+
+        let bpe = tokenizer();
+        let result_tokens = bpe.encode_with_special_tokens(&result).len();
+        assert!(
+            result_tokens <= budget,
+            "ASCII budget violated: got {} tokens for budget {}",
+            result_tokens,
+            budget
+        );
+        // The whitespace backstep should ensure the result ends at a word/space
+        // boundary: either the input contains "<result-trimmed> " immediately
+        // after the result, or the result is a suffix of the input.
+        let trimmed = result.trim_end();
+        let space_marker = format!("{} ", trimmed);
+        assert!(
+            input.contains(&space_marker) || input.ends_with(trimmed),
+            "result should end at a word boundary; got tail: {:?}",
+            &result[result.len().saturating_sub(40)..]
+        );
+    }
+
+    #[test]
+    fn compress_text_mixed_cjk_ascii() {
+        // Mixed CJK + ASCII content; token count should still be respected
+        // and the result must be a prefix of the input (no reordering or
+        // content insertion).
+        let input: String =
+            "项目 X uses HNSW for ANN queries 实现细节: see vector_index.rs. ".repeat(20);
+        let budget = 25;
+
+        let result = compress_text(&input, budget);
+
+        let bpe = tokenizer();
+        let result_tokens = bpe.encode_with_special_tokens(&result).len();
+        assert!(
+            result_tokens <= budget,
+            "mixed budget violated: got {} tokens for budget {}",
+            result_tokens,
+            budget
+        );
+        // Result must be a prefix of the input (no content fabricated).
+        assert!(
+            input.starts_with(&result),
+            "result must be a prefix of input"
+        );
+    }
+
+    #[test]
+    fn compress_text_zero_or_empty() {
+        // Empty input: should never panic and must return empty.
+        assert_eq!(compress_text("", 100), "");
+
+        // budget=0 is clamped to budget.max(8) == 8 internally; the result
+        // must still respect that effective budget.
+        let result = compress_text("hello world this is a longer test sentence", 0);
+        let bpe = tokenizer();
+        let tokens = bpe.encode_with_special_tokens(&result).len();
+        assert!(
+            tokens <= 8,
+            "budget=0 must clamp to 8; got {} tokens",
+            tokens
+        );
+    }
+
+    #[test]
+    fn compress_text_exact_budget() {
+        // When the input's token count exactly equals the budget, no truncation
+        // should occur — the early-return branch (`tokens.len() <= limit`)
+        // must fire and return the input verbatim.
+        let input = "Hello, world!";
+        let bpe = tokenizer();
+        let n = bpe.encode_with_special_tokens(input).len();
+
+        let result = compress_text(input, n);
+        assert_eq!(result, input, "no truncation when token count == budget");
+    }
 }
