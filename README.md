@@ -143,3 +143,52 @@ cargo clippy --all-targets -- -D warnings
 - **Verbatim discipline**: `memories.content` is the **fact source** — never rewritten or truncated at storage. `memories.summary` is **index/hint only** — never used as the basis for answers or quotes. When a caller provides an explicit `summary` field, the ingest pipeline rejects requests where `summary` equals `content` — preventing agents from copying refined text into the content field. When no caller summary is supplied, the server derives one from `content[:80]` for indexing only.
 - **Lifecycle-aware**: memories have status (`Provisional`, `Active`, `PendingConfirmation`), confidence scores, decay, and feedback loops — not just CRUD operations.
 - **Graph-temporal**: edges carry `valid_from`/`valid_to` timestamps for point-in-time queries and supersede chains.
+
+## Claude Code Integration
+
+### Installation
+
+1. **Install hooks**:
+
+```bash
+mkdir -p ~/.mem/hooks
+cp hooks/claude_code_*.sh ~/.mem/hooks/
+```
+
+2. **Register hooks** in `~/.claude/settings.json`:
+
+```json
+{
+  "hooks": {
+    "Stop": "~/.mem/hooks/claude_code_stop.sh",
+    "PreCompact": "~/.mem/hooks/claude_code_precompact.sh",
+    "SessionStart": "~/.mem/hooks/claude_code_sessionstart.sh"
+  }
+}
+```
+
+3. **(Optional) Create identity file**:
+
+```bash
+cat > ~/.mem/identity.txt <<EOF
+I am a [role] working on [domain].
+I prefer [preferences].
+EOF
+```
+
+### Usage
+
+Hooks run automatically:
+- **Stop**: Every 15 exchanges, mines memories in background
+- **PreCompact**: Before context compression, final mine
+- **SessionStart**: Injects recent memories at session start
+
+Manual commands:
+
+```bash
+# Mine a transcript
+mem mine ~/.claude/projects/.../session.jsonl
+
+# Get wake-up context
+mem wake-up --token-budget 800
+```
