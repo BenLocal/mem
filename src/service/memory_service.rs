@@ -1,6 +1,5 @@
 use std::{
     collections::HashSet,
-    sync::atomic::{AtomicU64, Ordering},
     time::{SystemTime, UNIX_EPOCH},
 };
 
@@ -28,11 +27,6 @@ use crate::{
     pipeline::{compress, retrieve},
     storage::{DuckDbGraphStore, DuckDbRepository, EmbeddingJobInsert, GraphError, StorageError},
 };
-
-static EPISODE_SEQUENCE: AtomicU64 = AtomicU64::new(1);
-static MEMORY_SEQUENCE: AtomicU64 = AtomicU64::new(1);
-static FEEDBACK_SEQUENCE: AtomicU64 = AtomicU64::new(1);
-static EMBEDDING_JOB_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -635,21 +629,17 @@ fn current_timestamp() -> String {
 }
 
 fn next_feedback_id() -> String {
-    let sequence = FEEDBACK_SEQUENCE.fetch_add(1, Ordering::Relaxed);
-    format!("fb_{sequence:020}")
+    format!("fb_{}", uuid::Uuid::now_v7())
 }
 
 fn next_embedding_job_id() -> String {
-    let sequence = EMBEDDING_JOB_SEQUENCE.fetch_add(1, Ordering::Relaxed);
-    format!("ej_{sequence:020}")
+    format!("ej_{}", uuid::Uuid::now_v7())
 }
 
 fn next_memory_id() -> String {
-    let sequence = MEMORY_SEQUENCE.fetch_add(1, Ordering::Relaxed);
-    format!("mem_{sequence:020}")
+    format!("mem_{}", uuid::Uuid::now_v7())
 }
 
 fn next_episode_id() -> String {
-    let sequence = EPISODE_SEQUENCE.fetch_add(1, Ordering::Relaxed);
-    format!("ep_{sequence:020}")
+    format!("ep_{}", uuid::Uuid::now_v7())
 }
