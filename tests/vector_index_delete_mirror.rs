@@ -26,6 +26,7 @@ async fn delete_paths_mirror_into_vector_index() {
         tenant: "t".into(),
         memory_type: MemoryType::Implementation,
         content: c.into(),
+        summary: None,
         evidence: vec![],
         code_refs: vec![],
         scope: Scope::Repo,

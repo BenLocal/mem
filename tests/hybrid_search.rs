@@ -174,6 +174,7 @@ async fn ingest_for_e2e(
         tenant: "t".into(),
         memory_type: MemoryType::Implementation,
         content: content.into(),
+        summary: None,
         evidence: vec![],
         code_refs: vec![],
         scope: Scope::Repo,

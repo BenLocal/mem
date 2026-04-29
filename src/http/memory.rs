@@ -32,6 +32,8 @@ struct HttpIngestMemoryRequest {
     memory_type: MemoryType,
     content: String,
     #[serde(default)]
+    summary: Option<String>,
+    #[serde(default)]
     evidence: Vec<String>,
     #[serde(default)]
     code_refs: Vec<String>,
@@ -62,6 +64,7 @@ impl From<HttpIngestMemoryRequest> for IngestMemoryRequest {
             tenant: request.tenant,
             memory_type: request.memory_type,
             content: request.content,
+            summary: request.summary,
             evidence: request.evidence,
             code_refs: request.code_refs,
             scope: request.scope,

@@ -32,6 +32,9 @@ impl IntoResponse for AppError {
                 Json(json!({ "error": "memory not found" })),
             )
                 .into_response(),
+            Some(ServiceError::Storage(StorageError::InvalidInput(msg))) => {
+                (StatusCode::BAD_REQUEST, Json(json!({ "error": msg }))).into_response()
+            }
             _ => (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(json!({ "error": self.0.to_string() })),

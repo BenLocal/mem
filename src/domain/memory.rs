@@ -106,6 +106,8 @@ pub struct IngestMemoryRequest {
     pub tenant: String,
     pub memory_type: MemoryType,
     pub content: String,
+    #[serde(skip_serializing_if = "skip_none")]
+    pub summary: Option<String>,
     pub evidence: Vec<String>,
     pub code_refs: Vec<String>,
     pub scope: Scope,

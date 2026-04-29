@@ -238,7 +238,7 @@ MemPalace 第一原则是 "Verbatim always"——**永不改写用户内容**。
 
 ### 建议
 
-1. 在 ingest 路径加一个 `assert!(content.len() > 0)`，**禁止 `summary` 与 `content` 完全相同时写入**——这是 agent 偷懒抄过去的信号。
+1. ✅ 在 ingest 路径加一个 `assert!(content.len() > 0)`，**禁止 `summary` 与 `content` 完全相同时写入**——这是 agent 偷懒抄过去的信号。（2026-04-29 落地：`IngestMemoryRequest.summary: Option<String>`，caller 提供时校验 `summary != content`，4 个单测 + 2 个集成测试，HTTP DTO 与 InvalidInput→400 映射也一并补上。ROADMAP #9。）
 2. ✅ 把 `compress_text` 的"按词截断"换成 `tiktoken-rs` 之类的 token 计数器，对中英文都靠谱。（2026-04-29 落地：tiktoken-rs 0.11 + o200k_base，6 个单测覆盖 CJK / ASCII / 混合 / 边界。）
 3. 文档化：`summary` 是**索引/提示用**，`content` 是**事实源**——任何输出都必须基于 `content` 而不是 `summary`。
 

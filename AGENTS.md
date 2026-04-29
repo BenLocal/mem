@@ -48,7 +48,7 @@ cross build --release                          # cross-compile (reads ./Cross.to
 
 ## Design Discipline
 
-- **Verbatim rule**: `memories.content` is the **fact source** — never rewrite, never truncate at storage. `memories.summary` is **index / hint only** — never use it as the basis for an answer or quote. Output-layer compression (`pipeline/compress.rs`) operates on `content`, never replaces it. The ingest pipeline enforces that `summary` must not be identical to `content` (agents must not copy refined/summarized text into the `content` field).
+- **Verbatim rule**: `memories.content` is the **fact source** — never rewrite, never truncate at storage. `memories.summary` is **index / hint only** — never use it as the basis for an answer or quote. Output-layer compression (`pipeline/compress.rs`) operates on `content`, never replaces it. The ingest pipeline enforces that, when a caller provides an explicit `summary` field, it must not equal `content` — agents must not copy refined/summarized text into the `content` field. When no caller summary is supplied, the server derives one from `content[:80]` for indexing purposes only.
 - **Two-axis layering** (see `docs/mempalace-diff.md` §8): 📦 storage stays verbatim, 🔍 indexing / ranking / lifecycle is where structured signals live, ⚙️ infra / bug-fix is its own track. Before touching ranking, ingest, or output, name which layer you're in.
 
 ---

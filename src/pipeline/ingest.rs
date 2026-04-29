@@ -10,11 +10,14 @@ use crate::domain::memory::{
 /// 16-char hash.
 pub const CONTENT_HASH_LEN: usize = 64;
 
-/// Validate that the request follows verbatim discipline: `content` must not
-/// be identical to a non-empty `summary`. Returns `Err` if validation fails.
-pub fn validate_verbatim(request: &IngestMemoryRequest, summary: &str) -> Result<(), String> {
-    if !summary.is_empty() && summary.len() > 80 && summary == request.content {
-        return Err("summary must not be identical to content (verbatim violation)".into());
+/// Validate that the request follows verbatim discipline. When the caller
+/// supplies a non-empty `summary`, it must not equal `content` (otherwise
+/// the agent has copied refined/summarized text into the content field).
+pub fn validate_verbatim(content: &str, caller_summary: Option<&str>) -> Result<(), String> {
+    if let Some(summary) = caller_summary.filter(|s| !s.is_empty()) {
+        if summary == content {
+            return Err("summary must not be identical to content (verbatim violation)".into());
+        }
     }
     Ok(())
 }
@@ -196,4 +199,36 @@ pub fn extract_graph_edges(memory: &MemoryRecord) -> Vec<GraphEdge> {
     }
 
     edges
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn validate_verbatim_no_caller_summary_ok() {
+        assert!(validate_verbatim("any content here", None).is_ok());
+    }
+
+    #[test]
+    fn validate_verbatim_empty_caller_summary_ok() {
+        // Empty string normalized to "no summary supplied" → no validation.
+        assert!(validate_verbatim("any content here", Some("")).is_ok());
+    }
+
+    #[test]
+    fn validate_verbatim_caller_summary_differs_ok() {
+        assert!(validate_verbatim("hello world", Some("greeting")).is_ok());
+    }
+
+    #[test]
+    fn validate_verbatim_caller_summary_equals_content_rejected() {
+        let err = validate_verbatim("the same text", Some("the same text"))
+            .expect_err("should reject identical caller summary");
+        assert!(
+            err.contains("verbatim"),
+            "error must mention verbatim: {}",
+            err
+        );
+    }
 }

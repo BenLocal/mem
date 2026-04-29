@@ -165,6 +165,7 @@ fn content_hash_is_deterministic_for_same_request() {
         tenant: "tenant-a".into(),
         memory_type: MemoryType::Implementation,
         content: "invalidate cache when schema changes".into(),
+        summary: None,
         evidence: vec!["notes".into()],
         code_refs: vec!["src/cache.rs".into()],
         scope: Scope::Repo,
@@ -441,5 +442,68 @@ async fn get_memory_returns_full_version_chain_for_successor_ids() {
                 "updated_at": "2026-03-21T00:05:01Z"
             }
         ])
+    );
+}
+
+#[tokio::test]
+async fn ingest_rejects_summary_equals_content() {
+    let app = seeded_app(vec![]).await;
+    let verbatim_text =
+        "verbatim guard: content and summary are identical, which violates the rule";
+    let response = app
+        .post_json(
+            "/memories",
+            json!({
+                "memory_type": "implementation",
+                "content": verbatim_text,
+                "summary": verbatim_text,
+                "scope": "repo",
+                "write_mode": "auto"
+            }),
+        )
+        .await;
+
+    assert_eq!(response.status(), 400);
+    let body = response.json();
+    let error_msg = body["error"]
+        .as_str()
+        .expect("error field should be a string");
+    assert!(
+        error_msg.contains("summary") || error_msg.contains("verbatim"),
+        "error message should mention 'summary' or 'verbatim', got: {error_msg}"
+    );
+}
+
+#[tokio::test]
+async fn ingest_accepts_caller_summary_and_stores_it() {
+    let app = seeded_app(vec![]).await;
+    let content = "the cache must be invalidated whenever the DuckDB schema changes to avoid stale reads from the connection pool";
+    let caller_summary = "invalidate cache on schema change";
+
+    let created = app
+        .post_json(
+            "/memories",
+            json!({
+                "memory_type": "implementation",
+                "content": content,
+                "summary": caller_summary,
+                "scope": "repo",
+                "write_mode": "auto"
+            }),
+        )
+        .await;
+
+    assert_eq!(created.status(), 201);
+    let memory_id = created.json()["memory_id"]
+        .as_str()
+        .expect("memory_id should be present")
+        .to_string();
+
+    let detail = app.get(&format!("/memories/{memory_id}")).await;
+    assert_eq!(detail.status(), 200);
+    assert_eq!(
+        detail.json()["memory"]["summary"],
+        caller_summary,
+        "stored summary should be the caller-supplied value, not the auto-derived one"
     );
 }
