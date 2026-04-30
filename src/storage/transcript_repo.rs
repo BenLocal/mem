@@ -9,7 +9,8 @@ use std::collections::HashMap;
 
 use duckdb::{params, OptionalExt};
 
-use super::duckdb::{current_timestamp, DuckDbRepository, StorageError};
+use super::duckdb::{DuckDbRepository, StorageError};
+use super::time::current_timestamp;
 use super::vector_index::TranscriptEmbeddingRowSource;
 use crate::domain::ConversationMessage;
 

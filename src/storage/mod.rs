@@ -1,6 +1,7 @@
 pub mod duckdb;
 pub mod graph_store;
 pub mod schema;
+pub mod time;
 pub mod transcript_repo;
 pub mod vector_index;
 pub mod vector_index_diagnose;
@@ -9,6 +10,7 @@ pub use duckdb::{
     ClaimedEmbeddingJob, DuckDbRepository, EmbeddingJobInsert, FeedbackEvent, StorageError,
 };
 pub use graph_store::{DuckDbGraphStore, GraphError};
+pub use time::{current_timestamp, timestamp_add_ms};
 pub use transcript_repo::ClaimedTranscriptEmbeddingJob;
 pub use vector_index::{
     sidecar_paths, transcript_sidecar_paths, EmbeddingRowSource, TranscriptEmbeddingRowSource,

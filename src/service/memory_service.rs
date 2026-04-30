@@ -1,7 +1,4 @@
-use std::{
-    collections::HashSet,
-    time::{SystemTime, UNIX_EPOCH},
-};
+use std::collections::HashSet;
 
 use serde::Serialize;
 use std::sync::Arc;
@@ -25,7 +22,10 @@ use crate::{
     pipeline::ingest::{compute_content_hash, initial_status, memory_node_id},
     pipeline::workflow,
     pipeline::{compress, retrieve},
-    storage::{DuckDbGraphStore, DuckDbRepository, EmbeddingJobInsert, GraphError, StorageError},
+    storage::{
+        current_timestamp, DuckDbGraphStore, DuckDbRepository, EmbeddingJobInsert, GraphError,
+        StorageError,
+    },
 };
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
@@ -618,14 +618,6 @@ fn default_confidence(status: &MemoryStatus) -> f32 {
         MemoryStatus::Provisional => 0.5,
         MemoryStatus::Archived | MemoryStatus::Rejected => 0.0,
     }
-}
-
-fn current_timestamp() -> String {
-    let millis = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .expect("system time should be after unix epoch")
-        .as_millis();
-    format!("{millis:020}")
 }
 
 fn next_feedback_id() -> String {

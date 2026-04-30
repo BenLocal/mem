@@ -2,6 +2,7 @@ use std::sync::Arc;
 
 use thiserror::Error;
 
+use super::time::current_timestamp;
 use super::{DuckDbRepository, StorageError};
 use crate::domain::memory::{GraphEdge, MemoryRecord};
 use crate::pipeline::ingest::extract_graph_edges;
@@ -174,14 +175,6 @@ impl DuckDbGraphStore {
         }
         Ok(out)
     }
-}
-
-fn current_timestamp() -> String {
-    let millis = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .expect("system time should be after unix epoch")
-        .as_millis();
-    format!("{millis:020}")
 }
 
 fn map_row_to_edge(row: &duckdb::Row<'_>) -> Result<GraphEdge, duckdb::Error> {

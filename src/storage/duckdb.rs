@@ -2,7 +2,6 @@ use std::{
     collections::{HashMap, HashSet, VecDeque},
     path::Path,
     sync::{Arc, Mutex, MutexGuard, RwLock},
-    time::{SystemTime, UNIX_EPOCH},
 };
 
 use duckdb::{params, Connection, OptionalExt};
@@ -18,6 +17,7 @@ use crate::domain::{
 use crate::pipeline::ingest::{compute_content_hash_from_record, CONTENT_HASH_LEN};
 
 use super::schema;
+use super::time::current_timestamp;
 use super::vector_index::{EmbeddingRowSource, VectorIndex};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1887,14 +1887,6 @@ fn to_u64(value: i64) -> Result<u64, StorageError> {
 
 fn to_from_sql_error(error: StorageError) -> duckdb::Error {
     duckdb::Error::FromSqlConversionFailure(0, duckdb::types::Type::Text, Box::new(error))
-}
-
-pub(super) fn current_timestamp() -> String {
-    let millis = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .expect("system time should be after unix epoch")
-        .as_millis();
-    format!("{millis:020}")
 }
 
 struct FeedbackAdjustments {

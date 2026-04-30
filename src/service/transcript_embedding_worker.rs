@@ -16,16 +16,23 @@
 //!   memories pipeline already owns the repo's `attach_vector_index` slot).
 //!
 //! The provider-id sanity check, retry/backoff schedule, and error truncation
-//! are pasted from the memories worker — see `service/embedding_worker.rs` for
-//! the canonical implementation. A future cleanup task may dedupe the helper
-//! functions into a shared module; for now they're copied to keep the two
-//! workers independently readable.
+//! mirror the memories worker — see `service/embedding_worker.rs` for the
+//! canonical implementation. The byte-for-byte identical helpers
+//! (`f32_slice_to_blob`, `sha2_hex`, `failure_backoff_ms`, `truncate_error`)
+//! live in `service/embedding_helpers.rs` and are shared by both workers;
+//! `current_timestamp` / `timestamp_add_ms` come from `storage::time`.
 
 use std::sync::Arc;
 
 use crate::config::EmbeddingSettings;
 use crate::embedding::EmbeddingProvider;
-use crate::storage::{DuckDbRepository, StorageError, VectorIndex, VectorIndexError};
+use crate::service::embedding_helpers::{
+    f32_slice_to_blob, failure_backoff_ms, sha2_hex, truncate_error,
+};
+use crate::storage::{
+    current_timestamp, timestamp_add_ms, DuckDbRepository, StorageError, VectorIndex,
+    VectorIndexError,
+};
 use tracing::{error, info, warn};
 
 pub async fn run(
@@ -235,49 +242,4 @@ async fn record_failure(
         .await?;
     }
     Ok(())
-}
-
-fn failure_backoff_ms(attempt_after_fail: i64) -> u128 {
-    match attempt_after_fail {
-        1 => 60_000,
-        2 => 300_000,
-        _ => 1_800_000,
-    }
-}
-
-fn truncate_error(message: &str) -> String {
-    const MAX: usize = 2000;
-    if message.len() <= MAX {
-        message.to_string()
-    } else {
-        message.chars().take(MAX).collect()
-    }
-}
-
-fn f32_slice_to_blob(values: &[f32]) -> Vec<u8> {
-    let mut out = Vec::with_capacity(values.len() * 4);
-    for value in values {
-        out.extend_from_slice(&value.to_ne_bytes());
-    }
-    out
-}
-
-fn sha2_hex(text: &str) -> String {
-    use sha2::{Digest, Sha256};
-    let digest = Sha256::digest(text.as_bytes());
-    digest.iter().map(|b| format!("{b:02x}")).collect()
-}
-
-fn timestamp_add_ms(ts: &str, add_ms: u128) -> String {
-    let digits: String = ts.chars().filter(|c| c.is_ascii_digit()).collect();
-    let base: u128 = digits.parse().unwrap_or(0);
-    format!("{:020}", base.saturating_add(add_ms))
-}
-
-fn current_timestamp() -> String {
-    let millis = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .expect("system time should be after unix epoch")
-        .as_millis();
-    format!("{millis:020}")
 }
