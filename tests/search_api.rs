@@ -5,7 +5,6 @@ use axum::{
     http::{Request, StatusCode},
 };
 use mem::{
-    app::AppState,
     domain::{
         memory::{MemoryRecord, MemoryStatus, MemoryType, Scope, Visibility},
         query::{DirectiveItem, FactItem, PatternItem, SearchMemoryRequest, SearchMemoryResponse},
@@ -13,11 +12,13 @@ use mem::{
     },
     http,
     service::MemoryService,
-    storage::{DuckDbGraphStore, DuckDbRepository, VectorIndex},
+    storage::{DuckDbGraphStore, DuckDbRepository},
 };
 use serde_json::{json, Value};
 use tempfile::{tempdir, TempDir};
 use tower::util::ServiceExt;
+
+mod common;
 
 struct TestApp {
     _temp_dir: TempDir,
@@ -120,11 +121,7 @@ async fn seeded_search_app(memories: Vec<MemoryRecord>) -> TestApp {
         graph.sync_memory(&memory).await.unwrap();
     }
 
-    let state = AppState {
-        memory_service: MemoryService::new_with_graph(repo, graph),
-        config: mem::config::Config::local(),
-        transcript_index: Arc::new(VectorIndex::new_in_memory(8, "fake", "fake", 8)),
-    };
+    let state = common::test_app_state(MemoryService::new_with_graph(repo, graph));
 
     TestApp {
         _temp_dir: temp_dir,

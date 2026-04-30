@@ -3,18 +3,19 @@ use axum::{
     http::{Request, StatusCode},
 };
 use mem::{
-    app::{self, AppState},
+    app,
     domain::memory::{
         IngestMemoryRequest, MemoryRecord, MemoryStatus, MemoryType, Scope, Visibility, WriteMode,
     },
     http,
     pipeline::ingest::{compute_content_hash, initial_status},
-    storage::{DuckDbRepository, VectorIndex},
+    storage::DuckDbRepository,
 };
 use serde_json::{json, Value};
-use std::sync::Arc;
 use tempfile::{tempdir, TempDir};
 use tower::util::ServiceExt;
+
+mod common;
 
 struct TestApp {
     _temp_dir: Option<TempDir>,
@@ -134,11 +135,7 @@ async fn seeded_app(memories: Vec<MemoryRecord>) -> TestApp {
         repo.insert_memory(memory).await.unwrap();
     }
 
-    let state = AppState {
-        memory_service: mem::service::MemoryService::new(repo),
-        config: mem::config::Config::local(),
-        transcript_index: Arc::new(VectorIndex::new_in_memory(8, "fake", "fake", 8)),
-    };
+    let state = common::test_app_state(mem::service::MemoryService::new(repo));
 
     TestApp {
         _temp_dir: Some(temp_dir),

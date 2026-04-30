@@ -1,16 +1,16 @@
 use mem::{
-    app::AppState,
     domain::memory::{
         IngestMemoryRequest, MemoryRecord, MemoryStatus, MemoryType, Scope, Visibility, WriteMode,
     },
     http,
     service::MemoryService,
-    storage::{DuckDbRepository, EmbeddingJobInsert, VectorIndex},
+    storage::{DuckDbRepository, EmbeddingJobInsert},
 };
 use serde_json::json;
-use std::sync::Arc;
 use tempfile::tempdir;
 use tower::util::ServiceExt;
+
+mod common;
 
 fn sample_active_memory(memory_id: &str, tenant: &str, content_hash: &str) -> MemoryRecord {
     MemoryRecord {
@@ -162,11 +162,7 @@ async fn http_ingest_creates_embedding_job() {
     let dir = tempdir().unwrap();
     let db = dir.path().join("http-ej.duckdb");
     let repo = DuckDbRepository::open(&db).await.unwrap();
-    let state = AppState {
-        memory_service: MemoryService::new(repo.clone()),
-        config: mem::config::Config::local(),
-        transcript_index: Arc::new(VectorIndex::new_in_memory(8, "fake", "fake", 8)),
-    };
+    let state = common::test_app_state(MemoryService::new(repo.clone()));
     let router = http::router().with_state(state);
 
     let request = axum::http::Request::builder()
