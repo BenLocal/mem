@@ -1,9 +1,10 @@
 use mem::cli::repair::{
-    format_check_json, format_check_text, format_rebuild_json, format_rebuild_text, RebuildOutcome,
+    format_check_json, format_check_text, format_rebuild_json, format_rebuild_text,
+    run_check_for_test, RebuildOutcome,
 };
 use mem::storage::{
-    rebuild_index, sidecar_paths, DiagnosticReport, DiagnosticStatus, PathInfo, SidecarFile,
-    VectorIndexFingerprint,
+    rebuild_index, sidecar_paths, transcript_sidecar_paths, DiagnosticReport, DiagnosticStatus,
+    PathInfo, SidecarFile, VectorIndexFingerprint,
 };
 use std::path::PathBuf;
 
@@ -593,4 +594,92 @@ fn format_rebuild_json_for_failed() {
     assert_eq!(v["status"], "rebuild_failed");
     assert_eq!(v["exit_code"], 2);
     assert_eq!(v["details"]["reason"], "disk full");
+}
+
+// ── Aggregate (memories + transcripts) repair tests ───────────────────────────
+
+/// `mem repair --check` reports per-pipeline status for both sidecars and
+/// produces an aggregate exit code that reflects the worst of the two.
+///
+/// Setup: a temp DB with the memories sidecar created (one healthy row) and
+/// the transcripts sidecar deleted to force a "missing" diagnostic on that
+/// pipeline. Aggregate exit code is therefore 1 (corrupt > healthy).
+#[tokio::test]
+async fn repair_check_reports_status_for_both_sidecars() {
+    let dir = tempdir().unwrap();
+    let db = dir.path().join("agg.duckdb");
+
+    // Seed memories sidecar (healthy with one row).
+    let (repo, _idx) = seed_one_row_with_index(&db).await;
+
+    // Create the transcripts sidecar by calling its open_or_rebuild fn — both
+    // files will exist on disk once it returns. We use the shared fingerprint
+    // below; the transcript table is empty so the rebuild produces an
+    // empty-but-valid sidecar.
+    let settings = EmbeddingSettings::development_defaults();
+    let fp = VectorIndexFingerprint {
+        provider: settings.job_provider_id().to_string(),
+        model: settings.model.clone(),
+        dim: settings.dim,
+    };
+    let _tr_idx = VectorIndex::open_or_rebuild_transcripts(&repo, &db, &fp)
+        .await
+        .unwrap();
+    let (tr_idx_path, tr_meta_path) = transcript_sidecar_paths(&db);
+    assert!(
+        tr_idx_path.exists() && tr_meta_path.exists(),
+        "transcript sidecar should be on disk after open_or_rebuild_transcripts"
+    );
+
+    // Now delete the transcripts sidecar binary to force "SidecarMissing".
+    std::fs::remove_file(&tr_idx_path).unwrap();
+
+    // Build a Config pointing at the temp db.
+    let mut config = mem::config::Config::local();
+    config.db_path = db.clone();
+    config.embedding = settings;
+
+    let (text, exit) = run_check_for_test(&config, &fp).await;
+
+    assert!(
+        text.contains("=== Memories sidecar ==="),
+        "text should have memories section header: {text}"
+    );
+    assert!(
+        text.contains("=== Transcripts sidecar ==="),
+        "text should have transcripts section header: {text}"
+    );
+
+    // Memories side: expect a healthy line referencing `<db>.usearch` (but
+    // NOT `.transcripts.usearch`). We split on the transcripts header so we
+    // can scope the assertion to the memories block.
+    let (mem_block, tr_block) = text
+        .split_once("=== Transcripts sidecar ===")
+        .expect("split on transcripts header");
+    assert!(
+        mem_block.contains("Healthy"),
+        "memories section should be healthy: {mem_block}"
+    );
+    assert!(
+        mem_block.contains(".usearch") && !mem_block.contains(".transcripts.usearch"),
+        "memories section should reference memories sidecar path: {mem_block}"
+    );
+
+    // Transcripts side: expect "Sidecar index file is missing" and a path
+    // hint that points at the transcripts sidecar.
+    assert!(
+        tr_block.contains("Sidecar index file is missing") || tr_block.contains("Sidecar index"),
+        "transcripts section should say sidecar missing: {tr_block}"
+    );
+    assert!(
+        tr_block.contains("mem repair --rebuild"),
+        "transcripts section should suggest rebuild: {tr_block}"
+    );
+
+    // Aggregate exit code: memories=0, transcripts=1 (corrupt). Worst-of-two
+    // bubbles up.
+    assert_eq!(
+        exit, 1,
+        "aggregate exit code should reflect the unhealthy transcripts sidecar"
+    );
 }

@@ -1,7 +1,8 @@
 use crate::config::Config;
 use crate::storage::{
-    diagnose, rebuild_index, sidecar_paths, DiagnosticReport, DiagnosticStatus, DuckDbRepository,
-    PathInfo, SidecarFile, VectorIndexFingerprint,
+    diagnose, diagnose_transcripts, rebuild_index, rebuild_transcripts_index, sidecar_paths,
+    transcript_sidecar_paths, DiagnosticReport, DiagnosticStatus, DuckDbRepository, PathInfo,
+    SidecarFile, VectorIndexFingerprint,
 };
 use clap::Args;
 
@@ -253,6 +254,71 @@ pub fn format_rebuild_json(outcome: &RebuildOutcome) -> Value {
     }
 }
 
+/// Aggregated text output for `mem repair --check`. Two labelled sections,
+/// one per sidecar.
+pub fn format_aggregate_check_text(
+    memories: &DiagnosticReport,
+    transcripts: &DiagnosticReport,
+) -> String {
+    use std::fmt::Write;
+    let mut s = String::new();
+    writeln!(&mut s, "=== Memories sidecar ===").unwrap();
+    s.push_str(&format_check_text(memories));
+    writeln!(&mut s, "\n=== Transcripts sidecar ===").unwrap();
+    s.push_str(&format_check_text(transcripts));
+    s
+}
+
+/// Aggregated text output for `mem repair --rebuild`.
+pub fn format_aggregate_rebuild_text(
+    memories: &RebuildOutcome,
+    transcripts: &RebuildOutcome,
+) -> String {
+    use std::fmt::Write;
+    let mut s = String::new();
+    writeln!(&mut s, "=== Memories sidecar ===").unwrap();
+    s.push_str(&format_rebuild_text(memories));
+    writeln!(&mut s, "\n=== Transcripts sidecar ===").unwrap();
+    s.push_str(&format_rebuild_text(transcripts));
+    s
+}
+
+/// Aggregated JSON output for `mem repair --check`.
+pub fn format_aggregate_check_json(
+    memories: &DiagnosticReport,
+    transcripts: &DiagnosticReport,
+) -> Value {
+    let exit = aggregate_exit_code(
+        memories.details.exit_code(),
+        transcripts.details.exit_code(),
+    );
+    json!({
+        "command": "check",
+        "memories": format_check_json(memories),
+        "transcripts": format_check_json(transcripts),
+        "exit_code": exit,
+    })
+}
+
+/// Aggregated JSON output for `mem repair --rebuild`.
+pub fn format_aggregate_rebuild_json(
+    memories: &RebuildOutcome,
+    transcripts: &RebuildOutcome,
+) -> Value {
+    let exit = aggregate_exit_code(memories.exit_code(), transcripts.exit_code());
+    json!({
+        "command": "rebuild",
+        "memories": format_rebuild_json(memories),
+        "transcripts": format_rebuild_json(transcripts),
+        "exit_code": exit,
+    })
+}
+
+/// Worst-of-two exit code aggregator: any unhealthy pipeline propagates.
+pub fn aggregate_exit_code(a: i32, b: i32) -> i32 {
+    a.max(b)
+}
+
 /// Entry point for `mem repair`. Returns the process exit code.
 pub async fn run(args: RepairArgs) -> i32 {
     // Resolve config.
@@ -270,35 +336,58 @@ pub async fn run(args: RepairArgs) -> i32 {
     };
 
     if args.mode.rebuild {
-        run_rebuild(&config, &fp, args.json).await
+        let (mem_outcome, tr_outcome) = compute_rebuild_outcomes(&config, &fp).await;
+        emit_aggregate_rebuild(&mem_outcome, &tr_outcome, args.json)
     } else {
-        run_check(&config, &fp, args.json).await
+        let (mem_report, tr_report) = compute_check_reports(&config, &fp).await;
+        emit_aggregate_check(&mem_report, &tr_report, args.json)
     }
 }
 
-async fn run_check(config: &Config, fp: &VectorIndexFingerprint, as_json: bool) -> i32 {
+/// Compute both per-pipeline diagnostic reports without printing. Useful for
+/// tests; the CLI entry point wraps this with `emit_aggregate_check`.
+pub async fn compute_check_reports(
+    config: &Config,
+    fp: &VectorIndexFingerprint,
+) -> (DiagnosticReport, DiagnosticReport) {
     let started = std::time::Instant::now();
     let repo = match DuckDbRepository::open(&config.db_path).await {
         Ok(r) => r,
         Err(e) => {
-            let (idx_path, meta_path) = sidecar_paths(&config.db_path);
-            let report = DiagnosticReport {
+            // DB unavailable: same error for both pipelines, but with their
+            // respective sidecar paths.
+            let elapsed_ms = started.elapsed().as_millis() as u64;
+            let (mem_idx, mem_meta) = sidecar_paths(&config.db_path);
+            let (tr_idx, tr_meta) = transcript_sidecar_paths(&config.db_path);
+            let mem_report = DiagnosticReport {
                 status: "db_unavailable",
                 details: DiagnosticStatus::DbUnavailable {
                     reason: e.to_string(),
                 },
                 paths: PathInfo {
                     db: config.db_path.clone(),
-                    index: idx_path,
-                    meta: meta_path,
+                    index: mem_idx,
+                    meta: mem_meta,
                 },
-                elapsed_ms: started.elapsed().as_millis() as u64,
+                elapsed_ms,
             };
-            return emit_check(&report, as_json);
+            let tr_report = DiagnosticReport {
+                status: "db_unavailable",
+                details: DiagnosticStatus::DbUnavailable {
+                    reason: e.to_string(),
+                },
+                paths: PathInfo {
+                    db: config.db_path.clone(),
+                    index: tr_idx,
+                    meta: tr_meta,
+                },
+                elapsed_ms,
+            };
+            return (mem_report, tr_report);
         }
     };
 
-    let report = match diagnose(&repo, &config.db_path, fp).await {
+    let mem_report = match diagnose(&repo, &config.db_path, fp).await {
         Ok(r) => r,
         Err(e) => {
             let (idx_path, meta_path) = sidecar_paths(&config.db_path);
@@ -316,68 +405,145 @@ async fn run_check(config: &Config, fp: &VectorIndexFingerprint, as_json: bool) 
             }
         }
     };
-    emit_check(&report, as_json)
+
+    let tr_started = std::time::Instant::now();
+    let tr_report = match diagnose_transcripts(&repo, &config.db_path, fp).await {
+        Ok(r) => r,
+        Err(e) => {
+            let (idx_path, meta_path) = transcript_sidecar_paths(&config.db_path);
+            DiagnosticReport {
+                status: "db_unavailable",
+                details: DiagnosticStatus::DbUnavailable {
+                    reason: e.to_string(),
+                },
+                paths: PathInfo {
+                    db: config.db_path.clone(),
+                    index: idx_path,
+                    meta: meta_path,
+                },
+                elapsed_ms: tr_started.elapsed().as_millis() as u64,
+            }
+        }
+    };
+
+    (mem_report, tr_report)
 }
 
-async fn run_rebuild(config: &Config, fp: &VectorIndexFingerprint, as_json: bool) -> i32 {
-    let (idx_path, meta_path) = sidecar_paths(&config.db_path);
-    let paths = PathInfo {
+/// Compute both per-pipeline rebuild outcomes without printing.
+pub async fn compute_rebuild_outcomes(
+    config: &Config,
+    fp: &VectorIndexFingerprint,
+) -> (RebuildOutcome, RebuildOutcome) {
+    let (mem_idx, mem_meta) = sidecar_paths(&config.db_path);
+    let mem_paths = PathInfo {
         db: config.db_path.clone(),
-        index: idx_path,
-        meta: meta_path,
+        index: mem_idx,
+        meta: mem_meta,
+    };
+    let (tr_idx, tr_meta) = transcript_sidecar_paths(&config.db_path);
+    let tr_paths = PathInfo {
+        db: config.db_path.clone(),
+        index: tr_idx,
+        meta: tr_meta,
     };
 
     let repo = match DuckDbRepository::open(&config.db_path).await {
         Ok(r) => r,
         Err(e) => {
-            return emit_rebuild(
-                &RebuildOutcome::DbUnavailable {
-                    reason: e.to_string(),
-                    paths,
-                },
-                as_json,
-            );
+            let mem_out = RebuildOutcome::DbUnavailable {
+                reason: e.to_string(),
+                paths: mem_paths,
+            };
+            let tr_out = RebuildOutcome::DbUnavailable {
+                reason: e.to_string(),
+                paths: tr_paths,
+            };
+            return (mem_out, tr_out);
         }
     };
 
-    let started = std::time::Instant::now();
-    match rebuild_index(&repo, &config.db_path, fp).await {
-        Ok(idx) => {
-            let outcome = RebuildOutcome::Rebuilt {
-                rows: idx.size(),
-                paths,
-                elapsed_ms: started.elapsed().as_millis() as u64,
-            };
-            emit_rebuild(&outcome, as_json)
-        }
-        Err(e) => emit_rebuild(
-            &RebuildOutcome::Failed {
-                reason: e.to_string(),
-                paths,
-            },
-            as_json,
-        ),
-    }
+    let mem_started = std::time::Instant::now();
+    let mem_outcome = match rebuild_index(&repo, &config.db_path, fp).await {
+        Ok(idx) => RebuildOutcome::Rebuilt {
+            rows: idx.size(),
+            paths: mem_paths,
+            elapsed_ms: mem_started.elapsed().as_millis() as u64,
+        },
+        Err(e) => RebuildOutcome::Failed {
+            reason: e.to_string(),
+            paths: mem_paths,
+        },
+    };
+
+    // Per task spec: don't short-circuit on first failure unless DB itself was
+    // unavailable. Run the transcripts rebuild even if the memories rebuild
+    // failed.
+    let tr_started = std::time::Instant::now();
+    let tr_outcome = match rebuild_transcripts_index(&repo, &config.db_path, fp).await {
+        Ok(idx) => RebuildOutcome::Rebuilt {
+            rows: idx.size(),
+            paths: tr_paths,
+            elapsed_ms: tr_started.elapsed().as_millis() as u64,
+        },
+        Err(e) => RebuildOutcome::Failed {
+            reason: e.to_string(),
+            paths: tr_paths,
+        },
+    };
+
+    (mem_outcome, tr_outcome)
 }
 
-fn emit_check(report: &DiagnosticReport, as_json: bool) -> i32 {
-    if as_json {
-        let v = format_check_json(report);
-        println!("{}", serde_json::to_string_pretty(&v).unwrap());
-    } else {
-        print!("{}", format_check_text(report));
-    }
-    report.details.exit_code()
+/// Test-only helper: run `--check` end-to-end and return the formatted text
+/// plus aggregated exit code, without printing to stdout.
+pub async fn run_check_for_test(config: &Config, fp: &VectorIndexFingerprint) -> (String, i32) {
+    let (mem_report, tr_report) = compute_check_reports(config, fp).await;
+    let text = format_aggregate_check_text(&mem_report, &tr_report);
+    let exit = aggregate_exit_code(
+        mem_report.details.exit_code(),
+        tr_report.details.exit_code(),
+    );
+    (text, exit)
 }
 
-fn emit_rebuild(outcome: &RebuildOutcome, as_json: bool) -> i32 {
+/// Test-only helper: run `--rebuild` end-to-end and return the formatted text
+/// plus aggregated exit code, without printing to stdout.
+pub async fn run_rebuild_for_test(config: &Config, fp: &VectorIndexFingerprint) -> (String, i32) {
+    let (mem_outcome, tr_outcome) = compute_rebuild_outcomes(config, fp).await;
+    let text = format_aggregate_rebuild_text(&mem_outcome, &tr_outcome);
+    let exit = aggregate_exit_code(mem_outcome.exit_code(), tr_outcome.exit_code());
+    (text, exit)
+}
+
+fn emit_aggregate_check(
+    memories: &DiagnosticReport,
+    transcripts: &DiagnosticReport,
+    as_json: bool,
+) -> i32 {
     if as_json {
-        let v = format_rebuild_json(outcome);
+        let v = format_aggregate_check_json(memories, transcripts);
         println!("{}", serde_json::to_string_pretty(&v).unwrap());
     } else {
-        print!("{}", format_rebuild_text(outcome));
+        print!("{}", format_aggregate_check_text(memories, transcripts));
     }
-    outcome.exit_code()
+    aggregate_exit_code(
+        memories.details.exit_code(),
+        transcripts.details.exit_code(),
+    )
+}
+
+fn emit_aggregate_rebuild(
+    memories: &RebuildOutcome,
+    transcripts: &RebuildOutcome,
+    as_json: bool,
+) -> i32 {
+    if as_json {
+        let v = format_aggregate_rebuild_json(memories, transcripts);
+        println!("{}", serde_json::to_string_pretty(&v).unwrap());
+    } else {
+        print!("{}", format_aggregate_rebuild_text(memories, transcripts));
+    }
+    aggregate_exit_code(memories.exit_code(), transcripts.exit_code())
 }
 
 fn emit_config_error(args: &RepairArgs, reason: &str) -> i32 {

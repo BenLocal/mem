@@ -15,5 +15,6 @@ pub use vector_index::{
     VectorIndex, VectorIndexError, VectorIndexFingerprint, VectorIndexMeta,
 };
 pub use vector_index_diagnose::{
-    diagnose, rebuild_index, DiagnosticReport, DiagnosticStatus, PathInfo, SidecarFile,
+    diagnose, diagnose_transcripts, rebuild_index, rebuild_transcripts_index, DiagnosticReport,
+    DiagnosticStatus, PathInfo, SidecarFile,
 };
