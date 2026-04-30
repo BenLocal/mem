@@ -384,3 +384,22 @@ async fn concurrent_search_and_upsert_does_not_panic() {
     }
     assert!(idx.size() >= 32);
 }
+
+#[test]
+fn transcript_sidecar_paths_uses_dotted_suffix() {
+    use mem::storage::{sidecar_paths, transcript_sidecar_paths};
+    use std::path::PathBuf;
+
+    let db = PathBuf::from("/foo/mem.duckdb");
+    let (idx, meta) = transcript_sidecar_paths(&db);
+    assert_eq!(idx, PathBuf::from("/foo/mem.duckdb.transcripts.usearch"));
+    assert_eq!(
+        meta,
+        PathBuf::from("/foo/mem.duckdb.transcripts.usearch.meta.json")
+    );
+
+    // Memory sidecar paths must be unchanged.
+    let (idx2, meta2) = sidecar_paths(&db);
+    assert_eq!(idx2, PathBuf::from("/foo/mem.duckdb.usearch"));
+    assert_eq!(meta2, PathBuf::from("/foo/mem.duckdb.usearch.meta.json"));
+}

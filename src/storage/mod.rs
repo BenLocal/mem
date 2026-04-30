@@ -11,8 +11,8 @@ pub use duckdb::{
 pub use graph_store::{DuckDbGraphStore, GraphError};
 pub use transcript_repo::ClaimedTranscriptEmbeddingJob;
 pub use vector_index::{
-    sidecar_paths, EmbeddingRowSource, VectorIndex, VectorIndexError, VectorIndexFingerprint,
-    VectorIndexMeta,
+    sidecar_paths, transcript_sidecar_paths, EmbeddingRowSource, TranscriptEmbeddingRowSource,
+    VectorIndex, VectorIndexError, VectorIndexFingerprint, VectorIndexMeta,
 };
 pub use vector_index_diagnose::{
     diagnose, rebuild_index, DiagnosticReport, DiagnosticStatus, PathInfo, SidecarFile,

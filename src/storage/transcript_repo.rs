@@ -10,6 +10,7 @@ use std::collections::HashMap;
 use duckdb::{params, OptionalExt};
 
 use super::duckdb::{current_timestamp, DuckDbRepository, StorageError};
+use super::vector_index::TranscriptEmbeddingRowSource;
 use crate::domain::ConversationMessage;
 
 /// Row claimed by the transcript embedding worker (`status = processing`).
@@ -373,6 +374,37 @@ impl DuckDbRepository {
                 now,
             ],
         )?;
+        Ok(())
+    }
+}
+
+impl TranscriptEmbeddingRowSource for DuckDbRepository {
+    fn count_total_transcript_embeddings(&self) -> Result<i64, StorageError> {
+        let conn = self.conn()?;
+        let count: i64 = conn.query_row(
+            "select count(*) from conversation_message_embeddings",
+            params![],
+            |row| row.get(0),
+        )?;
+        Ok(count)
+    }
+
+    fn for_each_transcript_embedding(
+        &self,
+        _batch: usize,
+        f: &mut dyn FnMut(&str, &[u8]) -> Result<(), StorageError>,
+    ) -> Result<(), StorageError> {
+        let conn = self.conn()?;
+        let mut stmt = conn.prepare(
+            "select message_block_id, embedding from conversation_message_embeddings \
+             order by message_block_id",
+        )?;
+        let mut rows = stmt.query(params![])?;
+        while let Some(row) = rows.next()? {
+            let id: String = row.get(0)?;
+            let blob: Vec<u8> = row.get(1)?;
+            f(&id, &blob)?;
+        }
         Ok(())
     }
 }

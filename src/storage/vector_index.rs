@@ -82,6 +82,22 @@ pub trait EmbeddingRowSource {
     ) -> Result<(), StorageError>;
 }
 
+/// Source of `(message_block_id, embedding_blob)` rows for the transcript
+/// sidecar rebuild path. Mirrors [`EmbeddingRowSource`] for the memories
+/// pipeline; the only differences are the underlying table
+/// (`conversation_message_embeddings`) and the id semantics
+/// (`message_block_id` rather than `memory_id`).
+pub trait TranscriptEmbeddingRowSource {
+    fn count_total_transcript_embeddings(&self) -> Result<i64, StorageError>;
+
+    #[allow(clippy::type_complexity)]
+    fn for_each_transcript_embedding(
+        &self,
+        batch: usize,
+        f: &mut dyn FnMut(&str, &[u8]) -> Result<(), StorageError>,
+    ) -> Result<(), StorageError>;
+}
+
 pub struct VectorIndex {
     index: Arc<RwLock<Index>>,
     id_map: Arc<RwLock<HashMap<u64, String>>>,
@@ -555,6 +571,19 @@ pub fn sidecar_paths(db_path: &Path) -> (PathBuf, PathBuf) {
     idx.push(".usearch");
     let mut meta: OsString = db_path.as_os_str().to_owned();
     meta.push(".usearch.meta.json");
+    (PathBuf::from(idx), PathBuf::from(meta))
+}
+
+/// Compute the sidecar file paths for the **transcript** vector index.
+///
+/// `<db>.transcripts.usearch` holds the binary index;
+/// `<db>.transcripts.usearch.meta.json` holds the metadata. Kept distinct from
+/// the memories sidecar so the two pipelines never collide on disk.
+pub fn transcript_sidecar_paths(db_path: &Path) -> (PathBuf, PathBuf) {
+    let mut idx: OsString = db_path.as_os_str().to_owned();
+    idx.push(".transcripts.usearch");
+    let mut meta: OsString = db_path.as_os_str().to_owned();
+    meta.push(".transcripts.usearch.meta.json");
     (PathBuf::from(idx), PathBuf::from(meta))
 }
 
