@@ -9,6 +9,7 @@ pub use duckdb::{
     ClaimedEmbeddingJob, DuckDbRepository, EmbeddingJobInsert, FeedbackEvent, StorageError,
 };
 pub use graph_store::{DuckDbGraphStore, GraphError};
+pub use transcript_repo::ClaimedTranscriptEmbeddingJob;
 pub use vector_index::{
     sidecar_paths, EmbeddingRowSource, VectorIndex, VectorIndexError, VectorIndexFingerprint,
     VectorIndexMeta,

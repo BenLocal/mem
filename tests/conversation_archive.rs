@@ -197,3 +197,61 @@ async fn fetch_conversation_messages_by_ids_preserves_input_order() {
     assert_eq!(out[1].message_block_id, "mb-x");
     assert_eq!(out[2].message_block_id, "mb-y");
 }
+
+#[tokio::test]
+async fn transcript_embedding_job_lifecycle() {
+    let tmp = TempDir::new().unwrap();
+    let db = tmp.path().join("mem.duckdb");
+    let repo = DuckDbRepository::open(&db).await.unwrap();
+
+    let m = sample_message("life", true, BlockType::Text);
+    repo.create_conversation_message(&m).await.unwrap();
+
+    // Claim the next pending job.
+    let now = "2026-04-30T00:00:00Z";
+    let claimed = repo
+        .claim_next_transcript_embedding_job(now, 5)
+        .await
+        .unwrap();
+    let job = claimed.expect("should have one pending job");
+    assert_eq!(job.message_block_id, "mb-life");
+    assert_eq!(job.tenant, "local");
+    assert_eq!(job.attempt_count, 0);
+
+    // Second claim: nothing pending (the previous one is now 'processing').
+    let none = repo
+        .claim_next_transcript_embedding_job(now, 5)
+        .await
+        .unwrap();
+    assert!(none.is_none());
+
+    // Upsert embedding row.
+    let blob = vec![0u8, 0, 128, 63, 0, 0, 0, 64]; // 1.0, 2.0 in LE f32 (sized for dim=2)
+    repo.upsert_conversation_message_embedding(
+        &job.message_block_id,
+        &job.tenant,
+        "fake-model",
+        2,
+        &blob,
+        "fake-hash",
+        &m.created_at,
+        now,
+    )
+    .await
+    .unwrap();
+
+    // Complete the job.
+    repo.complete_transcript_embedding_job(&job.job_id, now)
+        .await
+        .unwrap();
+
+    let conn = duckdb::Connection::open(&db).unwrap();
+    let status: String = conn
+        .query_row(
+            "SELECT status FROM transcript_embedding_jobs WHERE job_id = ?",
+            [&job.job_id],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(status, "completed");
+}

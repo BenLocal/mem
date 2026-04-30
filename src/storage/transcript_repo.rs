@@ -7,10 +7,24 @@
 
 use std::collections::HashMap;
 
-use duckdb::params;
+use duckdb::{params, OptionalExt};
 
 use super::duckdb::{current_timestamp, DuckDbRepository, StorageError};
 use crate::domain::ConversationMessage;
+
+/// Row claimed by the transcript embedding worker (`status = processing`).
+///
+/// Mirrors `ClaimedEmbeddingJob` for the memories side, with `memory_id`
+/// renamed to `message_block_id` and `target_content_hash` dropped (transcript
+/// blocks are immutable on insert, so the hash is implicit in the row id).
+#[derive(Debug, Clone)]
+pub struct ClaimedTranscriptEmbeddingJob {
+    pub job_id: String,
+    pub tenant: String,
+    pub message_block_id: String,
+    pub provider: String,
+    pub attempt_count: i64,
+}
 
 impl DuckDbRepository {
     /// Inserts a single conversation transcript block, idempotent on the
@@ -168,6 +182,198 @@ impl DuckDbRepository {
         let ordered: Vec<ConversationMessage> =
             ids.iter().filter_map(|id| by_id.remove(id)).collect();
         Ok(ordered)
+    }
+
+    /// Claims the next eligible transcript embedding job, moving it to
+    /// `processing`. Eligible means `pending`, or `failed` with
+    /// `attempt_count < max_retries` (configured retry budget). Mirror of
+    /// `claim_next_embedding_job` for the transcript queue.
+    pub async fn claim_next_transcript_embedding_job(
+        &self,
+        now: &str,
+        max_retries: u32,
+    ) -> Result<Option<ClaimedTranscriptEmbeddingJob>, StorageError> {
+        let mut conn = self.conn()?;
+        let tx = conn.transaction()?;
+        let max_r = i64::from(max_retries);
+
+        let job_id: Option<String> = tx
+            .query_row(
+                "select job_id from transcript_embedding_jobs
+                 where available_at <= ?1
+                   and (
+                     status = 'pending'
+                     or (status = 'failed' and attempt_count < ?2)
+                   )
+                 order by available_at asc, created_at asc
+                 limit 1",
+                params![now, max_r],
+                |row| row.get(0),
+            )
+            .optional()?;
+
+        let Some(job_id) = job_id else {
+            tx.commit()?;
+            return Ok(None);
+        };
+
+        let updated = tx.execute(
+            "update transcript_embedding_jobs
+             set status = 'processing', updated_at = ?1
+             where job_id = ?2
+               and (
+                 status = 'pending'
+                 or (status = 'failed' and attempt_count < ?3)
+               )",
+            params![now, job_id, max_r],
+        )?;
+
+        if updated == 0 {
+            tx.commit()?;
+            return Ok(None);
+        }
+
+        let job = tx.query_row(
+            "select job_id, tenant, message_block_id, provider, attempt_count
+             from transcript_embedding_jobs where job_id = ?1",
+            params![job_id],
+            |row| {
+                Ok(ClaimedTranscriptEmbeddingJob {
+                    job_id: row.get(0)?,
+                    tenant: row.get(1)?,
+                    message_block_id: row.get(2)?,
+                    provider: row.get(3)?,
+                    attempt_count: row.get(4)?,
+                })
+            },
+        )?;
+
+        tx.commit()?;
+        Ok(Some(job))
+    }
+
+    pub async fn complete_transcript_embedding_job(
+        &self,
+        job_id: &str,
+        now: &str,
+    ) -> Result<(), StorageError> {
+        let conn = self.conn()?;
+        conn.execute(
+            "update transcript_embedding_jobs
+             set status = 'completed', last_error = null, updated_at = ?1
+             where job_id = ?2 and status = 'processing'",
+            params![now, job_id],
+        )?;
+        Ok(())
+    }
+
+    pub async fn mark_transcript_embedding_job_stale(
+        &self,
+        job_id: &str,
+        now: &str,
+    ) -> Result<(), StorageError> {
+        let conn = self.conn()?;
+        conn.execute(
+            "update transcript_embedding_jobs set status = 'stale', updated_at = ?1 where job_id = ?2",
+            params![now, job_id],
+        )?;
+        Ok(())
+    }
+
+    pub async fn reschedule_transcript_embedding_job_failure(
+        &self,
+        job_id: &str,
+        new_attempt_count: i64,
+        last_error: &str,
+        available_at: &str,
+        now: &str,
+    ) -> Result<(), StorageError> {
+        let conn = self.conn()?;
+        conn.execute(
+            "update transcript_embedding_jobs
+             set status = 'failed',
+                 attempt_count = ?1,
+                 last_error = ?2,
+                 available_at = ?3,
+                 updated_at = ?4
+             where job_id = ?5",
+            params![new_attempt_count, last_error, available_at, now, job_id],
+        )?;
+        Ok(())
+    }
+
+    pub async fn permanently_fail_transcript_embedding_job(
+        &self,
+        job_id: &str,
+        new_attempt_count: i64,
+        last_error: &str,
+        now: &str,
+    ) -> Result<(), StorageError> {
+        let conn = self.conn()?;
+        conn.execute(
+            "update transcript_embedding_jobs
+             set status = 'failed',
+                 attempt_count = ?1,
+                 last_error = ?2,
+                 updated_at = ?3
+             where job_id = ?4",
+            params![new_attempt_count, last_error, now, job_id],
+        )?;
+        Ok(())
+    }
+
+    pub async fn get_transcript_embedding_job_status(
+        &self,
+        job_id: &str,
+    ) -> Result<Option<String>, StorageError> {
+        let conn = self.conn()?;
+        let status: Option<String> = conn
+            .query_row(
+                "select status from transcript_embedding_jobs where job_id = ?1",
+                params![job_id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        Ok(status)
+    }
+
+    /// Replaces the conversation_message_embeddings row for `message_block_id`
+    /// with the new vector. Mirror of `upsert_memory_embedding`.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn upsert_conversation_message_embedding(
+        &self,
+        message_block_id: &str,
+        tenant: &str,
+        embedding_model: &str,
+        embedding_dim: i64,
+        embedding_blob: &[u8],
+        content_hash: &str,
+        source_updated_at: &str,
+        now: &str,
+    ) -> Result<(), StorageError> {
+        let conn = self.conn()?;
+        conn.execute(
+            "delete from conversation_message_embeddings where message_block_id = ?1",
+            params![message_block_id],
+        )?;
+        conn.execute(
+            "insert into conversation_message_embeddings (
+                message_block_id, tenant, embedding_model, embedding_dim, embedding,
+                content_hash, source_updated_at, created_at, updated_at
+            ) values (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+            params![
+                message_block_id,
+                tenant,
+                embedding_model,
+                embedding_dim,
+                embedding_blob,
+                content_hash,
+                source_updated_at,
+                now,
+                now,
+            ],
+        )?;
+        Ok(())
     }
 }
 
