@@ -9,13 +9,28 @@ use mem::storage::{
 use std::path::PathBuf;
 
 // ── imports used by the async integration tests ───────────────────────────────
-use mem::config::EmbeddingSettings;
+use mem::config::{EmbeddingProviderKind, EmbeddingSettings};
 use mem::domain::memory::{IngestMemoryRequest, MemoryType, Scope, Visibility, WriteMode};
 use mem::embedding::arc_embedding_provider;
 use mem::service::{embedding_worker, MemoryService};
 use mem::storage::{diagnose, DuckDbRepository, VectorIndex};
 use std::sync::Arc;
 use tempfile::tempdir;
+
+/// Embedding settings for the integration tests in this file.
+///
+/// These tests exercise the diagnose/rebuild plumbing — not the embedding
+/// provider — so they pin a small, offline `Fake` provider with a fixed
+/// dim. This decouples the tests from `EmbeddingSettings::development_defaults`
+/// (which now uses the EmbedAnything backend; see master commit 47aff1e) and
+/// keeps the test fixture vector sizes in sync with the runtime fingerprint.
+fn test_settings() -> EmbeddingSettings {
+    let mut s = EmbeddingSettings::development_defaults();
+    s.provider = EmbeddingProviderKind::Fake;
+    s.model = "fake".to_string();
+    s.dim = 256;
+    s
+}
 
 fn fp(dim: usize) -> VectorIndexFingerprint {
     VectorIndexFingerprint {
@@ -130,7 +145,7 @@ async fn seed_one_row_with_index(
     db_path: &std::path::Path,
 ) -> (DuckDbRepository, Arc<VectorIndex>) {
     let repo = DuckDbRepository::open(db_path).await.unwrap();
-    let settings = EmbeddingSettings::development_defaults();
+    let settings = test_settings();
     let provider = arc_embedding_provider(&settings).unwrap();
     let fp = VectorIndexFingerprint {
         provider: settings.job_provider_id().to_string(),
@@ -178,7 +193,7 @@ async fn diagnose_healthy_db_returns_healthy() {
     let db = dir.path().join("h.duckdb");
     let (repo, _idx) = seed_one_row_with_index(&db).await;
 
-    let settings = EmbeddingSettings::development_defaults();
+    let settings = test_settings();
     let fp = VectorIndexFingerprint {
         provider: settings.job_provider_id().to_string(),
         model: settings.model.clone(),
@@ -202,7 +217,7 @@ async fn diagnose_reports_sidecar_missing_when_index_file_deleted() {
     let (idx_path, _) = sidecar_paths(&db);
     std::fs::remove_file(&idx_path).unwrap();
 
-    let settings = EmbeddingSettings::development_defaults();
+    let settings = test_settings();
     let fp = VectorIndexFingerprint {
         provider: settings.job_provider_id().to_string(),
         model: settings.model.clone(),
@@ -226,7 +241,7 @@ async fn diagnose_reports_sidecar_missing_when_meta_file_deleted() {
     let (_, meta_path) = sidecar_paths(&db);
     std::fs::remove_file(&meta_path).unwrap();
 
-    let settings = EmbeddingSettings::development_defaults();
+    let settings = test_settings();
     let fp = VectorIndexFingerprint {
         provider: settings.job_provider_id().to_string(),
         model: settings.model.clone(),
@@ -249,7 +264,7 @@ async fn diagnose_reports_meta_corrupt_when_meta_is_invalid_json() {
     let (_, meta_path) = sidecar_paths(&db);
     std::fs::write(&meta_path, b"{ this is not json").unwrap();
 
-    let settings = EmbeddingSettings::development_defaults();
+    let settings = test_settings();
     let fp = VectorIndexFingerprint {
         provider: settings.job_provider_id().to_string(),
         model: settings.model.clone(),
@@ -270,13 +285,13 @@ async fn diagnose_reports_fingerprint_mismatch_on_dim_change() {
     let (repo, _idx) = seed_one_row_with_index(&db).await;
 
     // Pass a fingerprint with a different dim than what's on disk
-    let settings = EmbeddingSettings::development_defaults();
+    let settings = test_settings();
     let mut fp = VectorIndexFingerprint {
         provider: settings.job_provider_id().to_string(),
         model: settings.model.clone(),
         dim: settings.dim,
     };
-    fp.dim = 128; // disk has 256 (development default)
+    fp.dim = 128; // disk has settings.dim from test_settings()
 
     let report = diagnose(&repo, &db, &fp).await.unwrap();
     assert_eq!(report.status, "corrupt");
@@ -297,7 +312,7 @@ async fn diagnose_reports_fingerprint_mismatch_on_zero_dim_meta() {
     let (_, meta_path) = sidecar_paths(&db);
 
     // Hand-edit meta to have dim=0
-    let settings = EmbeddingSettings::development_defaults();
+    let settings = test_settings();
     let zero_meta = mem::storage::VectorIndexMeta {
         schema_version: 1,
         provider: settings.job_provider_id().to_string(),
@@ -329,7 +344,7 @@ async fn diagnose_reports_index_corrupt_when_binary_is_garbage() {
     let (idx_path, _) = sidecar_paths(&db);
     std::fs::write(&idx_path, b"GARBAGE_NOT_USEARCH_BINARY").unwrap();
 
-    let settings = EmbeddingSettings::development_defaults();
+    let settings = test_settings();
     let fp = VectorIndexFingerprint {
         provider: settings.job_provider_id().to_string(),
         model: settings.model.clone(),
@@ -356,7 +371,7 @@ async fn diagnose_reports_index_meta_drift_when_meta_lies_about_count() {
     meta.row_count += 5;
     std::fs::write(&meta_path, serde_json::to_vec(&meta).unwrap()).unwrap();
 
-    let settings = EmbeddingSettings::development_defaults();
+    let settings = test_settings();
     let fp = VectorIndexFingerprint {
         provider: settings.job_provider_id().to_string(),
         model: settings.model.clone(),
@@ -388,7 +403,7 @@ async fn diagnose_reports_db_drift_when_db_has_extra_rows() {
         .await
         .unwrap();
 
-    let settings = EmbeddingSettings::development_defaults();
+    let settings = test_settings();
     let fp = VectorIndexFingerprint {
         provider: settings.job_provider_id().to_string(),
         model: settings.model.clone(),
@@ -419,7 +434,7 @@ async fn rebuild_index_recovers_from_drift() {
         .await
         .unwrap();
 
-    let settings = EmbeddingSettings::development_defaults();
+    let settings = test_settings();
     let fp = VectorIndexFingerprint {
         provider: settings.job_provider_id().to_string(),
         model: settings.model.clone(),
@@ -616,7 +631,7 @@ async fn repair_check_reports_status_for_both_sidecars() {
     // files will exist on disk once it returns. We use the shared fingerprint
     // below; the transcript table is empty so the rebuild produces an
     // empty-but-valid sidecar.
-    let settings = EmbeddingSettings::development_defaults();
+    let settings = test_settings();
     let fp = VectorIndexFingerprint {
         provider: settings.job_provider_id().to_string(),
         model: settings.model.clone(),
