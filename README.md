@@ -192,3 +192,48 @@ mem mine ~/.claude/projects/.../session.jsonl
 # Get wake-up context
 mem wake-up --token-budget 800
 ```
+
+## Transcript Archive (conversation_messages)
+
+A second pipeline, fully isolated from `memories`, archives every Claude Code transcript block verbatim and exposes semantic search + ordered replay over those blocks. It exists alongside `memories` so the existing ranking / lifecycle / verbatim-guard surface is **untouched**: separate table (`conversation_messages`), separate embedding queue (`transcript_embedding_jobs`), and a separate HNSW sidecar at `<MEM_DB_PATH>.transcripts.usearch`. `mem mine` is now **dual-sink** — one transcript scan writes both extracted memories (existing path) and every block (text / tool_use / tool_result / thinking) to the archive. Design: [`docs/superpowers/specs/2026-04-30-conversation-archive-design.md`](docs/superpowers/specs/2026-04-30-conversation-archive-design.md).
+
+```bash
+# Ingest a single block (internal — `mem mine` POSTs these for you).
+curl -X POST localhost:3000/transcripts/messages \
+  -H 'content-type: application/json' \
+  -d '{
+    "tenant": "local",
+    "caller_agent": "claude-code",
+    "transcript_path": "/home/me/.claude/projects/foo/abc.jsonl",
+    "line_number": 1,
+    "block_index": 0,
+    "role": "user",
+    "block_type": "text",
+    "content": "how do I debug invoice retry failures?",
+    "embed_eligible": true,
+    "created_at": "2026-04-30T10:00:00Z"
+  }'
+
+# Semantic search over archived blocks (filters are all optional).
+curl -X POST localhost:3000/transcripts/search \
+  -H 'content-type: application/json' \
+  -d '{
+    "tenant": "local",
+    "query": "invoice retry debugging",
+    "role": "assistant",
+    "block_type": "text",
+    "limit": 10
+  }'
+
+# Time-ordered replay of one session (verbatim transcript).
+curl 'localhost:3000/transcripts?tenant=local&session_id=sess_abc'
+```
+
+**MCP does not expose transcript search by design** — agents go through `memory_search`, then use the resulting `session_id` to pull the surrounding transcript via the HTTP endpoints above.
+
+| Variable | Default | Meaning |
+|----------|---------|---------|
+| `MEM_TRANSCRIPT_EMBED_DISABLED` | unset | Set to `1` to stop the transcript embedding worker (e.g. when using OpenAI to avoid double provider spend). Blocks still archive verbatim. |
+| `MEM_TRANSCRIPT_VECTOR_INDEX_FLUSH_EVERY` | 256 | Flush cadence for the transcripts HNSW sidecar; lower than the memories sidecar because per-session bursts are larger. |
+
+`mem repair --check|--rebuild` covers both sidecars (memories and transcripts) in one pass.

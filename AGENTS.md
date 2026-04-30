@@ -22,7 +22,7 @@ cargo clippy --all-targets -- -D warnings      # required by CI
 cross build --release                          # cross-compile (reads ./Cross.toml)
 ```
 
-**Key env vars:** `MEM_DB_PATH` (DuckDB file), `BIND_ADDR` (HTTP bind), `MEM_BASE_URL` / `MEM_TENANT` (MCP forwarder), `MEM_MCP_EXPOSE_EMBEDDINGS=1` (admin tools), `MEM_VECTOR_INDEX_FLUSH_EVERY` / `_OVERSAMPLE` / `_USE_LEGACY` (HNSW sidecar tuning).
+**Key env vars:** `MEM_DB_PATH` (DuckDB file), `BIND_ADDR` (HTTP bind), `MEM_BASE_URL` / `MEM_TENANT` (MCP forwarder), `MEM_MCP_EXPOSE_EMBEDDINGS=1` (admin tools), `MEM_VECTOR_INDEX_FLUSH_EVERY` / `_OVERSAMPLE` / `_USE_LEGACY` (HNSW sidecar tuning), `MEM_TRANSCRIPT_EMBED_DISABLED=1` / `MEM_TRANSCRIPT_VECTOR_INDEX_FLUSH_EVERY` (transcript-archive worker + sidecar tuning).
 
 ---
 
@@ -43,6 +43,7 @@ cross build --release                          # cross-compile (reads ./Cross.to
 - **Embedding pipeline is async + persistent**: writes enqueue rows in `embedding_jobs` (DuckDB table); `service/embedding_worker.rs` consumes with retry/backoff and mirrors successful upserts into `VectorIndex`. Provider trait under `src/embedding/` (embed_anything local / OpenAI / fake). Failure does not block ingest — jobs go `pending → processing → completed | failed | stale`.
 - **Memory has lifecycle, not just CRUD**: `MemoryStatus = Provisional | Active | PendingConfirmation`, `supersedes_memory_id` forms version chains, `feedback_events` mutate `confidence` / `decay_score`. New code touching memories must respect status transitions — see `domain/memory.rs`.
 - **CLI layer (`src/cli/`)**: home of subcommand handlers other than `serve` / `mcp`. Currently houses `cli/repair.rs`. Pattern: handler returns `i32` (process exit code); `main.rs` dispatches and `std::process::exit`s.
+- **Transcript archive (parallel pipeline to memories)**: a verbatim conversation archive lives alongside `memories` with **zero shared state**. Separate table `conversation_messages` (storage entry: `src/storage/transcript_repo.rs`), separate queue `transcript_embedding_jobs`, separate HNSW sidecar at `<MEM_DB_PATH>.transcripts.usearch`, separate worker `src/service/transcript_embedding_worker.rs`. HTTP entry is `src/http/transcripts.rs` (`POST /transcripts/messages`, `POST /transcripts/search`, `GET /transcripts?session_id=…&tenant=…`). `mem mine` is **dual-sink**: one transcript scan writes both extracted memories (unchanged) and every block (text / tool_use / tool_result / thinking) to the archive. `mem repair` covers both sidecars. MCP surface is intentionally untouched — transcript search is HTTP-only by design. Spec: `docs/superpowers/specs/2026-04-30-conversation-archive-design.md`.
 
 ---
 
