@@ -543,7 +543,7 @@ impl MemoryService {
         query: SearchMemoryRequest,
     ) -> Result<SearchMemoryResponse, ServiceError> {
         let tenant = query.tenant.as_deref().unwrap_or("local");
-        let lexical = self.repository.search_candidates(tenant).await?;
+        let lexical = self.lexical_candidates(tenant, &query.query).await?;
 
         let semantic = if let Some(provider) = self.embedding_search_provider.as_ref() {
             match provider.embed_text(&query.query).await {
@@ -569,7 +569,7 @@ impl MemoryService {
             Ok(ranked) => ranked,
             Err(e) => {
                 tracing::warn!(error = %e, "graph backend error during rank_with_graph_hybrid; falling back to no graph boost");
-                let lex2 = self.repository.search_candidates(tenant).await?;
+                let lex2 = self.lexical_candidates(tenant, &query.query).await?;
                 if semantic.is_empty() {
                     retrieve::rank_candidates(lex2, &query)
                 } else {
@@ -579,6 +579,55 @@ impl MemoryService {
         };
 
         Ok(compress::compress(&ranked, query.token_budget))
+    }
+
+    /// Lexical candidate selection.
+    ///
+    /// Returns the full live set for the tenant, but with BM25-matching rows
+    /// **moved to the front** so they get the highest RRF lexical rank in
+    /// `retrieve::merge_and_rank_hybrid`. Non-matching rows still enter the
+    /// pipeline so semantic / scope / freshness signals can score them; the
+    /// relevance floor in `retrieve::finalize` drops anything that fails to
+    /// accumulate enough signal.
+    ///
+    /// This keeps BM25 a ranking signal rather than a hard filter — relevant
+    /// rows bubble up, irrelevant rows get filtered by the threshold instead
+    /// of being pre-excluded from scoring.
+    async fn lexical_candidates(
+        &self,
+        tenant: &str,
+        query: &str,
+    ) -> Result<Vec<MemoryRecord>, ServiceError> {
+        const BM25_TOP_K: usize = 48;
+
+        let all = self
+            .repository
+            .search_candidates(tenant)
+            .await
+            .map_err(ServiceError::Storage)?;
+
+        if query.trim().is_empty() || all.is_empty() {
+            return Ok(all);
+        }
+
+        let bm25 = self
+            .repository
+            .bm25_candidates(tenant, query, BM25_TOP_K)
+            .await
+            .map_err(ServiceError::Storage)?;
+
+        if bm25.is_empty() {
+            return Ok(all);
+        }
+
+        let bm25_ids: HashSet<String> = bm25.iter().map(|m| m.memory_id.clone()).collect();
+        let mut combined = bm25;
+        for memory in all {
+            if !bm25_ids.contains(&memory.memory_id) {
+                combined.push(memory);
+            }
+        }
+        Ok(combined)
     }
 
     async fn enqueue_embedding_job_for_memory(
