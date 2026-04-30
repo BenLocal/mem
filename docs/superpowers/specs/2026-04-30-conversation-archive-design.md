@@ -79,7 +79,7 @@ Claude Code transcript (~/.claude/projects/<proj>/<session>.jsonl)
 
 ## Schema
 
-新增 `db/schema/005_conversation_messages.sql`（append-only 约定；**不**修改 001-004）：
+新增 `db/schema/006_conversation_messages.sql`（append-only 约定；**不**修改 001-004）：
 
 ```sql
 -- Conversation archive: every block of every transcript message,

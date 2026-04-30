@@ -1,7 +1,10 @@
 use std::{
     collections::{HashMap, HashSet, VecDeque},
     path::Path,
-    sync::{Arc, Mutex, MutexGuard, RwLock},
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc, Mutex, MutexGuard, RwLock,
+    },
 };
 
 use duckdb::{params, Connection, OptionalExt};
@@ -91,6 +94,11 @@ pub struct DuckDbRepository {
     /// `create_conversation_message` errors loudly rather than silently using
     /// a default that may diverge from the configured provider.
     transcript_job_provider: Arc<RwLock<Option<String>>>,
+    /// Set whenever a row is inserted into `memories` whose summary/content
+    /// would change BM25 results. Cleared by `bm25_candidates` after a
+    /// successful index rebuild. DuckDB FTS is non-incremental, so we
+    /// rebuild lazily on the next BM25 query rather than after every write.
+    fts_dirty: Arc<AtomicBool>,
 }
 
 #[derive(Debug, Error)]
@@ -124,6 +132,9 @@ impl DuckDbRepository {
             conn: Arc::new(Mutex::new(conn)),
             vector_index: Arc::new(RwLock::new(None)),
             transcript_job_provider: Arc::new(RwLock::new(None)),
+            // Force a build on the very first BM25 query so a freshly opened
+            // (or previously upgraded) DB doesn't silently miss results.
+            fts_dirty: Arc::new(AtomicBool::new(true)),
         })
     }
 
@@ -213,6 +224,7 @@ impl DuckDbRepository {
                 stored.last_validated_at,
             ],
         )?;
+        self.fts_dirty.store(true, Ordering::Release);
 
         Ok(memory)
     }
@@ -1001,6 +1013,90 @@ impl DuckDbRepository {
         Ok(candidates)
     }
 
+    /// BM25 lexical retrieval. Returns up to `k` records ranked by BM25 score
+    /// for the tenant's live memories, omitting rejected/archived rows. An
+    /// empty `query` yields an empty result.
+    ///
+    /// DuckDB FTS is non-incremental: the index is rebuilt lazily here when
+    /// any prior write set the dirty flag. The rebuild is a single PRAGMA
+    /// call and runs under the same connection mutex as everything else, so
+    /// concurrent searches see a consistent snapshot.
+    pub async fn bm25_candidates(
+        &self,
+        tenant: &str,
+        query: &str,
+        k: usize,
+    ) -> Result<Vec<MemoryRecord>, StorageError> {
+        if query.trim().is_empty() || k == 0 {
+            return Ok(vec![]);
+        }
+        self.ensure_fts_index_fresh()?;
+
+        let scored: Vec<(String, f64)> = {
+            let conn = self.conn()?;
+            let mut stmt = conn.prepare(
+                "with scored as (
+                    select memory_id,
+                           fts_main_memories.match_bm25(memory_id, ?1, conjunctive := 0) as bm25
+                    from memories
+                    where tenant = ?2
+                      and status not in ('rejected', 'archived')
+                )
+                 select memory_id, bm25
+                 from scored
+                 where bm25 is not null
+                 order by bm25 desc
+                 limit ?3",
+            )?;
+            let rows = stmt.query_map(params![query, tenant, k as i64], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, f64>(1)?))
+            })?;
+            rows.collect::<Result<Vec<_>, _>>()?
+        };
+
+        if scored.is_empty() {
+            return Ok(vec![]);
+        }
+
+        let id_refs: Vec<&str> = scored.iter().map(|(id, _)| id.as_str()).collect();
+        let mut records = self.fetch_memories_by_ids(tenant, &id_refs).await?;
+
+        // Preserve BM25 rank order — `fetch_memories_by_ids` returns rows in
+        // arbitrary order.
+        let rank_by_id: HashMap<&str, usize> = scored
+            .iter()
+            .enumerate()
+            .map(|(i, (id, _))| (id.as_str(), i))
+            .collect();
+        records.sort_by_key(|m| *rank_by_id.get(m.memory_id.as_str()).unwrap_or(&usize::MAX));
+
+        Ok(records)
+    }
+
+    /// Rebuilds the FTS index if any write since the last build set the dirty
+    /// flag. Cheap when clean. Only invoked on the BM25 read path.
+    fn ensure_fts_index_fresh(&self) -> Result<(), StorageError> {
+        if !self.fts_dirty.swap(false, Ordering::AcqRel) {
+            return Ok(());
+        }
+        let conn = self.conn()?;
+        // `LOAD fts;` is normally done at bootstrap, but defensive in case
+        // the extension state was reset. The bundled FTS extension does not
+        // accept the `overwrite := 1` named arg, so we drop-then-create for
+        // idempotency. `drop_fts_index` is best-effort: it errors on first
+        // run when the index doesn't exist yet, which we tolerate.
+        let _ = conn.execute_batch("load fts;");
+        let _ = conn.execute_batch("pragma drop_fts_index('memories');");
+        if let Err(e) = conn.execute_batch(
+            "pragma create_fts_index('memories', 'memory_id', 'summary', 'content');",
+        ) {
+            // Restore the flag so the next caller retries the build.
+            self.fts_dirty.store(true, Ordering::Release);
+            return Err(StorageError::DuckDb(e));
+        }
+        Ok(())
+    }
+
     /// Returns [`MemoryRecord`] rows for the given ids, filtered to a tenant and
     /// the standard "live" status set (excludes `rejected` and `archived`).
     /// Used by the rewritten `semantic_search_memories` (Task 14) as an ANN post-filter.
@@ -1136,6 +1232,7 @@ impl DuckDbRepository {
                     stored.last_validated_at,
                 ],
             )?;
+            self.fts_dirty.store(true, Ordering::Release);
             restore_embedding_references(&conn, &jobs, embedding.as_ref())?;
         }
 

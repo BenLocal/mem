@@ -14,12 +14,48 @@ struct ScoredMemory {
     score: i64,
 }
 
+/// Default relevance floor: a memory must reach this score to surface in
+/// results. Sized to let a pure semantic-rank-1 hit through (~16 RRF +
+/// modest lifecycle baseline), while filtering candidates that have no
+/// textual or semantic signal at all. Tunable via `MEM_MIN_SCORE`. Raise
+/// it to be more aggressive about filtering scope-only matches.
+const DEFAULT_MIN_RELEVANCE_SCORE: i64 = 25;
+
+fn min_relevance_score() -> i64 {
+    std::env::var("MEM_MIN_SCORE")
+        .ok()
+        .and_then(|v| v.parse::<i64>().ok())
+        .unwrap_or(DEFAULT_MIN_RELEVANCE_SCORE)
+}
+
+/// Filters scored candidates by the relevance floor and strips scores.
+/// Used at every user-visible exit point so empty results bubble up to
+/// `compress`, which renders them as empty sections.
+///
+/// `Preference` (rendered as Directive) and `Workflow` (rendered as
+/// Suggested Workflow) are "always-applicable" memory types: they describe
+/// background guidance / procedural defaults that should surface regardless
+/// of textual match with the current query. The relevance floor only gates
+/// the relevance-driven sections (Facts, Patterns).
+fn finalize(scored: Vec<ScoredMemory>) -> Vec<MemoryRecord> {
+    let floor = min_relevance_score();
+    scored
+        .into_iter()
+        .filter(|entry| {
+            matches!(
+                entry.memory.memory_type,
+                MemoryType::Preference | MemoryType::Workflow
+            ) || entry.score > floor
+        })
+        .map(|entry| entry.memory)
+        .collect()
+}
+
 pub fn rank_candidates(
     candidates: Vec<MemoryRecord>,
     query: &SearchMemoryRequest,
 ) -> Vec<MemoryRecord> {
-    let scored = score_candidates(candidates, query, &HashSet::new(), 0);
-    scored.into_iter().map(|entry| entry.memory).collect()
+    finalize(score_candidates(candidates, query, &HashSet::new(), 0))
 }
 
 pub fn merge_and_rank_hybrid(
@@ -29,6 +65,24 @@ pub fn merge_and_rank_hybrid(
     related_memory_ids: &HashSet<String>,
     graph_boost: i64,
 ) -> Vec<MemoryRecord> {
+    finalize(merge_and_rank_hybrid_scored(
+        lexical,
+        semantic,
+        query,
+        related_memory_ids,
+        graph_boost,
+    ))
+}
+
+/// Internal: hybrid scoring without the relevance-floor filter. Used by
+/// graph-expansion paths that need the unfiltered top-N to derive anchors.
+fn merge_and_rank_hybrid_scored(
+    lexical: Vec<MemoryRecord>,
+    semantic: Vec<(MemoryRecord, f32)>,
+    query: &SearchMemoryRequest,
+    related_memory_ids: &HashSet<String>,
+    graph_boost: i64,
+) -> Vec<ScoredMemory> {
     let lexical_ranks: HashMap<String, usize> = lexical
         .iter()
         .enumerate()
@@ -55,7 +109,7 @@ pub fn merge_and_rank_hybrid(
 
     let candidates: Vec<MemoryRecord> = by_id.into_values().collect();
 
-    let scored = if use_legacy_ranker() {
+    if use_legacy_ranker() {
         score_candidates_hybrid_legacy(
             candidates,
             query,
@@ -73,9 +127,7 @@ pub fn merge_and_rank_hybrid(
             &lexical_ranks,
             &semantic_ranks,
         )
-    };
-
-    scored.into_iter().map(|entry| entry.memory).collect()
+    }
 }
 
 fn use_legacy_ranker() -> bool {
@@ -105,11 +157,14 @@ pub async fn rank_with_graph_hybrid(
         ));
     }
 
-    let preliminary =
-        merge_and_rank_hybrid(lexical.clone(), semantic.clone(), query, &HashSet::new(), 0);
-    let anchors = graph_anchor_nodes_from_records(&preliminary);
+    // Use the unfiltered scored output to derive graph anchors — anchor
+    // selection should consider the full top-N regardless of the relevance
+    // floor; the floor only gates the *user-visible* result.
+    let preliminary_scored =
+        merge_and_rank_hybrid_scored(lexical.clone(), semantic.clone(), query, &HashSet::new(), 0);
+    let anchors = graph_anchor_nodes(&preliminary_scored);
     if anchors.is_empty() {
-        return Ok(preliminary);
+        return Ok(finalize(preliminary_scored));
     }
 
     let related_memory_ids = graph.related_memory_ids(&anchors).await?;
@@ -135,7 +190,7 @@ pub async fn rank_with_graph(
     let base = score_candidates(candidates, query, &HashSet::new(), 0);
     let anchor_nodes = graph_anchor_nodes(&base);
     if anchor_nodes.is_empty() {
-        return Ok(base.into_iter().map(|entry| entry.memory).collect());
+        return Ok(finalize(base));
     }
 
     let related_memory_ids = graph.related_memory_ids(&anchor_nodes).await?;
@@ -146,7 +201,7 @@ pub async fn rank_with_graph(
         &related_lookup,
         12,
     );
-    Ok(rescored.into_iter().map(|entry| entry.memory).collect())
+    Ok(finalize(rescored))
 }
 
 pub async fn candidate_memory_ids(
@@ -163,16 +218,6 @@ pub async fn candidate_memory_ids(
     nodes.sort();
     nodes.dedup();
     graph.related_memory_ids(&nodes).await
-}
-
-fn graph_anchor_nodes_from_records(memories: &[MemoryRecord]) -> Vec<String> {
-    let wrap: Vec<ScoredMemory> = memories
-        .iter()
-        .take(5)
-        .cloned()
-        .map(|memory| ScoredMemory { memory, score: 0 })
-        .collect();
-    graph_anchor_nodes(&wrap)
 }
 
 /// Computes the additive non-recall portion of a memory's score, covering

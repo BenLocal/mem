@@ -4,7 +4,7 @@
 
 **Goal:** Add a parallel pipeline to mem that stores every Claude Code transcript block verbatim in a new `conversation_messages` table, with its own embedding queue and HNSW sidecar — completely isolated from the existing `memories` pipeline (no changes to ranking, lifecycle, verbatim guard, or compress).
 
-**Architecture:** A new schema migration (`005_conversation_messages.sql`) introduces two tables. New domain types, repository methods, a copy of the embedding worker, a new HTTP module (`http/transcripts.rs`), and a new service module (`service/transcript_service.rs`) drive a `POST /transcripts/messages` ingest endpoint, a `POST /transcripts/search` semantic search endpoint, and a `GET /transcripts?session_id=…` retrieval endpoint. `cli/mine.rs` is extended so a single transcript scan writes to both `memories` (existing path, unchanged) and `conversation_messages` (new). `mem repair` learns to check/rebuild the second sidecar at `<MEM_DB_PATH>.transcripts.usearch`.
+**Architecture:** A new schema migration (`006_conversation_messages.sql`) introduces two tables. New domain types, repository methods, a copy of the embedding worker, a new HTTP module (`http/transcripts.rs`), and a new service module (`service/transcript_service.rs`) drive a `POST /transcripts/messages` ingest endpoint, a `POST /transcripts/search` semantic search endpoint, and a `GET /transcripts?session_id=…` retrieval endpoint. `cli/mine.rs` is extended so a single transcript scan writes to both `memories` (existing path, unchanged) and `conversation_messages` (new). `mem repair` learns to check/rebuild the second sidecar at `<MEM_DB_PATH>.transcripts.usearch`.
 
 **Tech Stack:** Rust 2021, DuckDB (bundled), `usearch` HNSW, axum HTTP, tokio, `reqwest` (for `mem mine` CLI), `uuid::Uuid::now_v7()`, `serde_json`, integration tests in `tests/` against ephemeral DuckDB.
 
@@ -14,7 +14,7 @@
 
 ## Conventions referenced throughout
 
-- **Append-only schema files**: never edit `001_init.sql`–`004_sessions.sql`; new tables go in `005_conversation_messages.sql`.
+- **Append-only schema files**: never edit `001_init.sql`–`004_sessions.sql`; new tables go in `006_conversation_messages.sql`.
 - **Single-writer DB**: all writes serialize through `Arc<Mutex<Connection>>`. Never split a logical unit (insert message + enqueue job) across two acquisitions.
 - **Verbatim**: `conversation_messages.content` stores the block text exactly as it appeared in the transcript; never trim, never reformat.
 - **Consistent test pattern**: integration tests use `axum::Router` + ephemeral DuckDB, see `tests/sessions_integration.rs` and `tests/ingest_api.rs` for the existing test-app builder.
@@ -25,7 +25,7 @@
 ## File Structure (locked decisions)
 
 **Created:**
-- `db/schema/005_conversation_messages.sql`
+- `db/schema/006_conversation_messages.sql`
 - `src/domain/conversation_message.rs`
 - `src/service/transcript_service.rs`
 - `src/service/transcript_embedding_worker.rs`
@@ -55,10 +55,10 @@
 
 ---
 
-## Task 1: Schema migration `005_conversation_messages.sql`
+## Task 1: Schema migration `006_conversation_messages.sql`
 
 **Files:**
-- Create: `db/schema/005_conversation_messages.sql`
+- Create: `db/schema/006_conversation_messages.sql`
 - Test: `tests/conversation_archive.rs`
 
 - [ ] **Step 1: Write the failing schema integration test**
@@ -124,7 +124,7 @@ Expected: FAIL — "Table conversation_messages does not exist" or similar from 
 
 - [ ] **Step 3: Add the migration file**
 
-Create `db/schema/005_conversation_messages.sql`:
+Create `db/schema/006_conversation_messages.sql`:
 
 ```sql
 -- Conversation archive: every block of every transcript message,
@@ -209,7 +209,7 @@ The migration file is automatically picked up by `src/storage/schema.rs` (verify
 
 - [ ] **Step 4: Wire migration into schema loader**
 
-Read `src/storage/schema.rs` to find how 001-004 are loaded. Add `005_conversation_messages.sql` to the same list. Example pattern (verify against actual code):
+Read `src/storage/schema.rs` to find how 001-004 are loaded. Add `006_conversation_messages.sql` to the same list. Example pattern (verify against actual code):
 
 ```rust
 const MIGRATIONS: &[(&str, &str)] = &[
@@ -217,7 +217,7 @@ const MIGRATIONS: &[(&str, &str)] = &[
     ("002_embeddings.sql", include_str!("../../db/schema/002_embeddings.sql")),
     ("003_graph.sql", include_str!("../../db/schema/003_graph.sql")),
     ("004_sessions.sql", include_str!("../../db/schema/004_sessions.sql")),
-    ("005_conversation_messages.sql", include_str!("../../db/schema/005_conversation_messages.sql")),
+    ("006_conversation_messages.sql", include_str!("../../db/schema/006_conversation_messages.sql")),
 ];
 ```
 
@@ -231,7 +231,7 @@ Expected: PASS.
 - [ ] **Step 6: Commit**
 
 ```bash
-git add db/schema/005_conversation_messages.sql src/storage/schema.rs tests/conversation_archive.rs
+git add db/schema/006_conversation_messages.sql src/storage/schema.rs tests/conversation_archive.rs
 git commit -m "feat(transcripts): add conversation_messages and embedding queue schema"
 ```
 
@@ -2433,7 +2433,7 @@ Run before declaring the plan complete:
 - `MessageRole::as_db_str` ↔ `from_db_str` ↔ `serde(rename_all = "lowercase")` all produce `"user" | "assistant" | "system"`.
 - `BlockType::as_db_str` ↔ `from_db_str` ↔ `serde(rename_all = "snake_case")` all produce `"text" | "tool_use" | "tool_result" | "thinking"`.
 - `cli/mine.rs` POST payload uses these exact strings.
-- `005_conversation_messages.sql` CHECK constraints use these exact strings.
+- `006_conversation_messages.sql` CHECK constraints use these exact strings.
 
 If a check fails during execution, fix in place and re-run the suite.
 
