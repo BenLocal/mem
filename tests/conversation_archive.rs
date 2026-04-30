@@ -139,3 +139,61 @@ async fn create_conversation_message_is_idempotent_on_unique_conflict() {
         .unwrap();
     assert_eq!(job_count, 1, "no duplicate job on idempotent insert");
 }
+
+#[tokio::test]
+async fn get_by_session_returns_time_ordered_blocks() {
+    let tmp = TempDir::new().unwrap();
+    let db = tmp.path().join("mem.duckdb");
+    let repo = DuckDbRepository::open(&db).await.unwrap();
+
+    let mut m1 = sample_message("a", true, BlockType::Text);
+    m1.created_at = "2026-04-30T00:00:02Z".to_string();
+    m1.line_number = 1;
+
+    let mut m2 = sample_message("b", true, BlockType::Text);
+    m2.created_at = "2026-04-30T00:00:01Z".to_string();
+    m2.line_number = 2;
+
+    let mut m3 = sample_message("c", false, BlockType::ToolUse);
+    m3.created_at = "2026-04-30T00:00:03Z".to_string();
+    m3.line_number = 3;
+
+    repo.create_conversation_message(&m1).await.unwrap();
+    repo.create_conversation_message(&m2).await.unwrap();
+    repo.create_conversation_message(&m3).await.unwrap();
+
+    let out = repo
+        .get_conversation_messages_by_session("local", "sess-1")
+        .await
+        .unwrap();
+
+    assert_eq!(out.len(), 3);
+    assert_eq!(out[0].message_block_id, "mb-b"); // earliest
+    assert_eq!(out[1].message_block_id, "mb-a");
+    assert_eq!(out[2].message_block_id, "mb-c"); // latest
+}
+
+#[tokio::test]
+async fn fetch_conversation_messages_by_ids_preserves_input_order() {
+    let tmp = TempDir::new().unwrap();
+    let db = tmp.path().join("mem.duckdb");
+    let repo = DuckDbRepository::open(&db).await.unwrap();
+
+    for (i, suffix) in ["x", "y", "z"].iter().enumerate() {
+        let mut m = sample_message(suffix, true, BlockType::Text);
+        m.line_number = (i + 1) as u64;
+        repo.create_conversation_message(&m).await.unwrap();
+    }
+
+    // Search returns ranked by score, so we ask the repo to fetch in a specific order.
+    let ids = vec!["mb-z".to_string(), "mb-x".to_string(), "mb-y".to_string()];
+    let out = repo
+        .fetch_conversation_messages_by_ids("local", &ids)
+        .await
+        .unwrap();
+
+    assert_eq!(out.len(), 3);
+    assert_eq!(out[0].message_block_id, "mb-z");
+    assert_eq!(out[1].message_block_id, "mb-x");
+    assert_eq!(out[2].message_block_id, "mb-y");
+}
