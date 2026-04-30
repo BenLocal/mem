@@ -3,9 +3,9 @@
 //! The single point of truth for assembling an [`AppState`] in tests.
 //! Each test file picks the [`MemoryService`] flavor it needs (e.g.
 //! `MemoryService::new`, `new_with_graph`, `with_graph_and_embedding_providers`)
-//! and hands the constructed service to [`test_app_state`]; the helper then
-//! fills in the rest of the `AppState` plumbing — currently the in-memory
-//! `transcript_index` placeholder.
+//! and hands the repo + constructed service to [`test_app_state`]; the helper
+//! then fills in the rest of the `AppState` plumbing — currently the in-memory
+//! `transcript_index` placeholder and a no-provider [`TranscriptService`].
 //!
 //! Centralising the boilerplate here means future `AppState` field additions
 //! only need a one-line edit in this module instead of an N-file mechanical
@@ -20,19 +20,27 @@
 
 use std::sync::Arc;
 
-use mem::{app::AppState, service::MemoryService, storage::VectorIndex};
+use mem::{
+    app::AppState,
+    service::{MemoryService, TranscriptService},
+    storage::{DuckDbRepository, VectorIndex},
+};
 
 /// Builds an [`AppState`] suitable for integration tests.
 ///
-/// The caller picks the [`MemoryService`] flavor it needs — plain `new`,
-/// `new_with_graph`, `with_graph_and_embedding_providers`, etc. — and this
-/// helper assembles the rest of the `AppState`. Currently that means the
-/// `transcript_index` placeholder; future fields land here too so individual
-/// test suites don't need to be edited.
-pub fn test_app_state(memory_service: MemoryService) -> AppState {
+/// The caller passes the open [`DuckDbRepository`] (already seeded as needed)
+/// and the [`MemoryService`] flavor under test. The helper provides the
+/// transcript-side pieces: an 8-dim in-memory `VectorIndex` placeholder and
+/// a [`TranscriptService`] with no embedding provider attached. Tests that
+/// need a real-sized index or a live provider should bypass this helper and
+/// construct `AppState` directly.
+pub fn test_app_state(repo: DuckDbRepository, memory_service: MemoryService) -> AppState {
+    let transcript_index = Arc::new(VectorIndex::new_in_memory(8, "fake", "fake", 8));
+    let transcript_service = TranscriptService::new(repo, transcript_index.clone(), None);
     AppState {
         memory_service,
         config: mem::config::Config::local(),
-        transcript_index: Arc::new(VectorIndex::new_in_memory(8, "fake", "fake", 8)),
+        transcript_index,
+        transcript_service,
     }
 }

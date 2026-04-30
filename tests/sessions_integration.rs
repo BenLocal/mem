@@ -92,7 +92,7 @@ async fn fresh_app() -> TestApp {
     let db_path = temp_dir.path().join("sessions-integration.duckdb");
     let repo = DuckDbRepository::open(&db_path).await.unwrap();
 
-    let state = common::test_app_state(mem::service::MemoryService::new(repo));
+    let state = common::test_app_state(repo.clone(), mem::service::MemoryService::new(repo));
 
     TestApp {
         _temp_dir: Some(temp_dir),

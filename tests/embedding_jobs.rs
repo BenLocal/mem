@@ -162,7 +162,7 @@ async fn http_ingest_creates_embedding_job() {
     let dir = tempdir().unwrap();
     let db = dir.path().join("http-ej.duckdb");
     let repo = DuckDbRepository::open(&db).await.unwrap();
-    let state = common::test_app_state(MemoryService::new(repo.clone()));
+    let state = common::test_app_state(repo.clone(), MemoryService::new(repo.clone()));
     let router = http::router().with_state(state);
 
     let request = axum::http::Request::builder()

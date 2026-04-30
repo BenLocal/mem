@@ -88,7 +88,8 @@ async fn test_app() -> TestApp {
     let temp_dir = tempdir().unwrap();
     let db_path = temp_dir.path().join("workflow-test.duckdb");
     let repo = DuckDbRepository::open(&db_path).await.unwrap();
-    let state = common::test_app_state(mem::service::MemoryService::new(repo.clone()));
+    let state =
+        common::test_app_state(repo.clone(), mem::service::MemoryService::new(repo.clone()));
 
     TestApp {
         _temp_dir: temp_dir,

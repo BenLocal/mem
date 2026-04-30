@@ -121,7 +121,7 @@ async fn seeded_search_app(memories: Vec<MemoryRecord>) -> TestApp {
         graph.sync_memory(&memory).await.unwrap();
     }
 
-    let state = common::test_app_state(MemoryService::new_with_graph(repo, graph));
+    let state = common::test_app_state(repo.clone(), MemoryService::new_with_graph(repo, graph));
 
     TestApp {
         _temp_dir: temp_dir,

@@ -135,7 +135,7 @@ async fn seeded_app(memories: Vec<MemoryRecord>) -> TestApp {
         repo.insert_memory(memory).await.unwrap();
     }
 
-    let state = common::test_app_state(mem::service::MemoryService::new(repo));
+    let state = common::test_app_state(repo.clone(), mem::service::MemoryService::new(repo));
 
     TestApp {
         _temp_dir: Some(temp_dir),

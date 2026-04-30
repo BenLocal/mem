@@ -5,7 +5,7 @@ use tracing::info;
 
 use crate::{
     http,
-    service::MemoryService,
+    service::{MemoryService, TranscriptService},
     storage::{DuckDbGraphStore, DuckDbRepository, VectorIndex, VectorIndexFingerprint},
 };
 
@@ -14,10 +14,13 @@ pub struct AppState {
     pub memory_service: MemoryService,
     pub config: crate::config::Config,
     /// Transcript-archive HNSW sidecar. Held on `AppState` (not on the
-    /// repository like the memories index) so Task 9's `TranscriptService`
-    /// can take an explicit `Arc<VectorIndex>` rather than reaching through
-    /// the repository for it.
+    /// repository like the memories index) so [`TranscriptService`] can take
+    /// an explicit `Arc<VectorIndex>` rather than reaching through the
+    /// repository for it.
     pub transcript_index: Arc<VectorIndex>,
+    /// Service façade backing the `/transcripts/*` HTTP routes. Cheap to
+    /// clone (wraps `Clone`/`Arc` collaborators) so it can sit on `AppState`.
+    pub transcript_service: TranscriptService,
 }
 
 impl AppState {
@@ -96,6 +99,11 @@ impl AppState {
 
         let embedding_provider = config.embedding.job_provider_id().to_string();
         let graph = Arc::new(DuckDbGraphStore::new(Arc::new(repository.clone())));
+        let transcript_service = TranscriptService::new(
+            repository.clone(),
+            transcript_index.clone(),
+            Some(provider.clone()),
+        );
         let memory_service = MemoryService::with_graph_and_embedding_providers(
             repository,
             graph,
@@ -107,6 +115,7 @@ impl AppState {
             memory_service,
             config,
             transcript_index,
+            transcript_service,
         })
     }
 

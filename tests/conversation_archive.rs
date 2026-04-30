@@ -2,6 +2,8 @@ use mem::domain::{BlockType, ConversationMessage, MessageRole};
 use mem::storage::DuckDbRepository;
 use tempfile::TempDir;
 
+mod common;
+
 fn sample_message(suffix: &str, embed: bool, block_type: BlockType) -> ConversationMessage {
     ConversationMessage {
         message_block_id: format!("mb-{suffix}"),
@@ -291,4 +293,234 @@ async fn recent_conversation_messages_returns_newest_first_limited() {
     assert_eq!(out.len(), 2, "limit caps the result");
     assert_eq!(out[0].message_block_id, "mb-3", "newest first");
     assert_eq!(out[1].message_block_id, "mb-2");
+}
+
+// ---------------------------------------------------------------------------
+// HTTP integration tests for the /transcripts/* surface (Task 9).
+//
+// These build the router directly via `common::test_app_state` instead of
+// going through `app::router_with_config`, to avoid spinning up a real
+// embedding provider for every test. The `TranscriptService` constructed by
+// the helper has `provider = None`, which means semantic queries return zero
+// hits; the empty-query / time-based fallback still works (used by the
+// search filter test below).
+// ---------------------------------------------------------------------------
+
+mod http_routes {
+    use super::*;
+
+    use axum::body::{to_bytes, Body};
+    use axum::http::{Request, StatusCode};
+    use mem::http;
+    use mem::service::MemoryService;
+    use serde_json::{json, Value};
+    use tower::ServiceExt;
+
+    async fn build_router() -> (axum::Router, TempDir, DuckDbRepository) {
+        let dir = TempDir::new().unwrap();
+        let db = dir.path().join("mem.duckdb");
+        let repo = DuckDbRepository::open(&db).await.unwrap();
+        repo.set_transcript_job_provider("embedanything");
+        let state = super::common::test_app_state(repo.clone(), MemoryService::new(repo.clone()));
+        let router = http::router().with_state(state);
+        (router, dir, repo)
+    }
+
+    #[tokio::test]
+    async fn post_transcripts_messages_creates_a_row() {
+        let (app, _dir, _repo) = build_router().await;
+
+        let body = json!({
+            "session_id": "sess-1",
+            "tenant": "local",
+            "caller_agent": "claude-code",
+            "transcript_path": "/tmp/t.jsonl",
+            "line_number": 1,
+            "block_index": 0,
+            "role": "assistant",
+            "block_type": "text",
+            "content": "hello",
+            "embed_eligible": true,
+            "created_at": "2026-04-30T00:00:00Z"
+        });
+
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/transcripts/messages")
+                    .header("content-type", "application/json")
+                    .body(Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let v: Value = serde_json::from_slice(&bytes).unwrap();
+        assert!(v["message_block_id"].is_string());
+        let id = v["message_block_id"].as_str().unwrap();
+        assert!(!id.is_empty(), "service should mint a non-empty id");
+    }
+
+    #[tokio::test]
+    async fn get_transcripts_by_session_returns_blocks() {
+        let (app, _dir, _repo) = build_router().await;
+
+        // Seed two blocks via POST.
+        for i in 0..2u64 {
+            let body = json!({
+                "session_id": "sess-X",
+                "tenant": "local",
+                "caller_agent": "claude-code",
+                "transcript_path": "/tmp/t.jsonl",
+                "line_number": i + 1,
+                "block_index": 0,
+                "role": "user",
+                "block_type": "text",
+                "content": format!("msg-{i}"),
+                "embed_eligible": false,
+                "created_at": format!("2026-04-30T00:00:0{i}Z")
+            });
+            let resp = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri("/transcripts/messages")
+                        .header("content-type", "application/json")
+                        .body(Body::from(body.to_string()))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), StatusCode::OK);
+        }
+
+        // Fetch.
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/transcripts?session_id=sess-X&tenant=local")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let v: Value = serde_json::from_slice(&bytes).unwrap();
+        let messages = v["messages"].as_array().expect("messages array");
+        assert_eq!(messages.len(), 2);
+        assert_eq!(messages[0]["content"], "msg-0");
+        assert_eq!(messages[1]["content"], "msg-1");
+    }
+
+    #[tokio::test]
+    async fn post_transcripts_search_filters_by_role_and_block_type() {
+        let (app, _dir, _repo) = build_router().await;
+
+        // Seed: 1 user/text, 1 assistant/text, 1 assistant/tool_use.
+        // Distinct (line_number) so the unique constraint accepts all three.
+        let seeds = [
+            ("user", "text", "user-says-hello", true, 1u64),
+            ("assistant", "text", "assistant-answers", true, 2u64),
+            (
+                "assistant",
+                "tool_use",
+                r#"{"path":"README.md"}"#,
+                false,
+                3u64,
+            ),
+        ];
+        for (role, block_type, content, eligible, line) in seeds {
+            let body = json!({
+                "session_id": "sess-Y",
+                "tenant": "local",
+                "caller_agent": "claude-code",
+                "transcript_path": "/tmp/t.jsonl",
+                "line_number": line,
+                "block_index": 0,
+                "role": role,
+                "block_type": block_type,
+                "content": content,
+                "embed_eligible": eligible,
+                "created_at": format!("2026-04-30T00:00:0{line}Z"),
+            });
+            let resp = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri("/transcripts/messages")
+                        .header("content-type", "application/json")
+                        .body(Body::from(body.to_string()))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), StatusCode::OK);
+        }
+
+        // Empty query → recent-time fallback (provider is None in tests).
+        // Filter by role=user → expect 1 hit.
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/transcripts/search")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        json!({
+                            "query": "",
+                            "tenant": "local",
+                            "role": "user",
+                            "limit": 10,
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let v: Value = serde_json::from_slice(&bytes).unwrap();
+        let hits = v["hits"].as_array().expect("hits array");
+        assert_eq!(hits.len(), 1, "role=user filters to single match");
+        assert_eq!(hits[0]["role"], "user");
+        assert_eq!(hits[0]["content"], "user-says-hello");
+
+        // Filter by block_type=tool_use → expect 1 hit.
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/transcripts/search")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        json!({
+                            "query": "",
+                            "tenant": "local",
+                            "block_type": "tool_use",
+                            "limit": 10,
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let v: Value = serde_json::from_slice(&bytes).unwrap();
+        let hits = v["hits"].as_array().expect("hits array");
+        assert_eq!(hits.len(), 1, "block_type=tool_use filters to single match");
+        assert_eq!(hits[0]["block_type"], "tool_use");
+    }
 }
