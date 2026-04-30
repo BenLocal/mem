@@ -40,41 +40,187 @@ pub struct ExtractedMemory {
     pub line_number: usize,
 }
 
+/// One transcript block destined for `/transcripts/messages`.
+///
+/// Field semantics mirror `http::transcripts::IngestRequest`. The CLI
+/// produces these from a single linear pass over the JSONL transcript so
+/// the "memories" extract pipeline and the "transcript archive" pipeline
+/// share a single I/O cost.
+pub struct ArchivedBlock {
+    pub session_id: String,
+    pub timestamp: String,
+    pub line_number: usize,
+    pub block_index: usize,
+    pub message_uuid: Option<String>,
+    /// Lowercase: "user" | "assistant" | "system". Matches Task 2's
+    /// `MessageRole` serde rename rule (`rename_all = "lowercase"`).
+    pub role: String,
+    /// snake_case: "text" | "tool_use" | "tool_result" | "thinking".
+    /// Matches Task 2's `BlockType` serde rename rule (`rename_all =
+    /// "snake_case"`).
+    pub block_type: String,
+    pub content: String,
+    pub tool_name: Option<String>,
+    pub tool_use_id: Option<String>,
+}
+
+/// Backwards-compatible wrapper retained for the legacy unit tests in
+/// `tests/cli_mine.rs`. New code should prefer [`parse_transcript_full`]
+/// which also returns the per-block archive payload.
 pub fn parse_transcript(path: &Path) -> Result<Vec<ExtractedMemory>> {
+    parse_transcript_full(path).map(|(mems, _blocks)| mems)
+}
+
+/// Parses a Claude Code JSONL transcript into both extracted memories
+/// (legacy `<mem-save>` / pattern matches) and a flat list of every
+/// block ready to be POSTed to `/transcripts/messages`.
+///
+/// Only `assistant` `text` blocks feed the memory extractor — that
+/// preserves the pre-existing extraction behavior. Every block of every
+/// message (user / assistant / system, all four block types) is added
+/// to the archive output.
+pub fn parse_transcript_full(path: &Path) -> Result<(Vec<ExtractedMemory>, Vec<ArchivedBlock>)> {
     let file = File::open(path)?;
     let reader = BufReader::new(file);
     let mut memories = Vec::new();
+    let mut blocks = Vec::new();
 
-    for (line_num, line) in reader.lines().enumerate() {
+    for (line_idx, line) in reader.lines().enumerate() {
         let line = line?;
         let value: Value = match serde_json::from_str(&line) {
             Ok(v) => v,
             Err(_) => continue,
         };
 
-        if value["type"] != "assistant" {
-            continue;
-        }
+        // Claude Code transcripts use `type` as the message-envelope
+        // discriminator. Only `user`, `assistant`, `system` carry blocks
+        // we want to archive; meta lines (e.g. "custom-title") are
+        // skipped.
+        let role = match value["type"].as_str() {
+            Some(r @ ("user" | "assistant" | "system")) => r,
+            _ => continue,
+        };
 
-        if let Some(content_array) = value["message"]["content"].as_array() {
-            for item in content_array {
+        let session_id = value["sessionId"].as_str().unwrap_or("").to_string();
+        let timestamp = value["timestamp"].as_str().unwrap_or("").to_string();
+        let message_uuid = value["uuid"].as_str().map(|s| s.to_string());
+
+        let Some(content_array) = value["message"]["content"].as_array() else {
+            continue;
+        };
+
+        let line_number = line_idx + 1;
+
+        for (block_idx, item) in content_array.iter().enumerate() {
+            let block_type = item["type"].as_str().unwrap_or("");
+
+            // Memory extraction (legacy path) only runs on assistant
+            // text blocks — same condition the original code enforced.
+            if role == "assistant" && block_type == "text" {
                 if let Some(text) = item["text"].as_str() {
                     if let Some(extracted) = extract_memory(text) {
-                        let session_id = value["sessionId"].as_str().unwrap_or("").to_string();
-                        let timestamp = value["timestamp"].as_str().unwrap_or("").to_string();
                         memories.push(ExtractedMemory {
                             content: extracted,
-                            session_id,
-                            timestamp,
-                            line_number: line_num + 1,
+                            session_id: session_id.clone(),
+                            timestamp: timestamp.clone(),
+                            line_number,
                         });
                     }
                 }
             }
+
+            // Archive every recognized block. Unknown types are skipped
+            // (not an error — Claude Code may add new block kinds and we
+            // shouldn't fail mining a transcript over them).
+            let archived = match block_type {
+                "text" => Some(ArchivedBlock {
+                    session_id: session_id.clone(),
+                    timestamp: timestamp.clone(),
+                    line_number,
+                    block_index: block_idx,
+                    message_uuid: message_uuid.clone(),
+                    role: role.to_string(),
+                    block_type: "text".to_string(),
+                    content: item["text"].as_str().unwrap_or("").to_string(),
+                    tool_name: None,
+                    tool_use_id: None,
+                }),
+                "thinking" => Some(ArchivedBlock {
+                    session_id: session_id.clone(),
+                    timestamp: timestamp.clone(),
+                    line_number,
+                    block_index: block_idx,
+                    message_uuid: message_uuid.clone(),
+                    role: role.to_string(),
+                    block_type: "thinking".to_string(),
+                    content: item["thinking"].as_str().unwrap_or("").to_string(),
+                    tool_name: None,
+                    tool_use_id: None,
+                }),
+                "tool_use" => Some(ArchivedBlock {
+                    session_id: session_id.clone(),
+                    timestamp: timestamp.clone(),
+                    line_number,
+                    block_index: block_idx,
+                    message_uuid: message_uuid.clone(),
+                    role: role.to_string(),
+                    block_type: "tool_use".to_string(),
+                    content: serde_json::to_string(&item["input"]).unwrap_or_default(),
+                    tool_name: item["name"].as_str().map(|s| s.to_string()),
+                    tool_use_id: item["id"].as_str().map(|s| s.to_string()),
+                }),
+                "tool_result" => Some(ArchivedBlock {
+                    session_id: session_id.clone(),
+                    timestamp: timestamp.clone(),
+                    line_number,
+                    block_index: block_idx,
+                    message_uuid: message_uuid.clone(),
+                    role: role.to_string(),
+                    block_type: "tool_result".to_string(),
+                    content: extract_tool_result_content(&item["content"]),
+                    tool_name: None,
+                    tool_use_id: item["tool_use_id"].as_str().map(|s| s.to_string()),
+                }),
+                _ => {
+                    // Unknown block type: silently drop. Logging would
+                    // spam stderr on transcripts that legitimately use
+                    // novel kinds.
+                    None
+                }
+            };
+            if let Some(b) = archived {
+                blocks.push(b);
+            }
         }
     }
 
-    Ok(memories)
+    Ok((memories, blocks))
+}
+
+/// `tool_result.content` in Claude Code transcripts comes in two shapes:
+/// a plain string (older runs) or an array of `{type, text}` objects
+/// (newer multi-part results). Concatenate text parts when an array is
+/// supplied; pass strings through verbatim. Anything else stringifies
+/// the whole JSON value as a fallback so no information is lost.
+fn extract_tool_result_content(value: &Value) -> String {
+    if let Some(s) = value.as_str() {
+        return s.to_string();
+    }
+    if let Some(arr) = value.as_array() {
+        let mut parts = Vec::with_capacity(arr.len());
+        for item in arr {
+            if let Some(t) = item["text"].as_str() {
+                parts.push(t.to_string());
+            } else if let Some(s) = item.as_str() {
+                parts.push(s.to_string());
+            }
+        }
+        return parts.join("\n");
+    }
+    if value.is_null() {
+        return String::new();
+    }
+    serde_json::to_string(value).unwrap_or_default()
 }
 
 fn extract_memory(text: &str) -> Option<String> {
@@ -92,8 +238,8 @@ fn extract_memory(text: &str) -> Option<String> {
 }
 
 pub async fn run(args: MineArgs) -> i32 {
-    let memories = match parse_transcript(&args.transcript_path) {
-        Ok(m) => m,
+    let (memories, blocks) = match parse_transcript_full(&args.transcript_path) {
+        Ok(t) => t,
         Err(e) => {
             eprintln!("Failed to parse transcript: {}", e);
             return 1;
@@ -101,9 +247,14 @@ pub async fn run(args: MineArgs) -> i32 {
     };
 
     let client = reqwest::Client::new();
-    let mut success = 0;
-    let mut failed = 0;
+    let mut mem_ok: u32 = 0;
+    let mut mem_fail: u32 = 0;
+    let mut block_ok: u32 = 0;
+    let mut block_fail: u32 = 0;
 
+    // Legacy memories pipeline — unchanged from the original
+    // implementation. The idempotency_key shape and 409-as-success
+    // handling are explicitly preserved.
     for memory in memories {
         let idempotency_key = format!("{}:{}", args.transcript_path.display(), memory.line_number);
 
@@ -124,26 +275,72 @@ pub async fn run(args: MineArgs) -> i32 {
             .await
         {
             Ok(resp) if resp.status().is_success() || resp.status() == 409 => {
-                success += 1;
+                mem_ok += 1;
             }
             Ok(resp) => {
                 eprintln!("Failed to save memory: {}", resp.status());
-                failed += 1;
+                mem_fail += 1;
             }
             Err(e) => {
                 eprintln!("Request error: {}", e);
-                failed += 1;
+                mem_fail += 1;
+            }
+        }
+    }
+
+    // New transcript-archive pipeline. Block-level idempotency is
+    // enforced server-side by the `(transcript_path, line_number,
+    // block_index)` unique constraint; a duplicate insert still returns
+    // 200 OK (with a freshly minted message_block_id that the server
+    // discards via `INSERT ... ON CONFLICT DO NOTHING`), so we only
+    // need to count 2xx responses.
+    for b in blocks {
+        let embed_eligible = matches!(b.block_type.as_str(), "text" | "thinking");
+        let payload = serde_json::json!({
+            "session_id": b.session_id,
+            "tenant": args.tenant,
+            "caller_agent": args.agent,
+            "transcript_path": args.transcript_path.display().to_string(),
+            "line_number": b.line_number,
+            "block_index": b.block_index,
+            "message_uuid": b.message_uuid,
+            "role": b.role,
+            "block_type": b.block_type,
+            "content": b.content,
+            "tool_name": b.tool_name,
+            "tool_use_id": b.tool_use_id,
+            "embed_eligible": embed_eligible,
+            "created_at": b.timestamp,
+        });
+
+        match client
+            .post(format!("{}/transcripts/messages", args.base_url))
+            .json(&payload)
+            .send()
+            .await
+        {
+            Ok(resp) if resp.status().is_success() => {
+                block_ok += 1;
+            }
+            Ok(resp) => {
+                eprintln!("Failed to archive block: {}", resp.status());
+                block_fail += 1;
+            }
+            Err(e) => {
+                eprintln!("Block POST error: {}", e);
+                block_fail += 1;
             }
         }
     }
 
     println!(
-        "Mined {} memories ({} success, {} failed)",
-        success + failed,
-        success,
-        failed
+        "Mined: memories={}/{} blocks={}/{}",
+        mem_ok,
+        mem_ok + mem_fail,
+        block_ok,
+        block_ok + block_fail
     );
-    if failed > 0 {
+    if mem_fail > 0 || block_fail > 0 {
         1
     } else {
         0
