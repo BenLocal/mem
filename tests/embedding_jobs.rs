@@ -5,9 +5,10 @@ use mem::{
     },
     http,
     service::MemoryService,
-    storage::{DuckDbRepository, EmbeddingJobInsert},
+    storage::{DuckDbRepository, EmbeddingJobInsert, VectorIndex},
 };
 use serde_json::json;
+use std::sync::Arc;
 use tempfile::tempdir;
 use tower::util::ServiceExt;
 
@@ -164,6 +165,7 @@ async fn http_ingest_creates_embedding_job() {
     let state = AppState {
         memory_service: MemoryService::new(repo.clone()),
         config: mem::config::Config::local(),
+        transcript_index: Arc::new(VectorIndex::new_in_memory(8, "fake", "fake", 8)),
     };
     let router = http::router().with_state(state);
 

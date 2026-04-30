@@ -13,6 +13,11 @@ use crate::{
 pub struct AppState {
     pub memory_service: MemoryService,
     pub config: crate::config::Config,
+    /// Transcript-archive HNSW sidecar. Held on `AppState` (not on the
+    /// repository like the memories index) so Task 9's `TranscriptService`
+    /// can take an explicit `Arc<VectorIndex>` rather than reaching through
+    /// the repository for it.
+    pub transcript_index: Arc<VectorIndex>,
 }
 
 impl AppState {
@@ -28,12 +33,24 @@ impl AppState {
         let vector_index =
             Arc::new(VectorIndex::open_or_rebuild(&repository, &config.db_path, &fp).await?);
         repository.attach_vector_index(vector_index.clone());
+        repository.set_transcript_job_provider(config.embedding.job_provider_id());
         info!(
             size = vector_index.size(),
             provider = %fp.provider,
             model = %fp.model,
             dim = fp.dim,
             "vector index ready"
+        );
+
+        let transcript_index = Arc::new(
+            VectorIndex::open_or_rebuild_transcripts(&repository, &config.db_path, &fp).await?,
+        );
+        info!(
+            size = transcript_index.size(),
+            provider = %fp.provider,
+            model = %fp.model,
+            dim = fp.dim,
+            "transcript vector index ready"
         );
 
         let provider = crate::embedding::arc_embedding_provider(&config.embedding)
@@ -57,6 +74,26 @@ impl AppState {
             crate::service::decay_worker::start_decay_worker(Arc::new(repo_decay)).await;
         });
 
+        if !config.embedding.transcript_disabled {
+            let provider_transcript = provider.clone();
+            let repo_transcript = repository.clone();
+            let mut transcript_settings = config.embedding.clone();
+            // Transcript pipeline has its own flush cadence — the memories
+            // value is intentionally *not* reused.
+            transcript_settings.vector_index_flush_every =
+                config.embedding.transcript_vector_index_flush_every;
+            let transcript_index_for_worker = transcript_index.clone();
+            tokio::spawn(async move {
+                crate::service::transcript_embedding_worker::run(
+                    repo_transcript,
+                    provider_transcript,
+                    transcript_settings,
+                    transcript_index_for_worker,
+                )
+                .await;
+            });
+        }
+
         let embedding_provider = config.embedding.job_provider_id().to_string();
         let graph = Arc::new(DuckDbGraphStore::new(Arc::new(repository.clone())));
         let memory_service = MemoryService::with_graph_and_embedding_providers(
@@ -69,6 +106,7 @@ impl AppState {
         Ok(Self {
             memory_service,
             config,
+            transcript_index,
         })
     }
 

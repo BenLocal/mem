@@ -9,9 +9,10 @@ use mem::{
         memory::{MemoryRecord, MemoryStatus, MemoryType, Scope, Visibility},
     },
     http,
-    storage::{duckdb::DuckDbRepository, FeedbackEvent},
+    storage::{duckdb::DuckDbRepository, FeedbackEvent, VectorIndex},
 };
 use serde_json::{json, Value};
+use std::sync::Arc;
 use tempfile::{tempdir, TempDir};
 use tower::util::ServiceExt;
 
@@ -90,6 +91,7 @@ async fn test_app() -> TestApp {
     let state = AppState {
         memory_service: mem::service::MemoryService::new(repo.clone()),
         config: mem::config::Config::local(),
+        transcript_index: Arc::new(VectorIndex::new_in_memory(8, "fake", "fake", 8)),
     };
 
     TestApp {

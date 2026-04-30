@@ -34,6 +34,15 @@ pub struct EmbeddingSettings {
     /// source of truth at search time. See `mempalace-diff §8 #3` Task 14 carryover.
     #[allow(dead_code)]
     pub vector_index_use_legacy: bool,
+    /// When `true`, `app.rs` skips spawning the transcript embedding worker.
+    /// Set via `MEM_TRANSCRIPT_EMBED_DISABLED` (`"1"` or `"true"`,
+    /// case-insensitive). Used by the cli/mine.rs offline pipeline and tests
+    /// that want transcript ingest without a background worker.
+    pub transcript_disabled: bool,
+    /// Sidecar flush cadence (writes between persists) for the transcript HNSW
+    /// index. Set via `MEM_TRANSCRIPT_VECTOR_INDEX_FLUSH_EVERY`. Defaults to
+    /// `256`; `0` is rejected at parse time and falls back to the default.
+    pub transcript_vector_index_flush_every: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -61,6 +70,8 @@ pub enum ConfigError {
     InvalidVectorIndexFlushEvery(String),
     #[error("invalid MEM_VECTOR_INDEX_OVERSAMPLE: {0}")]
     InvalidVectorIndexOversample(String),
+    #[error("invalid MEM_TRANSCRIPT_VECTOR_INDEX_FLUSH_EVERY: {0}")]
+    InvalidTranscriptVectorIndexFlushEvery(String),
 }
 
 impl EmbeddingSettings {
@@ -77,6 +88,8 @@ impl EmbeddingSettings {
             vector_index_flush_every: 100,
             vector_index_oversample: 4,
             vector_index_use_legacy: false,
+            transcript_disabled: false,
+            transcript_vector_index_flush_every: 256,
         }
     }
 
@@ -167,6 +180,24 @@ impl EmbeddingSettings {
         }
         if let Some(raw) = get("MEM_VECTOR_INDEX_USE_LEGACY") {
             s.vector_index_use_legacy = matches!(raw.as_str(), "1" | "true" | "yes");
+        }
+
+        if let Some(raw) = get("MEM_TRANSCRIPT_EMBED_DISABLED") {
+            s.transcript_disabled =
+                matches!(raw.to_ascii_lowercase().as_str(), "1" | "true" | "yes");
+        }
+
+        if let Some(raw) = get("MEM_TRANSCRIPT_VECTOR_INDEX_FLUSH_EVERY") {
+            let n: usize = raw
+                .parse()
+                .map_err(|_| ConfigError::InvalidTranscriptVectorIndexFlushEvery(raw.clone()))?;
+            // `0` is meaningless (would flush on every write and never amortize
+            // disk I/O); reject loudly rather than silently falling back, to
+            // keep parity with `MEM_VECTOR_INDEX_FLUSH_EVERY`'s contract.
+            if n == 0 {
+                return Err(ConfigError::InvalidTranscriptVectorIndexFlushEvery(raw));
+            }
+            s.transcript_vector_index_flush_every = n;
         }
 
         Ok(s)

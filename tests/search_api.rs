@@ -13,7 +13,7 @@ use mem::{
     },
     http,
     service::MemoryService,
-    storage::{DuckDbGraphStore, DuckDbRepository},
+    storage::{DuckDbGraphStore, DuckDbRepository, VectorIndex},
 };
 use serde_json::{json, Value};
 use tempfile::{tempdir, TempDir};
@@ -123,6 +123,7 @@ async fn seeded_search_app(memories: Vec<MemoryRecord>) -> TestApp {
     let state = AppState {
         memory_service: MemoryService::new_with_graph(repo, graph),
         config: mem::config::Config::local(),
+        transcript_index: Arc::new(VectorIndex::new_in_memory(8, "fake", "fake", 8)),
     };
 
     TestApp {

@@ -87,10 +87,17 @@ impl DuckDbRepository {
         if inserted == 1 && msg.embed_eligible {
             let job_id = uuid::Uuid::now_v7().to_string();
             let now = current_timestamp();
-            // TODO(transcripts task 8): thread the configured embedding
-            // provider id through the repo (e.g. via a `with_embedding_job_provider`
-            // builder set in `app.rs`) instead of hardcoding the default.
-            let provider = "embedanything";
+            // Provider id is configured once at startup via
+            // `set_transcript_job_provider` in `app.rs`. Failing loudly here is
+            // preferable to silently substituting a default that would later
+            // mismatch the worker's `job_provider_id()` and dead-letter every
+            // job for the wrong reason.
+            let provider = self
+                .transcript_job_provider()
+                .ok_or(StorageError::InvalidData(
+                    "transcript embedding job provider not configured; \
+                 call DuckDbRepository::set_transcript_job_provider during startup",
+                ))?;
             conn.execute(
                 "insert into transcript_embedding_jobs (
                     job_id, tenant, message_block_id, provider,

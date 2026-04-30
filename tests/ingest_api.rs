@@ -9,9 +9,10 @@ use mem::{
     },
     http,
     pipeline::ingest::{compute_content_hash, initial_status},
-    storage::DuckDbRepository,
+    storage::{DuckDbRepository, VectorIndex},
 };
 use serde_json::{json, Value};
+use std::sync::Arc;
 use tempfile::{tempdir, TempDir};
 use tower::util::ServiceExt;
 
@@ -136,6 +137,7 @@ async fn seeded_app(memories: Vec<MemoryRecord>) -> TestApp {
     let state = AppState {
         memory_service: mem::service::MemoryService::new(repo),
         config: mem::config::Config::local(),
+        transcript_index: Arc::new(VectorIndex::new_in_memory(8, "fake", "fake", 8)),
     };
 
     TestApp {

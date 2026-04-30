@@ -84,6 +84,13 @@ struct MemoryEmbeddingRow {
 pub struct DuckDbRepository {
     conn: Arc<Mutex<Connection>>,
     vector_index: Arc<RwLock<Option<Arc<VectorIndex>>>>,
+    /// Embedding provider id stored on `transcript_embedding_jobs.provider`
+    /// rows enqueued by [`Self::create_conversation_message`]. Set once during
+    /// `app.rs` startup via [`Self::set_transcript_job_provider`]; if `None`
+    /// when a transcript row is inserted with `embed_eligible == true`,
+    /// `create_conversation_message` errors loudly rather than silently using
+    /// a default that may diverge from the configured provider.
+    transcript_job_provider: Arc<RwLock<Option<String>>>,
 }
 
 #[derive(Debug, Error)]
@@ -116,6 +123,7 @@ impl DuckDbRepository {
         Ok(Self {
             conn: Arc::new(Mutex::new(conn)),
             vector_index: Arc::new(RwLock::new(None)),
+            transcript_job_provider: Arc::new(RwLock::new(None)),
         })
     }
 
@@ -137,6 +145,25 @@ impl DuckDbRepository {
         self.vector_index
             .read()
             .expect("vector_index lock poisoned")
+            .clone()
+    }
+
+    /// Sets the embedding provider id used by
+    /// [`Self::create_conversation_message`] when enqueueing transcript
+    /// embedding jobs. Mirrors the [`Self::attach_vector_index`] interior-
+    /// mutability pattern so the repository can be cloned and shared before
+    /// the provider is known.
+    pub fn set_transcript_job_provider(&self, provider: impl Into<String>) {
+        *self
+            .transcript_job_provider
+            .write()
+            .expect("transcript_job_provider lock poisoned") = Some(provider.into());
+    }
+
+    pub(crate) fn transcript_job_provider(&self) -> Option<String> {
+        self.transcript_job_provider
+            .read()
+            .expect("transcript_job_provider lock poisoned")
             .clone()
     }
 

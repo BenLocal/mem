@@ -72,6 +72,7 @@ async fn create_conversation_message_inserts_row_and_optionally_enqueues_job() {
     let tmp = TempDir::new().unwrap();
     let db = tmp.path().join("mem.duckdb");
     let repo = DuckDbRepository::open(&db).await.unwrap();
+    repo.set_transcript_job_provider("embedanything");
 
     // Eligible: row + job
     let m1 = sample_message("eligible", true, BlockType::Text);
@@ -114,6 +115,7 @@ async fn create_conversation_message_is_idempotent_on_unique_conflict() {
     let tmp = TempDir::new().unwrap();
     let db = tmp.path().join("mem.duckdb");
     let repo = DuckDbRepository::open(&db).await.unwrap();
+    repo.set_transcript_job_provider("embedanything");
 
     let m = sample_message("first", true, BlockType::Text);
     repo.create_conversation_message(&m).await.unwrap();
@@ -145,6 +147,7 @@ async fn get_by_session_returns_time_ordered_blocks() {
     let tmp = TempDir::new().unwrap();
     let db = tmp.path().join("mem.duckdb");
     let repo = DuckDbRepository::open(&db).await.unwrap();
+    repo.set_transcript_job_provider("embedanything");
 
     let mut m1 = sample_message("a", true, BlockType::Text);
     m1.created_at = "2026-04-30T00:00:02Z".to_string();
@@ -178,6 +181,7 @@ async fn fetch_conversation_messages_by_ids_preserves_input_order() {
     let tmp = TempDir::new().unwrap();
     let db = tmp.path().join("mem.duckdb");
     let repo = DuckDbRepository::open(&db).await.unwrap();
+    repo.set_transcript_job_provider("embedanything");
 
     for (i, suffix) in ["x", "y", "z"].iter().enumerate() {
         let mut m = sample_message(suffix, true, BlockType::Text);
@@ -203,6 +207,7 @@ async fn transcript_embedding_job_lifecycle() {
     let tmp = TempDir::new().unwrap();
     let db = tmp.path().join("mem.duckdb");
     let repo = DuckDbRepository::open(&db).await.unwrap();
+    repo.set_transcript_job_provider("embedanything");
 
     let m = sample_message("life", true, BlockType::Text);
     repo.create_conversation_message(&m).await.unwrap();

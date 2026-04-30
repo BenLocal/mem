@@ -15,8 +15,8 @@ use tempfile::TempDir;
 
 /// Build an `EmbeddingSettings` with `provider = EmbedAnything` so the worker's
 /// `job.provider != settings.job_provider_id()` sanity check passes — the
-/// repository hardcodes `"embedanything"` on every transcript job (see Task 8
-/// TODO in `transcript_repo.rs::create_conversation_message`). The actual
+/// fixtures call `set_transcript_job_provider("embedanything")` after opening
+/// the repo so every enqueued job records that same provider id. The actual
 /// embedder we hand to `tick` is a fake; the settings only gate the provider
 /// id check, not the embedding work.
 fn test_settings(dim: usize, max_retries: u32) -> EmbeddingSettings {
@@ -54,6 +54,7 @@ async fn worker_processes_pending_transcript_jobs_and_writes_to_index() {
     let tmp = TempDir::new().unwrap();
     let db = tmp.path().join("mem.duckdb");
     let repo = DuckDbRepository::open(&db).await.unwrap();
+    repo.set_transcript_job_provider("embedanything");
 
     let dim = 8;
     let provider: Arc<dyn EmbeddingProvider> = Arc::new(FakeEmbeddingProvider::new("fake", dim));
@@ -132,6 +133,7 @@ async fn worker_failure_does_not_affect_memories_pipeline() {
     let tmp = TempDir::new().unwrap();
     let db = tmp.path().join("mem.duckdb");
     let repo = DuckDbRepository::open(&db).await.unwrap();
+    repo.set_transcript_job_provider("embedanything");
 
     let dim = 8;
     // Memories provider: a real fake (succeeds).

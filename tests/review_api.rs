@@ -6,9 +6,10 @@ use mem::{
     app::AppState,
     domain::memory::{FeedbackSummary, MemoryRecord, MemoryStatus, MemoryType, Scope, Visibility},
     http,
-    storage::duckdb::{DuckDbRepository, EmbeddingJobInsert},
+    storage::{duckdb::EmbeddingJobInsert, DuckDbRepository, VectorIndex},
 };
 use serde_json::{json, Value};
+use std::sync::Arc;
 use tempfile::{tempdir, TempDir};
 use tower::util::ServiceExt;
 
@@ -135,6 +136,7 @@ async fn seeded_app_with_pending_preference() -> TestApp {
     let state = AppState {
         memory_service: mem::service::MemoryService::new(repo.clone()),
         config: mem::config::Config::local(),
+        transcript_index: Arc::new(VectorIndex::new_in_memory(8, "fake", "fake", 8)),
     };
 
     TestApp {
@@ -155,6 +157,7 @@ async fn seeded_app_with_active_preference() -> TestApp {
     let state = AppState {
         memory_service: mem::service::MemoryService::new(repo.clone()),
         config: mem::config::Config::local(),
+        transcript_index: Arc::new(VectorIndex::new_in_memory(8, "fake", "fake", 8)),
     };
 
     TestApp {
@@ -404,6 +407,7 @@ async fn listing_pending_memories_respects_tenant_scope() {
     let state = AppState {
         memory_service: mem::service::MemoryService::new(repo.clone()),
         config: mem::config::Config::local(),
+        transcript_index: Arc::new(VectorIndex::new_in_memory(8, "fake", "fake", 8)),
     };
     let app = TestApp {
         _temp_dir: temp_dir,
