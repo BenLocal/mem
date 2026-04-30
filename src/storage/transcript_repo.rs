@@ -116,6 +116,33 @@ impl DuckDbRepository {
         Ok(())
     }
 
+    /// Singleton fetch by `(tenant, message_block_id)`. Used by the transcript
+    /// embedding worker to materialise the row text before calling the
+    /// embedder. Returns `Ok(None)` when no row matches (treated as "row
+    /// disappeared after job enqueue" by the worker, which permanently fails
+    /// the job).
+    pub async fn get_conversation_message_by_id(
+        &self,
+        tenant: &str,
+        message_block_id: &str,
+    ) -> Result<Option<ConversationMessage>, StorageError> {
+        let conn = self.conn()?;
+        let mut stmt = conn.prepare(
+            "select message_block_id, session_id, tenant, caller_agent, transcript_path,
+                    line_number, block_index, message_uuid, role, block_type, content,
+                    tool_name, tool_use_id, embed_eligible, created_at
+             from conversation_messages
+             where tenant = ?1 and message_block_id = ?2",
+        )?;
+        let row = stmt
+            .query_row(
+                params![tenant, message_block_id],
+                row_to_conversation_message,
+            )
+            .optional()?;
+        Ok(row)
+    }
+
     /// Returns all `conversation_messages` rows for the given (tenant,
     /// session_id), ordered chronologically. Ties on `created_at` break by
     /// `(line_number, block_index)` to preserve in-line block order from the
