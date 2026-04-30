@@ -6,19 +6,23 @@
 //! - `POST /transcripts/search`   — ranked search with optional filters.
 //! - `GET  /transcripts`          — list every block for a session, ordered.
 //!
-//! Error mapping is intentionally simple: any [`StorageError`] becomes a
-//! 500 with the underlying message in the body. Validation lives at the
+//! Error mapping uses the shared [`AppError`] umbrella (same as
+//! `http/memory.rs`): a bare `StorageError::InvalidInput` becomes 400,
+//! everything else becomes 500. Validation also happens at the
 //! deserialization boundary (axum returns 400 for malformed JSON / missing
-//! query params), so this file does not produce 400s of its own.
+//! query params). The query-embed failure path in
+//! `transcript_service::search` is the natural 400-worthy case currently in
+//! the wild — it returns `StorageError::InvalidInput` when the caller's
+//! query text fails to embed.
 
 use axum::extract::{Query, State};
-use axum::http::StatusCode;
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use serde::{Deserialize, Serialize};
 
 use crate::app::AppState;
 use crate::domain::{BlockType, ConversationMessage, MessageRole};
+use crate::error::AppError;
 use crate::service::{TranscriptSearchFilters, TranscriptSearchHit};
 
 pub fn router() -> Router<AppState> {
@@ -58,7 +62,7 @@ pub struct IngestResponse {
 async fn post_message(
     State(state): State<AppState>,
     Json(req): Json<IngestRequest>,
-) -> Result<Json<IngestResponse>, (StatusCode, String)> {
+) -> Result<Json<IngestResponse>, AppError> {
     // The HTTP boundary mints the id (UUID v7 keeps the surface ID convention
     // consistent with the memories pipeline — see commit 3100d49).
     let id = uuid::Uuid::now_v7().to_string();
@@ -79,11 +83,7 @@ async fn post_message(
         embed_eligible: req.embed_eligible,
         created_at: req.created_at,
     };
-    state
-        .transcript_service
-        .ingest(msg)
-        .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    state.transcript_service.ingest(msg).await?;
     Ok(Json(IngestResponse {
         message_block_id: id,
     }))
@@ -107,12 +107,11 @@ pub struct GetBySessionResponse {
 async fn get_by_session(
     State(state): State<AppState>,
     Query(q): Query<GetBySessionQuery>,
-) -> Result<Json<GetBySessionResponse>, (StatusCode, String)> {
+) -> Result<Json<GetBySessionResponse>, AppError> {
     let messages = state
         .transcript_service
         .get_by_session(&q.tenant, &q.session_id)
-        .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+        .await?;
     Ok(Json(GetBySessionResponse { messages }))
 }
 
@@ -156,7 +155,7 @@ pub struct SearchResponse {
 async fn post_search(
     State(state): State<AppState>,
     Json(req): Json<SearchRequest>,
-) -> Result<Json<SearchResponse>, (StatusCode, String)> {
+) -> Result<Json<SearchResponse>, AppError> {
     let filters = TranscriptSearchFilters {
         session_id: req.session_id,
         role: req.role,
@@ -167,8 +166,7 @@ async fn post_search(
     let hits: Vec<TranscriptSearchHit> = state
         .transcript_service
         .search(&req.tenant, &req.query, &filters, req.limit)
-        .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+        .await?;
     let dtos = hits
         .into_iter()
         .map(|h| SearchHitDto {

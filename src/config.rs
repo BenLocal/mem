@@ -333,4 +333,79 @@ mod tests {
         assert_eq!(s.vector_index_oversample, 8);
         assert!(s.vector_index_use_legacy);
     }
+
+    #[test]
+    fn transcript_embed_disabled_default_false() {
+        let s = EmbeddingSettings::from_env_vars(|_| None).unwrap();
+        assert!(!s.transcript_disabled);
+    }
+
+    #[test]
+    fn transcript_embed_disabled_accepts_truthy_values() {
+        for raw in ["1", "true", "TRUE", "True", "yes", "Yes", "YES"] {
+            let s =
+                EmbeddingSettings::from_env_vars(env(&[("MEM_TRANSCRIPT_EMBED_DISABLED", raw)]))
+                    .unwrap_or_else(|e| panic!("parse failed for {raw:?}: {e}"));
+            assert!(
+                s.transcript_disabled,
+                "expected MEM_TRANSCRIPT_EMBED_DISABLED={raw:?} to enable transcript_disabled"
+            );
+        }
+    }
+
+    #[test]
+    fn transcript_embed_disabled_falsy_values_stay_disabled() {
+        // Anything that isn't 1/true/yes (case-insensitive) leaves the flag false.
+        for raw in ["0", "false", "no", ""] {
+            let s =
+                EmbeddingSettings::from_env_vars(env(&[("MEM_TRANSCRIPT_EMBED_DISABLED", raw)]))
+                    .unwrap();
+            assert!(
+                !s.transcript_disabled,
+                "expected MEM_TRANSCRIPT_EMBED_DISABLED={raw:?} to leave transcript_disabled=false"
+            );
+        }
+    }
+
+    #[test]
+    fn transcript_vector_index_flush_every_default_256() {
+        let s = EmbeddingSettings::from_env_vars(|_| None).unwrap();
+        assert_eq!(s.transcript_vector_index_flush_every, 256);
+    }
+
+    #[test]
+    fn transcript_vector_index_flush_every_parses_positive() {
+        let s = EmbeddingSettings::from_env_vars(env(&[(
+            "MEM_TRANSCRIPT_VECTOR_INDEX_FLUSH_EVERY",
+            "512",
+        )]))
+        .unwrap();
+        assert_eq!(s.transcript_vector_index_flush_every, 512);
+    }
+
+    #[test]
+    fn transcript_vector_index_flush_every_rejects_zero() {
+        let err = EmbeddingSettings::from_env_vars(env(&[(
+            "MEM_TRANSCRIPT_VECTOR_INDEX_FLUSH_EVERY",
+            "0",
+        )]))
+        .unwrap_err();
+        assert!(matches!(
+            err,
+            ConfigError::InvalidTranscriptVectorIndexFlushEvery(ref s) if s == "0"
+        ));
+    }
+
+    #[test]
+    fn transcript_vector_index_flush_every_rejects_non_numeric() {
+        let err = EmbeddingSettings::from_env_vars(env(&[(
+            "MEM_TRANSCRIPT_VECTOR_INDEX_FLUSH_EVERY",
+            "abc",
+        )]))
+        .unwrap_err();
+        assert!(matches!(
+            err,
+            ConfigError::InvalidTranscriptVectorIndexFlushEvery(ref s) if s == "abc"
+        ));
+    }
 }

@@ -333,8 +333,14 @@ pub async fn run(args: MineArgs) -> i32 {
         }
     }
 
+    // Counts reflect what the CLI *sent* (HTTP 2xx), not what the server
+    // actually inserted. The server deduplicates by (transcript_path,
+    // line_number, block_index) for transcript blocks and by
+    // idempotency_key for memories, so re-running mine on the same file
+    // returns 2xx without double-inserting. Use `mem-cli` / DuckDB queries
+    // to count rows on disk if you need exact insert deltas.
     println!(
-        "Mined: memories={}/{} blocks={}/{}",
+        "Mined: memories sent={}/{} blocks sent={}/{} (server-side dedup applied)",
         mem_ok,
         mem_ok + mem_fail,
         block_ok,
