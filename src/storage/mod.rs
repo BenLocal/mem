@@ -1,6 +1,7 @@
 pub mod duckdb;
 pub mod graph_store;
 pub mod schema;
+pub mod transcript_repo;
 pub mod vector_index;
 pub mod vector_index_diagnose;
 
