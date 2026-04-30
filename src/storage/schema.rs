@@ -13,12 +13,15 @@ const GRAPH_SCHEMA_SQL: &str = include_str!("../../db/schema/003_graph.sql");
 // idempotent. See docs/superpowers/specs/2026-04-29-sessions-design.md §DuckDB
 // caveats.
 const SESSIONS_SCHEMA_SQL: &str = include_str!("../../db/schema/004_sessions.sql");
+const CONVERSATION_MESSAGES_SCHEMA_SQL: &str =
+    include_str!("../../db/schema/005_conversation_messages.sql");
 
 pub fn bootstrap(conn: &Connection) -> Result<(), StorageError> {
     conn.execute_batch(INIT_SCHEMA_SQL)?;
     conn.execute_batch(EMBEDDINGS_SCHEMA_SQL)?;
     conn.execute_batch(GRAPH_SCHEMA_SQL)?;
     apply_sessions_schema(conn)?;
+    conn.execute_batch(CONVERSATION_MESSAGES_SCHEMA_SQL)?;
     let migrated = migrate_content_hash_to_sha256(conn)?;
     if migrated > 0 {
         info!(
