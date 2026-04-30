@@ -3,14 +3,15 @@ use axum::{
     http::{Request, StatusCode},
 };
 use mem::{
-    app::AppState,
     domain::memory::{FeedbackSummary, MemoryRecord, MemoryStatus, MemoryType, Scope, Visibility},
     http,
-    storage::duckdb::{DuckDbRepository, EmbeddingJobInsert},
+    storage::{duckdb::EmbeddingJobInsert, DuckDbRepository},
 };
 use serde_json::{json, Value};
 use tempfile::{tempdir, TempDir};
 use tower::util::ServiceExt;
+
+mod common;
 
 fn sample_memory(memory_id: &str, status: MemoryStatus) -> MemoryRecord {
     MemoryRecord {
@@ -132,10 +133,8 @@ async fn seeded_app_with_pending_preference() -> TestApp {
         .await
         .unwrap();
 
-    let state = AppState {
-        memory_service: mem::service::MemoryService::new(repo.clone()),
-        config: mem::config::Config::local(),
-    };
+    let state =
+        common::test_app_state(repo.clone(), mem::service::MemoryService::new(repo.clone()));
 
     TestApp {
         _temp_dir: temp_dir,
@@ -152,10 +151,8 @@ async fn seeded_app_with_active_preference() -> TestApp {
         .await
         .unwrap();
 
-    let state = AppState {
-        memory_service: mem::service::MemoryService::new(repo.clone()),
-        config: mem::config::Config::local(),
-    };
+    let state =
+        common::test_app_state(repo.clone(), mem::service::MemoryService::new(repo.clone()));
 
     TestApp {
         _temp_dir: temp_dir,
@@ -401,10 +398,8 @@ async fn listing_pending_memories_respects_tenant_scope() {
     .await
     .unwrap();
 
-    let state = AppState {
-        memory_service: mem::service::MemoryService::new(repo.clone()),
-        config: mem::config::Config::local(),
-    };
+    let state =
+        common::test_app_state(repo.clone(), mem::service::MemoryService::new(repo.clone()));
     let app = TestApp {
         _temp_dir: temp_dir,
         router: http::router().with_state(state),

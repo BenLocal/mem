@@ -12,10 +12,12 @@
 
 use axum::body::{to_bytes, Body};
 use axum::http::{Request, StatusCode};
-use mem::{app::AppState, http, storage::DuckDbRepository};
+use mem::{http, storage::DuckDbRepository};
 use serde_json::{json, Value};
 use tempfile::{tempdir, TempDir};
 use tower::util::ServiceExt;
+
+mod common;
 
 // ---------------------------------------------------------------------------
 // Test infrastructure (inline; mirrors the pattern in tests/ingest_api.rs)
@@ -90,10 +92,7 @@ async fn fresh_app() -> TestApp {
     let db_path = temp_dir.path().join("sessions-integration.duckdb");
     let repo = DuckDbRepository::open(&db_path).await.unwrap();
 
-    let state = AppState {
-        memory_service: mem::service::MemoryService::new(repo),
-        config: mem::config::Config::local(),
-    };
+    let state = common::test_app_state(repo.clone(), mem::service::MemoryService::new(repo));
 
     TestApp {
         _temp_dir: Some(temp_dir),

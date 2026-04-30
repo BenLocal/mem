@@ -82,6 +82,22 @@ pub trait EmbeddingRowSource {
     ) -> Result<(), StorageError>;
 }
 
+/// Source of `(message_block_id, embedding_blob)` rows for the transcript
+/// sidecar rebuild path. Mirrors [`EmbeddingRowSource`] for the memories
+/// pipeline; the only differences are the underlying table
+/// (`conversation_message_embeddings`) and the id semantics
+/// (`message_block_id` rather than `memory_id`).
+pub trait TranscriptEmbeddingRowSource {
+    fn count_total_transcript_embeddings(&self) -> Result<i64, StorageError>;
+
+    #[allow(clippy::type_complexity)]
+    fn for_each_transcript_embedding(
+        &self,
+        batch: usize,
+        f: &mut dyn FnMut(&str, &[u8]) -> Result<(), StorageError>,
+    ) -> Result<(), StorageError>;
+}
+
 pub struct VectorIndex {
     index: Arc<RwLock<Index>>,
     id_map: Arc<RwLock<HashMap<u64, String>>>,
@@ -543,6 +559,99 @@ impl VectorIndex {
         );
         Ok(fresh)
     }
+
+    /// Transcript-pipeline counterpart to [`Self::open_or_rebuild`].
+    ///
+    /// Same load/rebuild semantics, but operates on the transcript sidecar
+    /// (`<db>.transcripts.usearch` + meta) and pulls rebuild rows from a
+    /// [`TranscriptEmbeddingRowSource`]. Kept as a near-duplicate of
+    /// `open_or_rebuild` rather than parameterized; the body is short and a
+    /// shared generic helper would obscure both pipelines without saving real
+    /// lines.
+    pub async fn open_or_rebuild_transcripts<S: TranscriptEmbeddingRowSource>(
+        source: &S,
+        db_path: &Path,
+        expected_fp: &VectorIndexFingerprint,
+    ) -> Result<Self, VectorIndexError> {
+        let (idx_path, meta_path) = transcript_sidecar_paths(db_path);
+
+        let live_count = source
+            .count_total_transcript_embeddings()
+            .map_err(|e| VectorIndexError::UsearchOp(format!("count failed: {e}")))?;
+
+        if idx_path.exists() && meta_path.exists() {
+            match Self::load_from(&idx_path, &meta_path, expected_fp).await {
+                Ok(loaded) => {
+                    let idx_count = loaded.size();
+                    if idx_count as i64 == live_count {
+                        tracing::info!(
+                            rows = idx_count,
+                            "loaded transcript vector index from sidecar"
+                        );
+                        return Ok(loaded);
+                    }
+                    tracing::warn!(
+                        index = idx_count,
+                        db = live_count,
+                        "transcript vector index row count drift; rebuilding"
+                    );
+                }
+                Err(VectorIndexError::FingerprintMismatch { stored, current }) => {
+                    tracing::warn!(
+                        ?stored,
+                        ?current,
+                        "transcript vector index fingerprint mismatch; rebuilding"
+                    );
+                }
+                Err(other) => {
+                    tracing::warn!(error = %other, "transcript vector index load failed; rebuilding");
+                }
+            }
+        }
+
+        let started = std::time::Instant::now();
+        let mut fresh = VectorIndex::new_in_memory(
+            expected_fp.dim,
+            &expected_fp.provider,
+            &expected_fp.model,
+            (live_count as usize).max(8),
+        );
+
+        source
+            .for_each_transcript_embedding(512, &mut |message_block_id, blob| {
+                let vec = decode_f32_blob(blob, expected_fp.dim).map_err(|e| {
+                    super::StorageError::VectorIndex(format!("rebuild decode: {e}"))
+                })?;
+                let key = memory_id_to_u64(message_block_id);
+                // id_map first, then index — matches lock ordering elsewhere.
+                let mut id_map = fresh
+                    .lock_id_map_write()
+                    .map_err(|e| super::StorageError::VectorIndex(e.to_string()))?;
+                let index = fresh
+                    .lock_index_write()
+                    .map_err(|e| super::StorageError::VectorIndex(e.to_string()))?;
+                index
+                    .add(key, &vec)
+                    .map_err(|e| super::StorageError::VectorIndex(e.to_string()))?;
+                id_map.insert(key, message_block_id.to_string());
+                Ok(())
+            })
+            .map_err(|e| VectorIndexError::UsearchOp(format!("rebuild iter: {e}")))?;
+
+        if let Err(e) = fresh.save_to(&idx_path, &meta_path).await {
+            try_cleanup_tmp_paths(&idx_path, &meta_path);
+            return Err(e);
+        }
+        fresh.idx_path = Some(idx_path);
+        fresh.meta_path = Some(meta_path);
+
+        tracing::info!(
+            rows = fresh.size(),
+            elapsed_ms = started.elapsed().as_millis() as u64,
+            "rebuilt transcript vector index"
+        );
+        Ok(fresh)
+    }
 }
 
 /// Compute the sidecar file paths for a given DuckDB path.
@@ -555,6 +664,19 @@ pub fn sidecar_paths(db_path: &Path) -> (PathBuf, PathBuf) {
     idx.push(".usearch");
     let mut meta: OsString = db_path.as_os_str().to_owned();
     meta.push(".usearch.meta.json");
+    (PathBuf::from(idx), PathBuf::from(meta))
+}
+
+/// Compute the sidecar file paths for the **transcript** vector index.
+///
+/// `<db>.transcripts.usearch` holds the binary index;
+/// `<db>.transcripts.usearch.meta.json` holds the metadata. Kept distinct from
+/// the memories sidecar so the two pipelines never collide on disk.
+pub fn transcript_sidecar_paths(db_path: &Path) -> (PathBuf, PathBuf) {
+    let mut idx: OsString = db_path.as_os_str().to_owned();
+    idx.push(".transcripts.usearch");
+    let mut meta: OsString = db_path.as_os_str().to_owned();
+    meta.push(".transcripts.usearch.meta.json");
     (PathBuf::from(idx), PathBuf::from(meta))
 }
 

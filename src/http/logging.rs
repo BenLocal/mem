@@ -34,5 +34,8 @@ pub async fn log_request_response(req: Request, next: Next) -> Response {
 }
 
 async fn buffer_body(body: Body) -> Bytes {
-    body.collect().await.map(|c| c.to_bytes()).unwrap_or_default()
+    body.collect()
+        .await
+        .map(|c| c.to_bytes())
+        .unwrap_or_default()
 }

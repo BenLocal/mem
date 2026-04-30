@@ -4,7 +4,7 @@ use std::time::Instant;
 
 use serde::Serialize;
 
-use super::vector_index::{sidecar_paths, VectorIndex, VectorIndexMeta};
+use super::vector_index::{sidecar_paths, transcript_sidecar_paths, VectorIndex, VectorIndexMeta};
 use super::{DuckDbRepository, StorageError, VectorIndexFingerprint};
 
 #[derive(Debug, Clone, Serialize)]
@@ -269,6 +269,183 @@ pub async fn rebuild_index(
         }
     }
     let idx = VectorIndex::open_or_rebuild(repo, db_path, expected_fp)
+        .await
+        .map_err(|e| StorageError::VectorIndex(format!("rebuild failed: {e}")))?;
+    Ok(Arc::new(idx))
+}
+
+// ── transcripts variants ─────────────────────────────────────────────────────
+//
+// Near-duplicates of `diagnose` and `rebuild_index` above. They differ in
+// exactly two spots: the sidecar paths (`transcript_sidecar_paths` instead of
+// `sidecar_paths`) and the row-count source (the
+// `TranscriptEmbeddingRowSource` impl instead of the memory variant). The
+// bodies were left as copies rather than parameterized — the existing fns
+// each branch through ~7 specific status variants and a generic helper
+// would obscure both pipelines without saving meaningful lines. Per the
+// Task 11 plan: ship the parallel fns, defer the refactor.
+
+/// Transcript counterpart to [`diagnose`]. Inspects the transcript sidecar
+/// (`<db>.transcripts.usearch` + meta) and the live transcript embedding count
+/// to determine sidecar health. Same return semantics: `Err` only when the DB
+/// itself is unavailable; every other anomaly is a `DiagnosticStatus` variant.
+pub async fn diagnose_transcripts(
+    repo: &DuckDbRepository,
+    db_path: &Path,
+    expected_fp: &VectorIndexFingerprint,
+) -> Result<DiagnosticReport, StorageError> {
+    use super::vector_index::TranscriptEmbeddingRowSource;
+
+    let started = Instant::now();
+    let (idx_path, meta_path) = transcript_sidecar_paths(db_path);
+    let path_info = PathInfo {
+        db: db_path.to_path_buf(),
+        index: idx_path.clone(),
+        meta: meta_path.clone(),
+    };
+
+    let live_count = repo.count_total_transcript_embeddings()?;
+
+    if !idx_path.exists() {
+        return Ok(report_for(
+            DiagnosticStatus::SidecarMissing {
+                which: SidecarFile::Index,
+            },
+            path_info,
+            started,
+        ));
+    }
+    if !meta_path.exists() {
+        return Ok(report_for(
+            DiagnosticStatus::SidecarMissing {
+                which: SidecarFile::Meta,
+            },
+            path_info,
+            started,
+        ));
+    }
+
+    let meta_bytes = match std::fs::read(&meta_path) {
+        Ok(b) => b,
+        Err(e) => {
+            return Ok(report_for(
+                DiagnosticStatus::MetaCorrupt {
+                    reason: e.to_string(),
+                },
+                path_info,
+                started,
+            ));
+        }
+    };
+    let meta: VectorIndexMeta = match serde_json::from_slice(&meta_bytes) {
+        Ok(m) => m,
+        Err(e) => {
+            return Ok(report_for(
+                DiagnosticStatus::MetaCorrupt {
+                    reason: e.to_string(),
+                },
+                path_info,
+                started,
+            ));
+        }
+    };
+
+    if meta.dim == 0
+        || meta.provider != expected_fp.provider
+        || meta.model != expected_fp.model
+        || meta.dim != expected_fp.dim
+    {
+        return Ok(report_for(
+            DiagnosticStatus::FingerprintMismatch {
+                stored: VectorIndexFingerprint {
+                    provider: meta.provider.clone(),
+                    model: meta.model.clone(),
+                    dim: meta.dim,
+                },
+                current: expected_fp.clone(),
+            },
+            path_info,
+            started,
+        ));
+    }
+
+    let opts = usearch_options(&meta);
+    let index_load_result = match usearch::Index::new(&opts) {
+        Ok(idx) => match idx.reserve(meta.row_count.max(8)) {
+            Ok(()) => match idx_path.to_str() {
+                Some(p) => match idx.load(p) {
+                    Ok(()) => Ok(idx),
+                    Err(e) => Err(format!("usearch load failed: {e}")),
+                },
+                None => Err("non-utf8 sidecar path".to_string()),
+            },
+            Err(e) => Err(format!("reserve failed: {e}")),
+        },
+        Err(e) => Err(format!("new index failed: {e}")),
+    };
+    let index = match index_load_result {
+        Ok(i) => i,
+        Err(reason) => {
+            return Ok(report_for(
+                DiagnosticStatus::IndexCorrupt { reason },
+                path_info,
+                started,
+            ));
+        }
+    };
+
+    let index_size = index.size();
+    if index_size != meta.row_count {
+        return Ok(report_for(
+            DiagnosticStatus::IndexMetaDrift {
+                index_size,
+                meta_count: meta.row_count,
+            },
+            path_info,
+            started,
+        ));
+    }
+    if (meta.row_count as i64) != live_count {
+        return Ok(report_for(
+            DiagnosticStatus::DbDrift {
+                meta_count: meta.row_count,
+                db_count: live_count,
+            },
+            path_info,
+            started,
+        ));
+    }
+
+    Ok(report_for(
+        DiagnosticStatus::Healthy { rows: live_count },
+        path_info,
+        started,
+    ))
+}
+
+/// Force a fresh rebuild of the **transcript** sidecar from DuckDB. Mirror of
+/// [`rebuild_index`] for the transcript pipeline.
+pub async fn rebuild_transcripts_index(
+    repo: &DuckDbRepository,
+    db_path: &Path,
+    expected_fp: &VectorIndexFingerprint,
+) -> Result<Arc<VectorIndex>, StorageError> {
+    let (idx_path, meta_path) = transcript_sidecar_paths(db_path);
+    if let Err(e) = std::fs::remove_file(&idx_path) {
+        if e.kind() != std::io::ErrorKind::NotFound {
+            return Err(StorageError::VectorIndex(format!(
+                "failed to remove old transcripts index: {e}"
+            )));
+        }
+    }
+    if let Err(e) = std::fs::remove_file(&meta_path) {
+        if e.kind() != std::io::ErrorKind::NotFound {
+            return Err(StorageError::VectorIndex(format!(
+                "failed to remove old transcripts meta: {e}"
+            )));
+        }
+    }
+    let idx = VectorIndex::open_or_rebuild_transcripts(repo, db_path, expected_fp)
         .await
         .map_err(|e| StorageError::VectorIndex(format!("rebuild failed: {e}")))?;
     Ok(Arc::new(idx))

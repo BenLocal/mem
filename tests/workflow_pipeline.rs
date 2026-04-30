@@ -3,7 +3,6 @@ use axum::{
     http::{Request, StatusCode},
 };
 use mem::{
-    app::AppState,
     domain::{
         episode::EpisodeRecord,
         memory::{MemoryRecord, MemoryStatus, MemoryType, Scope, Visibility},
@@ -14,6 +13,8 @@ use mem::{
 use serde_json::{json, Value};
 use tempfile::{tempdir, TempDir};
 use tower::util::ServiceExt;
+
+mod common;
 
 struct TestApp {
     _temp_dir: TempDir,
@@ -87,10 +88,8 @@ async fn test_app() -> TestApp {
     let temp_dir = tempdir().unwrap();
     let db_path = temp_dir.path().join("workflow-test.duckdb");
     let repo = DuckDbRepository::open(&db_path).await.unwrap();
-    let state = AppState {
-        memory_service: mem::service::MemoryService::new(repo.clone()),
-        config: mem::config::Config::local(),
-    };
+    let state =
+        common::test_app_state(repo.clone(), mem::service::MemoryService::new(repo.clone()));
 
     TestApp {
         _temp_dir: temp_dir,

@@ -644,3 +644,15 @@ M（1.5 天，前提是 #11 完成）：
 - **联动**：必须先做完 #11；如果 #11 推迟，#13 也跟着推迟
 
 > commit 时引用：`feat(integration): add Claude Code / Codex hook bundle and offline miner (closes mempalace-diff §8 #13)`
+
+---
+
+## 14. Conversation Archive（verbatim transcript 全量归档，与 memories 管道完全隔离）
+
+> **2026-04-30 落地**：✅ 在 §13 的 `mem mine` 之上加一条**全量原始对话归档**管道。新表 `conversation_messages`（每个 transcript block 一行，verbatim）+ 独立队列 `transcript_embedding_jobs` + 独立 HNSW sidecar `<MEM_DB_PATH>.transcripts.usearch`；与 `memories` 表 / 嵌入队列 / sidecar **完全不共享**任何状态或向量空间。`mem mine` 改为 dual-sink，单次扫描既写既有 memories 路径也写新 archive；`mem repair --check|--rebuild` 同时覆盖两个 sidecar。HTTP 路由 `POST /transcripts/messages` / `POST /transcripts/search` / `GET /transcripts?session_id=…&tenant=…`。**MCP 表面零变化**——transcript 搜索仅 HTTP，agent 走 `memory_search` → 命中后用 `session_id` 拉对应 transcript。详见 spec [`docs/superpowers/specs/2026-04-30-conversation-archive-design.md`](./superpowers/specs/2026-04-30-conversation-archive-design.md) 与 plan [`docs/superpowers/plans/2026-04-30-conversation-archive.md`](./superpowers/plans/2026-04-30-conversation-archive.md)。
+
+### 与既有路线的关系
+
+§7 verbatim 纪律的自然延伸：`memories.content` 守护事实级原文，`conversation_messages.content` 守护对话级原文。两条管道共用一个 `session_id` 锚点（§11 Sessions），但 ranking / lifecycle / compress / verbatim guard 全部不动。新增 env：`MEM_TRANSCRIPT_EMBED_DISABLED=1`（停 transcript embedding worker，避免 OpenAI 用户成本翻倍）、`MEM_TRANSCRIPT_VECTOR_INDEX_FLUSH_EVERY`（默认 256，低于 memories sidecar 的 1024，因为单 session 写入 burst 更大）。
+
+> commit 时引用：`feat(transcripts): add conversation_messages archive pipeline alongside memories (closes mempalace-diff §14)`

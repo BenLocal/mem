@@ -4,6 +4,7 @@ pub mod health;
 pub mod logging;
 pub mod memory;
 pub mod review;
+pub mod transcripts;
 
 use axum::{middleware, Router};
 
@@ -16,5 +17,6 @@ pub fn router() -> Router<AppState> {
         .merge(embeddings::router())
         .merge(review::router())
         .merge(graph::router())
+        .merge(transcripts::router())
         .layer(middleware::from_fn(logging::log_request_response))
 }
