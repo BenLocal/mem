@@ -176,6 +176,38 @@ impl DuckDbRepository {
         Ok(out)
     }
 
+    /// Returns the most recent `conversation_messages` rows for `tenant`,
+    /// newest first, capped at `limit`. Used by the transcript search service
+    /// as the empty-query fallback (when no embedding query is supplied) and
+    /// as a CLI/diagnostic listing helper.
+    ///
+    /// Tie-breaking on `created_at` mirrors `get_conversation_messages_by_session`
+    /// (`line_number, block_index`) so equal-timestamp blocks come back in a
+    /// deterministic order — but since the primary sort is DESC, ties resolve
+    /// in reverse line order, which matches the "newest line wins" intent.
+    pub async fn recent_conversation_messages(
+        &self,
+        tenant: &str,
+        limit: usize,
+    ) -> Result<Vec<ConversationMessage>, StorageError> {
+        let conn = self.conn()?;
+        let mut stmt = conn.prepare(
+            "select message_block_id, session_id, tenant, caller_agent, transcript_path,
+                    line_number, block_index, message_uuid, role, block_type, content,
+                    tool_name, tool_use_id, embed_eligible, created_at
+             from conversation_messages
+             where tenant = ?1
+             order by created_at desc, line_number desc, block_index desc
+             limit ?2",
+        )?;
+        let rows = stmt.query_map(params![tenant, limit as i64], row_to_conversation_message)?;
+        let mut out = Vec::new();
+        for r in rows {
+            out.push(r?);
+        }
+        Ok(out)
+    }
+
     /// Fetches the requested `conversation_messages` rows by `message_block_id`
     /// and re-orders the result to match the input slice. Missing ids are
     /// silently dropped (the caller treats this as "row was deleted between

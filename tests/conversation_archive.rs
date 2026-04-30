@@ -260,3 +260,35 @@ async fn transcript_embedding_job_lifecycle() {
         .unwrap();
     assert_eq!(status, "completed");
 }
+
+#[tokio::test]
+async fn recent_conversation_messages_returns_newest_first_limited() {
+    let tmp = TempDir::new().unwrap();
+    let db = tmp.path().join("mem.duckdb");
+    let repo = DuckDbRepository::open(&db).await.unwrap();
+    repo.set_transcript_job_provider("embedanything");
+
+    // Seed three messages with strictly increasing timestamps, distinct
+    // (line_number, block_index) so the unique constraint accepts all three.
+    let mut m1 = sample_message("1", true, BlockType::Text);
+    m1.created_at = "2026-04-30T00:00:01Z".to_string();
+    m1.line_number = 1;
+
+    let mut m2 = sample_message("2", true, BlockType::Text);
+    m2.created_at = "2026-04-30T00:00:02Z".to_string();
+    m2.line_number = 2;
+
+    let mut m3 = sample_message("3", true, BlockType::Text);
+    m3.created_at = "2026-04-30T00:00:03Z".to_string();
+    m3.line_number = 3;
+
+    repo.create_conversation_message(&m1).await.unwrap();
+    repo.create_conversation_message(&m2).await.unwrap();
+    repo.create_conversation_message(&m3).await.unwrap();
+
+    let out = repo.recent_conversation_messages("local", 2).await.unwrap();
+
+    assert_eq!(out.len(), 2, "limit caps the result");
+    assert_eq!(out[0].message_block_id, "mb-3", "newest first");
+    assert_eq!(out[1].message_block_id, "mb-2");
+}
