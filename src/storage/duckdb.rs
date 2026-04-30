@@ -246,6 +246,94 @@ impl DuckDbRepository {
         Ok(true)
     }
 
+    /// Inserts a single conversation transcript block, idempotent on the
+    /// `(transcript_path, line_number, block_index)` unique key, and—when the
+    /// row is actually written and `embed_eligible == true`—enqueues a single
+    /// `pending` row in `transcript_embedding_jobs`.
+    ///
+    /// Concurrency: both INSERTs run inside a single `Arc<Mutex<Connection>>`
+    /// acquisition (via `self.conn()`); the lock is never released between
+    /// them, so a "row written but job not enqueued" partial state is
+    /// impossible from concurrent callers.
+    ///
+    /// Idempotency: implemented via DuckDB's `INSERT OR IGNORE`, which swallows
+    /// the unique-constraint violation and reports `affected_rows = 0` on the
+    /// duplicate. We deliberately use this rather than `ON CONFLICT (...) DO
+    /// NOTHING` to match the in-tree convention already used by
+    /// `seed_memory_embedding_for_test`.
+    pub async fn create_conversation_message(
+        &self,
+        msg: &crate::domain::ConversationMessage,
+    ) -> Result<(), StorageError> {
+        let conn = self.conn()?;
+
+        // Step 1: insert the message row. Duplicate (transcript_path,
+        // line_number, block_index) is silently ignored by `insert or ignore`,
+        // yielding `inserted == 0`.
+        let inserted = conn.execute(
+            "insert or ignore into conversation_messages (
+                message_block_id, session_id, tenant, caller_agent, transcript_path,
+                line_number, block_index, message_uuid, role, block_type, content,
+                tool_name, tool_use_id, embed_eligible, created_at
+            ) values (
+                ?1, ?2, ?3, ?4, ?5,
+                ?6, ?7, ?8, ?9, ?10, ?11,
+                ?12, ?13, ?14, ?15
+            )",
+            params![
+                msg.message_block_id,
+                msg.session_id,
+                msg.tenant,
+                msg.caller_agent,
+                msg.transcript_path,
+                msg.line_number as i64,
+                msg.block_index as i64,
+                msg.message_uuid,
+                msg.role.as_db_str(),
+                msg.block_type.as_db_str(),
+                msg.content,
+                msg.tool_name,
+                msg.tool_use_id,
+                msg.embed_eligible,
+                msg.created_at,
+            ],
+        )?;
+
+        // Step 2: enqueue an embedding job iff a NEW row was written AND it is
+        // embed-eligible. Idempotent re-inserts (inserted == 0) skip enqueue,
+        // matching the deduplication contract of `try_enqueue_embedding_job`.
+        if inserted == 1 && msg.embed_eligible {
+            let job_id = uuid::Uuid::now_v7().to_string();
+            let now = current_timestamp();
+            // TODO(transcripts task 8): thread the configured embedding
+            // provider id through the repo (e.g. via a `with_embedding_job_provider`
+            // builder set in `app.rs`) instead of hardcoding the default.
+            let provider = "embedanything";
+            conn.execute(
+                "insert into transcript_embedding_jobs (
+                    job_id, tenant, message_block_id, provider,
+                    status, attempt_count, last_error,
+                    available_at, created_at, updated_at
+                ) values (
+                    ?1, ?2, ?3, ?4,
+                    'pending', 0, null,
+                    ?5, ?6, ?7
+                )",
+                params![
+                    job_id,
+                    msg.tenant,
+                    msg.message_block_id,
+                    provider,
+                    now,
+                    now,
+                    now,
+                ],
+            )?;
+        }
+
+        Ok(())
+    }
+
     pub async fn count_embedding_jobs_for_memory(
         &self,
         memory_id: &str,
