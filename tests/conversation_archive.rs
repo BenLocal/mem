@@ -508,7 +508,11 @@ mod http_routes {
         assert_eq!(primary_block["role"], "user");
         assert_eq!(primary_block["content"], "user-says-hello");
 
-        // Filter by block_type=tool_use → expect 1 hit.
+        // Filter by block_type=tool_use with empty query → expect 0 hits.
+        // The empty-query browse path (recent_conversation_messages) filters
+        // to embed_eligible = true rows so candidate primaries are symmetric
+        // with the BM25/HNSW/anchor channels; tool_use blocks are ineligible
+        // and therefore can never appear as primaries via empty-query browse.
         let resp = app
             .clone()
             .oneshot(
@@ -535,15 +539,9 @@ mod http_routes {
         let windows = v["windows"].as_array().expect("windows array");
         assert_eq!(
             windows.len(),
-            1,
-            "block_type=tool_use filters to single window"
+            0,
+            "block_type=tool_use yields no primaries via empty-query browse \
+             (tool_use is embed-ineligible)"
         );
-        let primary_block = windows[0]["blocks"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .find(|b| b["is_primary"].as_bool() == Some(true))
-            .expect("primary block in window");
-        assert_eq!(primary_block["block_type"], "tool_use");
     }
 }

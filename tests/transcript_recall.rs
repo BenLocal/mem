@@ -705,3 +705,62 @@ async fn empty_query_returns_recent_time_windows() {
         "empty query should still return windows from recent_*"
     );
 }
+
+#[tokio::test]
+async fn empty_query_excludes_tool_blocks() {
+    let dir = TempDir::new().unwrap();
+    let app = build_recall_app(&dir).await;
+
+    // Seed: 1 text (eligible), 1 tool_use (ineligible), 1 tool_result (ineligible).
+    ingest_via_http(
+        &app,
+        "S",
+        1,
+        "assistant",
+        "text",
+        "human-readable content",
+        true,
+        "2026-04-30T00:00:00Z",
+    )
+    .await;
+    ingest_via_http(
+        &app,
+        "S",
+        2,
+        "assistant",
+        "tool_use",
+        r#"{"file_path":"some.toml"}"#,
+        false,
+        "2026-04-30T00:00:01Z",
+    )
+    .await;
+    ingest_via_http(
+        &app,
+        "S",
+        3,
+        "assistant",
+        "tool_result",
+        "tool output content",
+        false,
+        "2026-04-30T00:00:02Z",
+    )
+    .await;
+
+    // Empty-query browse mode must surface only embed-eligible primaries.
+    let v = search_http(&app, json!({ "query": "", "tenant": "local", "limit": 5 })).await;
+    let windows = v["windows"].as_array().unwrap();
+    assert!(!windows.is_empty(), "should return at least the text block");
+
+    // Every primary block in every window must be embed_eligible (text or thinking).
+    for window in windows {
+        for block in window["blocks"].as_array().unwrap() {
+            if block["is_primary"].as_bool() == Some(true) {
+                let bt = block["block_type"].as_str().unwrap();
+                assert!(
+                    bt == "text" || bt == "thinking",
+                    "primary block_type must be embed_eligible; got {bt}"
+                );
+            }
+        }
+    }
+}

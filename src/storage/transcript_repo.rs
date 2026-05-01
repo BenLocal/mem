@@ -477,7 +477,7 @@ impl DuckDbRepository {
                     line_number, block_index, message_uuid, role, block_type, content,
                     tool_name, tool_use_id, embed_eligible, created_at
              from conversation_messages
-             where tenant = ?1
+             where tenant = ?1 and embed_eligible = true
              order by created_at desc, line_number desc, block_index desc
              limit ?2",
         )?;
