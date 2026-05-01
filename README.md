@@ -214,20 +214,30 @@ curl -X POST localhost:3000/transcripts/messages \
     "created_at": "2026-04-30T10:00:00Z"
   }'
 
-# Semantic search over archived blocks (filters are all optional).
-curl -X POST localhost:3000/transcripts/search \
-  -H 'content-type: application/json' \
-  -d '{
-    "tenant": "local",
-    "query": "invoice retry debugging",
-    "role": "assistant",
-    "block_type": "text",
-    "limit": 10
-  }'
-
 # Time-ordered replay of one session (verbatim transcript).
 curl 'localhost:3000/transcripts?tenant=local&session_id=sess_abc'
 ```
+
+**Search** (BM25 + HNSW hybrid; returns merged conversation windows):
+```bash
+curl -X POST localhost:3000/transcripts/search \
+  -H 'content-type: application/json' \
+  -d '{
+    "query": "vector index",
+    "tenant": "local",
+    "limit": 5,
+    "context_window": 2,
+    "anchor_session_id": null,
+    "include_tool_blocks_in_context": false
+  }' | jq
+```
+
+Response shape: `{ "windows": [{ "session_id": "...", "blocks": [...], "primary_ids": [...], "score": 47 }] }`. Each window is a conversation snippet around one or more primary hits; `is_primary: true` flags the actual matches inside the `blocks` array.
+
+**New request fields** (all optional; transcripts pipeline only):
+- `anchor_session_id` — boost blocks from this session above topical matches; useful when continuing a known conversation.
+- `context_window` — ±N blocks of context around each primary (default 2, cap 10).
+- `include_tool_blocks_in_context` — include `tool_use` / `tool_result` blocks as context (default false; primary blocks always returned regardless of type).
 
 **MCP does not expose transcript search by design** — agents go through `memory_search`, then use the resulting `session_id` to pull the surrounding transcript via the HTTP endpoints above.
 
