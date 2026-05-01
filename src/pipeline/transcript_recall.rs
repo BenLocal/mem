@@ -124,6 +124,150 @@ pub fn score_candidates(
     scored
 }
 
+// ── Window assembly types
+
+/// A primary hit with its hydrated context neighbors. The `primary` carries
+/// its scoring context (`ScoredBlock`); `before` and `after` are
+/// chronologically adjacent same-session blocks supplied by
+/// [`crate::storage::DuckDbRepository::context_window_for_block`].
+#[derive(Debug, Clone)]
+pub struct PrimaryWithContext {
+    pub primary: ScoredBlock,
+    pub before: Vec<ConversationMessage>,
+    pub after: Vec<ConversationMessage>,
+}
+
+/// Output of the window-merge phase: one or more primaries sharing a
+/// session, surrounded by their union'd context. `score` is the maximum of
+/// `primary_scores` values; `blocks` is chronologically sorted with
+/// duplicates removed.
+#[derive(Debug, Clone)]
+pub struct MergedWindow {
+    pub session_id: Option<String>,
+    pub blocks: Vec<ConversationMessage>,
+    pub primary_ids: Vec<String>,
+    pub primary_scores: HashMap<String, i64>,
+    pub score: i64,
+}
+
+/// Merge `PrimaryWithContext` items into windows. Two primaries belong in
+/// the same window iff they share `session_id` AND their full
+/// `(before, primary, after)` chronological ranges overlap or touch
+/// (last block of the earlier item's window >= first block of the later
+/// item's window in `(created_at, line_number, block_index)` order).
+///
+/// `session_id == None` primaries each get their own window — no merging
+/// across NULL.
+///
+/// Output windows are sorted by `score` descending.
+pub fn merge_windows(items: Vec<PrimaryWithContext>) -> Vec<MergedWindow> {
+    if items.is_empty() {
+        return vec![];
+    }
+
+    // Bucket by session_id; NULL gets its own bucket per primary.
+    let mut by_session: HashMap<Option<String>, Vec<PrimaryWithContext>> = HashMap::new();
+    for item in items {
+        let key = item.primary.message.session_id.clone();
+        by_session.entry(key).or_default().push(item);
+    }
+
+    let mut windows: Vec<MergedWindow> = Vec::new();
+    for (session, mut group) in by_session {
+        if session.is_none() {
+            // No merging for NULL sessions — each item is its own window.
+            for item in group {
+                windows.push(single_window(None, item));
+            }
+            continue;
+        }
+
+        // Sort the group by primary timestamp for left-to-right merging.
+        group.sort_by(|a, b| {
+            timestamp_score(&a.primary.message.created_at)
+                .cmp(&timestamp_score(&b.primary.message.created_at))
+        });
+
+        // Sweep: maintain a "current" merged window; if the next item's
+        // window-range start <= current's window-range end, merge.
+        let mut current: Option<MergedWindow> = None;
+        for item in group {
+            let item_window = single_window(session.clone(), item);
+
+            match current.take() {
+                None => current = Some(item_window),
+                Some(existing) => {
+                    if windows_overlap(&existing, &item_window) {
+                        current = Some(merge_two(existing, item_window));
+                    } else {
+                        windows.push(existing);
+                        current = Some(item_window);
+                    }
+                }
+            }
+        }
+        if let Some(w) = current {
+            windows.push(w);
+        }
+    }
+
+    windows.sort_by(|a, b| b.score.cmp(&a.score));
+    windows
+}
+
+fn single_window(session: Option<String>, item: PrimaryWithContext) -> MergedWindow {
+    let mut blocks = item.before;
+    blocks.push(item.primary.message.clone());
+    blocks.extend(item.after);
+    let primary_id = item.primary.message.message_block_id.clone();
+    let mut scores = HashMap::new();
+    scores.insert(primary_id.clone(), item.primary.score);
+    MergedWindow {
+        session_id: session,
+        blocks,
+        primary_ids: vec![primary_id],
+        primary_scores: scores,
+        score: item.primary.score,
+    }
+}
+
+fn windows_overlap(a: &MergedWindow, b: &MergedWindow) -> bool {
+    // Both windows are time-sorted; compare the last block of `a` to the
+    // first block of `b`. Overlap = `b`'s first ts <= `a`'s last ts.
+    let a_last = a.blocks.last().expect("non-empty window");
+    let b_first = b.blocks.first().expect("non-empty window");
+    timestamp_score(&b_first.created_at) <= timestamp_score(&a_last.created_at)
+}
+
+fn merge_two(a: MergedWindow, b: MergedWindow) -> MergedWindow {
+    // Merge block lists, dedup by message_block_id, sort by
+    // (created_at, line_number, block_index).
+    let mut all_blocks = a.blocks;
+    all_blocks.extend(b.blocks);
+    all_blocks.sort_by(|x, y| {
+        let tx = timestamp_score(&x.created_at);
+        let ty = timestamp_score(&y.created_at);
+        tx.cmp(&ty)
+            .then(x.line_number.cmp(&y.line_number))
+            .then(x.block_index.cmp(&y.block_index))
+    });
+    all_blocks.dedup_by(|x, y| x.message_block_id == y.message_block_id);
+
+    let mut primary_ids = a.primary_ids;
+    primary_ids.extend(b.primary_ids);
+    let mut primary_scores = a.primary_scores;
+    primary_scores.extend(b.primary_scores);
+    let score = primary_scores.values().copied().max().unwrap_or(0);
+
+    MergedWindow {
+        session_id: a.session_id,
+        blocks: all_blocks,
+        primary_ids,
+        primary_scores,
+        score,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -250,5 +394,132 @@ mod tests {
             new_s > old_s,
             "newer candidate must outrank older at equal RRF"
         );
+    }
+}
+
+#[cfg(test)]
+mod window_tests {
+    use super::*;
+    use crate::domain::{BlockType, MessageRole};
+
+    fn block(suffix: &str, session: &str, created: &str, line: u64) -> ConversationMessage {
+        ConversationMessage {
+            message_block_id: format!("mb-{suffix}"),
+            session_id: Some(session.to_string()),
+            tenant: "local".to_string(),
+            caller_agent: "claude-code".to_string(),
+            transcript_path: "/tmp/t.jsonl".to_string(),
+            line_number: line,
+            block_index: 0,
+            message_uuid: None,
+            role: MessageRole::Assistant,
+            block_type: BlockType::Text,
+            content: format!("c-{suffix}"),
+            tool_name: None,
+            tool_use_id: None,
+            embed_eligible: true,
+            created_at: created.to_string(),
+        }
+    }
+
+    fn pwc(
+        primary_suffix: &str,
+        session: &str,
+        created: &str,
+        line: u64,
+        score: i64,
+    ) -> PrimaryWithContext {
+        PrimaryWithContext {
+            primary: ScoredBlock {
+                message: block(primary_suffix, session, created, line),
+                score,
+            },
+            before: vec![],
+            after: vec![],
+        }
+    }
+
+    #[test]
+    fn single_primary_no_overlap_one_window() {
+        let item = pwc("p1", "S1", "00000000020260430000", 5, 30);
+        let windows = merge_windows(vec![item]);
+        assert_eq!(windows.len(), 1);
+        assert_eq!(windows[0].primary_ids, vec!["mb-p1"]);
+        assert_eq!(windows[0].score, 30);
+        assert_eq!(windows[0].blocks.len(), 1);
+    }
+
+    #[test]
+    fn two_primaries_same_session_overlapping_merge() {
+        let mut a = pwc("a", "S1", "00000000020260430010", 5, 30);
+        let mut b = pwc("b", "S1", "00000000020260430011", 6, 25);
+        // Make their context ranges overlap: a's `after` includes b, b's `before` includes a.
+        a.after = vec![block("b", "S1", "00000000020260430011", 6)];
+        b.before = vec![block("a", "S1", "00000000020260430010", 5)];
+        let windows = merge_windows(vec![a, b]);
+        assert_eq!(windows.len(), 1, "overlapping primaries should merge");
+        let mut ids = windows[0].primary_ids.clone();
+        ids.sort();
+        assert_eq!(ids, vec!["mb-a", "mb-b"]);
+        assert_eq!(windows[0].score, 30, "merged score = max(primary scores)");
+    }
+
+    #[test]
+    fn two_primaries_different_session_dont_merge() {
+        let a = pwc("a", "S1", "00000000020260430010", 5, 30);
+        let b = pwc("b", "S2", "00000000020260430011", 6, 25);
+        let windows = merge_windows(vec![a, b]);
+        assert_eq!(windows.len(), 2);
+    }
+
+    #[test]
+    fn two_primaries_same_session_far_apart_dont_merge() {
+        // Both in S1 but with no temporal overlap in their before/after ranges.
+        let a = pwc("a", "S1", "00000000020260430010", 1, 30); // no after
+        let b = pwc("b", "S1", "00000000020260430999", 2, 25); // no before
+        let windows = merge_windows(vec![a, b]);
+        assert_eq!(windows.len(), 2);
+    }
+
+    #[test]
+    fn merged_window_blocks_dedup_and_time_sorted() {
+        // Two primaries' contexts share one block ("shared").
+        let a = PrimaryWithContext {
+            primary: ScoredBlock {
+                message: block("a", "S1", "00000000020260430010", 1),
+                score: 30,
+            },
+            before: vec![],
+            after: vec![block("shared", "S1", "00000000020260430011", 2)],
+        };
+        let b = PrimaryWithContext {
+            primary: ScoredBlock {
+                message: block("b", "S1", "00000000020260430012", 3),
+                score: 25,
+            },
+            before: vec![block("shared", "S1", "00000000020260430011", 2)],
+            after: vec![],
+        };
+        let windows = merge_windows(vec![a, b]);
+        assert_eq!(windows.len(), 1);
+        let ids: Vec<&str> = windows[0]
+            .blocks
+            .iter()
+            .map(|b| b.message_block_id.as_str())
+            .collect();
+        assert_eq!(
+            ids,
+            vec!["mb-a", "mb-shared", "mb-b"],
+            "dedup'd and time-sorted"
+        );
+    }
+
+    #[test]
+    fn windows_sorted_by_score_descending() {
+        let low = pwc("low", "S1", "00000000020260430010", 1, 10);
+        let high = pwc("high", "S2", "00000000020260430011", 1, 50);
+        let windows = merge_windows(vec![low, high]);
+        assert_eq!(windows[0].primary_ids, vec!["mb-high"]);
+        assert_eq!(windows[1].primary_ids, vec!["mb-low"]);
     }
 }
