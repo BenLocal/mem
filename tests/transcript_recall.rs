@@ -295,3 +295,413 @@ async fn context_window_returns_not_found_for_missing_id() {
         "expected 'not found' in error: got {msg}"
     );
 }
+
+// ──────── Integration test scaffolding ────────
+
+use axum::body::Body;
+use axum::http::{Request, StatusCode};
+use serde_json::json;
+use tower::ServiceExt;
+
+async fn build_recall_app(db_dir: &TempDir) -> axum::Router {
+    use mem::config::Config;
+    use mem::service::MemoryService;
+    let mut cfg = Config::local();
+    cfg.db_path = db_dir.path().join("mem.duckdb");
+    let repo = DuckDbRepository::open(&cfg.db_path).await.unwrap();
+    repo.set_transcript_job_provider("embedanything");
+    let memory_service = MemoryService::new(repo.clone());
+    let state = common::test_app_state(repo, memory_service);
+    mem::http::router().with_state(state)
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn ingest_via_http(
+    app: &axum::Router,
+    session: &str,
+    line: u64,
+    role: &str,
+    block_type: &str,
+    content: &str,
+    embed: bool,
+    created: &str,
+) {
+    let body = json!({
+        "session_id": session,
+        "tenant": "local",
+        "caller_agent": "claude-code",
+        "transcript_path": "/tmp/t.jsonl",
+        "line_number": line,
+        "block_index": 0,
+        "role": role,
+        "block_type": block_type,
+        "content": content,
+        "embed_eligible": embed,
+        "created_at": created,
+    });
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/transcripts/messages")
+                .header("content-type", "application/json")
+                .body(Body::from(body.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+}
+
+async fn search_http(app: &axum::Router, body: serde_json::Value) -> serde_json::Value {
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/transcripts/search")
+                .header("content-type", "application/json")
+                .body(Body::from(body.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    serde_json::from_slice(&bytes).unwrap()
+}
+
+// ──────── Integration tests ────────
+
+#[tokio::test]
+async fn bm25_only_candidate_appears_in_results() {
+    let dir = TempDir::new().unwrap();
+    let app = build_recall_app(&dir).await;
+
+    ingest_via_http(
+        &app,
+        "S",
+        1,
+        "assistant",
+        "text",
+        "rust project layout",
+        true,
+        "2026-04-30T00:00:00Z",
+    )
+    .await;
+    ingest_via_http(
+        &app,
+        "S",
+        2,
+        "assistant",
+        "text",
+        "unrelated material",
+        true,
+        "2026-04-30T00:00:01Z",
+    )
+    .await;
+
+    let v = search_http(
+        &app,
+        json!({ "query": "rust", "tenant": "local", "limit": 5 }),
+    )
+    .await;
+    let windows = v["windows"].as_array().unwrap();
+    assert!(
+        !windows.is_empty(),
+        "BM25 alone should surface the rust block"
+    );
+    let primary_block_id = windows[0]["primary_ids"][0].as_str().unwrap();
+    assert!(
+        !primary_block_id.is_empty(),
+        "primary should reference a real id"
+    );
+    // The matching primary's content should be the rust block.
+    let primary_block = windows[0]["blocks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|b| b["is_primary"].as_bool() == Some(true))
+        .expect("primary block in window");
+    assert_eq!(primary_block["content"], "rust project layout");
+}
+
+#[tokio::test]
+async fn anchor_session_boost_lifts_matching_session_to_top() {
+    let dir = TempDir::new().unwrap();
+    let app = build_recall_app(&dir).await;
+
+    // Two sessions, each with one weakly relevant block.
+    ingest_via_http(
+        &app,
+        "A",
+        1,
+        "assistant",
+        "text",
+        "scattered keyword once",
+        true,
+        "2026-04-30T00:00:00Z",
+    )
+    .await;
+    ingest_via_http(
+        &app,
+        "B",
+        2,
+        "assistant",
+        "text",
+        "scattered keyword once",
+        true,
+        "2026-04-30T00:00:01Z",
+    )
+    .await;
+
+    let v = search_http(
+        &app,
+        json!({
+            "query": "scattered",
+            "tenant": "local",
+            "limit": 5,
+            "anchor_session_id": "A"
+        }),
+    )
+    .await;
+    let windows = v["windows"].as_array().unwrap();
+    assert!(!windows.is_empty());
+    assert_eq!(
+        windows[0]["session_id"].as_str(),
+        Some("A"),
+        "anchor session must rank first"
+    );
+}
+
+#[tokio::test]
+async fn context_window_includes_neighboring_text_blocks() {
+    let dir = TempDir::new().unwrap();
+    let app = build_recall_app(&dir).await;
+
+    // Five text blocks. Only the middle one carries the unique keyword so
+    // BM25 has a single primary candidate at position 2 (line 3); ±2 then
+    // hydrates into a window of exactly 5 blocks (primary + 2 before + 2 after).
+    let contents = [
+        "filler-alpha",
+        "filler-beta",
+        "uniqueneighborkeyword",
+        "filler-gamma",
+        "filler-delta",
+    ];
+    for (i, content) in contents.iter().enumerate() {
+        ingest_via_http(
+            &app,
+            "S",
+            (i + 1) as u64,
+            "assistant",
+            "text",
+            content,
+            true,
+            &format!("2026-04-30T00:00:0{i}Z"),
+        )
+        .await;
+    }
+
+    // Search for the middle block's keyword; expect a window of size 5.
+    let v = search_http(
+        &app,
+        json!({
+            "query": "uniqueneighborkeyword",
+            "tenant": "local",
+            "limit": 1,
+            "context_window": 2
+        }),
+    )
+    .await;
+    let windows = v["windows"].as_array().unwrap();
+    assert_eq!(windows.len(), 1);
+    let blocks = windows[0]["blocks"].as_array().unwrap();
+    assert_eq!(blocks.len(), 5, "primary + 2 before + 2 after = 5");
+    let primary_count = blocks
+        .iter()
+        .filter(|b| b["is_primary"] == json!(true))
+        .count();
+    assert_eq!(primary_count, 1);
+}
+
+#[tokio::test]
+async fn context_window_excludes_tool_blocks_by_default_via_http() {
+    let dir = TempDir::new().unwrap();
+    let app = build_recall_app(&dir).await;
+
+    // Only the middle text block carries the search keyword, so BM25 has
+    // exactly one candidate. With default tool exclusion, the ±2 window
+    // around it should skip past the tool_use / tool_result neighbors.
+    let kinds = [
+        ("text", true, "filler-alpha"),
+        ("tool_use", false, "filler-beta"),
+        ("text", true, "uniquedefaultkeyword"),
+        ("tool_result", false, "filler-gamma"),
+        ("text", true, "filler-delta"),
+    ];
+    for (i, (bt, eligible, content)) in kinds.iter().enumerate() {
+        ingest_via_http(
+            &app,
+            "S",
+            (i + 1) as u64,
+            "assistant",
+            bt,
+            content,
+            *eligible,
+            &format!("2026-04-30T00:00:0{i}Z"),
+        )
+        .await;
+    }
+
+    // Search hits the middle text block (index 2). Default context_window=2 + tool exclusion.
+    let v = search_http(
+        &app,
+        json!({
+            "query": "uniquedefaultkeyword",
+            "tenant": "local",
+            "limit": 1
+        }),
+    )
+    .await;
+    let windows = v["windows"].as_array().unwrap();
+    assert_eq!(windows.len(), 1);
+    let block_types: Vec<&str> = windows[0]["blocks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|b| b["block_type"].as_str().unwrap())
+        .collect();
+    assert!(
+        block_types.iter().all(|bt| *bt == "text"),
+        "context excludes tool blocks; got {block_types:?}"
+    );
+}
+
+#[tokio::test]
+async fn context_window_includes_tool_blocks_when_opted_in() {
+    let dir = TempDir::new().unwrap();
+    let app = build_recall_app(&dir).await;
+
+    // Five blocks: only the middle text block carries the search keyword,
+    // so BM25 has exactly one candidate and the primary is line 3 (index 2).
+    // The others surround it with one tool_use before and one tool_result
+    // after so the ±2 window picks up both when tools are opted in.
+    let kinds = [
+        ("text", true, "filler-alpha"),
+        ("tool_use", false, "filler-beta"),
+        ("text", true, "uniqueoptinkeyword"),
+        ("tool_result", false, "filler-gamma"),
+        ("text", true, "filler-delta"),
+    ];
+    for (i, (bt, eligible, content)) in kinds.iter().enumerate() {
+        ingest_via_http(
+            &app,
+            "S",
+            (i + 1) as u64,
+            "assistant",
+            bt,
+            content,
+            *eligible,
+            &format!("2026-04-30T00:00:0{i}Z"),
+        )
+        .await;
+    }
+
+    let v = search_http(
+        &app,
+        json!({
+            "query": "uniqueoptinkeyword",
+            "tenant": "local",
+            "limit": 1,
+            "context_window": 2,
+            "include_tool_blocks_in_context": true
+        }),
+    )
+    .await;
+    let windows = v["windows"].as_array().unwrap();
+    assert_eq!(windows.len(), 1);
+    let block_types: std::collections::HashSet<&str> = windows[0]["blocks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|b| b["block_type"].as_str().unwrap())
+        .collect();
+    assert!(
+        block_types.contains("tool_use"),
+        "tool_use must appear when opted in; got {block_types:?}"
+    );
+    assert!(block_types.contains("tool_result"));
+}
+
+#[tokio::test]
+async fn windows_merge_when_primaries_share_session_and_overlap() {
+    let dir = TempDir::new().unwrap();
+    let app = build_recall_app(&dir).await;
+
+    // Three adjacent text blocks, all with the same query keyword.
+    // With context_window=1, primary 1's after overlaps primary 3's before.
+    for i in 0..3 {
+        ingest_via_http(
+            &app,
+            "S",
+            (i + 1) as u64,
+            "assistant",
+            "text",
+            "shared-merge-keyword",
+            true,
+            &format!("2026-04-30T00:00:0{i}Z"),
+        )
+        .await;
+    }
+
+    let v = search_http(
+        &app,
+        json!({
+            "query": "shared-merge-keyword",
+            "tenant": "local",
+            "limit": 5,
+            "context_window": 1
+        }),
+    )
+    .await;
+    let windows = v["windows"].as_array().unwrap();
+    assert_eq!(
+        windows.len(),
+        1,
+        "all three primaries should merge into one window; got {} windows",
+        windows.len()
+    );
+    let primary_ids = windows[0]["primary_ids"].as_array().unwrap();
+    assert_eq!(primary_ids.len(), 3);
+}
+
+#[tokio::test]
+async fn empty_query_returns_recent_time_windows() {
+    let dir = TempDir::new().unwrap();
+    let app = build_recall_app(&dir).await;
+
+    for i in 0..3 {
+        ingest_via_http(
+            &app,
+            "S",
+            (i + 1) as u64,
+            "assistant",
+            "text",
+            &format!("recent-c{i}"),
+            true,
+            &format!("2026-04-30T00:00:0{i}Z"),
+        )
+        .await;
+    }
+
+    let v = search_http(&app, json!({ "query": "", "tenant": "local", "limit": 5 })).await;
+    let windows = v["windows"].as_array().unwrap();
+    assert!(
+        !windows.is_empty(),
+        "empty query should still return windows from recent_*"
+    );
+}
