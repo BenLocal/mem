@@ -490,10 +490,23 @@ mod http_routes {
         assert_eq!(resp.status(), StatusCode::OK);
         let bytes = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
         let v: Value = serde_json::from_slice(&bytes).unwrap();
-        let hits = v["hits"].as_array().expect("hits array");
-        assert_eq!(hits.len(), 1, "role=user filters to single match");
-        assert_eq!(hits[0]["role"], "user");
-        assert_eq!(hits[0]["content"], "user-says-hello");
+        let windows = v["windows"].as_array().expect("windows array");
+        assert_eq!(windows.len(), 1, "role=user filters to single window");
+        let primaries: Vec<&str> = windows[0]["primary_ids"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_str().unwrap())
+            .collect();
+        assert_eq!(primaries.len(), 1);
+        let primary_block = windows[0]["blocks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|b| b["is_primary"].as_bool() == Some(true))
+            .expect("primary block in window");
+        assert_eq!(primary_block["role"], "user");
+        assert_eq!(primary_block["content"], "user-says-hello");
 
         // Filter by block_type=tool_use → expect 1 hit.
         let resp = app
@@ -519,8 +532,18 @@ mod http_routes {
         assert_eq!(resp.status(), StatusCode::OK);
         let bytes = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
         let v: Value = serde_json::from_slice(&bytes).unwrap();
-        let hits = v["hits"].as_array().expect("hits array");
-        assert_eq!(hits.len(), 1, "block_type=tool_use filters to single match");
-        assert_eq!(hits[0]["block_type"], "tool_use");
+        let windows = v["windows"].as_array().expect("windows array");
+        assert_eq!(
+            windows.len(),
+            1,
+            "block_type=tool_use filters to single window"
+        );
+        let primary_block = windows[0]["blocks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|b| b["is_primary"].as_bool() == Some(true))
+            .expect("primary block in window");
+        assert_eq!(primary_block["block_type"], "tool_use");
     }
 }

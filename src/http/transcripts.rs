@@ -20,10 +20,13 @@ use axum::routing::{get, post};
 use axum::{Json, Router};
 use serde::{Deserialize, Serialize};
 
+use std::collections::HashSet;
+
 use crate::app::AppState;
 use crate::domain::{BlockType, ConversationMessage, MessageRole};
 use crate::error::AppError;
-use crate::service::{TranscriptSearchFilters, TranscriptSearchHit};
+use crate::pipeline::transcript_recall::MergedWindow;
+use crate::service::{TranscriptSearchFilters, TranscriptSearchOpts};
 
 pub fn router() -> Router<AppState> {
     Router::new()
@@ -130,6 +133,10 @@ pub struct SearchRequest {
     pub time_to: Option<String>,
     #[serde(default = "default_limit")]
     pub limit: usize,
+    pub anchor_session_id: Option<String>,
+    pub context_window: Option<usize>,
+    #[serde(default)]
+    pub include_tool_blocks_in_context: bool,
 }
 
 fn default_limit() -> usize {
@@ -137,19 +144,32 @@ fn default_limit() -> usize {
 }
 
 #[derive(Debug, Serialize)]
-pub struct SearchHitDto {
-    pub message_block_id: String,
-    pub session_id: Option<String>,
-    pub role: MessageRole,
-    pub block_type: BlockType,
-    pub content: String,
-    pub created_at: String,
-    pub score: f32,
+pub struct SearchResponse {
+    pub windows: Vec<TranscriptWindow>,
 }
 
 #[derive(Debug, Serialize)]
-pub struct SearchResponse {
-    pub hits: Vec<SearchHitDto>,
+pub struct TranscriptWindow {
+    pub session_id: Option<String>,
+    pub blocks: Vec<TranscriptWindowBlock>,
+    pub primary_ids: Vec<String>,
+    pub score: i64,
+}
+
+#[derive(Debug, Serialize)]
+pub struct TranscriptWindowBlock {
+    pub message_block_id: String,
+    pub session_id: Option<String>,
+    pub line_number: u64,
+    pub block_index: u32,
+    pub role: MessageRole,
+    pub block_type: BlockType,
+    pub content: String,
+    pub tool_name: Option<String>,
+    pub tool_use_id: Option<String>,
+    pub created_at: String,
+    pub is_primary: bool,
+    pub primary_score: Option<i64>,
 }
 
 async fn post_search(
@@ -163,21 +183,54 @@ async fn post_search(
         time_from: req.time_from,
         time_to: req.time_to,
     };
-    let hits: Vec<TranscriptSearchHit> = state
+    let opts = TranscriptSearchOpts {
+        anchor_session_id: req.anchor_session_id,
+        context_window: req.context_window,
+        include_tool_blocks_in_context: req.include_tool_blocks_in_context,
+    };
+
+    let result = state
         .transcript_service
-        .search(&req.tenant, &req.query, &filters, req.limit)
+        .search(&req.tenant, &req.query, &filters, req.limit, &opts)
         .await?;
-    let dtos = hits
+
+    let windows = result.windows.into_iter().map(window_to_dto).collect();
+    Ok(Json(SearchResponse { windows }))
+}
+
+fn window_to_dto(w: MergedWindow) -> TranscriptWindow {
+    let primary_set: HashSet<&str> = w.primary_ids.iter().map(String::as_str).collect();
+    let blocks: Vec<TranscriptWindowBlock> = w
+        .blocks
         .into_iter()
-        .map(|h| SearchHitDto {
-            message_block_id: h.message.message_block_id,
-            session_id: h.message.session_id,
-            role: h.message.role,
-            block_type: h.message.block_type,
-            content: h.message.content,
-            created_at: h.message.created_at,
-            score: h.score,
+        .map(|m| {
+            let id = m.message_block_id.clone();
+            let is_primary = primary_set.contains(id.as_str());
+            let primary_score = if is_primary {
+                w.primary_scores.get(&id).copied()
+            } else {
+                None
+            };
+            TranscriptWindowBlock {
+                message_block_id: id,
+                session_id: m.session_id,
+                line_number: m.line_number,
+                block_index: m.block_index,
+                role: m.role,
+                block_type: m.block_type,
+                content: m.content,
+                tool_name: m.tool_name,
+                tool_use_id: m.tool_use_id,
+                created_at: m.created_at,
+                is_primary,
+                primary_score,
+            }
         })
         .collect();
-    Ok(Json(SearchResponse { hits: dtos }))
+    TranscriptWindow {
+        session_id: w.session_id,
+        blocks,
+        primary_ids: w.primary_ids,
+        score: w.score,
+    }
 }

@@ -6,4 +6,6 @@ pub mod transcript_embedding_worker;
 pub mod transcript_service;
 
 pub use memory_service::{IngestMemoryResponse, MemoryService};
-pub use transcript_service::{TranscriptSearchFilters, TranscriptSearchHit, TranscriptService};
+pub use transcript_service::{
+    TranscriptSearchFilters, TranscriptSearchOpts, TranscriptSearchResult, TranscriptService,
+};

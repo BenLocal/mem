@@ -213,6 +213,34 @@ impl DuckDbRepository {
         Ok(hydrated)
     }
 
+    /// Returns up to `k` `message_block_id`s from the given anchor session
+    /// (most recent first, embed-eligible only). Used by
+    /// `TranscriptService::search` to ensure anchor-session blocks enter
+    /// the candidate pool even if no topical (BM25/HNSW) match would have
+    /// surfaced them.
+    pub async fn anchor_session_candidates(
+        &self,
+        tenant: &str,
+        session_id: &str,
+        k: usize,
+    ) -> Result<Vec<String>, StorageError> {
+        if k == 0 {
+            return Ok(vec![]);
+        }
+        let conn = self.conn()?;
+        let mut stmt = conn.prepare(
+            "select message_block_id \
+             from conversation_messages \
+             where tenant = ?1 and session_id = ?2 and embed_eligible = true \
+             order by created_at desc \
+             limit ?3",
+        )?;
+        let rows = stmt.query_map(params![tenant, session_id, k as i64], |r| {
+            r.get::<_, String>(0)
+        })?;
+        Ok(rows.collect::<Result<Vec<_>, _>>()?)
+    }
+
     /// Fetch the primary block and up to `k_before` / `k_after` adjacent
     /// blocks in the same `session_id`, ordered by
     /// `(created_at, line_number, block_index)`. If `include_tool_blocks`
