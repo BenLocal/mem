@@ -121,6 +121,11 @@ pub enum StorageError {
     InvalidInput(String),
     #[error("vector index error: {0}")]
     VectorIndex(String),
+    /// Internal-consistency lookup miss (e.g. an id returned by a sibling
+    /// index moments ago is no longer present). Carries only a `&'static
+    /// str` category so HTTP error bodies cannot leak runtime ids.
+    #[error("not found: {0}")]
+    NotFound(&'static str),
 }
 
 impl DuckDbRepository {

@@ -271,3 +271,27 @@ async fn context_window_does_not_cross_session_boundary() {
     assert_eq!(win.after.len(), 1);
     assert_eq!(win.after[0].message_block_id, "mb-a2");
 }
+
+#[tokio::test]
+async fn context_window_returns_not_found_for_missing_id() {
+    let tmp = TempDir::new().unwrap();
+    let db = tmp.path().join("mem.duckdb");
+    let repo = DuckDbRepository::open(&db).await.unwrap();
+    repo.set_transcript_job_provider("embedanything");
+
+    let err = repo
+        .context_window_for_block("local", "mb-does-not-exist", 1, 1, false)
+        .await
+        .expect_err("should error on missing primary");
+    let msg = err.to_string();
+    // Variant must NOT include the requested id (avoid leaking through HTTP).
+    assert!(
+        !msg.contains("mb-does-not-exist"),
+        "error message must not leak the requested id: got {msg}"
+    );
+    // Match shape (loose, in case error message wording shifts):
+    assert!(
+        msg.to_lowercase().contains("not found"),
+        "expected 'not found' in error: got {msg}"
+    );
+}

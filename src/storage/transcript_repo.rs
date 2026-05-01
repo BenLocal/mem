@@ -222,8 +222,9 @@ impl DuckDbRepository {
     ///
     /// Returns `Ok` with empty `before`/`after` if the primary has no
     /// `session_id` (NULL session). Returns
-    /// `StorageError::InvalidInput` if the primary id doesn't exist for
-    /// this tenant.
+    /// `StorageError::NotFound` if the primary id doesn't exist for
+    /// this tenant — this is treated as an internal-consistency event
+    /// (BM25/HNSW just returned the id) and surfaces as HTTP 500, not 400.
     pub async fn context_window_for_block(
         &self,
         tenant: &str,
@@ -249,9 +250,7 @@ impl DuckDbRepository {
                 Some(Ok(m)) => m,
                 Some(Err(e)) => return Err(StorageError::from(e)),
                 None => {
-                    return Err(StorageError::InvalidInput(format!(
-                        "primary block not found: {primary_id}"
-                    )));
+                    return Err(StorageError::NotFound("transcript primary block"));
                 }
             }
         };
