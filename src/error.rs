@@ -46,9 +46,18 @@ impl IntoResponse for AppError {
             };
         }
         // Bare StorageError (transcript routes go through this path — they
-        // don't wrap in ServiceError). InvalidInput → 400, everything else → 500.
+        // don't wrap in ServiceError). InvalidInput → 400, NotFound → 500
+        // (internal-consistency miss, neutral body to avoid leaking the
+        // looked-up id), everything else → 500.
         if let Some(StorageError::InvalidInput(msg)) = self.0.downcast_ref::<StorageError>() {
             return (StatusCode::BAD_REQUEST, Json(json!({ "error": msg }))).into_response();
+        }
+        if let Some(StorageError::NotFound(_)) = self.0.downcast_ref::<StorageError>() {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({ "error": "internal lookup miss" })),
+            )
+                .into_response();
         }
         (
             StatusCode::INTERNAL_SERVER_ERROR,

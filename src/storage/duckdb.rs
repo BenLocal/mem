@@ -99,6 +99,12 @@ pub struct DuckDbRepository {
     /// successful index rebuild. DuckDB FTS is non-incremental, so we
     /// rebuild lazily on the next BM25 query rather than after every write.
     fts_dirty: Arc<AtomicBool>,
+    /// Same idea as `fts_dirty` but for the `conversation_messages` FTS
+    /// index. Independent flag — transcripts and memories share zero state.
+    /// Initial value is `true` so the first BM25 query after process
+    /// restart always rebuilds (defends against stale sidecars across
+    /// restarts).
+    pub(crate) transcripts_fts_dirty: Arc<AtomicBool>,
 }
 
 #[derive(Debug, Error)]
@@ -115,6 +121,11 @@ pub enum StorageError {
     InvalidInput(String),
     #[error("vector index error: {0}")]
     VectorIndex(String),
+    /// Internal-consistency lookup miss (e.g. an id returned by a sibling
+    /// index moments ago is no longer present). Carries only a `&'static
+    /// str` category so HTTP error bodies cannot leak runtime ids.
+    #[error("not found: {0}")]
+    NotFound(&'static str),
 }
 
 impl DuckDbRepository {
@@ -135,6 +146,9 @@ impl DuckDbRepository {
             // Force a build on the very first BM25 query so a freshly opened
             // (or previously upgraded) DB doesn't silently miss results.
             fts_dirty: Arc::new(AtomicBool::new(true)),
+            // Same rationale as `fts_dirty`: force a build on the first
+            // transcript BM25 query after process startup.
+            transcripts_fts_dirty: Arc::new(AtomicBool::new(true)),
         })
     }
 
@@ -176,6 +190,15 @@ impl DuckDbRepository {
             .read()
             .expect("transcript_job_provider lock poisoned")
             .clone()
+    }
+
+    /// Marks the transcripts FTS index as needing a rebuild on the next
+    /// BM25 read. Mirrors the inline `self.fts_dirty.store(true, ...)`
+    /// pattern used by the memories side, but exposed as a method so
+    /// `transcript_repo.rs` can flip the flag without crossing module
+    /// boundaries on a private field.
+    pub(crate) fn set_transcripts_fts_dirty(&self) {
+        self.transcripts_fts_dirty.store(true, Ordering::Release);
     }
 
     pub async fn insert_memory(&self, memory: MemoryRecord) -> Result<MemoryRecord, StorageError> {

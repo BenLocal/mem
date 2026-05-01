@@ -6,6 +6,7 @@
 //! a separate `impl DuckDbRepository` block in this file.
 
 use std::collections::HashMap;
+use std::sync::atomic::Ordering;
 
 use duckdb::{params, OptionalExt};
 
@@ -26,6 +27,16 @@ pub struct ClaimedTranscriptEmbeddingJob {
     pub message_block_id: String,
     pub provider: String,
     pub attempt_count: i64,
+}
+
+/// Result of [`DuckDbRepository::context_window_for_block`]. The
+/// `primary` is the requested block; `before` and `after` are temporally
+/// adjacent same-session blocks (filtered per `include_tool_blocks`).
+#[derive(Debug, Clone)]
+pub struct ContextWindow {
+    pub primary: ConversationMessage,
+    pub before: Vec<ConversationMessage>,
+    pub after: Vec<ConversationMessage>,
 }
 
 impl DuckDbRepository {
@@ -85,22 +96,23 @@ impl DuckDbRepository {
         // Step 2: enqueue an embedding job iff a NEW row was written AND it is
         // embed-eligible. Idempotent re-inserts (inserted == 0) skip enqueue,
         // matching the deduplication contract of `try_enqueue_embedding_job`.
-        if inserted == 1 && msg.embed_eligible {
-            let job_id = uuid::Uuid::now_v7().to_string();
-            let now = current_timestamp();
-            // Provider id is configured once at startup via
-            // `set_transcript_job_provider` in `app.rs`. Failing loudly here is
-            // preferable to silently substituting a default that would later
-            // mismatch the worker's `job_provider_id()` and dead-letter every
-            // job for the wrong reason.
-            let provider = self
-                .transcript_job_provider()
-                .ok_or(StorageError::InvalidData(
-                    "transcript embedding job provider not configured; \
+        if inserted == 1 {
+            if msg.embed_eligible {
+                let job_id = uuid::Uuid::now_v7().to_string();
+                let now = current_timestamp();
+                // Provider id is configured once at startup via
+                // `set_transcript_job_provider` in `app.rs`. Failing loudly here is
+                // preferable to silently substituting a default that would later
+                // mismatch the worker's `job_provider_id()` and dead-letter every
+                // job for the wrong reason.
+                let provider = self
+                    .transcript_job_provider()
+                    .ok_or(StorageError::InvalidData(
+                        "transcript embedding job provider not configured; \
                  call DuckDbRepository::set_transcript_job_provider during startup",
-                ))?;
-            conn.execute(
-                "insert into transcript_embedding_jobs (
+                    ))?;
+                conn.execute(
+                    "insert into transcript_embedding_jobs (
                     job_id, tenant, message_block_id, provider,
                     status, attempt_count, last_error,
                     available_at, created_at, updated_at
@@ -109,18 +121,286 @@ impl DuckDbRepository {
                     'pending', 0, null,
                     ?5, ?6, ?7
                 )",
-                params![
-                    job_id,
-                    msg.tenant,
-                    msg.message_block_id,
-                    provider,
-                    now,
-                    now,
-                    now,
-                ],
-            )?;
+                    params![
+                        job_id,
+                        msg.tenant,
+                        msg.message_block_id,
+                        provider,
+                        now,
+                        now,
+                        now,
+                    ],
+                )?;
+            }
+            // Mark the transcripts FTS index dirty so the next BM25 read
+            // rebuilds. Done unconditionally on a successful insert (not only
+            // for embed-eligible rows) because the FTS index covers the full
+            // `conversation_messages` table per the Task 2 probe outcome —
+            // even ineligible rows go into the index, and the SELECT filters
+            // by `embed_eligible = true` at query time.
+            self.set_transcripts_fts_dirty();
         }
 
+        Ok(())
+    }
+
+    /// BM25 lexical candidates over `conversation_messages.content`,
+    /// filtered to `embed_eligible = true` rows (matching the HNSW
+    /// pipeline's coverage). Returns up to `k` rows ordered by BM25
+    /// score descending.
+    ///
+    /// The FTS index is built lazily by `ensure_transcript_fts_index_fresh`
+    /// on the first read after a write.
+    ///
+    /// Per the Task 2 probe, the bundled DuckDB FTS extension does NOT
+    /// support `where := '...'` predicate indexes, so the index covers
+    /// the full table and the SELECT filters at query time.
+    pub async fn bm25_transcript_candidates(
+        &self,
+        tenant: &str,
+        query: &str,
+        k: usize,
+    ) -> Result<Vec<ConversationMessage>, StorageError> {
+        if query.trim().is_empty() || k == 0 {
+            return Ok(vec![]);
+        }
+        self.ensure_transcript_fts_index_fresh()?;
+
+        let scored: Vec<(String, f64)> = {
+            let conn = self.conn()?;
+            let mut stmt = conn.prepare(
+                "with scored as (
+                    select message_block_id,
+                           fts_main_conversation_messages.match_bm25(message_block_id, ?1, conjunctive := 0) as bm25
+                    from conversation_messages
+                    where tenant = ?2
+                      and embed_eligible = true
+                )
+                 select message_block_id, bm25
+                 from scored
+                 where bm25 is not null
+                 order by bm25 desc
+                 limit ?3",
+            )?;
+            let rows = stmt.query_map(params![query, tenant, k as i64], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, f64>(1)?))
+            })?;
+            rows.collect::<Result<Vec<_>, _>>()?
+        };
+
+        if scored.is_empty() {
+            return Ok(vec![]);
+        }
+
+        let id_strings: Vec<String> = scored.iter().map(|(id, _)| id.clone()).collect();
+        let mut hydrated = self
+            .fetch_conversation_messages_by_ids(tenant, &id_strings)
+            .await?;
+
+        // Preserve BM25 rank order — `fetch_conversation_messages_by_ids`
+        // already orders by input slice, but we re-sort defensively in case
+        // that contract is ever relaxed.
+        let rank_by_id: HashMap<&str, usize> = scored
+            .iter()
+            .enumerate()
+            .map(|(i, (id, _))| (id.as_str(), i))
+            .collect();
+        hydrated.sort_by_key(|m| {
+            *rank_by_id
+                .get(m.message_block_id.as_str())
+                .unwrap_or(&usize::MAX)
+        });
+        Ok(hydrated)
+    }
+
+    /// Returns up to `k` `message_block_id`s from the given anchor session
+    /// (most recent first, embed-eligible only). Used by
+    /// `TranscriptService::search` to ensure anchor-session blocks enter
+    /// the candidate pool even if no topical (BM25/HNSW) match would have
+    /// surfaced them.
+    pub async fn anchor_session_candidates(
+        &self,
+        tenant: &str,
+        session_id: &str,
+        k: usize,
+    ) -> Result<Vec<String>, StorageError> {
+        if k == 0 {
+            return Ok(vec![]);
+        }
+        let conn = self.conn()?;
+        let mut stmt = conn.prepare(
+            "select message_block_id \
+             from conversation_messages \
+             where tenant = ?1 and session_id = ?2 and embed_eligible = true \
+             order by created_at desc \
+             limit ?3",
+        )?;
+        let rows = stmt.query_map(params![tenant, session_id, k as i64], |r| {
+            r.get::<_, String>(0)
+        })?;
+        Ok(rows.collect::<Result<Vec<_>, _>>()?)
+    }
+
+    /// Fetch the primary block and up to `k_before` / `k_after` adjacent
+    /// blocks in the same `session_id`, ordered by
+    /// `(created_at, line_number, block_index)`. If `include_tool_blocks`
+    /// is false, `before` and `after` only include `text` and `thinking`
+    /// block types (the primary itself is always returned regardless of
+    /// its type).
+    ///
+    /// Returns `Ok` with empty `before`/`after` if the primary has no
+    /// `session_id` (NULL session). Returns
+    /// `StorageError::NotFound` if the primary id doesn't exist for
+    /// this tenant — this is treated as an internal-consistency event
+    /// (BM25/HNSW just returned the id) and surfaces as HTTP 500, not 400.
+    pub async fn context_window_for_block(
+        &self,
+        tenant: &str,
+        primary_id: &str,
+        k_before: usize,
+        k_after: usize,
+        include_tool_blocks: bool,
+    ) -> Result<ContextWindow, StorageError> {
+        let conn = self.conn()?;
+
+        // 1. Fetch the primary first to get its session and timestamp.
+        let primary: ConversationMessage = {
+            let mut stmt = conn.prepare(
+                "select message_block_id, session_id, tenant, caller_agent, transcript_path, \
+                        line_number, block_index, message_uuid, role, block_type, content, \
+                        tool_name, tool_use_id, embed_eligible, created_at \
+                 from conversation_messages \
+                 where tenant = ?1 and message_block_id = ?2",
+            )?;
+            let mut rows =
+                stmt.query_map(params![tenant, primary_id], row_to_conversation_message)?;
+            match rows.next() {
+                Some(Ok(m)) => m,
+                Some(Err(e)) => return Err(StorageError::from(e)),
+                None => {
+                    return Err(StorageError::NotFound("transcript primary block"));
+                }
+            }
+        };
+
+        let session_id = match primary.session_id.as_deref() {
+            Some(s) => s.to_string(),
+            None => {
+                // No session → no neighbors by definition.
+                return Ok(ContextWindow {
+                    primary,
+                    before: vec![],
+                    after: vec![],
+                });
+            }
+        };
+
+        // 2. Block-type filter clause built once.
+        let type_filter = if include_tool_blocks {
+            ""
+        } else {
+            "and block_type in ('text', 'thinking')"
+        };
+
+        // 3. Fetch `k_before` blocks strictly before the primary's
+        //    (created_at, line_number, block_index) tuple. We use an
+        //    explicit disjunction rather than DuckDB's tuple comparison
+        //    to maximize compatibility across versions.
+        let before_sql = format!(
+            "select message_block_id, session_id, tenant, caller_agent, transcript_path, \
+                    line_number, block_index, message_uuid, role, block_type, content, \
+                    tool_name, tool_use_id, embed_eligible, created_at \
+             from conversation_messages \
+             where tenant = ?1 \
+               and session_id = ?2 \
+               and (
+                    created_at < ?3 \
+                    or (created_at = ?3 and line_number < ?4) \
+                    or (created_at = ?3 and line_number = ?4 and block_index < ?5)
+               ) \
+               {type_filter} \
+             order by created_at desc, line_number desc, block_index desc \
+             limit ?6"
+        );
+        let before: Vec<ConversationMessage> = {
+            let mut stmt = conn.prepare(&before_sql)?;
+            let rows = stmt.query_map(
+                params![
+                    tenant,
+                    session_id,
+                    primary.created_at,
+                    primary.line_number as i64,
+                    primary.block_index as i64,
+                    k_before as i64,
+                ],
+                row_to_conversation_message,
+            )?;
+            // The query returns DESC order; reverse to ASC for caller convenience.
+            let mut v: Vec<_> = rows.collect::<Result<Vec<_>, _>>()?;
+            v.reverse();
+            v
+        };
+
+        // 4. Fetch `k_after` blocks strictly after.
+        let after_sql = format!(
+            "select message_block_id, session_id, tenant, caller_agent, transcript_path, \
+                    line_number, block_index, message_uuid, role, block_type, content, \
+                    tool_name, tool_use_id, embed_eligible, created_at \
+             from conversation_messages \
+             where tenant = ?1 \
+               and session_id = ?2 \
+               and (
+                    created_at > ?3 \
+                    or (created_at = ?3 and line_number > ?4) \
+                    or (created_at = ?3 and line_number = ?4 and block_index > ?5)
+               ) \
+               {type_filter} \
+             order by created_at asc, line_number asc, block_index asc \
+             limit ?6"
+        );
+        let after: Vec<ConversationMessage> = {
+            let mut stmt = conn.prepare(&after_sql)?;
+            let rows = stmt.query_map(
+                params![
+                    tenant,
+                    session_id,
+                    primary.created_at,
+                    primary.line_number as i64,
+                    primary.block_index as i64,
+                    k_after as i64,
+                ],
+                row_to_conversation_message,
+            )?;
+            rows.collect::<Result<Vec<_>, _>>()?
+        };
+
+        Ok(ContextWindow {
+            primary,
+            before,
+            after,
+        })
+    }
+
+    /// Rebuild the transcripts FTS index iff the dirty flag is set. Cheap
+    /// when clean. Mirror of `ensure_fts_index_fresh` for memories — see
+    /// that method's docs for the drop-then-create rationale.
+    fn ensure_transcript_fts_index_fresh(&self) -> Result<(), StorageError> {
+        if !self.transcripts_fts_dirty.swap(false, Ordering::AcqRel) {
+            return Ok(());
+        }
+        let conn = self.conn()?;
+        // `LOAD fts;` is idempotent; defensive against state reset.
+        let _ = conn.execute_batch("load fts;");
+        // Drop existing index (errors first time when none exists; ignore).
+        let _ = conn.execute_batch("pragma drop_fts_index('conversation_messages');");
+        // Build full-table index (no `where := '...'` per Task 2 probe).
+        if let Err(e) = conn.execute_batch(
+            "pragma create_fts_index('conversation_messages', 'message_block_id', 'content');",
+        ) {
+            // Restore the flag so the next caller retries.
+            self.transcripts_fts_dirty.store(true, Ordering::Release);
+            return Err(StorageError::DuckDb(e));
+        }
         Ok(())
     }
 
@@ -197,7 +477,7 @@ impl DuckDbRepository {
                     line_number, block_index, message_uuid, role, block_type, content,
                     tool_name, tool_use_id, embed_eligible, created_at
              from conversation_messages
-             where tenant = ?1
+             where tenant = ?1 and embed_eligible = true
              order by created_at desc, line_number desc, block_index desc
              limit ?2",
         )?;

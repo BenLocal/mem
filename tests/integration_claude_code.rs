@@ -229,6 +229,11 @@ async fn end_to_end_mine_then_search_then_get() {
         "POST /transcripts/search must 2xx"
     );
     let v: serde_json::Value = resp.json().await.unwrap();
-    let hits = v["hits"].as_array().expect("hits array");
-    assert!(!hits.is_empty(), "expected at least one semantic hit");
+    let windows = v["windows"].as_array().expect("windows array");
+    assert!(!windows.is_empty(), "expected at least one window");
+    let primaries = windows[0]["primary_ids"].as_array().unwrap();
+    assert!(
+        !primaries.is_empty(),
+        "top window must have at least one primary"
+    );
 }
