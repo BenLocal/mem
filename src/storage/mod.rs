@@ -11,7 +11,7 @@ pub use duckdb::{
 };
 pub use graph_store::{DuckDbGraphStore, GraphError};
 pub use time::{current_timestamp, timestamp_add_ms};
-pub use transcript_repo::ClaimedTranscriptEmbeddingJob;
+pub use transcript_repo::{ClaimedTranscriptEmbeddingJob, ContextWindow};
 pub use vector_index::{
     sidecar_paths, transcript_sidecar_paths, EmbeddingRowSource, TranscriptEmbeddingRowSource,
     VectorIndex, VectorIndexError, VectorIndexFingerprint, VectorIndexMeta,

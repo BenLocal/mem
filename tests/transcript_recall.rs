@@ -144,3 +144,130 @@ async fn bm25_excludes_tool_blocks() {
         .unwrap();
     assert!(hits.is_empty(), "tool blocks must not surface in BM25");
 }
+
+#[tokio::test]
+async fn context_window_returns_neighbors_in_same_session() {
+    let tmp = TempDir::new().unwrap();
+    let db = tmp.path().join("mem.duckdb");
+    let repo = DuckDbRepository::open(&db).await.unwrap();
+    repo.set_transcript_job_provider("embedanything");
+
+    // Seed 5 text blocks, increasing line_number AND created_at.
+    for i in 0..5 {
+        let mut m = sample_block(
+            &format!("blk-{i}"),
+            &format!("content {i}"),
+            BlockType::Text,
+            true,
+        );
+        m.line_number = (i + 1) as u64;
+        m.created_at = format!("000000000{:011}", i + 1); // strictly increasing
+        repo.create_conversation_message(&m).await.unwrap();
+    }
+
+    let win = repo
+        .context_window_for_block("local", "mb-blk-2", 1, 1, false)
+        .await
+        .unwrap();
+    assert_eq!(win.before.len(), 1);
+    assert_eq!(win.before[0].message_block_id, "mb-blk-1");
+    assert_eq!(win.primary.message_block_id, "mb-blk-2");
+    assert_eq!(win.after.len(), 1);
+    assert_eq!(win.after[0].message_block_id, "mb-blk-3");
+}
+
+#[tokio::test]
+async fn context_window_excludes_tool_blocks_by_default() {
+    let tmp = TempDir::new().unwrap();
+    let db = tmp.path().join("mem.duckdb");
+    let repo = DuckDbRepository::open(&db).await.unwrap();
+    repo.set_transcript_job_provider("embedanything");
+
+    // text, tool_use, text, tool_result, text — primary at index 2 (the middle text).
+    let kinds = [
+        (BlockType::Text, true),
+        (BlockType::ToolUse, false),
+        (BlockType::Text, true),
+        (BlockType::ToolResult, false),
+        (BlockType::Text, true),
+    ];
+    for (i, (bt, eligible)) in kinds.iter().enumerate() {
+        let mut m = sample_block(&format!("k{i}"), &format!("c{i}"), *bt, *eligible);
+        m.line_number = (i + 1) as u64;
+        m.created_at = format!("000000000{:011}", i + 1);
+        repo.create_conversation_message(&m).await.unwrap();
+    }
+
+    // include_tool_blocks=false → before/after skip the tool blocks.
+    let win = repo
+        .context_window_for_block("local", "mb-k2", 2, 2, false)
+        .await
+        .unwrap();
+    let before_ids: Vec<&str> = win
+        .before
+        .iter()
+        .map(|m| m.message_block_id.as_str())
+        .collect();
+    let after_ids: Vec<&str> = win
+        .after
+        .iter()
+        .map(|m| m.message_block_id.as_str())
+        .collect();
+    assert_eq!(before_ids, vec!["mb-k0"]); // mb-k1 (tool_use) skipped
+    assert_eq!(after_ids, vec!["mb-k4"]); // mb-k3 (tool_result) skipped
+
+    // include_tool_blocks=true → all 4 neighbors returned.
+    let win = repo
+        .context_window_for_block("local", "mb-k2", 2, 2, true)
+        .await
+        .unwrap();
+    let before_ids: Vec<&str> = win
+        .before
+        .iter()
+        .map(|m| m.message_block_id.as_str())
+        .collect();
+    let after_ids: Vec<&str> = win
+        .after
+        .iter()
+        .map(|m| m.message_block_id.as_str())
+        .collect();
+    assert_eq!(before_ids, vec!["mb-k0", "mb-k1"]);
+    assert_eq!(after_ids, vec!["mb-k3", "mb-k4"]);
+}
+
+#[tokio::test]
+async fn context_window_does_not_cross_session_boundary() {
+    let tmp = TempDir::new().unwrap();
+    let db = tmp.path().join("mem.duckdb");
+    let repo = DuckDbRepository::open(&db).await.unwrap();
+    repo.set_transcript_job_provider("embedanything");
+
+    // Two sessions interleaved temporally; window for session A's block must
+    // not include session B blocks even though B's block sits between A's.
+    let mut a1 = sample_block("a1", "session A first", BlockType::Text, true);
+    a1.session_id = Some("A".to_string());
+    a1.line_number = 1;
+    a1.created_at = "00000000010000000001".to_string();
+
+    let mut b1 = sample_block("b1", "session B first", BlockType::Text, true);
+    b1.session_id = Some("B".to_string());
+    b1.line_number = 1;
+    b1.created_at = "00000000010000000002".to_string();
+
+    let mut a2 = sample_block("a2", "session A second", BlockType::Text, true);
+    a2.session_id = Some("A".to_string());
+    a2.line_number = 2;
+    a2.created_at = "00000000010000000003".to_string();
+
+    repo.create_conversation_message(&a1).await.unwrap();
+    repo.create_conversation_message(&b1).await.unwrap();
+    repo.create_conversation_message(&a2).await.unwrap();
+
+    let win = repo
+        .context_window_for_block("local", "mb-a1", 1, 1, false)
+        .await
+        .unwrap();
+    assert_eq!(win.before.len(), 0);
+    assert_eq!(win.after.len(), 1);
+    assert_eq!(win.after[0].message_block_id, "mb-a2");
+}

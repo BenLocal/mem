@@ -29,6 +29,16 @@ pub struct ClaimedTranscriptEmbeddingJob {
     pub attempt_count: i64,
 }
 
+/// Result of [`DuckDbRepository::context_window_for_block`]. The
+/// `primary` is the requested block; `before` and `after` are temporally
+/// adjacent same-session blocks (filtered per `include_tool_blocks`).
+#[derive(Debug, Clone)]
+pub struct ContextWindow {
+    pub primary: ConversationMessage,
+    pub before: Vec<ConversationMessage>,
+    pub after: Vec<ConversationMessage>,
+}
+
 impl DuckDbRepository {
     /// Inserts a single conversation transcript block, idempotent on the
     /// `(transcript_path, line_number, block_index)` unique key, and—when the
@@ -201,6 +211,147 @@ impl DuckDbRepository {
                 .unwrap_or(&usize::MAX)
         });
         Ok(hydrated)
+    }
+
+    /// Fetch the primary block and up to `k_before` / `k_after` adjacent
+    /// blocks in the same `session_id`, ordered by
+    /// `(created_at, line_number, block_index)`. If `include_tool_blocks`
+    /// is false, `before` and `after` only include `text` and `thinking`
+    /// block types (the primary itself is always returned regardless of
+    /// its type).
+    ///
+    /// Returns `Ok` with empty `before`/`after` if the primary has no
+    /// `session_id` (NULL session). Returns
+    /// `StorageError::InvalidInput` if the primary id doesn't exist for
+    /// this tenant.
+    pub async fn context_window_for_block(
+        &self,
+        tenant: &str,
+        primary_id: &str,
+        k_before: usize,
+        k_after: usize,
+        include_tool_blocks: bool,
+    ) -> Result<ContextWindow, StorageError> {
+        let conn = self.conn()?;
+
+        // 1. Fetch the primary first to get its session and timestamp.
+        let primary: ConversationMessage = {
+            let mut stmt = conn.prepare(
+                "select message_block_id, session_id, tenant, caller_agent, transcript_path, \
+                        line_number, block_index, message_uuid, role, block_type, content, \
+                        tool_name, tool_use_id, embed_eligible, created_at \
+                 from conversation_messages \
+                 where tenant = ?1 and message_block_id = ?2",
+            )?;
+            let mut rows =
+                stmt.query_map(params![tenant, primary_id], row_to_conversation_message)?;
+            match rows.next() {
+                Some(Ok(m)) => m,
+                Some(Err(e)) => return Err(StorageError::from(e)),
+                None => {
+                    return Err(StorageError::InvalidInput(format!(
+                        "primary block not found: {primary_id}"
+                    )));
+                }
+            }
+        };
+
+        let session_id = match primary.session_id.as_deref() {
+            Some(s) => s.to_string(),
+            None => {
+                // No session → no neighbors by definition.
+                return Ok(ContextWindow {
+                    primary,
+                    before: vec![],
+                    after: vec![],
+                });
+            }
+        };
+
+        // 2. Block-type filter clause built once.
+        let type_filter = if include_tool_blocks {
+            ""
+        } else {
+            "and block_type in ('text', 'thinking')"
+        };
+
+        // 3. Fetch `k_before` blocks strictly before the primary's
+        //    (created_at, line_number, block_index) tuple. We use an
+        //    explicit disjunction rather than DuckDB's tuple comparison
+        //    to maximize compatibility across versions.
+        let before_sql = format!(
+            "select message_block_id, session_id, tenant, caller_agent, transcript_path, \
+                    line_number, block_index, message_uuid, role, block_type, content, \
+                    tool_name, tool_use_id, embed_eligible, created_at \
+             from conversation_messages \
+             where tenant = ?1 \
+               and session_id = ?2 \
+               and (
+                    created_at < ?3 \
+                    or (created_at = ?3 and line_number < ?4) \
+                    or (created_at = ?3 and line_number = ?4 and block_index < ?5)
+               ) \
+               {type_filter} \
+             order by created_at desc, line_number desc, block_index desc \
+             limit ?6"
+        );
+        let before: Vec<ConversationMessage> = {
+            let mut stmt = conn.prepare(&before_sql)?;
+            let rows = stmt.query_map(
+                params![
+                    tenant,
+                    session_id,
+                    primary.created_at,
+                    primary.line_number as i64,
+                    primary.block_index as i64,
+                    k_before as i64,
+                ],
+                row_to_conversation_message,
+            )?;
+            // The query returns DESC order; reverse to ASC for caller convenience.
+            let mut v: Vec<_> = rows.collect::<Result<Vec<_>, _>>()?;
+            v.reverse();
+            v
+        };
+
+        // 4. Fetch `k_after` blocks strictly after.
+        let after_sql = format!(
+            "select message_block_id, session_id, tenant, caller_agent, transcript_path, \
+                    line_number, block_index, message_uuid, role, block_type, content, \
+                    tool_name, tool_use_id, embed_eligible, created_at \
+             from conversation_messages \
+             where tenant = ?1 \
+               and session_id = ?2 \
+               and (
+                    created_at > ?3 \
+                    or (created_at = ?3 and line_number > ?4) \
+                    or (created_at = ?3 and line_number = ?4 and block_index > ?5)
+               ) \
+               {type_filter} \
+             order by created_at asc, line_number asc, block_index asc \
+             limit ?6"
+        );
+        let after: Vec<ConversationMessage> = {
+            let mut stmt = conn.prepare(&after_sql)?;
+            let rows = stmt.query_map(
+                params![
+                    tenant,
+                    session_id,
+                    primary.created_at,
+                    primary.line_number as i64,
+                    primary.block_index as i64,
+                    k_after as i64,
+                ],
+                row_to_conversation_message,
+            )?;
+            rows.collect::<Result<Vec<_>, _>>()?
+        };
+
+        Ok(ContextWindow {
+            primary,
+            before,
+            after,
+        })
     }
 
     /// Rebuild the transcripts FTS index iff the dirty flag is set. Cheap
