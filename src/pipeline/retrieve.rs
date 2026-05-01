@@ -5,6 +5,7 @@ use crate::{
         memory::{MemoryRecord, MemoryStatus, MemoryType, Scope},
         query::SearchMemoryRequest,
     },
+    pipeline::ranking::{freshness_score, timestamp_score, RRF_K, RRF_SCALE},
     storage::DuckDbGraphStore,
 };
 
@@ -324,9 +325,6 @@ fn score_candidates_hybrid_legacy(
     scored
 }
 
-const RRF_K: usize = 60;
-const RRF_SCALE: f64 = 1000.0;
-
 fn score_candidates_hybrid_rrf(
     candidates: Vec<MemoryRecord>,
     query: &SearchMemoryRequest,
@@ -632,16 +630,6 @@ fn validation_score(validated: bool) -> i64 {
     }
 }
 
-fn freshness_score(newest: u128, current: u128) -> i64 {
-    if newest <= current {
-        return 6;
-    }
-
-    let delta = newest - current;
-    let bucket = (delta / 10_000).min(20);
-    6 - bucket as i64
-}
-
 fn staleness_penalty(decay_score: f32) -> i64 {
     (decay_score * 12.0).round() as i64
 }
@@ -667,14 +655,6 @@ fn tokenize(query: &str) -> Vec<String> {
         .filter(|part| !part.is_empty())
         .map(|part| part.to_lowercase())
         .collect()
-}
-
-fn timestamp_score(value: &str) -> u128 {
-    let digits = value
-        .chars()
-        .filter(|ch| ch.is_ascii_digit())
-        .collect::<String>();
-    digits.parse::<u128>().unwrap_or(0)
 }
 
 fn scope_name(scope: &Scope) -> &'static str {
