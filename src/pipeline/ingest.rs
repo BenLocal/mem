@@ -4,6 +4,7 @@ use sha2::{Digest, Sha256};
 use crate::domain::memory::{
     GraphEdge, IngestMemoryRequest, MemoryRecord, MemoryStatus, MemoryType, WriteMode,
 };
+use crate::domain::EntityKind;
 
 /// Length of `compute_content_hash` output (sha256 hex). Used by the storage
 /// migration to identify legacy rows that still hold the old DefaultHasher
@@ -103,86 +104,170 @@ pub fn workflow_node_id(workflow_id: &str) -> String {
     format!("workflow:{workflow_id}")
 }
 
-/// Extract graph edges derived from a memory's fields.
+/// Structured description of the target node in a draft edge.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ToNodeKind {
+    EntityRef { kind: EntityKind, alias: String },
+    LiteralMemory(String),
+}
+
+/// A draft graph edge whose target has not yet been resolved against an
+/// `EntityRegistry`. Produced by `extract_graph_edge_drafts`; resolved by
+/// `service::memory_service::resolve_drafts_to_edges` (Task 8).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GraphEdgeDraft {
+    pub from_node_id: String,
+    pub to_kind: ToNodeKind,
+    pub relation: String,
+}
+
+/// Pure: produce drafts that downstream code resolves against an
+/// `EntityRegistry`. Used by both `service::memory_service::ingest`
+/// (live writes) and `cli::repair::rebuild_graph` (historical re-derive).
 ///
-/// Returned `GraphEdge`s have `valid_from = String::new()` and `valid_to = None`
-/// as placeholders. The storage layer (`DuckDbGraphStore::sync_memory`, added in
-/// later tasks) overwrites `valid_from` with the current timestamp at write time.
-/// Keeping this function pure (no clock dependency) lets us test it without
-/// time mocking.
-pub fn extract_graph_edges(memory: &MemoryRecord) -> Vec<GraphEdge> {
-    let mut edges = Vec::new();
+/// Skips empty/whitespace-only field values.
+pub fn extract_graph_edge_drafts(memory: &MemoryRecord) -> Vec<GraphEdgeDraft> {
+    let mut drafts = Vec::new();
     let from_node_id = memory_node_id(&memory.memory_id);
 
-    if let Some(project) = memory.project.as_deref().filter(|value| !value.is_empty()) {
-        edges.push(GraphEdge {
+    if let Some(p) = memory.project.as_deref().filter(|v| !v.trim().is_empty()) {
+        drafts.push(GraphEdgeDraft {
             from_node_id: from_node_id.clone(),
-            to_node_id: project_node_id(project),
+            to_kind: ToNodeKind::EntityRef {
+                kind: EntityKind::Project,
+                alias: p.to_string(),
+            },
             relation: "applies_to".into(),
-            valid_from: String::new(),
-            valid_to: None,
         });
     }
-
-    if let Some(repo) = memory.repo.as_deref().filter(|value| !value.is_empty()) {
-        edges.push(GraphEdge {
+    if let Some(r) = memory.repo.as_deref().filter(|v| !v.trim().is_empty()) {
+        drafts.push(GraphEdgeDraft {
             from_node_id: from_node_id.clone(),
-            to_node_id: repo_node_id(repo),
+            to_kind: ToNodeKind::EntityRef {
+                kind: EntityKind::Repo,
+                alias: r.to_string(),
+            },
             relation: "observed_in".into(),
-            valid_from: String::new(),
-            valid_to: None,
         });
     }
-
-    if let (Some(repo), Some(module)) = (
-        memory.repo.as_deref().filter(|value| !value.is_empty()),
-        memory.module.as_deref().filter(|value| !value.is_empty()),
+    if let (Some(r), Some(m)) = (
+        memory.repo.as_deref().filter(|v| !v.trim().is_empty()),
+        memory.module.as_deref().filter(|v| !v.trim().is_empty()),
     ) {
-        edges.push(GraphEdge {
+        // Module is keyed as "<repo>:<module>" to match the legacy
+        // module_node_id format. resolve_or_create will treat this as a
+        // single alias string.
+        drafts.push(GraphEdgeDraft {
             from_node_id: from_node_id.clone(),
-            to_node_id: module_node_id(repo, module),
+            to_kind: ToNodeKind::EntityRef {
+                kind: EntityKind::Module,
+                alias: format!("{r}:{m}"),
+            },
             relation: "relevant_to".into(),
-            valid_from: String::new(),
-            valid_to: None,
         });
     }
-
-    if let Some(workflow_id) = memory
-        .task_type
-        .as_deref()
-        .filter(|value| !value.is_empty())
-    {
-        edges.push(GraphEdge {
+    if let Some(wf) = memory.task_type.as_deref().filter(|v| !v.trim().is_empty()) {
+        drafts.push(GraphEdgeDraft {
             from_node_id: from_node_id.clone(),
-            to_node_id: workflow_node_id(workflow_id),
+            to_kind: ToNodeKind::EntityRef {
+                kind: EntityKind::Workflow,
+                alias: wf.to_string(),
+            },
             relation: "uses_workflow".into(),
-            valid_from: String::new(),
-            valid_to: None,
         });
     } else if matches!(memory.memory_type, MemoryType::Workflow) {
-        edges.push(GraphEdge {
+        // Self-referencing workflow: alias = the memory_id itself.
+        drafts.push(GraphEdgeDraft {
             from_node_id: from_node_id.clone(),
-            to_node_id: workflow_node_id(&memory.memory_id),
+            to_kind: ToNodeKind::EntityRef {
+                kind: EntityKind::Workflow,
+                alias: memory.memory_id.clone(),
+            },
             relation: "uses_workflow".into(),
-            valid_from: String::new(),
-            valid_to: None,
         });
     }
-
-    if let Some(previous) = memory
+    for topic in memory.topics.iter().filter(|v| !v.trim().is_empty()) {
+        drafts.push(GraphEdgeDraft {
+            from_node_id: from_node_id.clone(),
+            to_kind: ToNodeKind::EntityRef {
+                kind: EntityKind::Topic,
+                alias: topic.clone(),
+            },
+            relation: "discusses".into(),
+        });
+    }
+    if let Some(prev) = memory
         .supersedes_memory_id
         .as_deref()
-        .filter(|value| !value.is_empty())
+        .filter(|v| !v.is_empty())
     {
-        edges.push(GraphEdge {
+        drafts.push(GraphEdgeDraft {
             from_node_id: from_node_id.clone(),
-            to_node_id: memory_node_id(previous),
+            to_kind: ToNodeKind::LiteralMemory(prev.to_string()),
             relation: "supersedes".into(),
-            valid_from: String::new(),
-            valid_to: None,
         });
     }
+    drafts
+}
 
+fn legacy_to_node_id(kind: &ToNodeKind) -> String {
+    match kind {
+        ToNodeKind::LiteralMemory(id) => memory_node_id(id),
+        ToNodeKind::EntityRef {
+            kind: EntityKind::Project,
+            alias,
+        } => project_node_id(alias),
+        ToNodeKind::EntityRef {
+            kind: EntityKind::Repo,
+            alias,
+        } => repo_node_id(alias),
+        ToNodeKind::EntityRef {
+            kind: EntityKind::Module,
+            alias,
+        } => {
+            // alias is "<repo>:<module>"; module_node_id rebuilds the same string.
+            if let Some((r, m)) = alias.split_once(':') {
+                module_node_id(r, m)
+            } else {
+                format!("module:{alias}")
+            }
+        }
+        ToNodeKind::EntityRef {
+            kind: EntityKind::Workflow,
+            alias,
+        } => workflow_node_id(alias),
+        ToNodeKind::EntityRef {
+            kind: EntityKind::Topic,
+            alias,
+        } => format!("topic:{alias}"),
+    }
+}
+
+/// **Deprecated.** Legacy wrapper that produces edges with the OLD
+/// `"project:..."` / `"repo:..."` etc. string `to_node_id` format. New
+/// code should call `extract_graph_edge_drafts` and resolve through
+/// `EntityRegistry` (see `service::memory_service::resolve_drafts_to_edges`).
+///
+/// This wrapper exists only so the in-tree `graph_store::sync_memory`
+/// caller and any historical tests keep compiling until they are migrated.
+#[deprecated(note = "Use extract_graph_edge_drafts + EntityRegistry resolution")]
+pub fn extract_graph_edges(memory: &MemoryRecord) -> Vec<GraphEdge> {
+    let from_node_id = memory_node_id(&memory.memory_id);
+
+    // Convert drafts via the legacy node-id scheme.
+    let mut edges: Vec<GraphEdge> = extract_graph_edge_drafts(memory)
+        .into_iter()
+        .map(|draft| GraphEdge {
+            from_node_id: draft.from_node_id,
+            to_node_id: legacy_to_node_id(&draft.to_kind),
+            relation: draft.relation,
+            valid_from: String::new(),
+            valid_to: None,
+        })
+        .collect();
+
+    // The `contradicts:` tag pattern has no field-level draft equivalent; it
+    // lives solely in this legacy wrapper until the new pipeline handles it.
     for contradicted in memory
         .tags
         .iter()
@@ -204,6 +289,102 @@ pub fn extract_graph_edges(memory: &MemoryRecord) -> Vec<GraphEdge> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::domain::memory::{MemoryStatus, Scope, Visibility};
+
+    fn baseline_memory(id: &str) -> MemoryRecord {
+        MemoryRecord {
+            memory_id: id.to_string(),
+            tenant: "local".to_string(),
+            memory_type: MemoryType::Implementation,
+            status: MemoryStatus::Active,
+            scope: Scope::Global,
+            visibility: Visibility::Private,
+            version: 1,
+            summary: "x".to_string(),
+            content: "x".to_string(),
+            source_agent: "test".to_string(),
+            content_hash: "00".repeat(32),
+            ..MemoryRecord::default()
+        }
+    }
+
+    #[test]
+    fn extract_graph_edge_drafts_emits_entity_refs_for_all_field_types() {
+        let memory = MemoryRecord {
+            memory_id: "m1".to_string(),
+            project: Some("mem".to_string()),
+            repo: Some("foo/bar".to_string()),
+            module: Some("storage".to_string()),
+            task_type: Some("debug".to_string()),
+            topics: vec!["Rust".to_string(), "ownership".to_string()],
+            ..baseline_memory("m1")
+        };
+        let drafts = extract_graph_edge_drafts(&memory);
+
+        let entity_refs: Vec<_> = drafts
+            .iter()
+            .filter_map(|d| match &d.to_kind {
+                ToNodeKind::EntityRef { kind, alias } => {
+                    Some((*kind, alias.clone(), d.relation.clone()))
+                }
+                _ => None,
+            })
+            .collect();
+
+        assert!(entity_refs.contains(&(EntityKind::Project, "mem".into(), "applies_to".into())));
+        assert!(entity_refs.contains(&(EntityKind::Repo, "foo/bar".into(), "observed_in".into())));
+        assert!(entity_refs
+            .iter()
+            .any(|(k, _, r)| *k == EntityKind::Module && r == "relevant_to"));
+        assert!(entity_refs.contains(&(
+            EntityKind::Workflow,
+            "debug".into(),
+            "uses_workflow".into()
+        )));
+        assert!(entity_refs.contains(&(EntityKind::Topic, "Rust".into(), "discusses".into())));
+        assert!(entity_refs.contains(&(EntityKind::Topic, "ownership".into(), "discusses".into())));
+    }
+
+    #[test]
+    fn extract_graph_edge_drafts_emits_literal_memory_for_supersedes() {
+        let memory = MemoryRecord {
+            memory_id: "m2".to_string(),
+            supersedes_memory_id: Some("m1".to_string()),
+            ..baseline_memory("m2")
+        };
+        let drafts = extract_graph_edge_drafts(&memory);
+        assert!(drafts.iter().any(|d| matches!(
+            &d.to_kind,
+            ToNodeKind::LiteralMemory(id) if id == "m1"
+        )));
+    }
+
+    #[test]
+    fn extract_graph_edge_drafts_skips_empty_topic_strings() {
+        let memory = MemoryRecord {
+            memory_id: "m3".to_string(),
+            topics: vec!["".to_string(), "Rust".to_string(), "  ".to_string()],
+            ..baseline_memory("m3")
+        };
+        let drafts = extract_graph_edge_drafts(&memory);
+        let topic_drafts: Vec<_> = drafts
+            .iter()
+            .filter(|d| {
+                matches!(
+                    &d.to_kind,
+                    ToNodeKind::EntityRef {
+                        kind: EntityKind::Topic,
+                        ..
+                    }
+                )
+            })
+            .collect();
+        assert_eq!(
+            topic_drafts.len(),
+            1,
+            "empty/whitespace-only topics filtered out"
+        );
+    }
 
     #[test]
     fn validate_verbatim_no_caller_summary_ok() {

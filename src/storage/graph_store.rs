@@ -5,6 +5,8 @@ use thiserror::Error;
 use super::time::current_timestamp;
 use super::{DuckDbRepository, StorageError};
 use crate::domain::memory::{GraphEdge, MemoryRecord};
+#[allow(deprecated)]
+// Task 9 migrates away from this; keep the import for the wrapper callsite
 use crate::pipeline::ingest::extract_graph_edges;
 
 #[derive(Debug, Error)]
@@ -52,6 +54,7 @@ impl DuckDbGraphStore {
         Ok(out)
     }
 
+    #[allow(deprecated)] // Task 9 will migrate this to extract_graph_edge_drafts + EntityRegistry
     pub async fn sync_memory(&self, memory: &MemoryRecord) -> Result<(), GraphError> {
         let edges = extract_graph_edges(memory);
         if edges.is_empty() {
