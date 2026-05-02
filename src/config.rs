@@ -43,6 +43,15 @@ pub struct EmbeddingSettings {
     /// index. Set via `MEM_TRANSCRIPT_VECTOR_INDEX_FLUSH_EVERY`. Defaults to
     /// `256`; `0` is rejected at parse time and falls back to the default.
     pub transcript_vector_index_flush_every: usize,
+    /// Oversample factor used by `TranscriptService::search` to widen the
+    /// BM25/HNSW/anchor candidate fan-out (`k = limit * oversample`). Set via
+    /// `MEM_TRANSCRIPT_OVERSAMPLE`. Defaults to `4`; `0` is rejected at parse
+    /// time. Read directly via `std::env::var` in `TranscriptService::search`,
+    /// mirroring the `MEM_VECTOR_INDEX_OVERSAMPLE` pattern on the memories
+    /// pipeline; this struct field is populated for diagnostic/logging
+    /// visibility but is not the source of truth at search time.
+    #[allow(dead_code)]
+    pub transcript_search_oversample: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -72,6 +81,8 @@ pub enum ConfigError {
     InvalidVectorIndexOversample(String),
     #[error("invalid MEM_TRANSCRIPT_VECTOR_INDEX_FLUSH_EVERY: {0}")]
     InvalidTranscriptVectorIndexFlushEvery(String),
+    #[error("invalid MEM_TRANSCRIPT_OVERSAMPLE: {0}")]
+    InvalidTranscriptOversample(String),
 }
 
 impl EmbeddingSettings {
@@ -90,6 +101,7 @@ impl EmbeddingSettings {
             vector_index_use_legacy: false,
             transcript_disabled: false,
             transcript_vector_index_flush_every: 256,
+            transcript_search_oversample: 4,
         }
     }
 
@@ -200,6 +212,18 @@ impl EmbeddingSettings {
             s.transcript_vector_index_flush_every = n;
         }
 
+        if let Some(raw) = get("MEM_TRANSCRIPT_OVERSAMPLE") {
+            let n: usize = raw
+                .parse()
+                .map_err(|_| ConfigError::InvalidTranscriptOversample(raw.clone()))?;
+            // `0` would degenerate to `k = limit * 0` and produce no candidates;
+            // reject loudly to keep parity with `MEM_VECTOR_INDEX_OVERSAMPLE`.
+            if n == 0 {
+                return Err(ConfigError::InvalidTranscriptOversample(raw));
+            }
+            s.transcript_search_oversample = n;
+        }
+
         Ok(s)
     }
 
@@ -262,10 +286,14 @@ mod tests {
 
     #[test]
     fn embedding_defaults_when_empty() {
+        // Mirrors `EmbeddingSettings::development_defaults` exactly: when the
+        // closure returns no env vars the parser must hand back the in-code
+        // defaults verbatim. Update both sides together when those defaults
+        // change (last touched by `47aff1e`, which switched to EmbedAnything).
         let s = EmbeddingSettings::from_env_vars(|_| None).unwrap();
-        assert_eq!(s.provider, EmbeddingProviderKind::Fake);
-        assert_eq!(s.model, "fake");
-        assert_eq!(s.dim, 256);
+        assert_eq!(s.provider, EmbeddingProviderKind::EmbedAnything);
+        assert_eq!(s.model, "Qwen/Qwen3-Embedding-0.6B");
+        assert_eq!(s.dim, 1024);
         assert_eq!(s.openai_api_key, None);
     }
 
@@ -406,6 +434,39 @@ mod tests {
         assert!(matches!(
             err,
             ConfigError::InvalidTranscriptVectorIndexFlushEvery(ref s) if s == "abc"
+        ));
+    }
+
+    #[test]
+    fn transcript_oversample_default_4() {
+        let s = EmbeddingSettings::from_env_vars(|_| None).unwrap();
+        assert_eq!(s.transcript_search_oversample, 4);
+    }
+
+    #[test]
+    fn transcript_oversample_parses_positive() {
+        let s =
+            EmbeddingSettings::from_env_vars(env(&[("MEM_TRANSCRIPT_OVERSAMPLE", "8")])).unwrap();
+        assert_eq!(s.transcript_search_oversample, 8);
+    }
+
+    #[test]
+    fn transcript_oversample_rejects_zero() {
+        let err = EmbeddingSettings::from_env_vars(env(&[("MEM_TRANSCRIPT_OVERSAMPLE", "0")]))
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            ConfigError::InvalidTranscriptOversample(ref s) if s == "0"
+        ));
+    }
+
+    #[test]
+    fn transcript_oversample_rejects_non_numeric() {
+        let err = EmbeddingSettings::from_env_vars(env(&[("MEM_TRANSCRIPT_OVERSAMPLE", "abc")]))
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            ConfigError::InvalidTranscriptOversample(ref s) if s == "abc"
         ));
     }
 }

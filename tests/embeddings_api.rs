@@ -75,6 +75,7 @@ impl TestApp {
 }
 
 #[tokio::test]
+#[ignore = "requires EmbedAnything model in runtime"]
 async fn embeddings_providers_describes_fake_backend() {
     let app = TestApp::new().await;
     let res = app.get("/embeddings/providers").await;

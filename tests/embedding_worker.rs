@@ -11,6 +11,7 @@ use std::sync::Arc;
 use tempfile::tempdir;
 
 #[tokio::test]
+#[ignore = "requires EmbedAnything model in runtime"]
 async fn worker_completes_job_and_writes_embedding_row() {
     let dir = tempdir().unwrap();
     let db = dir.path().join("worker-ok.duckdb");
@@ -80,6 +81,7 @@ async fn worker_completes_job_and_writes_embedding_row() {
 }
 
 #[tokio::test]
+#[ignore = "requires EmbedAnything model in runtime"]
 async fn worker_writes_to_attached_vector_index() {
     let dir = tempdir().unwrap();
     let db = dir.path().join("worker-vec.duckdb");
@@ -134,6 +136,7 @@ async fn worker_writes_to_attached_vector_index() {
 }
 
 #[tokio::test]
+#[ignore = "requires EmbedAnything model in runtime"]
 async fn worker_marks_stale_when_job_target_hash_mismatches_memory() {
     let dir = tempdir().unwrap();
     let db = dir.path().join("worker-stale.duckdb");

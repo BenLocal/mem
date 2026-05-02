@@ -117,7 +117,19 @@ impl TranscriptService {
         opts: &TranscriptSearchOpts,
     ) -> Result<TranscriptSearchResult, StorageError> {
         let limit = limit.clamp(1, 100);
-        let oversample = limit * 4;
+        // Oversample factor (`k = limit * factor`) is read directly from env at
+        // search time, mirroring the `MEM_VECTOR_INDEX_OVERSAMPLE` pattern in
+        // `DuckDbRepository::semantic_search_memories` (Option B): keeps the
+        // override flexible without plumbing config through the service. The
+        // parser in `config.rs` rejects 0 for `MEM_TRANSCRIPT_OVERSAMPLE`, but
+        // since this read bypasses the parser we apply the same `> 0` filter
+        // here defensively. Default 4 matches historical hardcoded behavior.
+        let oversample_factor = std::env::var("MEM_TRANSCRIPT_OVERSAMPLE")
+            .ok()
+            .and_then(|s| s.parse::<usize>().ok())
+            .filter(|n| *n > 0)
+            .unwrap_or(4);
+        let oversample = limit * oversample_factor;
         let context_window = opts.context_window.unwrap_or(2).min(10);
 
         // ─── Phase 1: gather candidate ids and per-channel ranks.

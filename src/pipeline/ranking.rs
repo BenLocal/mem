@@ -18,6 +18,21 @@ pub const RRF_SCALE: f64 = 1000.0;
 /// (lexical or semantic). Returns the same `i64` value the memories pipeline
 /// has been using since the BM25 hybrid retrieval landed; transcripts share
 /// the formula so RRF magnitudes are directly comparable.
+///
+/// **Asymmetry with `pipeline::retrieve::score_candidates_hybrid_rrf`**:
+/// memories' inline formula sums per-channel `f64` contributions before
+/// a single `.round()`, while this helper rounds per-channel before
+/// summing. For a candidate that hits both lex and sem at rank 1:
+/// memories computes `((1.0/61.0 + 1.0/61.0) * 1000.0).round() = 33`,
+/// while `rrf_contribution(1) + rrf_contribution(1) = 16 + 16 = 32`.
+/// The difference is bounded at ±1 in mixed-rank scenarios.
+///
+/// Memories preserves sum-then-round to keep its existing test scores
+/// stable (the integer values are pinned in tests like
+/// `rrf_both_paths_top_rank` at `pipeline::retrieve`). Transcripts use
+/// this helper directly and accept round-then-sum; do NOT migrate
+/// memories to call this helper without re-baselining
+/// `pipeline::retrieve::tests::rrf_*`.
 pub fn rrf_contribution(rank: usize) -> i64 {
     ((RRF_SCALE / (RRF_K as f64 + rank as f64)).round()) as i64
 }
@@ -77,10 +92,17 @@ mod tests {
     }
 
     #[test]
-    fn freshness_at_newest_is_max() {
+    fn freshness_score_returns_max_when_current_is_newest_or_future() {
+        // Early-return branch: current >= newest.
         assert_eq!(freshness_score(1_000, 1_000), 6);
-        assert_eq!(freshness_score(1_000, 999), 6); // newest <= current per the function: actually current=999 < newest=1000, delta=1, bucket=0 → 6. The point is the boundary returns 6.
-        assert_eq!(freshness_score(1_000, 5_000), 6); // current in future
+        assert_eq!(freshness_score(1_000, 5_000), 6);
+    }
+
+    #[test]
+    fn freshness_score_within_first_bucket_returns_max() {
+        // Bucket-path branch: delta < 10_000ms still rounds to bucket 0 → 6.
+        assert_eq!(freshness_score(1_000, 999), 6);
+        assert_eq!(freshness_score(200_000, 195_000), 6);
     }
 
     #[test]

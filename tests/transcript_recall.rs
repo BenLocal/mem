@@ -298,6 +298,11 @@ async fn context_window_returns_not_found_for_missing_id() {
 
 // ──────── Integration test scaffolding ────────
 
+// Convention: `<name>` = storage-level test (calls repo methods directly);
+// `<name>_via_http` = same scenario through the HTTP router. Example:
+// `context_window_excludes_tool_blocks_by_default` (storage) vs
+// `context_window_excludes_tool_blocks_by_default_via_http` (HTTP).
+
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use serde_json::json;
@@ -414,7 +419,13 @@ async fn bm25_only_candidate_appears_in_results() {
         !windows.is_empty(),
         "BM25 alone should surface the rust block"
     );
-    let primary_block_id = windows[0]["primary_ids"][0].as_str().unwrap();
+    let primaries = windows[0]["primary_ids"].as_array().unwrap();
+    assert_eq!(
+        primaries.len(),
+        1,
+        "exactly one block matches 'rust'; got primary_ids={primaries:?}"
+    );
+    let primary_block_id = primaries[0].as_str().unwrap();
     assert!(
         !primary_block_id.is_empty(),
         "primary should reference a real id"
@@ -475,6 +486,17 @@ async fn anchor_session_boost_lifts_matching_session_to_top() {
         Some("A"),
         "anchor session must rank first"
     );
+    assert_eq!(
+        windows.len(),
+        2,
+        "anchor boosts (not filters); session B must also surface"
+    );
+    let session_ids: std::collections::HashSet<&str> = windows
+        .iter()
+        .filter_map(|w| w["session_id"].as_str())
+        .collect();
+    assert!(session_ids.contains("A"));
+    assert!(session_ids.contains("B"));
 }
 
 #[tokio::test]
@@ -703,6 +725,17 @@ async fn empty_query_returns_recent_time_windows() {
     assert!(
         !windows.is_empty(),
         "empty query should still return windows from recent_*"
+    );
+    // The seed inserts 3 blocks at increasing timestamps; "recent-c2" is the newest.
+    // Recency fallback should make it appear in the top window.
+    let top_blocks = windows[0]["blocks"].as_array().unwrap();
+    let contents: Vec<&str> = top_blocks
+        .iter()
+        .filter_map(|b| b["content"].as_str())
+        .collect();
+    assert!(
+        contents.iter().any(|c| c.contains("recent-c2")),
+        "newest block should be in top window; got contents={contents:?}"
     );
 }
 
