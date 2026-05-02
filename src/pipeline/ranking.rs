@@ -18,6 +18,21 @@ pub const RRF_SCALE: f64 = 1000.0;
 /// (lexical or semantic). Returns the same `i64` value the memories pipeline
 /// has been using since the BM25 hybrid retrieval landed; transcripts share
 /// the formula so RRF magnitudes are directly comparable.
+///
+/// **Asymmetry with `pipeline::retrieve::score_candidates_hybrid_rrf`**:
+/// memories' inline formula sums per-channel `f64` contributions before
+/// a single `.round()`, while this helper rounds per-channel before
+/// summing. For a candidate that hits both lex and sem at rank 1:
+/// memories computes `((1.0/61.0 + 1.0/61.0) * 1000.0).round() = 33`,
+/// while `rrf_contribution(1) + rrf_contribution(1) = 16 + 16 = 32`.
+/// The difference is bounded at ±1 in mixed-rank scenarios.
+///
+/// Memories preserves sum-then-round to keep its existing test scores
+/// stable (the integer values are pinned in tests like
+/// `rrf_both_paths_top_rank` at `pipeline::retrieve`). Transcripts use
+/// this helper directly and accept round-then-sum; do NOT migrate
+/// memories to call this helper without re-baselining
+/// `pipeline::retrieve::tests::rrf_*`.
 pub fn rrf_contribution(rank: usize) -> i64 {
     ((RRF_SCALE / (RRF_K as f64 + rank as f64)).round()) as i64
 }
