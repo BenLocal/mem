@@ -6,6 +6,12 @@ use tower::util::ServiceExt;
 
 struct TestApp {
     router: axum::Router,
+    // RAII: removes the per-test DuckDB tempdir on drop. Even though /health
+    // doesn't write to the DB, AppState::from_config still opens the file —
+    // sharing ~/.mem/mem.duckdb across parallel test binaries (default path
+    // when MEM_DB_PATH is unset) is the same latent brittleness B3 fixed in
+    // embeddings_api / ingest_api.
+    _temp_dir: tempfile::TempDir,
 }
 
 struct TestResponse {
@@ -48,8 +54,15 @@ impl TestApp {
 }
 
 async fn test_app() -> TestApp {
+    let temp = tempfile::TempDir::new().expect("tempdir should create");
+    let mut cfg = mem::config::Config::local();
+    cfg.db_path = temp.path().join("mem.duckdb");
+    let router = mem::app::router_with_config(cfg)
+        .await
+        .expect("app router should build");
     TestApp {
-        router: mem::app::router().await.expect("app router should build"),
+        router,
+        _temp_dir: temp,
     }
 }
 
