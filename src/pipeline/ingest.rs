@@ -104,6 +104,10 @@ pub fn workflow_node_id(workflow_id: &str) -> String {
     format!("workflow:{workflow_id}")
 }
 
+pub fn topic_node_id(topic: &str) -> String {
+    format!("topic:{topic}")
+}
+
 /// Structured description of the target node in a draft edge.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ToNodeKind {
@@ -199,7 +203,7 @@ pub fn extract_graph_edge_drafts(memory: &MemoryRecord) -> Vec<GraphEdgeDraft> {
     if let Some(prev) = memory
         .supersedes_memory_id
         .as_deref()
-        .filter(|v| !v.is_empty())
+        .filter(|v| !v.trim().is_empty())
     {
         drafts.push(GraphEdgeDraft {
             from_node_id: from_node_id.clone(),
@@ -239,7 +243,7 @@ fn legacy_to_node_id(kind: &ToNodeKind) -> String {
         ToNodeKind::EntityRef {
             kind: EntityKind::Topic,
             alias,
-        } => format!("topic:{alias}"),
+        } => topic_node_id(alias),
     }
 }
 
@@ -333,9 +337,11 @@ mod tests {
 
         assert!(entity_refs.contains(&(EntityKind::Project, "mem".into(), "applies_to".into())));
         assert!(entity_refs.contains(&(EntityKind::Repo, "foo/bar".into(), "observed_in".into())));
-        assert!(entity_refs
-            .iter()
-            .any(|(k, _, r)| *k == EntityKind::Module && r == "relevant_to"));
+        assert!(entity_refs.contains(&(
+            EntityKind::Module,
+            "foo/bar:storage".into(),
+            "relevant_to".into()
+        )));
         assert!(entity_refs.contains(&(
             EntityKind::Workflow,
             "debug".into(),
@@ -383,6 +389,13 @@ mod tests {
             topic_drafts.len(),
             1,
             "empty/whitespace-only topics filtered out"
+        );
+        assert_eq!(
+            topic_drafts[0].to_kind,
+            ToNodeKind::EntityRef {
+                kind: EntityKind::Topic,
+                alias: "Rust".into()
+            }
         );
     }
 
