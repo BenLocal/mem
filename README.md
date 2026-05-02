@@ -247,3 +247,21 @@ Response shape: `{ "windows": [{ "session_id": "...", "blocks": [...], "primary_
 | `MEM_TRANSCRIPT_VECTOR_INDEX_FLUSH_EVERY` | 256 | Flush cadence for the transcripts HNSW sidecar; lower than the memories sidecar because per-session bursts are larger. |
 
 `mem repair --check|--rebuild` covers both sidecars (memories and transcripts) in one pass.
+
+## Entity Registry (entities + entity_aliases)
+
+Tenant-scoped registry that canonicalizes alias strings (`"Rust"` = `"Rust language"` = `"rustlang"`) to a stable `entity_id`. Three mechanisms feed it:
+
+1. **`mem mine` / `POST /memories`** — caller-supplied `topics: Vec<String>` field plus existing `project` / `repo` / `module` / `task_type` strings auto-promote to entities on first ingest.
+2. **`POST /entities`** — explicit creation with optional aliases.
+3. **`POST /entities/{id}/aliases`** — add a synonym to an existing entity; idempotent; returns 409 on conflict.
+
+After ingest, `graph_edges.to_node_id` is `"entity:<uuid>"` for every entity-typed edge. Memory→memory edges (`supersedes`) keep the `"memory:<id>"` prefix.
+
+**Migration**: existing `graph_edges` rows from before the registry shipped retain their legacy `"project:..."` / `"repo:..."` strings. Run `cargo run -- repair --rebuild-graph` to re-derive all memory-originating edges through the registry. Idempotent.
+
+**Aliases & normalization**: alias matching is lowercase + whitespace-collapsed; punctuation preserved (`C++` ≠ `c`). Caller's verbatim spelling lives on `entities.canonical_name`.
+
+**MCP**: the registry is HTTP-only; no MCP surface (matches the conversation-archive / transcript-recall convention).
+
+Spec: [`docs/superpowers/specs/2026-05-02-entity-registry-design.md`](docs/superpowers/specs/2026-05-02-entity-registry-design.md).

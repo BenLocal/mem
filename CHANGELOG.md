@@ -13,6 +13,45 @@ are organized by feature wave (merge commit ranges on `master`).
 
 ---
 
+## 2026-05-02 — Entity Registry
+
+**Range:** `8f8d2af..68395a0`.
+
+Adds a tenant-scoped entity registry that canonicalizes alias strings
+(`"Rust"` = `"Rust language"` = `"rustlang"`) to a stable UUIDv7
+`entity_id`. The ingest pipeline auto-promotes caller-supplied `topics`
+(and legacy `project` / `repo` / `module` / `task_type` fields) into
+registry entries on first write, so `graph_edges.to_node_id` is now
+`"entity:<uuid>"` for all entity-typed edges.
+
+### Added
+- `entities` + `entity_aliases` tables (schema 008) with composite-PK
+  ON CONFLICT for idempotent alias upserts.
+- `domain::entity`: `Entity`, `EntityKind` (snake_case serde), `EntityWithAliases`,
+  `AddAliasOutcome`.
+- `pipeline::entity_normalize::normalize_alias` — pure case-fold +
+  whitespace-collapse; punctuation preserved (`C++` ≠ `c`).
+- `EntityRegistry` trait + `DuckDbRepository` impl with single-mutex discipline.
+- `MemoryRecord.topics: Vec<String>` field, round-tripping via JSON column.
+- `extract_graph_edge_drafts` (pure) + `#[deprecated]` legacy wrapper.
+- `resolve_drafts_to_edges` service helper — routes drafts through the
+  registry and returns typed `GraphEdge` values.
+- Production ingest wired to produce `"entity:<uuid>"` graph edges.
+- 4 HTTP routes: `POST /entities`, `GET /entities/{id}`, `POST /entities/{id}/aliases`,
+  `GET /entities` (list). `POST /entities` returns 409 with `existing_entity_id`
+  on cross-entity alias conflict.
+- `mem repair --rebuild-graph` CLI subcommand — re-derives all
+  memory-originating edges through the registry per-tenant atomically.
+
+### Notes
+- MCP surface unchanged by design (HTTP-only, matching conversation-archive
+  / transcript-recall convention).
+- Migration: run `mem repair --rebuild-graph` to upgrade legacy
+  `"project:..."` / `"repo:..."` graph edge targets. Idempotent.
+- Spec: `docs/superpowers/specs/2026-05-02-entity-registry-design.md`.
+
+---
+
 ## 2026-04-30 — Conversation Archive
 
 **Merge:** `aa6eab1`. **Range:** `1ac2d6b..49b652f`.

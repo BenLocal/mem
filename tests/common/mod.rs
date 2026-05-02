@@ -22,7 +22,7 @@ use std::sync::Arc;
 
 use mem::{
     app::AppState,
-    service::{MemoryService, TranscriptService},
+    service::{EntityService, MemoryService, TranscriptService},
     storage::{DuckDbRepository, VectorIndex},
 };
 
@@ -36,11 +36,13 @@ use mem::{
 /// construct `AppState` directly.
 pub fn test_app_state(repo: DuckDbRepository, memory_service: MemoryService) -> AppState {
     let transcript_index = Arc::new(VectorIndex::new_in_memory(8, "fake", "fake", 8));
-    let transcript_service = TranscriptService::new(repo, transcript_index.clone(), None);
+    let transcript_service = TranscriptService::new(repo.clone(), transcript_index.clone(), None);
+    let entity_service = EntityService::new(repo);
     AppState {
         memory_service,
         config: mem::config::Config::local(),
         transcript_index,
         transcript_service,
+        entity_service,
     }
 }

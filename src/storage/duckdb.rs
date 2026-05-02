@@ -128,6 +128,76 @@ pub enum StorageError {
     NotFound(&'static str),
 }
 
+/// Tenant-scoped registry of canonical entities and their alias forms.
+///
+/// `resolve_or_create` is the auto-promote entry point: caller passes a
+/// verbatim alias and the registry returns a stable `entity_id`, atomically
+/// creating the entity (with `canonical_name = alias`) plus its first alias
+/// row when the normalized form is unknown. Both INSERTs run while a single
+/// `Arc<Mutex<Connection>>` guard is held, so no race window exists for the
+/// auto-promote case.
+///
+/// `add_alias` is for explicit synonym declarations; outcomes distinguish
+/// new alias inserts from idempotent re-adds and from conflicts where the
+/// alias already belongs to a different entity.
+///
+/// `canonical_name` is verbatim caller input (first-writer-wins). The
+/// normalized form (per [`crate::pipeline::entity_normalize::normalize_alias`])
+/// is what gets stored in `entity_aliases.alias_text` and used for lookups.
+#[async_trait::async_trait]
+pub trait EntityRegistry: Send + Sync {
+    /// Resolve `alias` (caller's verbatim input) under `tenant` to a stable
+    /// `entity_id`. If the normalized form is unknown, atomically create a
+    /// new entity (with `kind` and `canonical_name = alias`) plus its first
+    /// alias row. Both INSERTs run under a single mutex acquisition.
+    async fn resolve_or_create(
+        &self,
+        tenant: &str,
+        alias: &str,
+        kind: crate::domain::EntityKind,
+        now: &str,
+    ) -> Result<String, StorageError>;
+
+    /// Fetch the entity (by id, scoped to tenant) plus all its aliases in
+    /// `created_at ASC` order. Returns `Ok(None)` if no such entity exists.
+    async fn get_entity(
+        &self,
+        tenant: &str,
+        entity_id: &str,
+    ) -> Result<Option<crate::domain::EntityWithAliases>, StorageError>;
+
+    /// Add `alias` to an existing entity. Three outcomes:
+    /// - `Inserted`: alias was new, now linked to `entity_id`.
+    /// - `AlreadyOnSameEntity`: alias was already on this entity (idempotent).
+    /// - `ConflictWithDifferentEntity(other_id)`: alias is owned by another entity.
+    async fn add_alias(
+        &self,
+        tenant: &str,
+        entity_id: &str,
+        alias: &str,
+        now: &str,
+    ) -> Result<crate::domain::AddAliasOutcome, StorageError>;
+
+    /// Read-only lookup: returns the `entity_id` currently bound to the
+    /// normalized form of `alias` under `tenant`, or `None` if no such
+    /// binding exists. Used by service-layer flows that need to pre-check
+    /// alias ownership before attempting writes (e.g. atomic-from-caller
+    /// `create_with_aliases`).
+    async fn lookup_alias(&self, tenant: &str, alias: &str)
+        -> Result<Option<String>, StorageError>;
+
+    /// List entities under `tenant`, optionally filtered by `kind` and a
+    /// SQL `LIKE`-substring on `canonical_name`. Order is `created_at DESC`,
+    /// capped by `limit`.
+    async fn list_entities(
+        &self,
+        tenant: &str,
+        kind_filter: Option<crate::domain::EntityKind>,
+        query: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<crate::domain::Entity>, StorageError>;
+}
+
 impl DuckDbRepository {
     pub async fn open(path: impl AsRef<Path>) -> Result<Self, StorageError> {
         let path = path.as_ref();
@@ -210,13 +280,13 @@ impl DuckDbRepository {
                 content, evidence_json, code_refs_json, project, repo, module, task_type,
                 tags_json, confidence, decay_score, content_hash, idempotency_key,
                 session_id, supersedes_memory_id, source_agent, created_at, updated_at,
-                last_validated_at
+                last_validated_at, topics
             ) values (
                 ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8,
                 ?9, ?10, ?11, ?12, ?13, ?14, ?15,
                 ?16, ?17, ?18, ?19, ?20,
                 ?21, ?22, ?23, ?24, ?25,
-                ?26
+                ?26, ?27
             )",
             params![
                 stored.memory_id,
@@ -245,6 +315,7 @@ impl DuckDbRepository {
                 stored.created_at,
                 stored.updated_at,
                 stored.last_validated_at,
+                encode_json(&stored.topics)?,
             ],
         )?;
         self.fts_dirty.store(true, Ordering::Release);
@@ -687,6 +758,91 @@ impl DuckDbRepository {
         Ok(out)
     }
 
+    /// Returns every distinct `tenant` value that appears in the `memories`
+    /// table. Used by `mem repair --rebuild-graph` to iterate per-tenant
+    /// without forcing the operator to know which tenants exist on disk.
+    pub async fn list_distinct_memory_tenants(&self) -> Result<Vec<String>, StorageError> {
+        let conn = self.conn()?;
+        let mut stmt = conn.prepare("select distinct tenant from memories order by tenant")?;
+        let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
+        let mut out = Vec::new();
+        for r in rows {
+            out.push(r?);
+        }
+        Ok(out)
+    }
+
+    /// Returns full [`MemoryRecord`]s for every memory in the tenant, ordered
+    /// by `created_at` so the rebuild walks them in deterministic order.
+    /// Filters nothing — `archived` and `rejected` rows are returned too,
+    /// matching what the original ingest path would have considered.
+    pub async fn list_memories_for_tenant(
+        &self,
+        tenant: &str,
+    ) -> Result<Vec<MemoryRecord>, StorageError> {
+        let conn = self.conn()?;
+        let mut stmt = conn.prepare(
+            "select
+                memory_id, tenant, memory_type, status, scope, visibility, version,
+                summary, content, evidence_json, code_refs_json, project, repo,
+                module, task_type, tags_json, confidence, decay_score, content_hash,
+                idempotency_key, session_id, supersedes_memory_id, source_agent,
+                created_at, updated_at, last_validated_at, topics
+             from memories
+             where tenant = ?1
+             order by created_at asc",
+        )?;
+        let rows = stmt.query_map(params![tenant], map_memory_row)?;
+        let mut out = Vec::new();
+        for r in rows {
+            out.push(r?);
+        }
+        Ok(out)
+    }
+
+    /// Atomically replaces all graph edges sourced from memories in `tenant`
+    /// with the supplied `edges` slice.  The delete and all inserts execute
+    /// inside a single DuckDB transaction; if any step fails the tenant graph
+    /// is left in its pre-call state.
+    ///
+    /// Returns the number of edges inserted.  Used exclusively by
+    /// `mem repair --rebuild-graph`; production ingest uses
+    /// `DuckDbGraphStore::sync_memory`.
+    pub async fn rebuild_tenant_graph(
+        &self,
+        tenant: &str,
+        edges: &[crate::domain::memory::GraphEdge],
+    ) -> Result<usize, StorageError> {
+        let mut conn = self.conn()?;
+        let tx = conn.transaction()?;
+
+        // Sweep all memory-sourced edges for this tenant — both legacy formats
+        // and current `entity:<uuid>` targets.
+        tx.execute(
+            "delete from graph_edges \
+             where from_node_id in (select 'memory:' || memory_id from memories where tenant = ?1)",
+            params![tenant],
+        )?;
+
+        for edge in edges {
+            tx.execute(
+                "insert into graph_edges \
+                 (from_node_id, to_node_id, relation, valid_from, valid_to) \
+                 values (?1, ?2, ?3, ?4, ?5)",
+                params![
+                    edge.from_node_id,
+                    edge.to_node_id,
+                    edge.relation,
+                    edge.valid_from,
+                    edge.valid_to,
+                ],
+            )?;
+        }
+
+        tx.commit()?;
+        Ok(edges.len())
+    }
+
     /// Joins `memories` with valid `memory_embeddings` (hash match), scores by cosine similarity in Rust.
     /// Uses the attached `VectorIndex` (ANN path) when available; falls back to the legacy linear scan
     /// when no index is attached or `MEM_VECTOR_INDEX_USE_LEGACY=1` is set.
@@ -777,7 +933,7 @@ impl DuckDbRepository {
                 m.summary, m.content, m.evidence_json, m.code_refs_json, m.project, m.repo,
                 m.module, m.task_type, m.tags_json, m.confidence, m.decay_score, m.content_hash,
                 m.idempotency_key, m.session_id, m.supersedes_memory_id, m.source_agent,
-                m.created_at, m.updated_at, m.last_validated_at,
+                m.created_at, m.updated_at, m.last_validated_at, m.topics,
                 e.embedding
              from memories m
              inner join memory_embeddings e on m.memory_id = e.memory_id
@@ -892,7 +1048,7 @@ impl DuckDbRepository {
                     content, evidence_json, code_refs_json, project, repo, module, task_type,
                     tags_json, confidence, decay_score, content_hash, idempotency_key,
                     session_id, supersedes_memory_id, source_agent, created_at, updated_at,
-                    last_validated_at
+                    last_validated_at, topics
                  from memories
                  where memory_id = ?1",
                 params![memory_id],
@@ -916,7 +1072,7 @@ impl DuckDbRepository {
                     content, evidence_json, code_refs_json, project, repo, module, task_type,
                     tags_json, confidence, decay_score, content_hash, idempotency_key,
                     session_id, supersedes_memory_id, source_agent, created_at, updated_at,
-                    last_validated_at
+                    last_validated_at, topics
                  from memories
                  where tenant = ?1 and memory_id = ?2",
                 params![tenant, memory_id],
@@ -940,7 +1096,7 @@ impl DuckDbRepository {
                     content, evidence_json, code_refs_json, project, repo, module, task_type,
                     tags_json, confidence, decay_score, content_hash, idempotency_key,
                     session_id, supersedes_memory_id, source_agent, created_at, updated_at,
-                    last_validated_at
+                    last_validated_at, topics
                  from memories
                  where tenant = ?1 and memory_id = ?2 and status = ?3",
                 params![
@@ -969,7 +1125,7 @@ impl DuckDbRepository {
                     content, evidence_json, code_refs_json, project, repo, module, task_type,
                     tags_json, confidence, decay_score, content_hash, idempotency_key,
                     session_id, supersedes_memory_id, source_agent, created_at, updated_at,
-                    last_validated_at
+                    last_validated_at, topics
                  from memories
                  where tenant = ?1
                    and (((?2 is not null and idempotency_key = ?2) or content_hash = ?3))
@@ -996,7 +1152,7 @@ impl DuckDbRepository {
                 content, evidence_json, code_refs_json, project, repo, module, task_type,
                 tags_json, confidence, decay_score, content_hash, idempotency_key,
                 session_id, supersedes_memory_id, source_agent, created_at, updated_at,
-                last_validated_at
+                last_validated_at, topics
              from memories
              where tenant = ?1 and status = ?2
              order by created_at desc",
@@ -1017,7 +1173,7 @@ impl DuckDbRepository {
                 content, evidence_json, code_refs_json, project, repo, module, task_type,
                 tags_json, confidence, decay_score, content_hash, idempotency_key,
                 session_id, supersedes_memory_id, source_agent, created_at, updated_at,
-                last_validated_at
+                last_validated_at, topics
              from memories
              where tenant = ?1
              order by updated_at desc, version desc, memory_id asc",
@@ -1142,7 +1298,7 @@ impl DuckDbRepository {
                 summary, content, evidence_json, code_refs_json, project, repo,
                 module, task_type, tags_json, confidence, decay_score, content_hash,
                 idempotency_key, session_id, supersedes_memory_id, source_agent,
-                created_at, updated_at, last_validated_at
+                created_at, updated_at, last_validated_at, topics
              from memories
              where tenant = ?1
                and status not in ('rejected', 'archived')
@@ -1218,13 +1374,13 @@ impl DuckDbRepository {
                     content, evidence_json, code_refs_json, project, repo, module, task_type,
                     tags_json, confidence, decay_score, content_hash, idempotency_key,
                     session_id, supersedes_memory_id, source_agent, created_at, updated_at,
-                    last_validated_at
+                    last_validated_at, topics
                 ) values (
                     ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8,
                     ?9, ?10, ?11, ?12, ?13, ?14, ?15,
                     ?16, ?17, ?18, ?19, ?20,
                     ?21, ?22, ?23, ?24, ?25,
-                    ?26
+                    ?26, ?27
                 )",
                 params![
                     stored.memory_id,
@@ -1253,6 +1409,7 @@ impl DuckDbRepository {
                     stored.created_at,
                     stored.updated_at,
                     stored.last_validated_at,
+                    encode_json(&stored.topics)?,
                 ],
             )?;
             self.fts_dirty.store(true, Ordering::Release);
@@ -1828,7 +1985,7 @@ fn restore_embedding_references(
 
 fn map_memory_with_blob(row: &duckdb::Row<'_>) -> Result<(MemoryRecord, Vec<u8>), duckdb::Error> {
     let memory = map_memory_row(row)?;
-    let blob: Vec<u8> = row.get(26)?;
+    let blob: Vec<u8> = row.get(27)?;
     Ok((memory, blob))
 }
 
@@ -1882,7 +2039,7 @@ pub(crate) fn migrate_content_hash_to_sha256(conn: &Connection) -> Result<usize,
             content, evidence_json, code_refs_json, project, repo, module, task_type,
             tags_json, confidence, decay_score, content_hash, idempotency_key,
             session_id, supersedes_memory_id, source_agent, created_at, updated_at,
-            last_validated_at
+            last_validated_at, topics
          from memories
          where length(content_hash) != ?1",
     )?;
@@ -1908,6 +2065,10 @@ pub(crate) fn migrate_content_hash_to_sha256(conn: &Connection) -> Result<usize,
 }
 
 fn map_memory_row(row: &duckdb::Row<'_>) -> Result<MemoryRecord, duckdb::Error> {
+    let topics: Vec<String> = match row.get::<_, Option<String>>(26)? {
+        Some(s) => decode_json(&s).map_err(to_from_sql_error)?,
+        None => Vec::new(),
+    };
     Ok(MemoryRecord {
         memory_id: row.get(0)?,
         tenant: row.get(1)?,
@@ -1935,6 +2096,7 @@ fn map_memory_row(row: &duckdb::Row<'_>) -> Result<MemoryRecord, duckdb::Error> 
         created_at: row.get(23)?,
         updated_at: row.get(24)?,
         last_validated_at: row.get(25)?,
+        topics,
     })
 }
 

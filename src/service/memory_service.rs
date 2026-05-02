@@ -19,12 +19,14 @@ use crate::{
         },
         query::{SearchMemoryRequest, SearchMemoryResponse},
     },
-    pipeline::ingest::{compute_content_hash, initial_status, memory_node_id},
+    pipeline::ingest::{
+        compute_content_hash, initial_status, memory_node_id, GraphEdgeDraft, ToNodeKind,
+    },
     pipeline::workflow,
     pipeline::{compress, retrieve},
     storage::{
-        current_timestamp, DuckDbGraphStore, DuckDbRepository, EmbeddingJobInsert, GraphError,
-        StorageError,
+        current_timestamp, DuckDbGraphStore, DuckDbRepository, EmbeddingJobInsert, EntityRegistry,
+        GraphError, StorageError,
     },
 };
 
@@ -186,6 +188,7 @@ impl MemoryService {
             module: request.module,
             task_type: request.task_type,
             tags: request.tags,
+            topics: request.topics,
             confidence: default_confidence(&status),
             decay_score: 0.0,
             content_hash,
@@ -199,7 +202,9 @@ impl MemoryService {
         };
 
         let stored = self.repository.insert_memory(memory).await?;
-        self.graph.sync_memory(&stored).await?;
+        let drafts = crate::pipeline::ingest::extract_graph_edge_drafts(&stored);
+        let edges = resolve_drafts_to_edges(drafts, &self.repository, &stored.tenant, &now).await?;
+        self.graph.sync_memory_edges(&edges, &now).await?;
         self.enqueue_embedding_job_for_memory(&stored).await?;
         self.repository
             .touch_session(&session_id, &now)
@@ -443,7 +448,7 @@ impl MemoryService {
     ///
     /// After storage is updated, the graph is kept consistent:
     /// 1. v1's edges are closed (`close_edges_for_memory`)
-    /// 2. v2's edges are opened (`sync_memory`)
+    /// 2. v2's edges are opened via the new draft + registry-resolve + `sync_memory_edges` path
     pub async fn edit_and_accept_pending(
         &self,
         tenant: &str,
@@ -469,7 +474,11 @@ impl MemoryService {
         self.graph
             .close_edges_for_memory(&original.memory_id)
             .await?;
-        self.graph.sync_memory(&superseding).await?;
+        let now = current_timestamp();
+        let drafts = crate::pipeline::ingest::extract_graph_edge_drafts(&superseding);
+        let edges =
+            resolve_drafts_to_edges(drafts, &self.repository, &superseding.tenant, &now).await?;
+        self.graph.sync_memory_edges(&edges, &now).await?;
 
         self.enqueue_embedding_job_for_memory(&superseding).await?;
 
@@ -520,6 +529,7 @@ impl MemoryService {
             module: original.module.clone(),
             task_type: original.task_type.clone(),
             tags: patch.tags.clone(),
+            topics: original.topics.clone(),
             source_agent: original.source_agent.clone(),
             idempotency_key: None,
             write_mode: crate::domain::memory::WriteMode::Auto,
@@ -543,6 +553,7 @@ impl MemoryService {
             module: original.module.clone(),
             task_type: original.task_type.clone(),
             tags: patch.tags,
+            topics: original.topics.clone(),
             confidence: default_confidence(&MemoryStatus::Active),
             decay_score: 0.0,
             content_hash: compute_content_hash(&request),
@@ -670,6 +681,48 @@ impl MemoryService {
         self.repository.try_enqueue_embedding_job(insert).await?;
         Ok(())
     }
+}
+
+/// Resolve a batch of `GraphEdgeDraft`s into concrete `GraphEdge`s with stable
+/// `to_node_id` strings.
+///
+/// `LiteralMemory` drafts pass through unchanged (`memory:<id>`). `EntityRef`
+/// drafts are resolved through [`EntityRegistry::resolve_or_create`], which
+/// maps `(tenant, alias, kind)` to a stable `entity_id`; the resulting node id
+/// is `entity:<id>`.
+///
+/// Each call to `resolve_or_create` acquires-and-releases the DuckDB connection
+/// mutex (see `entity_repo.rs`) — the locks are sequenced, not nested. Pure
+/// async; the caller passes `now` so timestamps stay deterministic in tests.
+///
+/// Wired into `MemoryService::ingest` and `edit_and_accept_pending` by Task 9
+/// of the entity-registry roadmap.
+pub(crate) async fn resolve_drafts_to_edges(
+    drafts: Vec<GraphEdgeDraft>,
+    registry: &impl EntityRegistry,
+    tenant: &str,
+    now: &str,
+) -> Result<Vec<GraphEdge>, StorageError> {
+    let mut out = Vec::with_capacity(drafts.len());
+    for draft in drafts {
+        let to_node_id = match draft.to_kind {
+            ToNodeKind::LiteralMemory(memory_id) => format!("memory:{memory_id}"),
+            ToNodeKind::EntityRef { kind, alias } => {
+                let id = registry
+                    .resolve_or_create(tenant, &alias, kind, now)
+                    .await?;
+                format!("entity:{id}")
+            }
+        };
+        out.push(GraphEdge {
+            from_node_id: draft.from_node_id,
+            to_node_id,
+            relation: draft.relation,
+            valid_from: now.to_string(),
+            valid_to: None,
+        });
+    }
+    Ok(out)
 }
 
 fn summarize(content: &str) -> String {

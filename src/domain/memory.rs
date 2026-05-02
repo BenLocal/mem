@@ -121,6 +121,8 @@ pub struct IngestMemoryRequest {
     #[serde(skip_serializing_if = "skip_none")]
     pub task_type: Option<String>,
     pub tags: Vec<String>,
+    #[serde(default)]
+    pub topics: Vec<String>,
     pub source_agent: String,
     #[serde(skip_serializing_if = "skip_none")]
     pub idempotency_key: Option<String>,
@@ -150,6 +152,7 @@ pub struct MemoryRecord {
     #[serde(skip_serializing_if = "skip_none")]
     pub task_type: Option<String>,
     pub tags: Vec<String>,
+    pub topics: Vec<String>,
     pub confidence: f32,
     pub decay_score: f32,
     pub content_hash: String,
@@ -185,6 +188,7 @@ impl Default for MemoryRecord {
             module: None,
             task_type: None,
             tags: Vec::new(),
+            topics: Vec::new(),
             confidence: 0.0,
             decay_score: 0.0,
             content_hash: String::new(),

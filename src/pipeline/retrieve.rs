@@ -690,6 +690,7 @@ mod tests {
             module: None,
             task_type: None,
             tags: vec![],
+            topics: vec![],
             confidence: 0.0,
             decay_score: 0.0,
             content_hash: String::new(),

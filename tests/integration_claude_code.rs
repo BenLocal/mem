@@ -89,7 +89,9 @@ fn write_transcript_fixture(file: &NamedTempFile) {
 async fn end_to_end_mine_then_search_then_get() {
     use mem::config::{EmbeddingProviderKind, EmbeddingSettings};
     use mem::embedding::{EmbeddingProvider, FakeEmbeddingProvider};
-    use mem::service::{transcript_embedding_worker, MemoryService, TranscriptService};
+    use mem::service::{
+        transcript_embedding_worker, EntityService, MemoryService, TranscriptService,
+    };
     use mem::storage::{DuckDbRepository, VectorIndex, VectorIndexFingerprint};
 
     // --- Construct AppState manually (no worker spawn, no model load).
@@ -126,6 +128,7 @@ async fn end_to_end_mine_then_search_then_get() {
         config: mem::config::Config::local(),
         transcript_index: transcript_index.clone(),
         transcript_service,
+        entity_service: EntityService::new(repo.clone()),
     };
     let app = mem::http::router().with_state(state);
 

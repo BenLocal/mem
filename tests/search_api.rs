@@ -1,3 +1,8 @@
+// `seeded_search_app` calls the deprecated `DuckDbGraphStore::sync_memory`
+// method directly; the legacy `to_node_id` format it produces is fine for the
+// search-pipeline assertions in this file.
+#![allow(deprecated)]
+
 use std::sync::Arc;
 
 use axum::{
@@ -97,6 +102,7 @@ fn memory(spec: MemorySpec<'_>) -> MemoryRecord {
         module: spec.module.map(str::to_string),
         task_type: Some("implementation".into()),
         tags: vec!["search".into()],
+        topics: vec![],
         confidence: 0.9,
         decay_score: spec.decay_score,
         content_hash: format!("hash-{}", spec.memory_id),

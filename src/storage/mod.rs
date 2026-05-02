@@ -1,4 +1,5 @@
 pub mod duckdb;
+pub mod entity_repo;
 pub mod graph_store;
 pub mod schema;
 pub mod time;
@@ -7,7 +8,8 @@ pub mod vector_index;
 pub mod vector_index_diagnose;
 
 pub use duckdb::{
-    ClaimedEmbeddingJob, DuckDbRepository, EmbeddingJobInsert, FeedbackEvent, StorageError,
+    ClaimedEmbeddingJob, DuckDbRepository, EmbeddingJobInsert, EntityRegistry, FeedbackEvent,
+    StorageError,
 };
 pub use graph_store::{DuckDbGraphStore, GraphError};
 pub use time::{current_timestamp, timestamp_add_ms};

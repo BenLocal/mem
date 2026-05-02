@@ -75,6 +75,7 @@ pub fn workflow_memory_request(
         module: episode.module.clone(),
         task_type: None,
         tags,
+        topics: vec![],
         source_agent: episode.source_agent.clone(),
         idempotency_key: Some(workflow_idempotency_key(&candidate.goal, &candidate.steps)),
         write_mode: WriteMode::Auto,
