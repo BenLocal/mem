@@ -14,7 +14,7 @@
 | 5 | 🔍 | ✅ 检索分数归一化 / 两路 RRF（lex+sem，`MEM_RANKER=legacy` 一档兜底）| 🟡 排序质量 | S（3h） | 低 | `pipeline/retrieve.rs` |
 | 6 | 📦 | ✅ `compress_text` 改 token 计数（tiktoken-rs::o200k_base，CJK 不再按词裸奔截断）| 🟡 输出 verbatim 纪律 | S（2h） | 低 | `pipeline/compress.rs` |
 | 7 | 🔍 | ✅ `decay_score` 后台衰减 worker（`f7a6c87` feat(service): add decay_worker for time-based memory decay；`62b2662` fix(decay): rewrite decay_worker SQL for DuckDB and ms-string timestamps） | 🟡 生命周期闭环 | S（3h） | 低 | `service/`、新增 `decay_worker.rs` |
-| 8 | 🔍 | Entity registry（可选） | 🟢 数据卫生 | M（半天） | 中（迁移） | `domain/entity.rs`、schema |
+| 8 | 🔍 | ✅ **Entity registry**（`entities` + `entity_aliases`；`MemoryRecord.topics`；ingest auto-promotes via `extract_graph_edge_drafts` + `resolve_drafts_to_edges`；4 HTTP routes `/entities`；`mem repair --rebuild-graph`；`8f8d2af..68395a0`） | 🟢 数据卫生 | M（半天） | 中（迁移） | `domain/entity.rs`、`storage/entity_registry.rs`、`db/schema/008_entity_registry.sql`、`src/http/entities.rs`、`src/cli/repair.rs` |
 | 9 | 📦 | ✅ **Verbatim 守护**（caller 显式提供 `summary` 时校验 `summary != content`；AGENTS.md / README.md 已写） | 🟢 哲学一致性 | S（1h） | 低 | `pipeline/ingest.rs`、`AGENTS.md`、`README.md` |
 | 10 | 🔍 | ✅ **Sessions**（schema + auto-bucket；HTTP 端点 / `episodes.session_id` / DELETE 软删延后） | 🟠 表达力 | M（半天） | 中（schema 迁移）| 新增 `sessions` 表 + `memories.session_id` + auto-bucket on ingest，详见 [§11](./mempalace-diff.md#11-sessions对齐-mempalace-的-room但和-episodes-正交) |
 | 11 | 🔍 | ✅ **检索流水线 Stage 2 拆分**（lifecycle 加性层抽出共享 helper；Stage 3 / 响应形状变更延后） | 🟠 架构升级 | M（1 天 → 实际 ~2h，按 §12 line 513 降级路径） | 中（依赖 #2 + #5） | `pipeline/retrieve.rs` 重构、`pipeline/compress.rs` 输出层调整，详见 [§12](./mempalace-diff.md#12-检索流水线三段式重构取-mem-之结构化借-mempalace-之分层) |
