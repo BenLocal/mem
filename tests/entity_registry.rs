@@ -192,6 +192,38 @@ async fn memory_record_empty_topics_round_trips_as_empty_vec() {
 }
 
 #[tokio::test]
+async fn memory_record_null_topics_in_legacy_row_decodes_as_empty_vec() {
+    let tmp = TempDir::new().unwrap();
+    let db = tmp.path().join("mem.duckdb");
+    let repo = DuckDbRepository::open(&db).await.unwrap();
+
+    let memory = baseline_memory("mem-null-topics");
+    repo.insert_memory(memory).await.unwrap();
+
+    // Simulate a legacy row written before the topics column was added by
+    // forcing topics to NULL via raw SQL.
+    {
+        let conn = duckdb::Connection::open(&db).unwrap();
+        conn.execute(
+            "UPDATE memories SET topics = NULL WHERE memory_id = ?1",
+            duckdb::params!["mem-null-topics"],
+        )
+        .unwrap();
+    }
+
+    let fetched = repo
+        .get_memory_for_tenant("local", "mem-null-topics")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        fetched.topics,
+        Vec::<String>::new(),
+        "NULL topics in a legacy row must deserialize as empty Vec, not an error"
+    );
+}
+
+#[tokio::test]
 async fn resolve_or_create_inserts_entity_and_alias_on_first_call() {
     let tmp = TempDir::new().unwrap();
     let db = tmp.path().join("mem.duckdb");

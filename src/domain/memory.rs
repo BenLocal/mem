@@ -152,7 +152,6 @@ pub struct MemoryRecord {
     #[serde(skip_serializing_if = "skip_none")]
     pub task_type: Option<String>,
     pub tags: Vec<String>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub topics: Vec<String>,
     pub confidence: f32,
     pub decay_score: f32,

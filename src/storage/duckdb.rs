@@ -1972,11 +1972,10 @@ pub(crate) fn migrate_content_hash_to_sha256(conn: &Connection) -> Result<usize,
 }
 
 fn map_memory_row(row: &duckdb::Row<'_>) -> Result<MemoryRecord, duckdb::Error> {
-    let topics: Vec<String> = row
-        .get::<_, Option<String>>(26)?
-        .as_deref()
-        .and_then(|s| serde_json::from_str(s).ok())
-        .unwrap_or_default();
+    let topics: Vec<String> = match row.get::<_, Option<String>>(26)? {
+        Some(s) => decode_json(&s).map_err(to_from_sql_error)?,
+        None => Vec::new(),
+    };
     Ok(MemoryRecord {
         memory_id: row.get(0)?,
         tenant: row.get(1)?,
