@@ -4,9 +4,11 @@ use axum::{
 };
 use mem::app;
 use serde_json::{json, Value};
+use tempfile::TempDir;
 use tower::util::ServiceExt;
 
 struct TestApp {
+    _temp_dir: TempDir,
     router: axum::Router,
 }
 
@@ -23,8 +25,15 @@ impl TestResponse {
 
 impl TestApp {
     async fn new() -> Self {
+        let temp_dir = TempDir::new().expect("tempdir should create");
+        let mut cfg = mem::config::Config::local();
+        cfg.db_path = temp_dir.path().join("mem.duckdb");
+        let router = app::router_with_config(cfg)
+            .await
+            .expect("app router should build");
         Self {
-            router: app::router().await.expect("app router should build"),
+            _temp_dir: temp_dir,
+            router,
         }
     }
 

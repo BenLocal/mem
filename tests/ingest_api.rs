@@ -85,9 +85,15 @@ impl TestApp {
 }
 
 async fn test_app() -> TestApp {
+    let temp_dir = tempdir().expect("tempdir should create");
+    let mut cfg = mem::config::Config::local();
+    cfg.db_path = temp_dir.path().join("mem.duckdb");
+    let router = app::router_with_config(cfg)
+        .await
+        .expect("app router should build");
     TestApp {
-        _temp_dir: None,
-        router: app::router().await.expect("app router should build"),
+        _temp_dir: Some(temp_dir),
+        router,
     }
 }
 
