@@ -1,4 +1,5 @@
 pub mod compress;
+pub mod entity_normalize;
 pub mod ingest;
 pub mod ranking;
 pub mod retrieve;
