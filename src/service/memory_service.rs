@@ -19,12 +19,14 @@ use crate::{
         },
         query::{SearchMemoryRequest, SearchMemoryResponse},
     },
-    pipeline::ingest::{compute_content_hash, initial_status, memory_node_id},
+    pipeline::ingest::{
+        compute_content_hash, initial_status, memory_node_id, GraphEdgeDraft, ToNodeKind,
+    },
     pipeline::workflow,
     pipeline::{compress, retrieve},
     storage::{
-        current_timestamp, DuckDbGraphStore, DuckDbRepository, EmbeddingJobInsert, GraphError,
-        StorageError,
+        current_timestamp, DuckDbGraphStore, DuckDbRepository, EmbeddingJobInsert, EntityRegistry,
+        GraphError, StorageError,
     },
 };
 
@@ -673,6 +675,48 @@ impl MemoryService {
         self.repository.try_enqueue_embedding_job(insert).await?;
         Ok(())
     }
+}
+
+/// Resolve a batch of `GraphEdgeDraft`s into concrete `GraphEdge`s with stable
+/// `to_node_id` strings.
+///
+/// `LiteralMemory` drafts pass through unchanged (`memory:<id>`). `EntityRef`
+/// drafts are resolved through [`EntityRegistry::resolve_or_create`], which
+/// maps `(tenant, alias, kind)` to a stable `entity_id`; the resulting node id
+/// is `entity:<id>`.
+///
+/// Each call to `resolve_or_create` acquires-and-releases the DuckDB connection
+/// mutex (see `entity_repo.rs`) — the locks are sequenced, not nested. Pure
+/// async; the caller passes `now` so timestamps stay deterministic in tests.
+///
+/// Wired into `MemoryService::ingest` by Task 9 of the entity-registry roadmap.
+#[allow(dead_code)] // Task 9 wires this into `MemoryService::ingest`.
+pub(crate) async fn resolve_drafts_to_edges(
+    drafts: Vec<GraphEdgeDraft>,
+    registry: &impl EntityRegistry,
+    tenant: &str,
+    now: &str,
+) -> Result<Vec<GraphEdge>, StorageError> {
+    let mut out = Vec::with_capacity(drafts.len());
+    for draft in drafts {
+        let to_node_id = match draft.to_kind {
+            ToNodeKind::LiteralMemory(memory_id) => format!("memory:{memory_id}"),
+            ToNodeKind::EntityRef { kind, alias } => {
+                let id = registry
+                    .resolve_or_create(tenant, &alias, kind, now)
+                    .await?;
+                format!("entity:{id}")
+            }
+        };
+        out.push(GraphEdge {
+            from_node_id: draft.from_node_id,
+            to_node_id,
+            relation: draft.relation,
+            valid_from: now.to_string(),
+            valid_to: None,
+        });
+    }
+    Ok(out)
 }
 
 fn summarize(content: &str) -> String {

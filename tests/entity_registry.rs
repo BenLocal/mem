@@ -453,3 +453,157 @@ async fn get_entity_returns_canonical_with_aliases_in_creation_order() {
         vec!["rust", "rust language", "rustlang"]
     );
 }
+
+// ---------------------------------------------------------------------------
+// Ingest → resolve → graph_edges integration (Task 8 + Task 9).
+//
+// `resolve_drafts_to_edges` is defined in `service::memory_service` (Task 8).
+// The ingest call site is migrated to use it in Task 9. Until then these
+// tests are `#[ignore]`d — they exercise the full HTTP flow and assert that
+// `graph_edges.to_node_id` carries `entity:<uuid>` (resolved via
+// EntityRegistry), not the legacy `topic:<alias>` literal.
+// ---------------------------------------------------------------------------
+
+use axum::body::Body;
+use axum::http::{Request, StatusCode};
+use serde_json::json;
+use tower::util::ServiceExt;
+
+#[tokio::test]
+#[ignore = "wired in Task 9"]
+async fn ingest_memory_with_topics_creates_entity_refs_in_graph_edges() {
+    let tmp = TempDir::new().unwrap();
+    let mut cfg = mem::config::Config::local();
+    cfg.db_path = tmp.path().join("mem.duckdb");
+    let app = mem::app::router_with_config(cfg.clone()).await.unwrap();
+
+    let body = json!({
+        "tenant": "local",
+        "memory_type": "observation",
+        "content": "Rust borrow checker discussion",
+        "scope": "global",
+        "source_agent": "test",
+        "topics": ["Rust", "ownership"],
+        "write_mode": "auto"
+    });
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/memories")
+                .header("content-type", "application/json")
+                .body(Body::from(body.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::CREATED);
+
+    // Verify graph_edges has 2 'discusses' edges pointing to entity:<uuid>.
+    let conn = duckdb::Connection::open(&cfg.db_path).unwrap();
+    let count: i64 = conn
+        .query_row(
+            "select count(*) from graph_edges \
+             where relation = 'discusses' and to_node_id like 'entity:%'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(count, 2);
+
+    // Verify entities table has 2 entities of kind='topic'.
+    let entity_count: i64 = conn
+        .query_row(
+            "select count(*) from entities where kind='topic' and tenant='local'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(entity_count, 2);
+}
+
+#[tokio::test]
+#[ignore = "wired in Task 9"]
+async fn ingest_with_existing_alias_reuses_entity_id() {
+    let tmp = TempDir::new().unwrap();
+    let mut cfg = mem::config::Config::local();
+    cfg.db_path = tmp.path().join("mem.duckdb");
+    let app = mem::app::router_with_config(cfg.clone()).await.unwrap();
+
+    async fn post(body: serde_json::Value, app: &axum::Router) -> axum::http::Response<Body> {
+        app.clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/memories")
+                    .header("content-type", "application/json")
+                    .body(Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap()
+    }
+
+    let r1 = post(
+        json!({
+            "tenant": "local",
+            "memory_type": "observation",
+            "content": "first mention",
+            "scope": "global",
+            "source_agent": "test",
+            "topics": ["Rust"],
+            "write_mode": "auto"
+        }),
+        &app,
+    )
+    .await;
+    assert_eq!(r1.status(), StatusCode::CREATED);
+
+    let r2 = post(
+        json!({
+            "tenant": "local",
+            "memory_type": "observation",
+            "content": "second mention with case variation",
+            "scope": "global",
+            "source_agent": "test",
+            "topics": ["rust"],
+            "write_mode": "auto"
+        }),
+        &app,
+    )
+    .await;
+    assert_eq!(r2.status(), StatusCode::CREATED);
+
+    // Both memories' 'discusses' edges should point to the SAME entity_id.
+    let conn = duckdb::Connection::open(&cfg.db_path).unwrap();
+    let entity_count: i64 = conn
+        .query_row(
+            "select count(*) from entities where kind='topic' and tenant='local'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        entity_count, 1,
+        "case-insensitive alias should not create duplicate entity"
+    );
+
+    let edge_count: i64 = conn
+        .query_row(
+            "select count(*) from graph_edges where relation='discusses'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(edge_count, 2);
+
+    // Both edges should have the same to_node_id (same entity_id).
+    let distinct_targets: i64 = conn
+        .query_row(
+            "select count(distinct to_node_id) from graph_edges where relation='discusses'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(distinct_targets, 1);
+}
