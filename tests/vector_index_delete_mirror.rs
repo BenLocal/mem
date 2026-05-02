@@ -7,6 +7,7 @@ use std::sync::Arc;
 use tempfile::tempdir;
 
 #[tokio::test]
+#[ignore = "requires EmbedAnything model in runtime"]
 async fn delete_paths_mirror_into_vector_index() {
     let dir = tempdir().unwrap();
     let db = dir.path().join("del.duckdb");

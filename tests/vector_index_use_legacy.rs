@@ -7,6 +7,7 @@ use std::sync::Arc;
 use tempfile::tempdir;
 
 #[tokio::test]
+#[ignore = "requires EmbedAnything model in runtime"]
 async fn use_legacy_env_skips_vector_index() {
     let dir = tempdir().unwrap();
     let db = dir.path().join("legacy.duckdb");
