@@ -16,6 +16,7 @@ const SESSIONS_SCHEMA_SQL: &str = include_str!("../../db/schema/004_sessions.sql
 const FTS_SCHEMA_SQL: &str = include_str!("../../db/schema/005_fts.sql");
 const CONVERSATION_MESSAGES_SCHEMA_SQL: &str =
     include_str!("../../db/schema/006_conversation_messages.sql");
+const ENTITY_REGISTRY_SCHEMA_SQL: &str = include_str!("../../db/schema/008_entity_registry.sql");
 
 pub fn bootstrap(conn: &Connection) -> Result<(), StorageError> {
     conn.execute_batch(INIT_SCHEMA_SQL)?;
@@ -24,12 +25,35 @@ pub fn bootstrap(conn: &Connection) -> Result<(), StorageError> {
     apply_sessions_schema(conn)?;
     conn.execute_batch(FTS_SCHEMA_SQL)?;
     conn.execute_batch(CONVERSATION_MESSAGES_SCHEMA_SQL)?;
+    apply_entity_registry_schema(conn)?; // NEW
     let migrated = migrate_content_hash_to_sha256(conn)?;
     if migrated > 0 {
         info!(
             count = migrated,
             "migrated legacy content_hash rows to sha256 (mempalace-diff §8 #1)"
         );
+    }
+    Ok(())
+}
+
+/// Apply `008_entity_registry.sql` statement-by-statement so that the
+/// `ALTER TABLE memories ADD COLUMN topics` line is idempotent. Same
+/// "swallow already-exists" handling as `apply_sessions_schema` for 004.
+fn apply_entity_registry_schema(conn: &Connection) -> Result<(), StorageError> {
+    for stmt in ENTITY_REGISTRY_SCHEMA_SQL
+        .split(';')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        if let Err(e) = conn.execute_batch(stmt) {
+            let msg = e.to_string();
+            if stmt.to_ascii_lowercase().contains("alter table")
+                && msg.to_ascii_lowercase().contains("already exists")
+            {
+                continue;
+            }
+            return Err(StorageError::DuckDb(e));
+        }
     }
     Ok(())
 }

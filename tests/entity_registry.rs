@@ -46,3 +46,61 @@ fn composite_pk_on_conflict_probe() {
         }
     }
 }
+
+use mem::storage::DuckDbRepository;
+use tempfile::TempDir;
+
+#[tokio::test]
+async fn schema_creates_entities_aliases_and_topics_column() {
+    let tmp = TempDir::new().unwrap();
+    let db = tmp.path().join("mem.duckdb");
+    let _repo = DuckDbRepository::open(&db).await.unwrap();
+
+    let conn = duckdb::Connection::open(&db).unwrap();
+
+    let entities_count: i64 = conn
+        .query_row(
+            "select count(*) from information_schema.tables where table_name='entities'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(entities_count, 1, "entities table should exist");
+
+    let aliases_count: i64 = conn
+        .query_row(
+            "select count(*) from information_schema.tables where table_name='entity_aliases'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(aliases_count, 1, "entity_aliases table should exist");
+
+    // memories.topics column added by the ALTER in 008.
+    let topics_col: i64 = conn
+        .query_row(
+            "select count(*) from information_schema.columns where table_name='memories' and column_name='topics'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(topics_col, 1, "memories.topics column should exist");
+
+    // CHECK constraint on entities.kind: invalid kind rejected.
+    let bad = conn.execute(
+        "insert into entities (entity_id, tenant, canonical_name, kind, created_at) \
+         values ('e1', 't', 'X', 'bogus', '00000000020260502000')",
+        [],
+    );
+    assert!(bad.is_err(), "kind='bogus' should violate CHECK constraint");
+}
+
+#[tokio::test]
+async fn schema_bootstrap_is_idempotent() {
+    let tmp = TempDir::new().unwrap();
+    let db = tmp.path().join("mem.duckdb");
+    let _repo1 = DuckDbRepository::open(&db).await.unwrap();
+    drop(_repo1);
+    let _repo2 = DuckDbRepository::open(&db).await.unwrap();
+    // No panic: re-opening must not fail on duplicate ALTER.
+}
