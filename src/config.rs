@@ -286,10 +286,14 @@ mod tests {
 
     #[test]
     fn embedding_defaults_when_empty() {
+        // Mirrors `EmbeddingSettings::development_defaults` exactly: when the
+        // closure returns no env vars the parser must hand back the in-code
+        // defaults verbatim. Update both sides together when those defaults
+        // change (last touched by `47aff1e`, which switched to EmbedAnything).
         let s = EmbeddingSettings::from_env_vars(|_| None).unwrap();
-        assert_eq!(s.provider, EmbeddingProviderKind::Fake);
-        assert_eq!(s.model, "fake");
-        assert_eq!(s.dim, 256);
+        assert_eq!(s.provider, EmbeddingProviderKind::EmbedAnything);
+        assert_eq!(s.model, "Qwen/Qwen3-Embedding-0.6B");
+        assert_eq!(s.dim, 1024);
         assert_eq!(s.openai_api_key, None);
     }
 
