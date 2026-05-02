@@ -4,9 +4,11 @@ use axum::{
 };
 use mem::app;
 use serde_json::{json, Value};
+use tempfile::TempDir;
 use tower::util::ServiceExt;
 
 struct TestApp {
+    _temp_dir: TempDir,
     router: axum::Router,
 }
 
@@ -23,8 +25,24 @@ impl TestResponse {
 
 impl TestApp {
     async fn new() -> Self {
+        Self::new_with_provider(mem::config::EmbeddingProviderKind::Fake).await
+    }
+
+    async fn new_with_provider(provider: mem::config::EmbeddingProviderKind) -> Self {
+        let temp_dir = TempDir::new().expect("tempdir should create");
+        let mut cfg = mem::config::Config::local();
+        cfg.db_path = temp_dir.path().join("mem.duckdb");
+        cfg.embedding.provider = provider;
+        if matches!(provider, mem::config::EmbeddingProviderKind::Fake) {
+            cfg.embedding.model = "fake".to_string();
+            cfg.embedding.dim = 64;
+        }
+        let router = app::router_with_config(cfg)
+            .await
+            .expect("app router should build");
         Self {
-            router: app::router().await.expect("app router should build"),
+            _temp_dir: temp_dir,
+            router,
         }
     }
 
@@ -75,9 +93,11 @@ impl TestApp {
 }
 
 #[tokio::test]
-#[ignore = "requires EmbedAnything model in runtime"]
 async fn embeddings_providers_describes_fake_backend() {
-    let app = TestApp::new().await;
+    // Pin to Fake explicitly so the assertion stays stable independent of
+    // whatever `Config::local()` defaults to (currently EmbedAnything since
+    // commit 47aff1e). Tests the API contract for the Fake provider.
+    let app = TestApp::new_with_provider(mem::config::EmbeddingProviderKind::Fake).await;
     let res = app.get("/embeddings/providers").await;
     assert_eq!(res.status, StatusCode::OK);
     let j = res.json();

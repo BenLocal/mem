@@ -1,4 +1,4 @@
-use mem::config::EmbeddingSettings;
+use mem::config::{EmbeddingProviderKind, EmbeddingSettings};
 use mem::domain::memory::{IngestMemoryRequest, MemoryType, Scope, Visibility, WriteMode};
 use mem::embedding::arc_embedding_provider;
 use mem::service::{embedding_worker, MemoryService};
@@ -7,12 +7,16 @@ use std::sync::Arc;
 use tempfile::tempdir;
 
 #[tokio::test]
-#[ignore = "requires EmbedAnything model in runtime"]
 async fn use_legacy_env_skips_vector_index() {
     let dir = tempdir().unwrap();
     let db = dir.path().join("legacy.duckdb");
     let repo = DuckDbRepository::open(&db).await.unwrap();
-    let settings = EmbeddingSettings::development_defaults();
+    // Pin to Fake provider so the test runs deterministically without an
+    // EmbedAnything model present in the test environment.
+    let mut settings = EmbeddingSettings::development_defaults();
+    settings.provider = EmbeddingProviderKind::Fake;
+    settings.model = "fake".to_string();
+    settings.dim = 64;
     let provider = arc_embedding_provider(&settings).unwrap();
     let fp = VectorIndexFingerprint {
         provider: settings.job_provider_id().to_string(),
@@ -22,7 +26,7 @@ async fn use_legacy_env_skips_vector_index() {
     let idx = Arc::new(VectorIndex::open_or_rebuild(&repo, &db, &fp).await.unwrap());
     repo.attach_vector_index(idx.clone());
 
-    let svc = MemoryService::new(repo.clone());
+    let svc = MemoryService::new_with_settings(repo.clone(), &settings);
     let _ = svc
         .ingest(IngestMemoryRequest {
             tenant: "t".into(),

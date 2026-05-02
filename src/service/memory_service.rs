@@ -81,6 +81,28 @@ impl MemoryService {
         Self::new(repository)
     }
 
+    /// Like [`MemoryService::new`] but derives the `embedding_jobs.provider`
+    /// value from `settings.job_provider_id()` so the worker's runtime
+    /// provider check (`embedding_worker::tick`) succeeds against jobs this
+    /// service enqueues.
+    ///
+    /// The default `new` constructor hardcodes `"fake"` for legacy
+    /// compatibility; tests that build an [`EmbeddingSettings`] should prefer
+    /// this constructor so the configured provider id flows through.
+    pub fn new_with_settings(
+        repository: DuckDbRepository,
+        settings: &crate::config::EmbeddingSettings,
+    ) -> Self {
+        let repo_arc = Arc::new(repository.clone());
+        let graph = Arc::new(DuckDbGraphStore::new(repo_arc));
+        Self::with_graph_and_embedding_providers(
+            repository,
+            graph,
+            settings.job_provider_id().to_string(),
+            None,
+        )
+    }
+
     /// Constructor that accepts a pre-built `DuckDbGraphStore` (used by tests and `app.rs`).
     pub fn new_with_graph(repository: DuckDbRepository, graph: Arc<DuckDbGraphStore>) -> Self {
         Self::with_graph_and_embedding_providers(repository, graph, "fake".to_string(), None)

@@ -1,5 +1,5 @@
 use mem::{
-    config::EmbeddingSettings,
+    config::{EmbeddingProviderKind, EmbeddingSettings},
     domain::memory::{
         IngestMemoryRequest, MemoryRecord, MemoryStatus, MemoryType, Scope, Visibility, WriteMode,
     },
@@ -10,16 +10,27 @@ use mem::{
 use std::sync::Arc;
 use tempfile::tempdir;
 
+/// Build an [`EmbeddingSettings`] pinned to the deterministic Fake provider so
+/// these worker-driven tests don't depend on the real EmbedAnything model
+/// being downloaded in the test environment. Mirrors the `development_defaults`
+/// shape but flips `provider` (and the model/dim that go with it).
+fn fake_settings() -> EmbeddingSettings {
+    let mut s = EmbeddingSettings::development_defaults();
+    s.provider = EmbeddingProviderKind::Fake;
+    s.model = "fake".to_string();
+    s.dim = 64;
+    s
+}
+
 #[tokio::test]
-#[ignore = "requires EmbedAnything model in runtime"]
 async fn worker_completes_job_and_writes_embedding_row() {
     let dir = tempdir().unwrap();
     let db = dir.path().join("worker-ok.duckdb");
     let repo = DuckDbRepository::open(&db).await.unwrap();
-    let settings = EmbeddingSettings::development_defaults();
+    let settings = fake_settings();
     let provider = arc_embedding_provider(&settings).unwrap();
 
-    let service = MemoryService::new(repo.clone());
+    let service = MemoryService::new_with_settings(repo.clone(), &settings);
     let request = IngestMemoryRequest {
         tenant: "tenant-w".into(),
         memory_type: MemoryType::Implementation,
@@ -81,12 +92,11 @@ async fn worker_completes_job_and_writes_embedding_row() {
 }
 
 #[tokio::test]
-#[ignore = "requires EmbedAnything model in runtime"]
 async fn worker_writes_to_attached_vector_index() {
     let dir = tempdir().unwrap();
     let db = dir.path().join("worker-vec.duckdb");
     let repo = DuckDbRepository::open(&db).await.unwrap();
-    let settings = EmbeddingSettings::development_defaults();
+    let settings = fake_settings();
     let provider = arc_embedding_provider(&settings).unwrap();
 
     let fp = mem::storage::VectorIndexFingerprint {
@@ -102,7 +112,7 @@ async fn worker_writes_to_attached_vector_index() {
     repo.attach_vector_index(idx.clone());
     assert_eq!(idx.size(), 0);
 
-    let service = MemoryService::new(repo.clone());
+    let service = MemoryService::new_with_settings(repo.clone(), &settings);
     let response = service
         .ingest(IngestMemoryRequest {
             tenant: "t".into(),
@@ -136,12 +146,11 @@ async fn worker_writes_to_attached_vector_index() {
 }
 
 #[tokio::test]
-#[ignore = "requires EmbedAnything model in runtime"]
 async fn worker_marks_stale_when_job_target_hash_mismatches_memory() {
     let dir = tempdir().unwrap();
     let db = dir.path().join("worker-stale.duckdb");
     let repo = DuckDbRepository::open(&db).await.unwrap();
-    let settings = EmbeddingSettings::development_defaults();
+    let settings = fake_settings();
     let provider = arc_embedding_provider(&settings).unwrap();
 
     let memory = MemoryRecord {
