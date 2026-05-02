@@ -604,3 +604,185 @@ async fn ingest_with_existing_alias_reuses_entity_id() {
         .unwrap();
     assert_eq!(distinct_targets, 1);
 }
+
+// ---------------------------------------------------------------------------
+// HTTP routes (Task 10): POST/GET /entities, POST /entities/{id}/aliases.
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn post_entities_creates_with_aliases() {
+    let tmp = TempDir::new().unwrap();
+    let mut cfg = mem::config::Config::local();
+    cfg.db_path = tmp.path().join("mem.duckdb");
+    let app = mem::app::router_with_config(cfg).await.unwrap();
+
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/entities")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({
+                        "tenant": "local",
+                        "canonical_name": "Rust",
+                        "kind": "topic",
+                        "aliases": ["Rust language", "rustlang"]
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::CREATED);
+
+    let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(v["entity"]["canonical_name"], "Rust");
+    let aliases = v["aliases"].as_array().unwrap();
+    assert!(aliases.iter().any(|a| a.as_str() == Some("rust language")));
+    assert!(aliases.iter().any(|a| a.as_str() == Some("rustlang")));
+}
+
+#[tokio::test]
+async fn get_entity_returns_canonical_with_aliases() {
+    let tmp = TempDir::new().unwrap();
+    let mut cfg = mem::config::Config::local();
+    cfg.db_path = tmp.path().join("mem.duckdb");
+    let app = mem::app::router_with_config(cfg).await.unwrap();
+
+    // Create.
+    let create = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/entities")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({
+                        "tenant": "local",
+                        "canonical_name": "Rust",
+                        "kind": "topic"
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(create.status(), StatusCode::CREATED);
+    let bytes = axum::body::to_bytes(create.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    let id = v["entity"]["entity_id"].as_str().unwrap().to_string();
+
+    // Get.
+    let get = app
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri(format!("/entities/{id}?tenant=local"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(get.status(), StatusCode::OK);
+    let bytes = axum::body::to_bytes(get.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(v["entity"]["entity_id"], id);
+}
+
+#[tokio::test]
+async fn post_entity_aliases_idempotent_and_409_on_conflict() {
+    let tmp = TempDir::new().unwrap();
+    let mut cfg = mem::config::Config::local();
+    cfg.db_path = tmp.path().join("mem.duckdb");
+    let app = mem::app::router_with_config(cfg).await.unwrap();
+
+    // Helper: POST /entities, return entity_id.
+    async fn create_one(canonical: &str, app: axum::Router) -> String {
+        let body = json!({
+            "tenant": "local",
+            "canonical_name": canonical,
+            "kind": "topic"
+        })
+        .to_string();
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/entities")
+                    .header("content-type", "application/json")
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        v["entity"]["entity_id"].as_str().unwrap().to_string()
+    }
+
+    let rust_id = create_one("Rust", app.clone()).await;
+    let py_id = create_one("Python", app.clone()).await;
+
+    // First add — Inserted (200).
+    let r1 = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!("/entities/{rust_id}/aliases"))
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({"tenant": "local", "alias": "Rust language"}).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(r1.status(), StatusCode::OK);
+
+    // Idempotent re-add — same outcome 200.
+    let r2 = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!("/entities/{rust_id}/aliases"))
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({"tenant": "local", "alias": "Rust language"}).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(r2.status(), StatusCode::OK);
+
+    // Conflict — alias 'rust' already on rust_id; trying on py_id → 409.
+    let r3 = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!("/entities/{py_id}/aliases"))
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({"tenant": "local", "alias": "Rust"}).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(r3.status(), StatusCode::CONFLICT);
+}

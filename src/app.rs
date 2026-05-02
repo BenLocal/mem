@@ -5,7 +5,7 @@ use tracing::info;
 
 use crate::{
     http,
-    service::{MemoryService, TranscriptService},
+    service::{EntityService, MemoryService, TranscriptService},
     storage::{DuckDbGraphStore, DuckDbRepository, VectorIndex, VectorIndexFingerprint},
 };
 
@@ -21,6 +21,10 @@ pub struct AppState {
     /// Service façade backing the `/transcripts/*` HTTP routes. Cheap to
     /// clone (wraps `Clone`/`Arc` collaborators) so it can sit on `AppState`.
     pub transcript_service: TranscriptService,
+    /// Service façade backing the `/entities/*` HTTP routes. Wraps the
+    /// shared `DuckDbRepository` and exposes the `EntityRegistry` trait
+    /// behind an HTTP-friendly surface.
+    pub entity_service: EntityService,
 }
 
 impl AppState {
@@ -104,6 +108,7 @@ impl AppState {
             transcript_index.clone(),
             Some(provider.clone()),
         );
+        let entity_service = EntityService::new(repository.clone());
         let memory_service = MemoryService::with_graph_and_embedding_providers(
             repository,
             graph,
@@ -116,6 +121,7 @@ impl AppState {
             config,
             transcript_index,
             transcript_service,
+            entity_service,
         })
     }
 
