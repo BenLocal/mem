@@ -57,6 +57,6 @@ cross build --release                          # cross-compile (reads ./Cross.to
 ## Where to find design context
 
 - **`docs/mempalace-diff.md`** — comparison with MemPalace + roadmap (§8 numbered items #1–#13). Completed items have ✅; commit messages reference them (e.g. `closes mempalace-diff §8 #3`). Read before non-trivial design changes.
-- **`docs/superpowers/specs/`** — design specs from brainstorming sessions (e.g. `2026-04-27-vector-index-sidecar-design.md`, `2026-04-28-mem-repair-cli-design.md`).
+- **`docs/superpowers/specs/`** — design specs from brainstorming sessions (e.g. `2026-04-27-vector-index-sidecar-design.md`, `2026-04-28-mem-repair-cli-design.md`, `2026-04-30-conversation-archive-design.md`, `2026-05-01-transcript-recall-design.md`).
 - **`docs/superpowers/plans/`** — TDD-style implementation plans paired with the specs above; useful for "why is it like this" archaeology.
 - **`docs/superpowers/skills/mem-mcp-codex/SKILL.md`** — how caller agents (Codex / Cursor) are expected to use the MCP tools; check before changing tool surface.
