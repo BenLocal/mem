@@ -92,10 +92,17 @@ mod tests {
     }
 
     #[test]
-    fn freshness_at_newest_is_max() {
+    fn freshness_score_returns_max_when_current_is_newest_or_future() {
+        // Early-return branch: current >= newest.
         assert_eq!(freshness_score(1_000, 1_000), 6);
-        assert_eq!(freshness_score(1_000, 999), 6); // newest <= current per the function: actually current=999 < newest=1000, delta=1, bucket=0 → 6. The point is the boundary returns 6.
-        assert_eq!(freshness_score(1_000, 5_000), 6); // current in future
+        assert_eq!(freshness_score(1_000, 5_000), 6);
+    }
+
+    #[test]
+    fn freshness_score_within_first_bucket_returns_max() {
+        // Bucket-path branch: delta < 10_000ms still rounds to bucket 0 → 6.
+        assert_eq!(freshness_score(1_000, 999), 6);
+        assert_eq!(freshness_score(200_000, 195_000), 6);
     }
 
     #[test]
