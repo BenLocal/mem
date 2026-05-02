@@ -758,6 +758,89 @@ impl DuckDbRepository {
         Ok(out)
     }
 
+    /// Returns every distinct `tenant` value that appears in the `memories`
+    /// table. Used by `mem repair --rebuild-graph` to iterate per-tenant
+    /// without forcing the operator to know which tenants exist on disk.
+    pub async fn list_distinct_memory_tenants(&self) -> Result<Vec<String>, StorageError> {
+        let conn = self.conn()?;
+        let mut stmt = conn.prepare("select distinct tenant from memories order by tenant")?;
+        let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
+        let mut out = Vec::new();
+        for r in rows {
+            out.push(r?);
+        }
+        Ok(out)
+    }
+
+    /// Returns full [`MemoryRecord`]s for every memory in the tenant, ordered
+    /// by `created_at` so the rebuild walks them in deterministic order.
+    /// Filters nothing — `archived` and `rejected` rows are returned too,
+    /// matching what the original ingest path would have considered.
+    pub async fn list_memories_for_tenant(
+        &self,
+        tenant: &str,
+    ) -> Result<Vec<MemoryRecord>, StorageError> {
+        let conn = self.conn()?;
+        let mut stmt = conn.prepare(
+            "select
+                memory_id, tenant, memory_type, status, scope, visibility, version,
+                summary, content, evidence_json, code_refs_json, project, repo,
+                module, task_type, tags_json, confidence, decay_score, content_hash,
+                idempotency_key, session_id, supersedes_memory_id, source_agent,
+                created_at, updated_at, last_validated_at, topics
+             from memories
+             where tenant = ?1
+             order by created_at asc",
+        )?;
+        let rows = stmt.query_map(params![tenant], map_memory_row)?;
+        let mut out = Vec::new();
+        for r in rows {
+            out.push(r?);
+        }
+        Ok(out)
+    }
+
+    /// Hard-deletes every `graph_edges` row whose `from_node_id` corresponds
+    /// to a memory in the given tenant. Sweeps both `entity:<uuid>` and the
+    /// pre-migration legacy formats (`project:foo`, `topic:rust`, …).
+    ///
+    /// Used as the first step of `mem repair --rebuild-graph`: clear, then
+    /// re-derive. Per spec risk #2, this trades historical `valid_to` ranges
+    /// for a clean slate — acceptable for a first-run upgrade migration.
+    pub async fn delete_graph_edges_from_memories(
+        &self,
+        tenant: &str,
+    ) -> Result<usize, StorageError> {
+        let conn = self.conn()?;
+        let count = conn.execute(
+            "delete from graph_edges \
+             where from_node_id in (select 'memory:' || memory_id from memories where tenant = ?1)",
+            params![tenant],
+        )?;
+        Ok(count)
+    }
+
+    /// Inserts a single `graph_edges` row verbatim. Thin wrapper used by the
+    /// rebuild path; production ingest goes through `DuckDbGraphStore`.
+    pub async fn insert_graph_edge(
+        &self,
+        edge: &crate::domain::memory::GraphEdge,
+    ) -> Result<(), StorageError> {
+        let conn = self.conn()?;
+        conn.execute(
+            "insert into graph_edges (from_node_id, to_node_id, relation, valid_from, valid_to) \
+             values (?1, ?2, ?3, ?4, ?5)",
+            params![
+                edge.from_node_id,
+                edge.to_node_id,
+                edge.relation,
+                edge.valid_from,
+                edge.valid_to,
+            ],
+        )?;
+        Ok(())
+    }
+
     /// Joins `memories` with valid `memory_embeddings` (hash match), scores by cosine similarity in Rust.
     /// Uses the attached `VectorIndex` (ANN path) when available; falls back to the legacy linear scan
     /// when no index is attached or `MEM_VECTOR_INDEX_USE_LEGACY=1` is set.

@@ -21,9 +21,17 @@ pub struct RepairMode {
     /// Read-only health check (default).
     #[arg(long)]
     pub check: bool,
-    /// Force rebuild from DuckDB (requires `mem serve` to be stopped).
+    /// Force rebuild of the HNSW vector-index sidecar from DuckDB
+    /// (requires `mem serve` to be stopped).
     #[arg(long)]
     pub rebuild: bool,
+    /// Re-derive every memory→{entity,memory} edge from `memories` using the
+    /// production extract_graph_edge_drafts → resolve_drafts_to_edges path.
+    /// Sweeps any pre-migration legacy `project:foo`/`topic:rust` edges.
+    /// Idempotent, but requires `mem serve` to be stopped — DuckDB is
+    /// single-writer.
+    #[arg(long)]
+    pub rebuild_graph: bool,
 }
 
 /// Render a human-readable summary of a [`DiagnosticReport`].
@@ -164,6 +172,36 @@ impl RebuildOutcome {
             RebuildOutcome::Rebuilt { .. } => "rebuilt",
             RebuildOutcome::DbUnavailable { .. } => "db_unavailable",
             RebuildOutcome::Failed { .. } => "rebuild_failed",
+        }
+    }
+}
+
+/// Outcome of `mem repair --rebuild-graph`. Process exit code mirrors the
+/// `RebuildOutcome` convention: 0 on success, 2 on any failure.
+#[derive(Debug, Clone)]
+pub enum RebuildGraphOutcome {
+    Rebuilt {
+        rebuilt_memory_count: usize,
+        new_edge_count: usize,
+        elapsed_ms: u64,
+    },
+    Failed {
+        reason: String,
+    },
+}
+
+impl RebuildGraphOutcome {
+    pub fn exit_code(&self) -> i32 {
+        match self {
+            RebuildGraphOutcome::Rebuilt { .. } => 0,
+            RebuildGraphOutcome::Failed { .. } => 2,
+        }
+    }
+
+    pub fn coarse_status(&self) -> &'static str {
+        match self {
+            RebuildGraphOutcome::Rebuilt { .. } => "rebuilt",
+            RebuildGraphOutcome::Failed { .. } => "rebuild_failed",
         }
     }
 }
@@ -335,12 +373,146 @@ pub async fn run(args: RepairArgs) -> i32 {
         dim: config.embedding.dim,
     };
 
-    if args.mode.rebuild {
+    if args.mode.rebuild_graph {
+        let outcome = match rebuild_graph_for_test(&config).await {
+            Ok(o) => o,
+            Err(e) => RebuildGraphOutcome::Failed {
+                reason: e.to_string(),
+            },
+        };
+        emit_rebuild_graph(&outcome, args.json)
+    } else if args.mode.rebuild {
         let (mem_outcome, tr_outcome) = compute_rebuild_outcomes(&config, &fp).await;
         emit_aggregate_rebuild(&mem_outcome, &tr_outcome, args.json)
     } else {
         let (mem_report, tr_report) = compute_check_reports(&config, &fp).await;
         emit_aggregate_check(&mem_report, &tr_report, args.json)
+    }
+}
+
+/// Run the graph rebuild end-to-end against `config.db_path`.
+///
+/// Walks every memory in the DB through the **same** production code path
+/// used by `MemoryService::ingest`:
+///
+/// 1. `extract_graph_edge_drafts(memory)` — pure (no DB), per Task 7.
+/// 2. `resolve_drafts_to_edges(drafts, &repo, tenant, now)` — calls
+///    `EntityRegistry::resolve_or_create` for each `EntityRef` draft.
+/// 3. Insert resolved edges via `DuckDbRepository::insert_graph_edge`.
+///
+/// Before the per-tenant loop runs, `delete_graph_edges_from_memories`
+/// sweeps every edge whose `from_node_id` is `memory:<id>` for that tenant —
+/// catching pre-migration legacy `to_node_id` strings (`project:foo`,
+/// `topic:rust`, …) and removing them so the rebuild starts from a clean
+/// slate.
+///
+/// Idempotent: re-running produces the same edge set because
+/// `resolve_or_create` returns existing entity_ids when the alias is already
+/// known. Acquires/releases the DuckDB mutex per memory — no nested
+/// transactions. Requires `mem serve` to be stopped (DuckDB is
+/// single-writer).
+///
+/// The `_for_test` suffix matches the `run_check_for_test` /
+/// `run_rebuild_for_test` naming above; this is the same function the CLI
+/// dispatcher invokes.
+pub async fn rebuild_graph_for_test(config: &Config) -> Result<RebuildGraphOutcome, anyhow::Error> {
+    use crate::pipeline::ingest::extract_graph_edge_drafts;
+    use crate::service::memory_service::resolve_drafts_to_edges;
+    use crate::storage::current_timestamp;
+
+    let started = std::time::Instant::now();
+    let repo = DuckDbRepository::open(&config.db_path).await?;
+    let now = current_timestamp();
+
+    let tenants = repo.list_distinct_memory_tenants().await?;
+    let mut total_memories = 0usize;
+    let mut total_edges = 0usize;
+
+    for tenant in tenants {
+        // Sweep legacy + entity edges so the rebuild produces a clean graph.
+        // Per spec risk #2, this trades historical valid_to ranges for a
+        // clean migration — acceptable for a first-run upgrade.
+        repo.delete_graph_edges_from_memories(&tenant).await?;
+
+        let memories = repo.list_memories_for_tenant(&tenant).await?;
+        for memory in &memories {
+            let drafts = extract_graph_edge_drafts(memory);
+            let edges = resolve_drafts_to_edges(drafts, &repo, &tenant, &now).await?;
+            for edge in &edges {
+                repo.insert_graph_edge(edge).await?;
+            }
+            total_edges += edges.len();
+        }
+        total_memories += memories.len();
+    }
+
+    Ok(RebuildGraphOutcome::Rebuilt {
+        rebuilt_memory_count: total_memories,
+        new_edge_count: total_edges,
+        elapsed_ms: started.elapsed().as_millis() as u64,
+    })
+}
+
+fn emit_rebuild_graph(outcome: &RebuildGraphOutcome, as_json: bool) -> i32 {
+    if as_json {
+        let v = format_rebuild_graph_json(outcome);
+        println!("{}", serde_json::to_string_pretty(&v).unwrap());
+    } else {
+        print!("{}", format_rebuild_graph_text(outcome));
+    }
+    outcome.exit_code()
+}
+
+/// Render a human-readable summary of a [`RebuildGraphOutcome`].
+pub fn format_rebuild_graph_text(outcome: &RebuildGraphOutcome) -> String {
+    use std::fmt::Write;
+    let mut s = String::new();
+    match outcome {
+        RebuildGraphOutcome::Rebuilt {
+            rebuilt_memory_count,
+            new_edge_count,
+            elapsed_ms,
+        } => {
+            writeln!(&mut s, "Rebuilt graph edges from memories.").unwrap();
+            writeln!(
+                &mut s,
+                "   memories scanned : {rebuilt_memory_count}\n   edges written    : {new_edge_count}\n   elapsed          : {elapsed_ms}ms"
+            )
+            .unwrap();
+        }
+        RebuildGraphOutcome::Failed { reason } => {
+            writeln!(&mut s, "Rebuild-graph failed: {reason}").unwrap();
+            writeln!(
+                &mut s,
+                "   Is `mem serve` running? Stop the service before running this command."
+            )
+            .unwrap();
+        }
+    }
+    s
+}
+
+/// Render a structured JSON summary of a [`RebuildGraphOutcome`].
+pub fn format_rebuild_graph_json(outcome: &RebuildGraphOutcome) -> Value {
+    match outcome {
+        RebuildGraphOutcome::Rebuilt {
+            rebuilt_memory_count,
+            new_edge_count,
+            elapsed_ms,
+        } => json!({
+            "command": "rebuild-graph",
+            "status": outcome.coarse_status(),
+            "exit_code": outcome.exit_code(),
+            "rebuilt_memory_count": rebuilt_memory_count,
+            "new_edge_count": new_edge_count,
+            "elapsed_ms": elapsed_ms,
+        }),
+        RebuildGraphOutcome::Failed { reason } => json!({
+            "command": "rebuild-graph",
+            "status": outcome.coarse_status(),
+            "exit_code": outcome.exit_code(),
+            "details": {"reason": reason},
+        }),
     }
 }
 
@@ -548,8 +720,15 @@ fn emit_aggregate_rebuild(
 
 fn emit_config_error(args: &RepairArgs, reason: &str) -> i32 {
     if args.json {
+        let command = if args.mode.rebuild_graph {
+            "rebuild-graph"
+        } else if args.mode.rebuild {
+            "rebuild"
+        } else {
+            "check"
+        };
         let v = json!({
-            "command": if args.mode.rebuild { "rebuild" } else { "check" },
+            "command": command,
             "status": "config_error",
             "exit_code": 2,
             "details": {"reason": reason},

@@ -1,6 +1,6 @@
 use mem::cli::repair::{
     format_check_json, format_check_text, format_rebuild_json, format_rebuild_text,
-    run_check_for_test, RebuildOutcome,
+    rebuild_graph_for_test, run_check_for_test, RebuildGraphOutcome, RebuildOutcome,
 };
 use mem::storage::{
     rebuild_index, sidecar_paths, transcript_sidecar_paths, DiagnosticReport, DiagnosticStatus,
@@ -16,6 +16,13 @@ use mem::service::{embedding_worker, MemoryService};
 use mem::storage::{diagnose, DuckDbRepository, VectorIndex};
 use std::sync::Arc;
 use tempfile::tempdir;
+
+// ── extra imports used by the `--rebuild-graph` migration tests ───────────────
+use axum::body::Body;
+use axum::http::{Request, StatusCode};
+use serde_json::json;
+use tempfile::TempDir;
+use tower::util::ServiceExt;
 
 /// Embedding settings for the integration tests in this file.
 ///
@@ -698,4 +705,171 @@ async fn repair_check_reports_status_for_both_sidecars() {
         exit, 1,
         "aggregate exit code should reflect the unhealthy transcripts sidecar"
     );
+}
+
+// ── `mem repair --rebuild-graph` migration tests ──────────────────────────────
+//
+// These tests verify Task 11 of docs/superpowers/plans/2026-05-02-entity-registry.md:
+// the rebuild walks every memory, deletes pre-migration legacy edges
+// (`to_node_id LIKE 'project:%'` etc.), and re-derives `entity:<uuid>` edges
+// through the production extract_graph_edge_drafts → resolve_drafts_to_edges
+// chain. The rebuild must be idempotent (re-running is a no-op) and must
+// degrade gracefully on an empty DB.
+
+/// After ingest writes the new entity-typed graph edges, an injected
+/// pre-migration legacy edge (`project:foo`) must be removed by
+/// `--rebuild-graph`, leaving only `entity:<uuid>` edges. Idempotency
+/// is covered by `rebuild_graph_is_idempotent` below.
+#[tokio::test]
+async fn rebuild_graph_converts_legacy_to_entity_refs() {
+    let tmp = TempDir::new().unwrap();
+    let mut cfg = mem::config::Config::local();
+    cfg.db_path = tmp.path().join("mem.duckdb");
+
+    // Bootstrap and seed a memory through the production path.
+    let app = mem::app::router_with_config(cfg.clone()).await.unwrap();
+    let body = json!({
+        "tenant": "local",
+        "memory_type": "implementation",
+        "content": "x",
+        "scope": "global",
+        "source_agent": "test",
+        "project": "mem",
+        "topics": ["Rust"],
+        "write_mode": "auto"
+    });
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/memories")
+                .header("content-type", "application/json")
+                .body(Body::from(body.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::CREATED);
+
+    // Inject a legacy-format graph edge directly. The from_node_id references
+    // a memory that exists in the table (we re-use one from above), simulating
+    // a pre-migration edge that the rebuild should sweep away.
+    //
+    // We scope the side-channel `Connection` to a block so it is dropped
+    // before `rebuild_graph_for_test` opens its own connection — DuckDB
+    // treats overlapping file connections cautiously, and dropping ours
+    // first avoids visibility flakiness around the insert.
+    {
+        let conn = duckdb::Connection::open(&cfg.db_path).unwrap();
+        let memory_id: String = conn
+            .query_row(
+                "select memory_id from memories where tenant = 'local' limit 1",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        let from = format!("memory:{memory_id}");
+        conn.execute(
+            "insert into graph_edges (from_node_id, to_node_id, relation, valid_from, valid_to) \
+             values (?1, 'project:legacy-project', 'applies_to', '00000000020260501000', null)",
+            duckdb::params![&from],
+        )
+        .unwrap();
+    }
+
+    let outcome = rebuild_graph_for_test(&cfg).await.unwrap();
+    assert!(matches!(outcome, RebuildGraphOutcome::Rebuilt { .. }));
+
+    // After rebuild: NO legacy 'project:...' edges remain.
+    let conn = duckdb::Connection::open(&cfg.db_path).unwrap();
+    let legacy_count: i64 = conn
+        .query_row(
+            "select count(*) from graph_edges where to_node_id like 'project:%'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(legacy_count, 0);
+
+    // All memory→entity edges use 'entity:<uuid>' format.
+    let entity_count: i64 = conn
+        .query_row(
+            "select count(*) from graph_edges \
+             where from_node_id like 'memory:%' and to_node_id like 'entity:%'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert!(
+        entity_count >= 2,
+        "got {entity_count}; expected at least project + topic edges"
+    );
+}
+
+/// Running `--rebuild-graph` twice produces the same edge count as running
+/// it once — `EntityRegistry::resolve_or_create` returns existing entity_ids
+/// on lookup, so the rebuild is fully idempotent.
+#[tokio::test]
+async fn rebuild_graph_is_idempotent() {
+    let tmp = TempDir::new().unwrap();
+    let mut cfg = mem::config::Config::local();
+    cfg.db_path = tmp.path().join("mem.duckdb");
+    let app = mem::app::router_with_config(cfg.clone()).await.unwrap();
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/memories")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({
+                        "tenant": "local",
+                        "memory_type": "implementation",
+                        "content": "x",
+                        "scope": "global",
+                        "source_agent": "test",
+                        "topics": ["Rust"],
+                        "write_mode": "auto"
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::CREATED);
+
+    rebuild_graph_for_test(&cfg).await.unwrap();
+    let conn = duckdb::Connection::open(&cfg.db_path).unwrap();
+    let count1: i64 = conn
+        .query_row("select count(*) from graph_edges", [], |r| r.get(0))
+        .unwrap();
+
+    rebuild_graph_for_test(&cfg).await.unwrap();
+    let count2: i64 = conn
+        .query_row("select count(*) from graph_edges", [], |r| r.get(0))
+        .unwrap();
+
+    assert_eq!(count1, count2, "rebuild must be idempotent");
+}
+
+/// On a freshly-bootstrapped DB with zero memories, `--rebuild-graph`
+/// returns successfully with `rebuilt_memory_count == 0`.
+#[tokio::test]
+async fn rebuild_graph_handles_empty_database() {
+    let tmp = TempDir::new().unwrap();
+    let mut cfg = mem::config::Config::local();
+    cfg.db_path = tmp.path().join("mem.duckdb");
+    // Bootstrap schema by spinning up the router (which calls
+    // `DuckDbRepository::open` → schema migrations).
+    let _app = mem::app::router_with_config(cfg.clone()).await.unwrap();
+
+    let outcome = rebuild_graph_for_test(&cfg).await.unwrap();
+    match outcome {
+        RebuildGraphOutcome::Rebuilt {
+            rebuilt_memory_count,
+            ..
+        } => assert_eq!(rebuilt_memory_count, 0),
+        other => panic!("expected Rebuilt, got {other:?}"),
+    }
 }
