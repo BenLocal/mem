@@ -1,6 +1,7 @@
 use mem::cli::repair::{
-    format_check_json, format_check_text, format_rebuild_json, format_rebuild_text,
-    rebuild_graph_for_test, run_check_for_test, RebuildGraphOutcome, RebuildOutcome,
+    compute_rebuild_graph_outcome, format_check_json, format_check_text, format_rebuild_graph_json,
+    format_rebuild_graph_text, format_rebuild_json, format_rebuild_text, run_check_for_test,
+    RebuildGraphOutcome, RebuildOutcome,
 };
 use mem::storage::{
     rebuild_index, sidecar_paths, transcript_sidecar_paths, DiagnosticReport, DiagnosticStatus,
@@ -756,7 +757,7 @@ async fn rebuild_graph_converts_legacy_to_entity_refs() {
     // a pre-migration edge that the rebuild should sweep away.
     //
     // We scope the side-channel `Connection` to a block so it is dropped
-    // before `rebuild_graph_for_test` opens its own connection — DuckDB
+    // before `compute_rebuild_graph_outcome` opens its own connection — DuckDB
     // treats overlapping file connections cautiously, and dropping ours
     // first avoids visibility flakiness around the insert.
     {
@@ -777,7 +778,7 @@ async fn rebuild_graph_converts_legacy_to_entity_refs() {
         .unwrap();
     }
 
-    let outcome = rebuild_graph_for_test(&cfg).await.unwrap();
+    let outcome = compute_rebuild_graph_outcome(&cfg).await.unwrap();
     assert!(matches!(outcome, RebuildGraphOutcome::Rebuilt { .. }));
 
     // After rebuild: NO legacy 'project:...' edges remain.
@@ -839,13 +840,13 @@ async fn rebuild_graph_is_idempotent() {
         .unwrap();
     assert_eq!(resp.status(), StatusCode::CREATED);
 
-    rebuild_graph_for_test(&cfg).await.unwrap();
+    compute_rebuild_graph_outcome(&cfg).await.unwrap();
     let conn = duckdb::Connection::open(&cfg.db_path).unwrap();
     let count1: i64 = conn
         .query_row("select count(*) from graph_edges", [], |r| r.get(0))
         .unwrap();
 
-    rebuild_graph_for_test(&cfg).await.unwrap();
+    compute_rebuild_graph_outcome(&cfg).await.unwrap();
     let count2: i64 = conn
         .query_row("select count(*) from graph_edges", [], |r| r.get(0))
         .unwrap();
@@ -864,7 +865,7 @@ async fn rebuild_graph_handles_empty_database() {
     // `DuckDbRepository::open` → schema migrations).
     let _app = mem::app::router_with_config(cfg.clone()).await.unwrap();
 
-    let outcome = rebuild_graph_for_test(&cfg).await.unwrap();
+    let outcome = compute_rebuild_graph_outcome(&cfg).await.unwrap();
     match outcome {
         RebuildGraphOutcome::Rebuilt {
             rebuilt_memory_count,
@@ -872,4 +873,64 @@ async fn rebuild_graph_handles_empty_database() {
         } => assert_eq!(rebuilt_memory_count, 0),
         other => panic!("expected Rebuilt, got {other:?}"),
     }
+}
+
+// ── format_rebuild_graph_text / _json unit tests ──────────────────────────────
+
+#[test]
+fn format_rebuild_graph_text_emits_status_for_rebuilt() {
+    let outcome = RebuildGraphOutcome::Rebuilt {
+        rebuilt_memory_count: 42,
+        new_edge_count: 87,
+        elapsed_ms: 155,
+    };
+    let s = format_rebuild_graph_text(&outcome);
+    assert!(s.contains("Rebuilt"), "should say Rebuilt: {s}");
+    assert!(s.contains("42"), "should include memory count: {s}");
+    assert!(s.contains("87"), "should include edge count: {s}");
+    assert!(s.contains("155"), "should include elapsed: {s}");
+}
+
+#[test]
+fn format_rebuild_graph_text_emits_status_for_failed() {
+    let outcome = RebuildGraphOutcome::Failed {
+        reason: "connection refused".into(),
+    };
+    let s = format_rebuild_graph_text(&outcome);
+    assert!(
+        s.contains("Rebuild-graph failed:"),
+        "should say Rebuild-graph failed: {s}"
+    );
+    assert!(
+        s.contains("connection refused"),
+        "should include the reason: {s}"
+    );
+}
+
+#[test]
+fn format_rebuild_graph_json_emits_keys_for_rebuilt() {
+    let outcome = RebuildGraphOutcome::Rebuilt {
+        rebuilt_memory_count: 10,
+        new_edge_count: 25,
+        elapsed_ms: 99,
+    };
+    let v = format_rebuild_graph_json(&outcome);
+    assert_eq!(v["command"], "rebuild-graph");
+    assert_eq!(v["status"], "rebuilt");
+    assert_eq!(v["exit_code"], 0);
+    assert_eq!(v["rebuilt_memory_count"], 10);
+    assert_eq!(v["new_edge_count"], 25);
+    assert_eq!(v["elapsed_ms"], 99);
+}
+
+#[test]
+fn format_rebuild_graph_json_emits_keys_for_failed() {
+    let outcome = RebuildGraphOutcome::Failed {
+        reason: "disk full".into(),
+    };
+    let v = format_rebuild_graph_json(&outcome);
+    assert_eq!(v["command"], "rebuild-graph");
+    assert_eq!(v["status"], "rebuild_failed");
+    assert_eq!(v["exit_code"], 2);
+    assert_eq!(v["details"]["reason"], "disk full");
 }

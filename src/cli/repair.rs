@@ -374,7 +374,7 @@ pub async fn run(args: RepairArgs) -> i32 {
     };
 
     if args.mode.rebuild_graph {
-        let outcome = match rebuild_graph_for_test(&config).await {
+        let outcome = match compute_rebuild_graph_outcome(&config).await {
             Ok(o) => o,
             Err(e) => RebuildGraphOutcome::Failed {
                 reason: e.to_string(),
@@ -398,24 +398,20 @@ pub async fn run(args: RepairArgs) -> i32 {
 /// 1. `extract_graph_edge_drafts(memory)` — pure (no DB), per Task 7.
 /// 2. `resolve_drafts_to_edges(drafts, &repo, tenant, now)` — calls
 ///    `EntityRegistry::resolve_or_create` for each `EntityRef` draft.
-/// 3. Insert resolved edges via `DuckDbRepository::insert_graph_edge`.
+/// 3. Insert resolved edges atomically via
+///    `DuckDbRepository::rebuild_tenant_graph` (delete + bulk insert in one
+///    transaction per tenant).
 ///
-/// Before the per-tenant loop runs, `delete_graph_edges_from_memories`
-/// sweeps every edge whose `from_node_id` is `memory:<id>` for that tenant —
-/// catching pre-migration legacy `to_node_id` strings (`project:foo`,
-/// `topic:rust`, …) and removing them so the rebuild starts from a clean
-/// slate.
+/// Each tenant's rebuild is atomic; partial-failure across tenants is
+/// possible (the surviving tenants are correctly rebuilt; failing tenant
+/// left in pre-rebuild state).
 ///
 /// Idempotent: re-running produces the same edge set because
 /// `resolve_or_create` returns existing entity_ids when the alias is already
-/// known. Acquires/releases the DuckDB mutex per memory — no nested
-/// transactions. Requires `mem serve` to be stopped (DuckDB is
-/// single-writer).
-///
-/// The `_for_test` suffix matches the `run_check_for_test` /
-/// `run_rebuild_for_test` naming above; this is the same function the CLI
-/// dispatcher invokes.
-pub async fn rebuild_graph_for_test(config: &Config) -> Result<RebuildGraphOutcome, anyhow::Error> {
+/// known. Requires `mem serve` to be stopped (DuckDB is single-writer).
+pub async fn compute_rebuild_graph_outcome(
+    config: &Config,
+) -> Result<RebuildGraphOutcome, anyhow::Error> {
     use crate::pipeline::ingest::extract_graph_edge_drafts;
     use crate::service::memory_service::resolve_drafts_to_edges;
     use crate::storage::current_timestamp;
@@ -429,20 +425,20 @@ pub async fn rebuild_graph_for_test(config: &Config) -> Result<RebuildGraphOutco
     let mut total_edges = 0usize;
 
     for tenant in tenants {
-        // Sweep legacy + entity edges so the rebuild produces a clean graph.
-        // Per spec risk #2, this trades historical valid_to ranges for a
-        // clean migration — acceptable for a first-run upgrade.
-        repo.delete_graph_edges_from_memories(&tenant).await?;
-
         let memories = repo.list_memories_for_tenant(&tenant).await?;
+
+        // Collect all edges for this tenant first, then atomically replace the
+        // old graph in a single transaction.  This avoids a partially-demolished
+        // tenant graph on mid-rebuild kill.
+        let mut tenant_edges = Vec::new();
         for memory in &memories {
             let drafts = extract_graph_edge_drafts(memory);
             let edges = resolve_drafts_to_edges(drafts, &repo, &tenant, &now).await?;
-            for edge in &edges {
-                repo.insert_graph_edge(edge).await?;
-            }
-            total_edges += edges.len();
+            tenant_edges.extend(edges);
         }
+
+        let inserted = repo.rebuild_tenant_graph(&tenant, &tenant_edges).await?;
+        total_edges += inserted;
         total_memories += memories.len();
     }
 

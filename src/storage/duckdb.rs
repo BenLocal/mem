@@ -800,45 +800,47 @@ impl DuckDbRepository {
         Ok(out)
     }
 
-    /// Hard-deletes every `graph_edges` row whose `from_node_id` corresponds
-    /// to a memory in the given tenant. Sweeps both `entity:<uuid>` and the
-    /// pre-migration legacy formats (`project:foo`, `topic:rust`, …).
+    /// Atomically replaces all graph edges sourced from memories in `tenant`
+    /// with the supplied `edges` slice.  The delete and all inserts execute
+    /// inside a single DuckDB transaction; if any step fails the tenant graph
+    /// is left in its pre-call state.
     ///
-    /// Used as the first step of `mem repair --rebuild-graph`: clear, then
-    /// re-derive. Per spec risk #2, this trades historical `valid_to` ranges
-    /// for a clean slate — acceptable for a first-run upgrade migration.
-    pub async fn delete_graph_edges_from_memories(
+    /// Returns the number of edges inserted.  Used exclusively by
+    /// `mem repair --rebuild-graph`; production ingest uses
+    /// `DuckDbGraphStore::sync_memory`.
+    pub async fn rebuild_tenant_graph(
         &self,
         tenant: &str,
+        edges: &[crate::domain::memory::GraphEdge],
     ) -> Result<usize, StorageError> {
-        let conn = self.conn()?;
-        let count = conn.execute(
+        let mut conn = self.conn()?;
+        let tx = conn.transaction()?;
+
+        // Sweep all memory-sourced edges for this tenant — both legacy formats
+        // and current `entity:<uuid>` targets.
+        tx.execute(
             "delete from graph_edges \
              where from_node_id in (select 'memory:' || memory_id from memories where tenant = ?1)",
             params![tenant],
         )?;
-        Ok(count)
-    }
 
-    /// Inserts a single `graph_edges` row verbatim. Thin wrapper used by the
-    /// rebuild path; production ingest goes through `DuckDbGraphStore`.
-    pub async fn insert_graph_edge(
-        &self,
-        edge: &crate::domain::memory::GraphEdge,
-    ) -> Result<(), StorageError> {
-        let conn = self.conn()?;
-        conn.execute(
-            "insert into graph_edges (from_node_id, to_node_id, relation, valid_from, valid_to) \
-             values (?1, ?2, ?3, ?4, ?5)",
-            params![
-                edge.from_node_id,
-                edge.to_node_id,
-                edge.relation,
-                edge.valid_from,
-                edge.valid_to,
-            ],
-        )?;
-        Ok(())
+        for edge in edges {
+            tx.execute(
+                "insert into graph_edges \
+                 (from_node_id, to_node_id, relation, valid_from, valid_to) \
+                 values (?1, ?2, ?3, ?4, ?5)",
+                params![
+                    edge.from_node_id,
+                    edge.to_node_id,
+                    edge.relation,
+                    edge.valid_from,
+                    edge.valid_to,
+                ],
+            )?;
+        }
+
+        tx.commit()?;
+        Ok(edges.len())
     }
 
     /// Joins `memories` with valid `memory_embeddings` (hash match), scores by cosine similarity in Rust.
