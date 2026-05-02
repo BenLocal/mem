@@ -10,7 +10,7 @@ pub struct Entity {
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
-#[serde(rename_all = "lowercase")]
+#[serde(rename_all = "snake_case")]
 pub enum EntityKind {
     Topic,
     Project,
@@ -85,7 +85,7 @@ mod tests {
     }
 
     #[test]
-    fn entity_kind_serializes_lowercase() {
+    fn entity_kind_serializes_snake_case() {
         let k = EntityKind::Project;
         let s = serde_json::to_string(&k).unwrap();
         assert_eq!(s, "\"project\"");
