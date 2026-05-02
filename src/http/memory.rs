@@ -50,6 +50,8 @@ struct HttpIngestMemoryRequest {
     task_type: Option<String>,
     #[serde(default)]
     tags: Vec<String>,
+    #[serde(default)]
+    topics: Vec<String>,
     #[serde(default = "default_source_agent")]
     source_agent: String,
     #[serde(default)]
@@ -74,6 +76,7 @@ impl From<HttpIngestMemoryRequest> for IngestMemoryRequest {
             module: request.module,
             task_type: request.task_type,
             tags: request.tags,
+            topics: request.topics,
             source_agent: request.source_agent,
             idempotency_key: request.idempotency_key,
             write_mode: request.write_mode,

@@ -25,6 +25,7 @@ fn ingest_request(content: &str, summary: &str) -> IngestMemoryRequest {
         module: None,
         task_type: None,
         tags: vec![],
+        topics: vec![],
         source_agent: "test".into(),
         idempotency_key: None,
         write_mode: WriteMode::Auto,

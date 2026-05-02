@@ -165,6 +165,7 @@ async fn worker_failure_does_not_affect_memories_pipeline() {
             module: None,
             task_type: None,
             tags: vec![],
+            topics: vec![],
             source_agent: "test".into(),
             idempotency_key: None,
             write_mode: WriteMode::Auto,

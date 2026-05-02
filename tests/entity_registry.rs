@@ -105,10 +105,91 @@ async fn schema_bootstrap_is_idempotent() {
     // No panic: re-opening must not fail on duplicate ALTER.
 }
 
+use mem::domain::memory::{MemoryRecord, MemoryStatus, MemoryType, Scope, Visibility};
 use mem::domain::{AddAliasOutcome, EntityKind};
 use mem::storage::EntityRegistry;
 
 const NOW: &str = "00000000020260502000";
+
+fn baseline_memory(id: &str) -> MemoryRecord {
+    MemoryRecord {
+        memory_id: id.to_string(),
+        tenant: "local".to_string(),
+        memory_type: MemoryType::Implementation,
+        status: MemoryStatus::Active,
+        scope: Scope::Global,
+        visibility: Visibility::Private,
+        version: 1,
+        summary: "x".to_string(),
+        content: "x".to_string(),
+        evidence: vec![],
+        code_refs: vec![],
+        project: None,
+        repo: None,
+        module: None,
+        task_type: None,
+        tags: vec![],
+        topics: vec![],
+        confidence: 0.5,
+        decay_score: 0.0,
+        content_hash: "00".repeat(32),
+        idempotency_key: None,
+        session_id: None,
+        supersedes_memory_id: None,
+        source_agent: "test".to_string(),
+        created_at: NOW.to_string(),
+        updated_at: NOW.to_string(),
+        last_validated_at: None,
+    }
+}
+
+#[tokio::test]
+async fn memory_record_topics_round_trip() {
+    let tmp = TempDir::new().unwrap();
+    let db = tmp.path().join("mem.duckdb");
+    let repo = DuckDbRepository::open(&db).await.unwrap();
+
+    let memory = MemoryRecord {
+        memory_id: "mem-test".to_string(),
+        topics: vec!["Rust".into(), "ownership".into()],
+        content_hash: "deadbeef".repeat(8), // 64 chars
+        content: "discussion of language ownership".to_string(),
+        summary: "ownership notes".to_string(),
+        ..baseline_memory("mem-test")
+    };
+    repo.insert_memory(memory).await.unwrap();
+
+    let fetched = repo
+        .get_memory_for_tenant("local", "mem-test")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        fetched.topics,
+        vec!["Rust".to_string(), "ownership".to_string()]
+    );
+}
+
+#[tokio::test]
+async fn memory_record_empty_topics_round_trips_as_empty_vec() {
+    let tmp = TempDir::new().unwrap();
+    let db = tmp.path().join("mem.duckdb");
+    let repo = DuckDbRepository::open(&db).await.unwrap();
+
+    let memory = MemoryRecord {
+        memory_id: "mem-empty".to_string(),
+        topics: vec![],
+        ..baseline_memory("mem-empty")
+    };
+    repo.insert_memory(memory).await.unwrap();
+
+    let fetched = repo
+        .get_memory_for_tenant("local", "mem-empty")
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(fetched.topics.is_empty());
+}
 
 #[tokio::test]
 async fn resolve_or_create_inserts_entity_and_alias_on_first_call() {

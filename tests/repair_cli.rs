@@ -173,6 +173,7 @@ async fn seed_one_row_with_index(
         module: None,
         task_type: None,
         tags: vec![],
+        topics: vec![],
         source_agent: "test".into(),
         idempotency_key: None,
         write_mode: WriteMode::Auto,

@@ -31,6 +31,7 @@ fn sample_memory(memory_id: &str, status: MemoryStatus) -> MemoryRecord {
         module: Some("review".into()),
         task_type: Some("review".into()),
         tags: vec!["review".into()],
+        topics: vec![],
         confidence: 0.7,
         decay_score: 0.2,
         content_hash: format!("hash-{memory_id}"),

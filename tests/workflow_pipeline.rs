@@ -177,6 +177,7 @@ fn sample_versioned_memory(
         module: Some("storage".into()),
         task_type: Some("review".into()),
         tags: vec!["version".into()],
+        topics: vec![],
         confidence: 0.7,
         decay_score: 0.2,
         content_hash: format!("hash-{memory_id}"),

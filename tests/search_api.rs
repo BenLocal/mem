@@ -97,6 +97,7 @@ fn memory(spec: MemorySpec<'_>) -> MemoryRecord {
         module: spec.module.map(str::to_string),
         task_type: Some("implementation".into()),
         tags: vec!["search".into()],
+        topics: vec![],
         confidence: 0.9,
         decay_score: spec.decay_score,
         content_hash: format!("hash-{}", spec.memory_id),

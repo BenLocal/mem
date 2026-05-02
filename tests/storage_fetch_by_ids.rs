@@ -24,6 +24,7 @@ async fn fetch_by_ids_filters_tenant_and_status() {
         module: None,
         task_type: None,
         tags: vec![],
+        topics: vec![],
         source_agent: "test".into(),
         idempotency_key: None,
         write_mode: WriteMode::Auto,
