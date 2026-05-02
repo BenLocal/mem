@@ -5,10 +5,11 @@ use mem::{
     domain::{
         memory::{MemoryRecord, MemoryStatus, MemoryType, Scope, Visibility},
         query::SearchMemoryRequest,
+        EntityKind,
     },
     embedding::{arc_embedding_provider, deterministic_embedding},
     service::MemoryService,
-    storage::{DuckDbGraphStore, DuckDbRepository},
+    storage::{DuckDbGraphStore, DuckDbRepository, EntityRegistry},
 };
 use tempfile::tempdir;
 
@@ -206,13 +207,22 @@ async fn graph_boost_excludes_superseded_memory_from_related_memory_ids() {
     let svc = MemoryService::new_with_graph((*repo).clone(), graph.clone());
 
     // Ingest two memories sharing project=foo so graph edges link them via
-    // the project:foo node.
+    // the resolved entity node (entity:<uuid>) — Task 9 routed ingest through
+    // EntityRegistry::resolve_or_create.
     let r1 = ingest_for_e2e(&svc, "alpha", Some("foo"), Some("mem")).await;
     let r2 = ingest_for_e2e(&svc, "beta", Some("foo"), Some("mem")).await;
 
+    // Look up the entity_id that ingest auto-promoted for project="foo" so we
+    // can drive the graph query against the same node both edges point at.
+    let project_entity_id = repo
+        .resolve_or_create("t", "foo", EntityKind::Project, "00000000020260502000")
+        .await
+        .unwrap();
+    let project_node = format!("entity:{project_entity_id}");
+
     // Pre-condition: both memories are reachable from the shared project node.
     let pre = graph
-        .related_memory_ids(&["project:foo".into()])
+        .related_memory_ids(std::slice::from_ref(&project_node))
         .await
         .unwrap();
     let mut pre_sorted = pre.clone();
@@ -228,7 +238,7 @@ async fn graph_boost_excludes_superseded_memory_from_related_memory_ids() {
 
     // Post-condition: only r2 is reachable — r1 is excluded by graph_boost.
     let post = graph
-        .related_memory_ids(&["project:foo".into()])
+        .related_memory_ids(std::slice::from_ref(&project_node))
         .await
         .unwrap();
     assert_eq!(

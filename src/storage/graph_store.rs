@@ -5,8 +5,12 @@ use thiserror::Error;
 use super::time::current_timestamp;
 use super::{DuckDbRepository, StorageError};
 use crate::domain::memory::{GraphEdge, MemoryRecord};
+// `extract_graph_edges` is the deprecated legacy extractor. The production
+// path is migrated (Task 9) to `extract_graph_edge_drafts` + `EntityRegistry`
+// resolution + `sync_memory_edges`. The deprecated `sync_memory` method below
+// stays only to keep historical tests in `tests/graph_temporal.rs` and
+// `tests/search_api.rs` compiling.
 #[allow(deprecated)]
-// Task 9 migrates away from this; keep the import for the wrapper callsite
 use crate::pipeline::ingest::extract_graph_edges;
 
 #[derive(Debug, Error)]
@@ -54,13 +58,51 @@ impl DuckDbGraphStore {
         Ok(out)
     }
 
-    #[allow(deprecated)] // Task 9 will migrate this to extract_graph_edge_drafts + EntityRegistry
+    /// **Deprecated.** Legacy entry point that internally calls
+    /// `extract_graph_edges` (the deprecated extractor) and writes edges with
+    /// the OLD `to_node_id` format (`project:foo`, `topic:rust`, …).
+    ///
+    /// New production code goes through `MemoryService::ingest`, which calls
+    /// `extract_graph_edge_drafts` + `EntityRegistry::resolve_or_create` +
+    /// [`DuckDbGraphStore::sync_memory_edges`] — producing `entity:<uuid>`
+    /// targets for entity-typed nodes.
+    ///
+    /// This method survives only so historical tests in `tests/graph_temporal.rs`
+    /// and `tests/search_api.rs` keep compiling unchanged. They assert against
+    /// the legacy node-id strings, and rewriting them is out of scope for the
+    /// entity-registry migration. New callers MUST use `sync_memory_edges`.
+    #[deprecated(
+        note = "Use extract_graph_edge_drafts + EntityRegistry resolution + sync_memory_edges"
+    )]
+    #[allow(deprecated)]
     pub async fn sync_memory(&self, memory: &MemoryRecord) -> Result<(), GraphError> {
         let edges = extract_graph_edges(memory);
         if edges.is_empty() {
             return Ok(());
         }
         let now = current_timestamp();
+        self.write_edges_idempotent(&edges, &now)
+    }
+
+    /// Persist a batch of pre-resolved edges (one per draft). Idempotent: if an
+    /// active edge for the same `(from, to, relation)` triple already exists,
+    /// it is left untouched. Used by `MemoryService::ingest` after the draft +
+    /// `EntityRegistry::resolve_or_create` resolution pass.
+    ///
+    /// Each edge's `valid_from` is overwritten with `now` so callers don't need
+    /// to think about clocks; `valid_to` is forced to `NULL` (active).
+    pub async fn sync_memory_edges(
+        &self,
+        edges: &[GraphEdge],
+        now: &str,
+    ) -> Result<(), GraphError> {
+        if edges.is_empty() {
+            return Ok(());
+        }
+        self.write_edges_idempotent(edges, now)
+    }
+
+    fn write_edges_idempotent(&self, edges: &[GraphEdge], now: &str) -> Result<(), GraphError> {
         let mut conn = self.repo.conn()?;
         let tx = conn.transaction()?;
         for edge in edges {

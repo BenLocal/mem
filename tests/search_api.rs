@@ -1,3 +1,8 @@
+// `seeded_search_app` calls the deprecated `DuckDbGraphStore::sync_memory`
+// method directly; the legacy `to_node_id` format it produces is fine for the
+// search-pipeline assertions in this file.
+#![allow(deprecated)]
+
 use std::sync::Arc;
 
 use axum::{

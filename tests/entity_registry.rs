@@ -457,11 +457,10 @@ async fn get_entity_returns_canonical_with_aliases_in_creation_order() {
 // ---------------------------------------------------------------------------
 // Ingest → resolve → graph_edges integration (Task 8 + Task 9).
 //
-// `resolve_drafts_to_edges` is defined in `service::memory_service` (Task 8).
-// The ingest call site is migrated to use it in Task 9. Until then these
-// tests are `#[ignore]`d — they exercise the full HTTP flow and assert that
-// `graph_edges.to_node_id` carries `entity:<uuid>` (resolved via
-// EntityRegistry), not the legacy `topic:<alias>` literal.
+// `resolve_drafts_to_edges` is defined in `service::memory_service` (Task 8)
+// and wired into `MemoryService::ingest` by Task 9. These exercise the full
+// HTTP flow and assert that `graph_edges.to_node_id` carries `entity:<uuid>`
+// (resolved via EntityRegistry), not the legacy `topic:<alias>` literal.
 // ---------------------------------------------------------------------------
 
 use axum::body::Body;
@@ -470,7 +469,6 @@ use serde_json::json;
 use tower::util::ServiceExt;
 
 #[tokio::test]
-#[ignore = "wired in Task 9"]
 async fn ingest_memory_with_topics_creates_entity_refs_in_graph_edges() {
     let tmp = TempDir::new().unwrap();
     let mut cfg = mem::config::Config::local();
@@ -479,7 +477,7 @@ async fn ingest_memory_with_topics_creates_entity_refs_in_graph_edges() {
 
     let body = json!({
         "tenant": "local",
-        "memory_type": "observation",
+        "memory_type": "implementation",
         "content": "Rust borrow checker discussion",
         "scope": "global",
         "source_agent": "test",
@@ -523,7 +521,6 @@ async fn ingest_memory_with_topics_creates_entity_refs_in_graph_edges() {
 }
 
 #[tokio::test]
-#[ignore = "wired in Task 9"]
 async fn ingest_with_existing_alias_reuses_entity_id() {
     let tmp = TempDir::new().unwrap();
     let mut cfg = mem::config::Config::local();
@@ -547,7 +544,7 @@ async fn ingest_with_existing_alias_reuses_entity_id() {
     let r1 = post(
         json!({
             "tenant": "local",
-            "memory_type": "observation",
+            "memory_type": "implementation",
             "content": "first mention",
             "scope": "global",
             "source_agent": "test",
@@ -562,7 +559,7 @@ async fn ingest_with_existing_alias_reuses_entity_id() {
     let r2 = post(
         json!({
             "tenant": "local",
-            "memory_type": "observation",
+            "memory_type": "implementation",
             "content": "second mention with case variation",
             "scope": "global",
             "source_agent": "test",

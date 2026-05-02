@@ -202,7 +202,9 @@ impl MemoryService {
         };
 
         let stored = self.repository.insert_memory(memory).await?;
-        self.graph.sync_memory(&stored).await?;
+        let drafts = crate::pipeline::ingest::extract_graph_edge_drafts(&stored);
+        let edges = resolve_drafts_to_edges(drafts, &self.repository, &stored.tenant, &now).await?;
+        self.graph.sync_memory_edges(&edges, &now).await?;
         self.enqueue_embedding_job_for_memory(&stored).await?;
         self.repository
             .touch_session(&session_id, &now)
@@ -446,7 +448,7 @@ impl MemoryService {
     ///
     /// After storage is updated, the graph is kept consistent:
     /// 1. v1's edges are closed (`close_edges_for_memory`)
-    /// 2. v2's edges are opened (`sync_memory`)
+    /// 2. v2's edges are opened via the new draft + registry-resolve + `sync_memory_edges` path
     pub async fn edit_and_accept_pending(
         &self,
         tenant: &str,
@@ -472,7 +474,11 @@ impl MemoryService {
         self.graph
             .close_edges_for_memory(&original.memory_id)
             .await?;
-        self.graph.sync_memory(&superseding).await?;
+        let now = current_timestamp();
+        let drafts = crate::pipeline::ingest::extract_graph_edge_drafts(&superseding);
+        let edges =
+            resolve_drafts_to_edges(drafts, &self.repository, &superseding.tenant, &now).await?;
+        self.graph.sync_memory_edges(&edges, &now).await?;
 
         self.enqueue_embedding_job_for_memory(&superseding).await?;
 
@@ -689,8 +695,8 @@ impl MemoryService {
 /// mutex (see `entity_repo.rs`) — the locks are sequenced, not nested. Pure
 /// async; the caller passes `now` so timestamps stay deterministic in tests.
 ///
-/// Wired into `MemoryService::ingest` by Task 9 of the entity-registry roadmap.
-#[allow(dead_code)] // Task 9 wires this into `MemoryService::ingest`.
+/// Wired into `MemoryService::ingest` and `edit_and_accept_pending` by Task 9
+/// of the entity-registry roadmap.
 pub(crate) async fn resolve_drafts_to_edges(
     drafts: Vec<GraphEdgeDraft>,
     registry: &impl EntityRegistry,

@@ -1,3 +1,10 @@
+// These tests intentionally call the deprecated `DuckDbGraphStore::sync_memory`
+// method — they assert against the legacy `to_node_id` strings (`project:foo`,
+// `topic:rust`, …) which only the deprecated path produces. The
+// EntityRegistry-based replacement (`sync_memory_edges`) yields `entity:<uuid>`
+// targets and is exercised by `tests/entity_registry.rs`.
+#![allow(deprecated)]
+
 use mem::domain::memory::GraphEdge;
 use mem::storage::{DuckDbGraphStore, DuckDbRepository};
 use std::sync::Arc;
@@ -211,10 +218,15 @@ async fn edit_and_accept_pending_closes_v1_edges_and_opens_v2() {
     let svc = MemoryService::new_with_graph((*repo).clone(), graph.clone());
 
     // Ingest v1 as a Workflow memory (always PendingConfirmation) with
-    // project=foo. ingest() still calls graph.sync_memory, so v1 edges exist.
+    // project=foo. After Task 9, `ingest` resolves project="foo" through
+    // EntityRegistry and writes an `entity:<uuid>` edge — assert from the
+    // memory's outbound side, which is format-agnostic.
     let r1 = ingest_pending(&svc, "v1-content", Some("foo"), Some("mem")).await;
 
-    let pre = graph.neighbors("project:foo").await.unwrap();
+    let pre = graph
+        .neighbors(&format!("memory:{}", r1.memory_id))
+        .await
+        .unwrap();
     assert!(!pre.is_empty(), "v1 should have active edges after ingest");
 
     // Drive the supersede via the public service API — this is the wiring under test.
@@ -377,6 +389,12 @@ async fn reopened_edge_creates_new_row() {
         .unwrap()
         .unwrap();
 
+    // Ingest already wrote v1 edges via the new pipeline (entity:<uuid> targets).
+    // Close them, then re-open via the deprecated path which writes legacy
+    // `project:foo` triples. The two passes produce different (from,to,relation)
+    // triples, so we narrow to the legacy `project:foo` row to assert the
+    // close-then-reopen behavior on a single triple.
+    graph.close_edges_for_memory(&r.memory_id).await.unwrap();
     graph.sync_memory(&memory).await.unwrap();
     graph.close_edges_for_memory(&r.memory_id).await.unwrap();
     tokio::time::sleep(std::time::Duration::from_millis(2)).await;
@@ -385,12 +403,12 @@ async fn reopened_edge_creates_new_row() {
     let history = graph.all_edges_for_memory(&r.memory_id).await.unwrap();
     let applies_to: Vec<_> = history
         .iter()
-        .filter(|e| e.relation == "applies_to")
+        .filter(|e| e.relation == "applies_to" && e.to_node_id == "project:foo")
         .collect();
     assert_eq!(
         applies_to.len(),
         2,
-        "expect closed + active rows for same triple"
+        "expect closed + active rows for same legacy triple: {history:?}"
     );
     let closed_count = applies_to.iter().filter(|e| e.valid_to.is_some()).count();
     let active_count = applies_to.iter().filter(|e| e.valid_to.is_none()).count();
