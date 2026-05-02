@@ -298,6 +298,11 @@ async fn context_window_returns_not_found_for_missing_id() {
 
 // ──────── Integration test scaffolding ────────
 
+// Convention: `<name>` = storage-level test (calls repo methods directly);
+// `<name>_via_http` = same scenario through the HTTP router. Example:
+// `context_window_excludes_tool_blocks_by_default` (storage) vs
+// `context_window_excludes_tool_blocks_by_default_via_http` (HTTP).
+
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use serde_json::json;
