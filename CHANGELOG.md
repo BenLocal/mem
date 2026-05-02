@@ -15,7 +15,7 @@ are organized by feature wave (merge commit ranges on `master`).
 
 ## 2026-04-30 — Conversation Archive
 
-**Merge:** `aa6eab1`. **Range:** `1ac2d6b..5a81f28`.
+**Merge:** `aa6eab1`. **Range:** `1ac2d6b..49b652f`.
 
 Adds a parallel "transcript archive" pipeline alongside `memories`. Every
 Claude Code transcript block is now stored verbatim with its own embedding
