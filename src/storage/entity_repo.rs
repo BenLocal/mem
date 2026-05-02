@@ -140,6 +140,25 @@ impl EntityRegistry for DuckDbRepository {
         }
     }
 
+    async fn lookup_alias(
+        &self,
+        tenant: &str,
+        alias: &str,
+    ) -> Result<Option<String>, StorageError> {
+        let normalized = normalize_alias(alias);
+        let conn = self.conn()?;
+        let owner: Option<String> = conn
+            .query_row(
+                "select entity_id from entity_aliases \
+                 where tenant = ?1 and alias_text = ?2",
+                duckdb::params![tenant, normalized],
+                |r| r.get(0),
+            )
+            .optional()
+            .map_err(StorageError::DuckDb)?;
+        Ok(owner)
+    }
+
     async fn list_entities(
         &self,
         tenant: &str,

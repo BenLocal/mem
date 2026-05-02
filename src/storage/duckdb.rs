@@ -178,6 +178,14 @@ pub trait EntityRegistry: Send + Sync {
         now: &str,
     ) -> Result<crate::domain::AddAliasOutcome, StorageError>;
 
+    /// Read-only lookup: returns the `entity_id` currently bound to the
+    /// normalized form of `alias` under `tenant`, or `None` if no such
+    /// binding exists. Used by service-layer flows that need to pre-check
+    /// alias ownership before attempting writes (e.g. atomic-from-caller
+    /// `create_with_aliases`).
+    async fn lookup_alias(&self, tenant: &str, alias: &str)
+        -> Result<Option<String>, StorageError>;
+
     /// List entities under `tenant`, optionally filtered by `kind` and a
     /// SQL `LIKE`-substring on `canonical_name`. Order is `created_at DESC`,
     /// capped by `limit`.

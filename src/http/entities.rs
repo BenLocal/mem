@@ -9,9 +9,11 @@
 //! - `GET  /entities?tenant=…&kind=…&q=……` — list entities (created_at desc).
 //!
 //! Status mapping:
-//! - `POST /entities` → 201 (always — `resolve_or_create` is idempotent on
-//!   alias hit, so re-POSTing the same canonical name still resolves to the
-//!   same entity_id and returns 201 + the existing record).
+//! - `POST /entities` → 201 (happy path — `resolve_or_create` is idempotent
+//!   on alias hit, so re-POSTing the same canonical name still resolves to
+//!   the same entity_id and returns 201 + the existing record) /
+//!   409 (any provided alias already bound to a *different* entity; body
+//!   carries `existing_entity_id` + `conflicting_alias` per spec line 436).
 //! - `GET /entities/{id}` → 200 / 404 (handler-level, since `Option::None` is
 //!   not an error per `EntityRegistry::get_entity`).
 //! - `POST /entities/{id}/aliases` → 200 (Inserted / AlreadyOnSameEntity) /
@@ -31,8 +33,9 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 
 use crate::app::AppState;
-use crate::domain::{AddAliasOutcome, Entity, EntityKind, EntityWithAliases};
+use crate::domain::{AddAliasOutcome, Entity, EntityKind};
 use crate::error::AppError;
+use crate::service::entity_service::CreateWithAliasesError;
 use crate::storage::time::current_timestamp;
 
 pub fn router() -> Router<AppState> {
@@ -58,9 +61,9 @@ struct CreateEntityRequest {
 async fn post_entity(
     State(state): State<AppState>,
     Json(req): Json<CreateEntityRequest>,
-) -> Result<(StatusCode, Json<EntityWithAliases>), AppError> {
+) -> Result<Response, AppError> {
     let now = current_timestamp();
-    let result = state
+    match state
         .entity_service
         .create_with_aliases(
             &req.tenant,
@@ -69,8 +72,22 @@ async fn post_entity(
             &req.aliases,
             &now,
         )
-        .await?;
-    Ok((StatusCode::CREATED, Json(result)))
+        .await
+    {
+        Ok(result) => Ok((StatusCode::CREATED, Json(result)).into_response()),
+        Err(CreateWithAliasesError::AliasConflict {
+            existing_entity_id,
+            conflicting_alias,
+        }) => Ok((
+            StatusCode::CONFLICT,
+            Json(json!({
+                "existing_entity_id": existing_entity_id,
+                "conflicting_alias": conflicting_alias,
+            })),
+        )
+            .into_response()),
+        Err(CreateWithAliasesError::Storage(e)) => Err(AppError::from(e)),
+    }
 }
 
 // ---------------------------------------------------------------------------

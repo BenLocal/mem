@@ -10,6 +10,22 @@
 use crate::domain::{AddAliasOutcome, Entity, EntityKind, EntityWithAliases};
 use crate::storage::{DuckDbRepository, EntityRegistry, StorageError};
 
+/// Error variants returned by [`EntityService::create_with_aliases`].
+///
+/// Distinguishes a structured cross-entity alias conflict (so the HTTP
+/// layer can return 409 + the conflicting owner per spec line 436) from
+/// generic storage errors that flow through `AppError` as-is.
+#[derive(Debug, thiserror::Error)]
+pub enum CreateWithAliasesError {
+    #[error(transparent)]
+    Storage(#[from] StorageError),
+    #[error("alias {conflicting_alias:?} is already owned by entity {existing_entity_id}")]
+    AliasConflict {
+        existing_entity_id: String,
+        conflicting_alias: String,
+    },
+}
+
 #[derive(Clone)]
 pub struct EntityService {
     repo: DuckDbRepository,
@@ -22,11 +38,19 @@ impl EntityService {
 
     /// Create or resolve `canonical_name` (caller's verbatim input) under
     /// `tenant`, then attach each item in `aliases` to the resulting
-    /// entity. The optional aliases use `add_alias` semantics: a conflict
-    /// (alias already owned by a *different* entity) propagates as
-    /// `StorageError::InvalidInput` so the HTTP layer returns 400. (The
-    /// 409 path is reserved for the explicit `POST .../aliases` endpoint
-    /// where the caller deliberately targets one entity_id.)
+    /// entity.
+    ///
+    /// Returns 409-mappable [`CreateWithAliasesError::AliasConflict`] if any
+    /// alias is already bound to a different entity.
+    ///
+    /// Read-then-write contract: the helper first runs a `lookup_alias`
+    /// pre-check on every requested alias to ensure none belong to a
+    /// different entity, *before* any writes. DuckDB's single
+    /// `Arc<Mutex<Connection>>` serializes all writes in this process, so
+    /// the brief read window followed by writes under the same caller is
+    /// race-free for in-process callers; the pre-check exists primarily to
+    /// avoid partial-state on conflict (no entity / alias rows leak when
+    /// one of N aliases is contested).
     pub async fn create_with_aliases(
         &self,
         tenant: &str,
@@ -34,7 +58,36 @@ impl EntityService {
         kind: EntityKind,
         aliases: &[String],
         now: &str,
-    ) -> Result<EntityWithAliases, StorageError> {
+    ) -> Result<EntityWithAliases, CreateWithAliasesError> {
+        // Pre-check: does any requested alias already belong to a *different*
+        // entity? If so, fail before any writes. We don't yet know the
+        // target entity_id (resolve_or_create may auto-promote), so we only
+        // flag aliases owned by an entity whose canonical_name's normalized
+        // form differs from the request — proxied via the canonical_name's
+        // own normalized lookup below.
+        let canonical_owner = self.repo.lookup_alias(tenant, canonical_name).await?;
+        for alias in aliases {
+            if let Some(owner) = self.repo.lookup_alias(tenant, alias).await? {
+                // If the canonical_name already maps to an entity, that's
+                // the would-be target; conflict only if the alias owner
+                // differs from it.
+                let conflicts = match &canonical_owner {
+                    Some(target) => &owner != target,
+                    // No prior canonical owner ⇒ resolve_or_create will
+                    // either reuse a sibling-alias owner or auto-promote a
+                    // new entity. In either case, an alias already owned by
+                    // some *other* entity is a conflict.
+                    None => true,
+                };
+                if conflicts {
+                    return Err(CreateWithAliasesError::AliasConflict {
+                        existing_entity_id: owner,
+                        conflicting_alias: alias.clone(),
+                    });
+                }
+            }
+        }
+
         let entity_id = self
             .repo
             .resolve_or_create(tenant, canonical_name, kind, now)
@@ -43,16 +96,24 @@ impl EntityService {
             match self.repo.add_alias(tenant, &entity_id, alias, now).await? {
                 AddAliasOutcome::Inserted | AddAliasOutcome::AlreadyOnSameEntity => {}
                 AddAliasOutcome::ConflictWithDifferentEntity(other) => {
-                    return Err(StorageError::InvalidInput(format!(
-                        "alias {alias:?} is already owned by entity {other}"
-                    )));
+                    // Defense-in-depth: pre-check should have caught this,
+                    // but propagate as the same typed conflict if a racer
+                    // (out-of-process) slipped in.
+                    return Err(CreateWithAliasesError::AliasConflict {
+                        existing_entity_id: other,
+                        conflicting_alias: alias.clone(),
+                    });
                 }
             }
         }
-        self.repo
+        let with_aliases = self
+            .repo
             .get_entity(tenant, &entity_id)
             .await?
-            .ok_or_else(|| StorageError::InvalidInput("entity disappeared after creation".into()))
+            .ok_or_else(|| {
+                StorageError::InvalidInput("entity disappeared after creation".into())
+            })?;
+        Ok(with_aliases)
     }
 
     pub async fn get(

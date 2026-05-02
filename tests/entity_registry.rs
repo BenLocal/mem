@@ -786,3 +786,151 @@ async fn post_entity_aliases_idempotent_and_409_on_conflict() {
         .unwrap();
     assert_eq!(r3.status(), StatusCode::CONFLICT);
 }
+
+#[tokio::test]
+async fn post_entities_returns_409_on_cross_entity_alias_conflict() {
+    let tmp = TempDir::new().unwrap();
+    let mut cfg = mem::config::Config::local();
+    cfg.db_path = tmp.path().join("mem.duckdb");
+    let app = mem::app::router_with_config(cfg).await.unwrap();
+
+    // 1. Create entity1 with alias "rustlang".
+    let r1 = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/entities")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({
+                        "tenant": "local",
+                        "canonical_name": "Rust",
+                        "kind": "topic",
+                        "aliases": ["rustlang"]
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(r1.status(), StatusCode::CREATED);
+    let bytes = axum::body::to_bytes(r1.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    let entity1_id = v["entity"]["entity_id"].as_str().unwrap().to_string();
+
+    // 2. Create entity2 with same alias "rustlang" (under a *different*
+    //    canonical_name so the would-be target differs from the alias's
+    //    existing owner).
+    let r2 = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/entities")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({
+                        "tenant": "local",
+                        "canonical_name": "Python",
+                        "kind": "topic",
+                        "aliases": ["rustlang"]
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    // 3. Assert second response is 409 with body referencing entity1.
+    assert_eq!(r2.status(), StatusCode::CONFLICT);
+    let bytes = axum::body::to_bytes(r2.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(v["existing_entity_id"], entity1_id);
+    assert_eq!(v["conflicting_alias"], "rustlang");
+}
+
+#[tokio::test]
+async fn get_entities_list_filters_kind_query_and_clamps_limit() {
+    let tmp = TempDir::new().unwrap();
+    let mut cfg = mem::config::Config::local();
+    cfg.db_path = tmp.path().join("mem.duckdb");
+    let app = mem::app::router_with_config(cfg).await.unwrap();
+
+    // Helper: POST /entities and ignore body.
+    async fn create_one(canonical: &str, kind: &str, app: axum::Router) {
+        let body = json!({
+            "tenant": "local",
+            "canonical_name": canonical,
+            "kind": kind,
+        })
+        .to_string();
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/entities")
+                    .header("content-type", "application/json")
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::CREATED);
+    }
+
+    // Insert in order: Rust (topic), Python (topic), mem (project), gizmo (project).
+    create_one("Rust", "topic", app.clone()).await;
+    create_one("Python", "topic", app.clone()).await;
+    create_one("mem", "project", app.clone()).await;
+    create_one("gizmo", "project", app.clone()).await;
+
+    // Helper: GET /entities and parse the entities array.
+    async fn list(uri: &str, app: axum::Router) -> Vec<serde_json::Value> {
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri(uri)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        v["entities"].as_array().cloned().unwrap()
+    }
+
+    // kind=topic filter.
+    let topics = list("/entities?tenant=local&kind=topic", app.clone()).await;
+    assert_eq!(topics.len(), 2);
+    for t in &topics {
+        assert_eq!(t["kind"], "topic");
+    }
+
+    // q= substring filter.
+    let just_rust = list("/entities?tenant=local&q=Rust", app.clone()).await;
+    assert_eq!(just_rust.len(), 1);
+    assert_eq!(just_rust[0]["canonical_name"], "Rust");
+
+    // limit=200 should silently clamp to ≤ 100 per spec.
+    let clamped = list("/entities?tenant=local&limit=200", app.clone()).await;
+    assert!(
+        clamped.len() <= 100,
+        "limit=200 should clamp to ≤ 100, got {}",
+        clamped.len()
+    );
+
+    // Default ordering: created_at desc — gizmo (last inserted) comes first.
+    let all = list("/entities?tenant=local", app.clone()).await;
+    assert_eq!(all.len(), 4);
+    assert_eq!(all[0]["canonical_name"], "gizmo");
+}
