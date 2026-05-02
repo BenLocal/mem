@@ -104,3 +104,239 @@ async fn schema_bootstrap_is_idempotent() {
     let _repo2 = DuckDbRepository::open(&db).await.unwrap();
     // No panic: re-opening must not fail on duplicate ALTER.
 }
+
+use mem::domain::{AddAliasOutcome, EntityKind};
+use mem::storage::EntityRegistry;
+
+const NOW: &str = "00000000020260502000";
+
+#[tokio::test]
+async fn resolve_or_create_inserts_entity_and_alias_on_first_call() {
+    let tmp = TempDir::new().unwrap();
+    let db = tmp.path().join("mem.duckdb");
+    let repo = DuckDbRepository::open(&db).await.unwrap();
+
+    let id = repo
+        .resolve_or_create("local", "Rust", EntityKind::Topic, NOW)
+        .await
+        .unwrap();
+    assert!(!id.is_empty());
+
+    // entity row + alias row both present.
+    let conn = duckdb::Connection::open(&db).unwrap();
+    let entity_count: i64 = conn
+        .query_row(
+            "select count(*) from entities where entity_id = ?1",
+            [&id],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(entity_count, 1);
+
+    let alias_count: i64 = conn
+        .query_row(
+            "select count(*) from entity_aliases where tenant='local' and alias_text='rust'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(alias_count, 1);
+
+    // canonical_name preserves caller's verbatim input.
+    let canonical: String = conn
+        .query_row(
+            "select canonical_name from entities where entity_id = ?1",
+            [&id],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(canonical, "Rust");
+}
+
+#[tokio::test]
+async fn resolve_or_create_is_idempotent_on_alias_hit() {
+    let tmp = TempDir::new().unwrap();
+    let db = tmp.path().join("mem.duckdb");
+    let repo = DuckDbRepository::open(&db).await.unwrap();
+
+    let id1 = repo
+        .resolve_or_create("local", "Rust", EntityKind::Topic, NOW)
+        .await
+        .unwrap();
+    let id2 = repo
+        .resolve_or_create("local", "rust", EntityKind::Topic, NOW)
+        .await
+        .unwrap();
+    let id3 = repo
+        .resolve_or_create("local", "  RUST  ", EntityKind::Topic, NOW)
+        .await
+        .unwrap();
+    let id4 = repo
+        .resolve_or_create("local", "Rust", EntityKind::Topic, NOW)
+        .await
+        .unwrap();
+
+    assert_eq!(id1, id2);
+    assert_eq!(id1, id3);
+    assert_eq!(id1, id4);
+
+    let conn = duckdb::Connection::open(&db).unwrap();
+    let entity_count: i64 = conn
+        .query_row("select count(*) from entities", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(entity_count, 1, "no duplicate entities created");
+}
+
+#[tokio::test]
+async fn resolve_or_create_creates_separate_entities_for_distinct_aliases() {
+    let tmp = TempDir::new().unwrap();
+    let db = tmp.path().join("mem.duckdb");
+    let repo = DuckDbRepository::open(&db).await.unwrap();
+
+    let rust = repo
+        .resolve_or_create("local", "Rust", EntityKind::Topic, NOW)
+        .await
+        .unwrap();
+    let lang = repo
+        .resolve_or_create("local", "Rust language", EntityKind::Topic, NOW)
+        .await
+        .unwrap();
+    assert_ne!(rust, lang, "caller did not declare these as synonyms");
+}
+
+#[tokio::test]
+async fn add_alias_links_to_existing_entity() {
+    let tmp = TempDir::new().unwrap();
+    let db = tmp.path().join("mem.duckdb");
+    let repo = DuckDbRepository::open(&db).await.unwrap();
+
+    let rust_id = repo
+        .resolve_or_create("local", "Rust", EntityKind::Topic, NOW)
+        .await
+        .unwrap();
+    let outcome = repo
+        .add_alias("local", &rust_id, "Rust language", NOW)
+        .await
+        .unwrap();
+    assert_eq!(outcome, AddAliasOutcome::Inserted);
+
+    // After add_alias, resolving "rust language" hits the existing rust_id.
+    let lang_resolved = repo
+        .resolve_or_create("local", "rust language", EntityKind::Topic, NOW)
+        .await
+        .unwrap();
+    assert_eq!(lang_resolved, rust_id);
+}
+
+#[tokio::test]
+async fn add_alias_returns_already_on_same_entity_when_idempotent() {
+    let tmp = TempDir::new().unwrap();
+    let db = tmp.path().join("mem.duckdb");
+    let repo = DuckDbRepository::open(&db).await.unwrap();
+
+    let rust_id = repo
+        .resolve_or_create("local", "Rust", EntityKind::Topic, NOW)
+        .await
+        .unwrap();
+    repo.add_alias("local", &rust_id, "rustlang", NOW)
+        .await
+        .unwrap();
+    let outcome = repo
+        .add_alias("local", &rust_id, "rustlang", NOW)
+        .await
+        .unwrap();
+    assert_eq!(outcome, AddAliasOutcome::AlreadyOnSameEntity);
+}
+
+#[tokio::test]
+async fn add_alias_returns_conflict_when_alias_belongs_to_different_entity() {
+    let tmp = TempDir::new().unwrap();
+    let db = tmp.path().join("mem.duckdb");
+    let repo = DuckDbRepository::open(&db).await.unwrap();
+
+    let rust_id = repo
+        .resolve_or_create("local", "Rust", EntityKind::Topic, NOW)
+        .await
+        .unwrap();
+    let py_id = repo
+        .resolve_or_create("local", "Python", EntityKind::Topic, NOW)
+        .await
+        .unwrap();
+    let outcome = repo.add_alias("local", &py_id, "rust", NOW).await.unwrap();
+    assert_eq!(
+        outcome,
+        AddAliasOutcome::ConflictWithDifferentEntity(rust_id)
+    );
+}
+
+#[tokio::test]
+async fn tenant_isolation_distinct_registries() {
+    let tmp = TempDir::new().unwrap();
+    let db = tmp.path().join("mem.duckdb");
+    let repo = DuckDbRepository::open(&db).await.unwrap();
+
+    let a = repo
+        .resolve_or_create("alice", "Rust", EntityKind::Topic, NOW)
+        .await
+        .unwrap();
+    let b = repo
+        .resolve_or_create("bob", "Rust", EntityKind::Topic, NOW)
+        .await
+        .unwrap();
+    assert_ne!(a, b, "different tenants must produce different entities");
+}
+
+#[tokio::test]
+async fn list_entities_filters_by_kind_and_query() {
+    let tmp = TempDir::new().unwrap();
+    let db = tmp.path().join("mem.duckdb");
+    let repo = DuckDbRepository::open(&db).await.unwrap();
+
+    repo.resolve_or_create("local", "Rust", EntityKind::Topic, NOW)
+        .await
+        .unwrap();
+    repo.resolve_or_create("local", "Python", EntityKind::Topic, NOW)
+        .await
+        .unwrap();
+    repo.resolve_or_create("local", "mem", EntityKind::Project, NOW)
+        .await
+        .unwrap();
+
+    let topics = repo
+        .list_entities("local", Some(EntityKind::Topic), None, 100)
+        .await
+        .unwrap();
+    assert_eq!(topics.len(), 2);
+
+    let rust_only = repo
+        .list_entities("local", None, Some("Rust"), 100)
+        .await
+        .unwrap();
+    assert_eq!(rust_only.len(), 1);
+    assert_eq!(rust_only[0].canonical_name, "Rust");
+}
+
+#[tokio::test]
+async fn get_entity_returns_canonical_with_aliases_in_creation_order() {
+    let tmp = TempDir::new().unwrap();
+    let db = tmp.path().join("mem.duckdb");
+    let repo = DuckDbRepository::open(&db).await.unwrap();
+
+    let id = repo
+        .resolve_or_create("local", "Rust", EntityKind::Topic, "00000000020260502000")
+        .await
+        .unwrap();
+    repo.add_alias("local", &id, "Rust language", "00000000020260502001")
+        .await
+        .unwrap();
+    repo.add_alias("local", &id, "rustlang", "00000000020260502002")
+        .await
+        .unwrap();
+
+    let with_aliases = repo.get_entity("local", &id).await.unwrap().unwrap();
+    assert_eq!(with_aliases.entity.canonical_name, "Rust");
+    assert_eq!(
+        with_aliases.aliases,
+        vec!["rust", "rust language", "rustlang"]
+    );
+}

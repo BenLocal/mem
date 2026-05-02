@@ -128,6 +128,68 @@ pub enum StorageError {
     NotFound(&'static str),
 }
 
+/// Tenant-scoped registry of canonical entities and their alias forms.
+///
+/// `resolve_or_create` is the auto-promote entry point: caller passes a
+/// verbatim alias and the registry returns a stable `entity_id`, atomically
+/// creating the entity (with `canonical_name = alias`) plus its first alias
+/// row when the normalized form is unknown. Both INSERTs run while a single
+/// `Arc<Mutex<Connection>>` guard is held, so no race window exists for the
+/// auto-promote case.
+///
+/// `add_alias` is for explicit synonym declarations; outcomes distinguish
+/// new alias inserts from idempotent re-adds and from conflicts where the
+/// alias already belongs to a different entity.
+///
+/// `canonical_name` is verbatim caller input (first-writer-wins). The
+/// normalized form (per [`crate::pipeline::entity_normalize::normalize_alias`])
+/// is what gets stored in `entity_aliases.alias_text` and used for lookups.
+#[async_trait::async_trait]
+pub trait EntityRegistry: Send + Sync {
+    /// Resolve `alias` (caller's verbatim input) under `tenant` to a stable
+    /// `entity_id`. If the normalized form is unknown, atomically create a
+    /// new entity (with `kind` and `canonical_name = alias`) plus its first
+    /// alias row. Both INSERTs run under a single mutex acquisition.
+    async fn resolve_or_create(
+        &self,
+        tenant: &str,
+        alias: &str,
+        kind: crate::domain::EntityKind,
+        now: &str,
+    ) -> Result<String, StorageError>;
+
+    /// Fetch the entity (by id, scoped to tenant) plus all its aliases in
+    /// `created_at ASC` order. Returns `Ok(None)` if no such entity exists.
+    async fn get_entity(
+        &self,
+        tenant: &str,
+        entity_id: &str,
+    ) -> Result<Option<crate::domain::EntityWithAliases>, StorageError>;
+
+    /// Add `alias` to an existing entity. Three outcomes:
+    /// - `Inserted`: alias was new, now linked to `entity_id`.
+    /// - `AlreadyOnSameEntity`: alias was already on this entity (idempotent).
+    /// - `ConflictWithDifferentEntity(other_id)`: alias is owned by another entity.
+    async fn add_alias(
+        &self,
+        tenant: &str,
+        entity_id: &str,
+        alias: &str,
+        now: &str,
+    ) -> Result<crate::domain::AddAliasOutcome, StorageError>;
+
+    /// List entities under `tenant`, optionally filtered by `kind` and a
+    /// SQL `LIKE`-substring on `canonical_name`. Order is `created_at DESC`,
+    /// capped by `limit`.
+    async fn list_entities(
+        &self,
+        tenant: &str,
+        kind_filter: Option<crate::domain::EntityKind>,
+        query: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<crate::domain::Entity>, StorageError>;
+}
+
 impl DuckDbRepository {
     pub async fn open(path: impl AsRef<Path>) -> Result<Self, StorageError> {
         let path = path.as_ref();
