@@ -7,3 +7,7 @@ target/
 
 # Worktrees
 .worktrees/
+
+# Recall bench fixtures (gitignored — real transcripts may be sensitive)
+bench-fixtures/
+target/bench-out/
