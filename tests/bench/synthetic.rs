@@ -2,9 +2,11 @@
 
 use super::fixture::*;
 use rand::rngs::StdRng;
-use rand::seq::SliceRandom;
 use rand::{Rng, SeedableRng};
 use std::collections::HashSet;
+
+const SYNTH_EPOCH_MS: u64 = 1_700_000_000_000;
+const MS_PER_DAY: u64 = 86_400_000;
 
 pub struct TopicSeed {
     pub canonical: &'static str,
@@ -122,15 +124,21 @@ pub fn generate(config: &SyntheticConfig) -> Fixture {
 
     for s_idx in 0..config.session_count {
         let topics_n = if rng.gen_bool(0.5) { 1 } else { 2 };
-        let mut chosen: Vec<usize> = (0..config.topic_pool.len()).collect();
-        chosen.shuffle(&mut rng);
-        let topics: Vec<usize> = chosen.into_iter().take(topics_n).collect();
+        let num_topics = config.topic_pool.len();
+        let topics: Vec<usize> = if topics_n == 1 {
+            vec![s_idx % num_topics]
+        } else {
+            vec![s_idx % num_topics, (s_idx + 1) % num_topics]
+        };
         session_topics.push(topics.clone());
 
         // 90 days span → each session gets a base offset; blocks within session monotonic.
         let base_day = rng.gen_range(0..90u64);
         let session_id = format!("synth_session_{:03}", s_idx);
-        let started_at = format_timestamp(2026, 5, 3, base_day, 0);
+        let started_at = format!(
+            "{:020}",
+            SYNTH_EPOCH_MS + (s_idx as u64) * 100 * 60_000 + base_day * MS_PER_DAY
+        );
 
         let mut blocks: Vec<BlockFixture> = Vec::with_capacity(config.blocks_per_session);
         for b_idx in 0..config.blocks_per_session {
@@ -152,7 +160,12 @@ pub fn generate(config: &SyntheticConfig) -> Fixture {
             let content = content_words.join(" ");
 
             let role = if b_idx % 2 == 0 { "user" } else { "assistant" };
-            let created_at = format_timestamp(2026, 5, 3, base_day, b_idx as u64);
+            // Globally unique timestamp: session band (100 min) + day offset + block (1 min)
+            let ms = SYNTH_EPOCH_MS
+                + (s_idx as u64) * 100 * 60_000
+                + base_day * MS_PER_DAY
+                + (b_idx as u64) * 60_000;
+            let created_at = format!("{:020}", ms);
 
             blocks.push(BlockFixture {
                 block_id: format!("synth_{:03}_{:02}", s_idx, b_idx),
@@ -215,15 +228,6 @@ pub fn generate(config: &SyntheticConfig) -> Fixture {
         sessions,
         queries,
     }
-}
-
-/// Compose a sortable timestamp string compatible with the project's
-/// `timestamp_score` parser (numeric prefix, microsecond resolution).
-fn format_timestamp(_year: u64, _month: u64, _day: u64, day_offset: u64, seq: u64) -> String {
-    // Project format: "00000000<unix-ms>". Generate a synthetic monotonic
-    // millisecond by combining day_offset and seq.
-    let ms = 1_700_000_000_000_u64 + day_offset * 86_400_000 + seq * 1_000;
-    format!("{:020}", ms)
 }
 
 #[cfg(test)]
@@ -306,6 +310,77 @@ mod tests {
         assert!(
             any_topic_hit,
             "content should embed at least one topic term"
+        );
+    }
+
+    #[test]
+    fn default_config_produces_unique_timestamps() {
+        let f = generate(&SyntheticConfig::default());
+        let all_ts: HashSet<String> = f
+            .sessions
+            .iter()
+            .flat_map(|s| s.blocks.iter().map(|b| b.created_at.clone()))
+            .collect();
+        assert_eq!(
+            all_ts.len(),
+            240,
+            "all 240 block timestamps must be unique; got {} unique",
+            all_ts.len()
+        );
+    }
+
+    #[test]
+    fn default_config_distributes_topics_evenly() {
+        let cfg = SyntheticConfig::default();
+        let num_topics = cfg.topic_pool.len();
+        // Compute per-topic block counts analytically using the round-robin formula.
+        // topics_n is still drawn from rng, but the topic *indices* are deterministic.
+        // We use rng only to replicate the topics_n coin flip per session.
+        let mut rng = rand::rngs::StdRng::seed_from_u64(cfg.seed);
+        let mut blocks_per_topic = vec![0usize; num_topics];
+        for s_idx in 0..cfg.session_count {
+            let topics_n = if rng.gen_bool(0.5) { 1 } else { 2 };
+            let topics: Vec<usize> = if topics_n == 1 {
+                vec![s_idx % num_topics]
+            } else {
+                vec![s_idx % num_topics, (s_idx + 1) % num_topics]
+            };
+            for b_idx in 0..cfg.blocks_per_session {
+                let topic_idx = topics[b_idx % topics.len()];
+                blocks_per_topic[topic_idx] += 1;
+            }
+            // Consume remaining rng calls the generator makes for this session
+            // so our rng state stays in sync for the next topics_n coin flip.
+            let _base_day = rng.gen_range(0..90u64);
+            for b_idx in 0..cfg.blocks_per_session {
+                let topic_idx = topics[b_idx % topics.len()];
+                let use_canonical = rng.gen_bool(0.4);
+                if !use_canonical {
+                    let alias_len = cfg.topic_pool[topic_idx].aliases.len();
+                    let _alias_idx = rng.gen_range(0..alias_len);
+                }
+                for _ in 0..cfg.noise_words_per_block {
+                    let _w = rng.gen_range(0..NOISE_WORDS.len());
+                }
+                let _insert_pos = rng.gen_range(0..=(cfg.noise_words_per_block));
+            }
+        }
+        let max = *blocks_per_topic.iter().max().unwrap();
+        let min = *blocks_per_topic.iter().min().unwrap();
+        // Round-robin guarantees much better balance than the old shuffle approach
+        // (old: span ~32, i.e. 4..36). Allow up to span=20 here as the guard.
+        assert!(
+            max - min <= 20,
+            "topic block distribution too skewed: max={} min={} span={}",
+            max,
+            min,
+            max - min
+        );
+        // Also assert every topic gets at least some coverage.
+        assert!(
+            min >= 8,
+            "some topic has too few blocks (min={}); expected ≥8",
+            min
         );
     }
 }
