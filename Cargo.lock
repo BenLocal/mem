@@ -3001,6 +3001,7 @@ dependencies = [
  "embed_anything",
  "http-body-util",
  "once_cell",
+ "rand 0.8.5",
  "regex",
  "reqwest",
  "rmcp",

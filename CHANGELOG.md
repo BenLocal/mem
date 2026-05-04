@@ -13,6 +13,34 @@ are organized by feature wave (merge commit ranges on `master`).
 
 ---
 
+## 2026-05-03 — Transcript Recall Quality Bench
+
+**Range:** `070f900..16a0afd`.
+
+### Added
+
+- 10-rung ablation harness for the transcript recall pipeline (`tests/recall_bench.rs`)
+- `src/pipeline/eval_metrics.rs` — pure NDCG@k / MRR / Recall@k / Precision@k
+- `tests/bench/` — fixture / synthetic generator / real loader / judgment / oracle / runner modules
+- Synthetic CI guard: monotone-improvement assertions across rungs
+- Real fixture loader: `MEM_BENCH_FIXTURE_PATH` env-var, JSON schema v1, `#[ignore]`'d
+
+### Changed
+
+- `pipeline::transcript_recall::ScoringOpts` extended with `disable_session_cooc /
+  disable_anchor / disable_freshness` bools (default false → zero behavior change)
+
+### Notes
+
+- Bench answers two questions: (1) does each existing signal carry weight?
+  (2) is a real cross-encoder worth pursuing? Oracle rerank rung gives the
+  binary-reranker upper bound.
+- Co-mention + entity-alias auto-judgment biases toward lexical hits;
+  absolute scores not directly comparable across BM25/HNSW, but Δ across rungs
+  is reliable.
+
+---
+
 ## 2026-05-02 — Entity Registry
 
 **Range:** `8f8d2af..68395a0`.
