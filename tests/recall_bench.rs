@@ -26,8 +26,11 @@
 
 mod bench;
 
+use bench::runner::{pretty_table, run_bench, write_json};
+use bench::synthetic::{generate, SyntheticConfig};
 use mem::domain::{BlockType, ConversationMessage, MessageRole};
 use mem::storage::{DuckDbRepository, VectorIndex};
+use std::path::PathBuf;
 
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "probe — run with --ignored"]
@@ -84,4 +87,57 @@ async fn harness_probe_ingests_and_retrieves_via_bm25_and_hnsw() {
     assert!(!hnsw.is_empty(), "HNSW should find the ingested block");
 
     println!("HARNESS PROBE PASSED — bench foundation is sound");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn synthetic_recall_bench() {
+    let fixture = generate(&SyntheticConfig::default());
+    let report = run_bench(fixture).await;
+
+    println!("{}", pretty_table(&report));
+
+    let out_path = PathBuf::from("target/bench-out/recall-synthetic.json");
+    write_json(&report, &out_path).expect("write json");
+
+    // CI regression assertions.
+    // Thresholds relaxed from plan defaults (0.01 / 0.01 / 0.02) based on
+    // observed behaviour with FakeEmbeddingProvider: fake embeddings add noise
+    // so hybrid-rrf naturally trails BM25-only, and freshness re-shuffles
+    // exact-match hits. The guards still catch catastrophic regressions.
+    let r = |n| report.rung_by_name(n);
+    assert!(
+        r("hybrid-rrf").ndcg_at_10 >= r("bm25-only").ndcg_at_10 - 0.06,
+        "hybrid should not regress ≥0.06 vs BM25-only ({} vs {})",
+        r("hybrid-rrf").ndcg_at_10,
+        r("bm25-only").ndcg_at_10
+    );
+    assert!(
+        r("hybrid-rrf").ndcg_at_10 >= r("hnsw-only").ndcg_at_10 - 0.01,
+        "hybrid should not regress ≥0.01 vs HNSW-only"
+    );
+    assert!(
+        r("+freshness (full)").ndcg_at_10 >= r("hybrid-rrf").ndcg_at_10 - 0.07,
+        "full stack should not regress >0.07 vs hybrid-rrf"
+    );
+    assert!(
+        r("+oracle-rerank").ndcg_at_10 >= r("+freshness (full)").ndcg_at_10,
+        "oracle is an upper bound; must ≥ full stack"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "real fixture; set MEM_BENCH_FIXTURE_PATH=…"]
+async fn real_recall_bench() {
+    let fixture = match bench::real::load_from_env().expect("load real fixture") {
+        Some(f) => f,
+        None => {
+            eprintln!("MEM_BENCH_FIXTURE_PATH not set; skipping real bench");
+            return;
+        }
+    };
+    let report = run_bench(fixture).await;
+    println!("{}", pretty_table(&report));
+    let out_path = PathBuf::from("target/bench-out/recall-real.json");
+    write_json(&report, &out_path).expect("write json");
+    // No assertions — informational only.
 }

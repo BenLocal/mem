@@ -126,7 +126,8 @@ async fn run_rung(fixture: &Fixture, rung: &Rung) -> RungReport {
     // ingested messages so HNSW search results (which return only ids) can be
     // hydrated into `ConversationMessage` records without an extra DB roundtrip.
     let fake = Arc::new(FakeEmbeddingProvider::new("fake", EMBED_DIM));
-    let index = VectorIndex::new_in_memory(EMBED_DIM, "fake", "fake", 8);
+    let total_blocks: usize = fixture.sessions.iter().map(|s| s.blocks.len()).sum();
+    let index = VectorIndex::new_in_memory(EMBED_DIM, "fake", "fake", total_blocks.max(8));
     let mut block_index: HashMap<String, ConversationMessage> = HashMap::new();
 
     for (s_pos, session) in fixture.sessions.iter().enumerate() {

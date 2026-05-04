@@ -19,6 +19,7 @@ pub struct BlockFixture {
 #[derive(Debug, Clone)]
 pub struct SessionFixture {
     pub session_id: SessionId,
+    #[allow(dead_code)]
     pub started_at: String,
     pub blocks: Vec<BlockFixture>,
 }
