@@ -8,4 +8,5 @@ pub mod fixture;
 pub mod judgment;
 pub mod oracle;
 pub mod real;
+pub mod runner;
 pub mod synthetic;
