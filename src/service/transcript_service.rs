@@ -200,6 +200,7 @@ impl TranscriptService {
         // ─── Phase 3: score.
         let scoring_opts = ScoringOpts {
             anchor_session_id: opts.anchor_session_id.as_deref(),
+            ..ScoringOpts::default()
         };
         let mut scored =
             score_candidates(candidates, &lexical_ranks, &semantic_ranks, scoring_opts);

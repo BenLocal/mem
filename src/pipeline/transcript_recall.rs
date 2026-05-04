@@ -31,9 +31,16 @@ pub const SESSION_COOCC_CAP_SIBLINGS: i64 = 4;
 pub const ANCHOR_SESSION_BONUS: i64 = 20;
 
 /// Optional per-call options.
+///
+/// Default values produce production behavior (no signals disabled). Bench
+/// callers (`tests/recall_bench.rs`) toggle the `disable_*` fields per-rung
+/// to measure each signal's marginal contribution.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct ScoringOpts<'a> {
     pub anchor_session_id: Option<&'a str>,
+    pub disable_session_cooc: bool,
+    pub disable_anchor: bool,
+    pub disable_freshness: bool,
 }
 
 /// One candidate annotated with its final composite score.
@@ -96,22 +103,29 @@ pub fn score_candidates(
                 .unwrap_or(0);
 
             // Session co-occurrence.
-            if let Some(sid) = m.session_id.as_deref() {
-                let total = *session_counts.get(sid).unwrap_or(&0);
-                let siblings = (total - 1).clamp(0, SESSION_COOCC_CAP_SIBLINGS);
-                s += SESSION_COOCC_PER_SIBLING * siblings;
+            if !opts.disable_session_cooc {
+                if let Some(sid) = m.session_id.as_deref() {
+                    let total = *session_counts.get(sid).unwrap_or(&0);
+                    let siblings = (total - 1).clamp(0, SESSION_COOCC_CAP_SIBLINGS);
+                    s += SESSION_COOCC_PER_SIBLING * siblings;
+                }
             }
 
             // Anchor session boost.
-            if let (Some(anchor), Some(sid)) = (opts.anchor_session_id, m.session_id.as_deref()) {
-                if anchor == sid {
-                    s += ANCHOR_SESSION_BONUS;
+            if !opts.disable_anchor {
+                if let (Some(anchor), Some(sid)) = (opts.anchor_session_id, m.session_id.as_deref())
+                {
+                    if anchor == sid {
+                        s += ANCHOR_SESSION_BONUS;
+                    }
                 }
             }
 
             // Freshness curve.
             let ts = timestamp_score(&m.created_at);
-            s += freshness_score(newest, ts);
+            if !opts.disable_freshness {
+                s += freshness_score(newest, ts);
+            }
 
             ScoredBlock {
                 message: m,
@@ -329,6 +343,7 @@ mod tests {
         let b1 = sample("b1", Some("B"), "00000000020260430000");
         let opts = ScoringOpts {
             anchor_session_id: Some("A"),
+            ..ScoringOpts::default()
         };
         let scored = score_candidates(vec![a1, b1], &HashMap::new(), &HashMap::new(), opts);
         // a1 gets anchor bonus; b1 does not. Both have 0 co-occ (only 1 in their session).
@@ -393,6 +408,118 @@ mod tests {
         assert!(
             new_s > old_s,
             "newer candidate must outrank older at equal RRF"
+        );
+    }
+
+    #[test]
+    fn disable_session_cooc_zeroes_that_bonus() {
+        // Two siblings in same session — without disabling, cooc bonus = 1*per_sibling
+        // = 3. With disable_session_cooc=true, bonus is 0. Verify the score delta.
+        let m_a = sample("a1", Some("s1"), "00000000020260503000");
+        let m_b = sample("b1", Some("s1"), "00000000020260503000");
+
+        let with_cooc = score_candidates(
+            vec![m_a.clone(), m_b.clone()],
+            &HashMap::new(),
+            &HashMap::new(),
+            ScoringOpts::default(),
+        );
+        let without_cooc = score_candidates(
+            vec![m_a, m_b],
+            &HashMap::new(),
+            &HashMap::new(),
+            ScoringOpts {
+                disable_session_cooc: true,
+                ..ScoringOpts::default()
+            },
+        );
+        assert!(
+            with_cooc[0].score > without_cooc[0].score,
+            "disabling cooc must lower score (got {} vs {})",
+            with_cooc[0].score,
+            without_cooc[0].score
+        );
+        assert_eq!(
+            with_cooc[0].score - without_cooc[0].score,
+            SESSION_COOCC_PER_SIBLING,
+            "cooc bonus delta should equal SESSION_COOCC_PER_SIBLING"
+        );
+    }
+
+    #[test]
+    fn disable_anchor_zeroes_anchor_bonus() {
+        let m = sample("a1", Some("s_anchor"), "00000000020260503000");
+        let with_anchor = score_candidates(
+            vec![m.clone()],
+            &HashMap::new(),
+            &HashMap::new(),
+            ScoringOpts {
+                anchor_session_id: Some("s_anchor"),
+                ..ScoringOpts::default()
+            },
+        );
+        let disabled = score_candidates(
+            vec![m],
+            &HashMap::new(),
+            &HashMap::new(),
+            ScoringOpts {
+                anchor_session_id: Some("s_anchor"),
+                disable_anchor: true,
+                ..ScoringOpts::default()
+            },
+        );
+        assert_eq!(
+            with_anchor[0].score - disabled[0].score,
+            ANCHOR_SESSION_BONUS
+        );
+    }
+
+    #[test]
+    fn disable_freshness_zeroes_freshness_bonus() {
+        // Two timestamps; the older one's freshness < newer one's. Both should
+        // converge to the same score when disable_freshness=true.
+        let m_new = sample("new", None, "00000000020260503000");
+        let m_old = sample("old", None, "00000000020260403000");
+
+        let with_fresh = score_candidates(
+            vec![m_new.clone(), m_old.clone()],
+            &HashMap::new(),
+            &HashMap::new(),
+            ScoringOpts::default(),
+        );
+        let without_fresh = score_candidates(
+            vec![m_new, m_old],
+            &HashMap::new(),
+            &HashMap::new(),
+            ScoringOpts {
+                disable_freshness: true,
+                ..ScoringOpts::default()
+            },
+        );
+        let with_diff = with_fresh
+            .iter()
+            .find(|s| s.message.message_block_id == "mb-new")
+            .unwrap()
+            .score
+            - with_fresh
+                .iter()
+                .find(|s| s.message.message_block_id == "mb-old")
+                .unwrap()
+                .score;
+        let without_diff = without_fresh
+            .iter()
+            .find(|s| s.message.message_block_id == "mb-new")
+            .unwrap()
+            .score
+            - without_fresh
+                .iter()
+                .find(|s| s.message.message_block_id == "mb-old")
+                .unwrap()
+                .score;
+        assert!(with_diff > 0, "with freshness, newer must outrank older");
+        assert_eq!(
+            without_diff, 0,
+            "with freshness disabled, both candidates must score equally"
         );
     }
 }
