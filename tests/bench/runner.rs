@@ -213,6 +213,14 @@ async fn run_rung(fixture: &Fixture, rung: &Rung) -> RungReport {
     }
 }
 
+// Bench-vs-production divergence (intentional v1):
+// Production TranscriptService::search injects up to `oversample` block ids
+// from the anchor_session_id directly into the candidate pool. The bench
+// currently does NOT replicate this injection — synthetic fixtures don't set
+// anchor_session_id, so the +anchor / all-minus-anchor rungs measure only
+// the ScoringOpts::anchor bonus, not the candidate-injection effect. If real
+// fixtures with anchored queries become common, this divergence should be
+// closed (mirror src/service/transcript_service.rs:178-187).
 #[allow(clippy::too_many_arguments)]
 async fn retrieve_and_rank(
     repo: &DuckDbRepository,

@@ -134,7 +134,15 @@ pub fn score_candidates(
         })
         .collect();
 
-    scored.sort_by(|a, b| b.score.cmp(&a.score));
+    // Sort by score descending; break ties by message_block_id ascending so
+    // that output order is deterministic regardless of HashMap iteration order
+    // in callers (e.g. bench runner). Determinism matters for reproducible
+    // bench runs and for stable production rankings when scores collide.
+    scored.sort_by(|a, b| {
+        b.score
+            .cmp(&a.score)
+            .then_with(|| a.message.message_block_id.cmp(&b.message.message_block_id))
+    });
     scored
 }
 
@@ -521,6 +529,42 @@ mod tests {
             without_diff, 0,
             "with freshness disabled, both candidates must score equally"
         );
+    }
+
+    #[test]
+    fn score_candidates_breaks_ties_deterministically() {
+        // Two messages with identical scoring inputs (same session, same timestamp,
+        // same RRF ranks) — only message_block_id differs ("aaa" vs "bbb").
+        // After scoring, the lower message_block_id ("aaa") should come first
+        // regardless of the order they are passed in. Run twice (reversed input)
+        // to confirm the tiebreak is stable and not input-order-dependent.
+        let m_aaa = sample("aaa", Some("s1"), "00000000020260503000");
+        let m_bbb = sample("bbb", Some("s1"), "00000000020260503000");
+
+        let mut lex = HashMap::new();
+        lex.insert("mb-aaa".to_string(), 1);
+        lex.insert("mb-bbb".to_string(), 1);
+
+        let run1 = score_candidates(
+            vec![m_aaa.clone(), m_bbb.clone()],
+            &lex,
+            &HashMap::new(),
+            ScoringOpts::default(),
+        );
+        let run2 = score_candidates(
+            vec![m_bbb.clone(), m_aaa.clone()],
+            &lex,
+            &HashMap::new(),
+            ScoringOpts::default(),
+        );
+
+        // Both runs must produce ["mb-aaa", "mb-bbb"] — lower id first.
+        assert_eq!(run1[0].message.message_block_id, "mb-aaa");
+        assert_eq!(run1[1].message.message_block_id, "mb-bbb");
+        assert_eq!(run2[0].message.message_block_id, "mb-aaa");
+        assert_eq!(run2[1].message.message_block_id, "mb-bbb");
+        // Sanity: scores are equal (the tiebreak is only on id).
+        assert_eq!(run1[0].score, run1[1].score);
     }
 }
 
