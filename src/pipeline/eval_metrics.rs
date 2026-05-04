@@ -5,7 +5,7 @@
 //!
 //! Conventions:
 //! - All functions are tenant-agnostic; pass run + qrels as plain slices/sets.
-//! - Generic over `I: Eq + Hash + Clone` so callers pass `String`, `&str`, or
+//! - Generic over `I: Eq + Hash` so callers pass `String`, `&str`, or
 //!   typed wrapper IDs without copying.
 //! - Relevance is binary (0/1). gain = 1.0 if id ∈ qrels, else 0.0.
 
@@ -29,7 +29,7 @@ pub fn ideal_dcg(relevant_count: usize, k: usize) -> f64 {
 }
 
 /// NDCG@k. Returns 0.0 if qrels is empty (degenerate case).
-pub fn ndcg_at_k<I: Eq + Hash + Clone>(run: &[I], qrels: &HashSet<I>, k: usize) -> f64 {
+pub fn ndcg_at_k<I: Eq + Hash>(run: &[I], qrels: &HashSet<I>, k: usize) -> f64 {
     let actual: Vec<f64> = run
         .iter()
         .take(k)
@@ -45,7 +45,7 @@ pub fn ndcg_at_k<I: Eq + Hash + Clone>(run: &[I], qrels: &HashSet<I>, k: usize) 
 }
 
 /// MRR — reciprocal rank of first relevant; 0 if none in run.
-pub fn mrr<I: Eq + Hash + Clone>(run: &[I], qrels: &HashSet<I>) -> f64 {
+pub fn mrr<I: Eq + Hash>(run: &[I], qrels: &HashSet<I>) -> f64 {
     run.iter()
         .position(|id| qrels.contains(id))
         .map(|p| 1.0 / (p + 1) as f64)
@@ -53,7 +53,7 @@ pub fn mrr<I: Eq + Hash + Clone>(run: &[I], qrels: &HashSet<I>) -> f64 {
 }
 
 /// Recall@k — fraction of relevant docs found in top-k.
-pub fn recall_at_k<I: Eq + Hash + Clone>(run: &[I], qrels: &HashSet<I>, k: usize) -> f64 {
+pub fn recall_at_k<I: Eq + Hash>(run: &[I], qrels: &HashSet<I>, k: usize) -> f64 {
     if qrels.is_empty() {
         return 0.0;
     }
@@ -62,12 +62,11 @@ pub fn recall_at_k<I: Eq + Hash + Clone>(run: &[I], qrels: &HashSet<I>, k: usize
 }
 
 /// Precision@k — fraction of top-k that is relevant.
-pub fn precision_at_k<I: Eq + Hash + Clone>(run: &[I], qrels: &HashSet<I>, k: usize) -> f64 {
+pub fn precision_at_k<I: Eq + Hash>(run: &[I], qrels: &HashSet<I>, k: usize) -> f64 {
     if k == 0 {
         return 0.0;
     }
-    let n = run.len().min(k);
-    if n == 0 {
+    if run.is_empty() {
         return 0.0;
     }
     let hits = run.iter().take(k).filter(|id| qrels.contains(id)).count();
@@ -77,7 +76,6 @@ pub fn precision_at_k<I: Eq + Hash + Clone>(run: &[I], qrels: &HashSet<I>, k: us
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::collections::HashSet;
 
     fn approx(actual: f64, expected: f64) {
         assert!(
