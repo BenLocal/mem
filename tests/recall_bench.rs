@@ -24,6 +24,8 @@
 //! Both BM25 and HNSW channels returned the ingested block (non-empty results
 //! confirmed by `assert!(!bm25.is_empty())` and `assert!(!hnsw.is_empty())`).
 
+mod bench;
+
 use mem::domain::{BlockType, ConversationMessage, MessageRole};
 use mem::storage::{DuckDbRepository, VectorIndex};
 
