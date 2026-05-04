@@ -346,3 +346,166 @@ mod tests {
         );
     }
 }
+
+use std::fmt::Write as _;
+use std::path::Path;
+
+pub fn pretty_table(report: &BenchReport) -> String {
+    let mut out = String::new();
+    let _ = writeln!(
+        &mut out,
+        "=== Recall Bench ({}, {} sessions × {} queries) ===",
+        report.fixture_kind, report.session_count, report.query_count
+    );
+    let _ = writeln!(
+        &mut out,
+        "{:<22}  NDCG@5  NDCG@10 NDCG@20  MRR    R@10   P@10",
+        ""
+    );
+    let baseline = report
+        .rungs
+        .iter()
+        .find(|r| r.name == "+freshness (full)")
+        .map(|r| r.ndcg_at_10);
+    for r in &report.rungs {
+        let delta = match (r.name.starts_with("all-minus-"), baseline) {
+            (true, Some(b)) => format!("  (Δ {:+.3})", r.ndcg_at_10 - b),
+            _ => String::new(),
+        };
+        let _ = writeln!(
+            &mut out,
+            "{:<22}  {:.3}   {:.3}   {:.3}   {:.3}  {:.3}  {:.3}{}",
+            r.name,
+            r.ndcg_at_5,
+            r.ndcg_at_10,
+            r.ndcg_at_20,
+            r.mrr,
+            r.recall_at_10,
+            r.precision_at_10,
+            delta
+        );
+    }
+    let _ = writeln!(&mut out);
+    let _ = writeln!(
+        &mut out,
+        "⚠ Bias notice: judgments derived from co-mention + entity aliases."
+    );
+    let _ = writeln!(
+        &mut out,
+        "  HNSW absolute scores under-counted; relative deltas reliable."
+    );
+    let _ = writeln!(
+        &mut out,
+        "  See docs/superpowers/specs/2026-05-03-transcript-recall-bench-design.md §3."
+    );
+    out
+}
+
+pub fn write_json(report: &BenchReport, path: &Path) -> std::io::Result<()> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let json = serde_json::json!({
+        "fixture_meta": {
+            "kind": report.fixture_kind,
+            "session_count": report.session_count,
+            "query_count": report.query_count,
+        },
+        "rungs": report.rungs.iter().map(|r| {
+            serde_json::json!({
+                "name": r.name,
+                "ndcg_at_5": r.ndcg_at_5,
+                "ndcg_at_10": r.ndcg_at_10,
+                "ndcg_at_20": r.ndcg_at_20,
+                "mrr": r.mrr,
+                "recall_at_10": r.recall_at_10,
+                "precision_at_10": r.precision_at_10,
+                "per_query": r.per_query.iter().map(|q| {
+                    serde_json::json!({
+                        "query_id": q.query_id,
+                        "ndcg_at_10": q.ndcg_at_10,
+                        "mrr": q.mrr,
+                    })
+                }).collect::<Vec<_>>(),
+            })
+        }).collect::<Vec<_>>(),
+    });
+    std::fs::write(path, serde_json::to_string_pretty(&json)?)?;
+    Ok(())
+}
+
+#[cfg(test)]
+mod output_tests {
+    use super::*;
+
+    fn fixture_report() -> BenchReport {
+        BenchReport {
+            fixture_kind: "Synthetic { seed: 42 }".to_string(),
+            session_count: 30,
+            query_count: 24,
+            rungs: vec![
+                RungReport {
+                    name: "bm25-only".to_string(),
+                    ndcg_at_5: 0.612,
+                    ndcg_at_10: 0.658,
+                    ndcg_at_20: 0.701,
+                    mrr: 0.721,
+                    recall_at_10: 0.583,
+                    precision_at_10: 0.290,
+                    per_query: vec![],
+                },
+                RungReport {
+                    name: "+freshness (full)".to_string(),
+                    ndcg_at_5: 0.741,
+                    ndcg_at_10: 0.782,
+                    ndcg_at_20: 0.815,
+                    mrr: 0.844,
+                    recall_at_10: 0.697,
+                    precision_at_10: 0.358,
+                    per_query: vec![],
+                },
+                RungReport {
+                    name: "all-minus-cooc".to_string(),
+                    ndcg_at_5: 0.735,
+                    ndcg_at_10: 0.776,
+                    ndcg_at_20: 0.811,
+                    mrr: 0.838,
+                    recall_at_10: 0.692,
+                    precision_at_10: 0.355,
+                    per_query: vec![],
+                },
+            ],
+        }
+    }
+
+    #[test]
+    fn pretty_table_contains_header_and_bias_notice() {
+        let s = pretty_table(&fixture_report());
+        assert!(s.contains("=== Recall Bench (Synthetic"));
+        assert!(s.contains("bm25-only"));
+        assert!(s.contains("Bias notice"));
+        assert!(s.contains("co-mention"));
+    }
+
+    #[test]
+    fn pretty_table_emits_delta_for_leave_one_out_rungs() {
+        let s = pretty_table(&fixture_report());
+        // all-minus-cooc Δ = 0.776 - 0.782 = -0.006
+        assert!(
+            s.contains("(Δ -0.006)"),
+            "expected leave-one-out delta in output: {s}"
+        );
+    }
+
+    #[test]
+    fn write_json_produces_well_formed_file() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let path = tmp.path().join("out").join("recall.json");
+        write_json(&fixture_report(), &path).unwrap();
+        let bytes = std::fs::read(&path).unwrap();
+        let parsed: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(parsed["fixture_meta"]["session_count"], 30);
+        assert_eq!(parsed["rungs"].as_array().unwrap().len(), 3);
+        assert_eq!(parsed["rungs"][0]["name"], "bm25-only");
+    }
+}
