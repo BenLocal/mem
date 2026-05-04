@@ -5,5 +5,6 @@
 #![allow(dead_code)] // submodules build incrementally; some helpers land before callers.
 
 pub mod fixture;
+pub mod judgment;
 pub mod real;
 pub mod synthetic;
