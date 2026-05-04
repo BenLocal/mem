@@ -275,6 +275,35 @@ MEM_BENCH_FIXTURE_PATH=/path/to/recall-real.json \
   cargo test --test recall_bench real_recall_bench -- --ignored --nocapture
 ```
 
+### Reading the output
+
+The bench answers two questions, each with a different lens:
+
+1. **"Does each existing signal carry weight?"** — read the `all-minus-X` rows.
+   The Δ column shows how much NDCG@10 drops when a single signal is removed
+   from the full stack. A large negative Δ means the signal is load-bearing;
+   ~0.000 means the signal is inert on this fixture.
+2. **"Is a real cross-encoder worth pursuing?"** — compare `+oracle-rerank`
+   (binary-reranker upper bound) to `+freshness (full)` (current production
+   stack). Big gap → spike a real cross-encoder. Small gap → don't bother.
+
+Watch for these synthetic-fixture artifacts (do not generalize to production):
+
+- **HNSW under-performs absolutely.** The CI run uses `FakeEmbeddingProvider`
+  which has near-zero semantic signal. `hnsw-only` will look bad regardless of
+  production-model behavior; only the *relative* shape across rungs is
+  trustworthy.
+- **BM25 may dominate.** Co-mention judgments are lexical-coupled, so BM25
+  often beats hybrid on synthetic data. This is a ground-truth bias, not a
+  ranker bug.
+- **`+freshness` may show a regression.** Synthetic timestamps span 90 days
+  uniformly while judgments are timestamp-agnostic, so the freshness signal
+  re-shuffles relevant-but-old hits below recent-but-irrelevant ones. On real
+  conversation data where recent matches *are* more relevant, this flips.
+- **`+anchor` is inert by default.** Synthetic queries don't carry
+  `anchor_session_id`. Set `SyntheticConfig::anchored_query_fraction > 0.0` to
+  exercise the anchor signal in custom configs.
+
 ### Notes
 
 - Judgments are derived automatically (co-mention + entity-alias). Absolute

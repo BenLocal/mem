@@ -99,6 +99,11 @@ pub struct SyntheticConfig {
     pub query_count: usize,
     pub noise_words_per_block: usize,
     pub tenant: &'static str,
+    /// Fraction of queries that get `anchor_session_id` set to a topic-covering
+    /// session. Default 0.0 → +anchor / all-minus-anchor rungs measure no signal
+    /// (synthetic baseline). Set to e.g. 0.5 to exercise the anchor-bonus branch
+    /// of `score_candidates` against the bench. Range [0.0, 1.0].
+    pub anchored_query_fraction: f64,
 }
 
 impl Default for SyntheticConfig {
@@ -111,6 +116,7 @@ impl Default for SyntheticConfig {
             query_count: 24,
             noise_words_per_block: 30,
             tenant: "local",
+            anchored_query_fraction: 0.0,
         }
     }
 }
@@ -213,10 +219,25 @@ pub fn generate(config: &SyntheticConfig) -> Fixture {
             .map(|(s_idx, _)| format!("synth_session_{:03}", s_idx))
             .collect();
 
+        // Optionally tag this query with an anchor session that covers the
+        // topic. The dice roll uses the same `rng`, keeping the generator
+        // deterministic.
+        let anchor_session_id = if config.anchored_query_fraction > 0.0
+            && rng.gen_bool(config.anchored_query_fraction.clamp(0.0, 1.0))
+        {
+            session_topics
+                .iter()
+                .enumerate()
+                .find(|(_, topics)| topics.contains(&topic_idx))
+                .map(|(s_idx, _)| format!("synth_session_{:03}", s_idx))
+        } else {
+            None
+        };
+
         queries.push(QueryFixture {
             query_id: format!("synth_q_{:03}", q_idx),
             text,
-            anchor_session_id: None,
+            anchor_session_id,
             anchor_entities: vec![topic.canonical.to_string()],
             synthetic_judgments: Some(synthetic_judgments),
         });
@@ -382,5 +403,71 @@ mod tests {
             "some topic has too few blocks (min={}); expected ≥8",
             min
         );
+    }
+
+    #[test]
+    fn default_config_has_no_anchored_queries() {
+        let f = generate(&SyntheticConfig::default());
+        for q in &f.queries {
+            assert!(
+                q.anchor_session_id.is_none(),
+                "default fraction=0.0 must produce no anchor_session_id, but {} got Some({:?})",
+                q.query_id,
+                q.anchor_session_id
+            );
+        }
+    }
+
+    #[test]
+    fn anchored_query_fraction_one_anchors_every_query() {
+        let f = generate(&SyntheticConfig {
+            anchored_query_fraction: 1.0,
+            ..SyntheticConfig::default()
+        });
+        for q in &f.queries {
+            assert!(
+                q.anchor_session_id.is_some(),
+                "fraction=1.0 must anchor every query, but {} has None",
+                q.query_id
+            );
+        }
+    }
+
+    #[test]
+    fn anchored_query_fraction_anchor_session_covers_topic() {
+        // Verify that when a query gets an anchor, the anchored session
+        // actually mentions the query's topic — so the +anchor rung
+        // exercises real signal, not arbitrary noise.
+        let f = generate(&SyntheticConfig {
+            anchored_query_fraction: 1.0,
+            ..SyntheticConfig::default()
+        });
+        for q in &f.queries {
+            let anchor_id = q
+                .anchor_session_id
+                .as_ref()
+                .expect("fraction=1.0 anchors all queries");
+            let session = f
+                .sessions
+                .iter()
+                .find(|s| &s.session_id == anchor_id)
+                .expect("anchored session must exist in fixture");
+            // The anchor session's blocks should mention the topic the query is about.
+            // anchor_entities[0] is the canonical name; check any block hits canonical or an alias.
+            let canonical = &q.anchor_entities[0];
+            let topic = DEFAULT_TOPICS
+                .iter()
+                .find(|t| t.canonical == canonical)
+                .expect("anchor_entities[0] must be a known canonical");
+            let any_block_hits = session.blocks.iter().any(|b| {
+                b.content.contains(topic.canonical)
+                    || topic.aliases.iter().any(|a| b.content.contains(a))
+            });
+            assert!(
+                any_block_hits,
+                "anchored session {} for query {} must mention topic {}",
+                anchor_id, q.query_id, canonical
+            );
+        }
     }
 }
