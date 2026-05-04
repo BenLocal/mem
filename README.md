@@ -248,6 +248,42 @@ Response shape: `{ "windows": [{ "session_id": "...", "blocks": [...], "primary_
 
 `mem repair --check|--rebuild` covers both sidecars (memories and transcripts) in one pass.
 
+## Recall Quality Bench (transcripts)
+
+A 10-rung ablation harness for the transcript recall pipeline. Quantifies
+each ranking signal's marginal NDCG@k contribution and gives an oracle
+upper bound for binary cross-encoder rerankers.
+
+### Synthetic (CI / regression smoke)
+
+Runs on a deterministic in-tree fixture (`SyntheticConfig::default()`,
+seed=42, 30 sessions × 8 blocks × 24 queries):
+
+```bash
+cargo test --test recall_bench synthetic_recall_bench -- --nocapture
+```
+
+Prints the 10-rung table to stdout; writes `target/bench-out/recall-synthetic.json`.
+
+### Real (local decision pull)
+
+Set `MEM_BENCH_FIXTURE_PATH` to a JSON dump of your own transcripts
+(see `docs/superpowers/specs/2026-05-03-transcript-recall-bench-design.md` §Real Fixture for schema):
+
+```bash
+MEM_BENCH_FIXTURE_PATH=/path/to/recall-real.json \
+  cargo test --test recall_bench real_recall_bench -- --ignored --nocapture
+```
+
+### Notes
+
+- Judgments are derived automatically (co-mention + entity-alias). Absolute
+  NDCG values under-count HNSW (synonym hits hidden by the heuristic);
+  relative deltas across rungs are reliable.
+- The bench shares `pipeline::transcript_recall::score_candidates` with
+  production — rung differences are config tuples, not parallel rankers.
+- Output JSON shape: see `tests/bench/runner.rs::write_json`.
+
 ## Entity Registry (entities + entity_aliases)
 
 Tenant-scoped registry that canonicalizes alias strings (`"Rust"` = `"Rust language"` = `"rustlang"`) to a stable `entity_id`. Three mechanisms feed it:
