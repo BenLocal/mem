@@ -313,6 +313,46 @@ Watch for these synthetic-fixture artifacts (do not generalize to production):
   production — rung differences are config tuples, not parallel rankers.
 - Output JSON shape: see `tests/bench/runner.rs::write_json`.
 
+## MemPalace LongMemEval Parity Bench
+
+External-comparison benchmark for mem vs mempalace's published
+LongMemEval baselines. Apple-to-apple at the protocol level: same
+dataset (LongMemEval Standard), same per-Q ephemeral corpus, same
+top-K retrieval, same Recall@5/Recall@10/NDCG@10 metrics. mem runs
+its own ranking stack (BM25 + HNSW + ScoringOpts) under three
+rungs (raw / rooms / full equivalents).
+
+### Run
+
+Pre-download `longmemeval_s_cleaned.json` from the LongMemEval
+upstream repo (https://github.com/xiaowu0162/LongMemEval). Set
+`EMBEDDING_PROVIDER=embedanything`, `EMBEDDING_MODEL=...`,
+`EMBEDDING_DIM=...` per `.env.example`. Then:
+
+    MEM_LONGMEMEVAL_PATH=/path/to/longmemeval_s_cleaned.json \
+      cargo test --test mempalace_bench longmemeval -- --ignored --nocapture
+
+For a smoke (50 questions instead of 500):
+
+    MEM_LONGMEMEVAL_PATH=/path/... \
+    MEM_LONGMEMEVAL_LIMIT=50 \
+      cargo test --test mempalace_bench longmemeval -- --ignored --nocapture
+
+Wall-clock: ~1.5-3 hours for 500 questions x 3 rungs (the embedding
+ingest dominates; rung re-rank is fast).
+
+### Reading the output
+
+Three JSON files written to `target/bench-out/`:
+- `results_mem_longmemeval_raw_<unix_ts>.json` (vs mempalace `raw` ≈ 0.966 R@5)
+- `results_mem_longmemeval_rooms_<unix_ts>.json` (vs mempalace `rooms` ≈ 0.894 R@5)
+- `results_mem_longmemeval_full_<unix_ts>.json` (vs mempalace `full` per their README)
+
+Plus a stdout comparison table. The `! Embedding-model parity caveat`
+footer notes that mem uses Qwen3 1024-dim while mempalace uses
+all-MiniLM-L6-v2 384-dim — absolute mem-vs-mempalace deltas include
+both ranking-algorithm AND embedding-model contributions.
+
 ## Entity Registry (entities + entity_aliases)
 
 Tenant-scoped registry that canonicalizes alias strings (`"Rust"` = `"Rust language"` = `"rustlang"`) to a stable `entity_id`. Three mechanisms feed it:

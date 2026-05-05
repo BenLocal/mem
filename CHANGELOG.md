@@ -13,6 +13,29 @@ are organized by feature wave (merge commit ranges on `master`).
 
 ---
 
+## 2026-05-05 — MemPalace LongMemEval Parity Bench
+
+### Added
+
+- `tests/mempalace_bench.rs` — `#[ignore]`'d entry that runs LongMemEval against
+  mem's stack and emits results JSON in mempalace-mirror shape
+- `tests/bench/longmemeval.rs` — runner: 3 rungs (raw / rooms / full), per-Q
+  ingest + re-rank, aggregate, output formatters
+- `tests/bench/longmemeval_dataset.rs` — JSON loader with env-var skip semantics
+- `src/pipeline/eval_metrics.rs` — `recall_any_at_k`, `recall_all_at_k` (mempalace-style binary indicators)
+
+### Notes
+
+- Manual decision tool, not in CI (matches mempalace's manual operation flow)
+- Uses production embedding stack (configured via `EMBEDDING_*` env vars);
+  warns if `EMBEDDING_PROVIDER=fake`
+- `MEM_LONGMEMEVAL_PATH` env var points to a pre-downloaded dataset
+- Mempalace's AAAK and llmrerank modes skipped (mem has no analog)
+- `1.5-3 hour` wall-clock for full 500-question run; `MEM_LONGMEMEVAL_LIMIT=50`
+  for smoke
+
+---
+
 ## 2026-05-03 — Transcript Recall Quality Bench
 
 **Range:** `070f900..16a0afd`.
