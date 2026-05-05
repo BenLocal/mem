@@ -59,6 +59,8 @@
 //!     `session_id` or similar identifier
 //!     `turns`  (array of turn objects with `role`/`content` or similar)
 
+mod bench;
+
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "probe; set MEM_LONGMEMEVAL_PATH=... and run with --ignored"]
 async fn longmemeval_format_probe() {

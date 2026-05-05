@@ -5,6 +5,7 @@
 
 pub mod fixture;
 pub mod judgment;
+pub mod longmemeval_dataset;
 pub mod oracle;
 pub mod real;
 pub mod runner;
