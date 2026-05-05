@@ -1,13 +1,18 @@
 //! Information-retrieval evaluation metrics. Pure functions, no I/O.
 //!
 //! Used by the recall ablation bench (`tests/recall_bench.rs`) and
-//! reusable for any future memories pipeline ablation.
+//! reusable for any future memories pipeline ablation, including the
+//! LongMemEval / mempalace parity bench (`tests/mempalace_bench.rs`).
 //!
 //! Conventions:
 //! - All functions are tenant-agnostic; pass run + qrels as plain slices/sets.
 //! - Generic over `I: Eq + Hash` so callers pass `String`, `&str`, or
 //!   typed wrapper IDs without copying.
 //! - Relevance is binary (0/1). gain = 1.0 if id ∈ qrels, else 0.0.
+//!
+//! Binary indicator metrics (mempalace-style):
+//! - [`recall_any_at_k`]: 1.0 if top-K contains ≥1 relevant id, else 0.0.
+//! - [`recall_all_at_k`]: 1.0 if top-K contains all relevant ids, else 0.0.
 
 use std::collections::HashSet;
 use std::hash::Hash;
@@ -59,6 +64,39 @@ pub fn recall_at_k<I: Eq + Hash>(run: &[I], qrels: &HashSet<I>, k: usize) -> f64
     }
     let hits = run.iter().take(k).filter(|id| qrels.contains(id)).count();
     hits as f64 / qrels.len() as f64
+}
+
+/// Mempalace-style binary recall: 1.0 if top-K contains >=1 relevant id, else 0.0.
+///
+/// This is a binary indicator — different from [`recall_at_k`] which returns the
+/// *fraction* of relevant ids found. Use this for "did we find at least one of
+/// the answer sessions" tasks (LongMemEval, ConvoMem). Returns 0.0 when qrels is
+/// empty (avoids degenerate "vacuously true" 1.0).
+pub fn recall_any_at_k<I: Eq + Hash>(run: &[I], qrels: &HashSet<I>, k: usize) -> f64 {
+    if qrels.is_empty() {
+        return 0.0;
+    }
+    if run.iter().take(k).any(|id| qrels.contains(id)) {
+        1.0
+    } else {
+        0.0
+    }
+}
+
+/// Mempalace-style binary recall: 1.0 if top-K contains ALL relevant ids, else 0.0.
+///
+/// Stricter than [`recall_any_at_k`]; useful for multi-hop tasks where partial
+/// recall is insufficient. Returns 0.0 when qrels is empty.
+pub fn recall_all_at_k<I: Eq + Hash>(run: &[I], qrels: &HashSet<I>, k: usize) -> f64 {
+    if qrels.is_empty() {
+        return 0.0;
+    }
+    let top_k: HashSet<&I> = run.iter().take(k).collect();
+    if qrels.iter().all(|id| top_k.contains(id)) {
+        1.0
+    } else {
+        0.0
+    }
 }
 
 /// Precision@k — fraction of top-k that is relevant.
@@ -202,5 +240,60 @@ mod tests {
         // run=[a,b], qrels={a,b}, k=5 → hits=2, k=5 → 2/5 = 0.4
         let run = vec!["a".to_string(), "b".to_string()];
         approx(precision_at_k(&run, &qrels(&["a", "b"]), 5), 0.4);
+    }
+
+    #[test]
+    fn recall_any_at_k_returns_one_when_any_relevant_in_top_k() {
+        let run = vec!["a".to_string(), "b".to_string(), "c".to_string()];
+        approx(recall_any_at_k(&run, &qrels(&["b"]), 3), 1.0);
+    }
+
+    #[test]
+    fn recall_any_at_k_returns_zero_when_none_in_top_k() {
+        let run = vec!["a".to_string(), "b".to_string(), "c".to_string()];
+        approx(recall_any_at_k(&run, &qrels(&["x"]), 3), 0.0);
+    }
+
+    #[test]
+    fn recall_any_at_k_caps_at_k() {
+        // Relevant exists at position 4, k=3 -> none in top-3 -> 0.0
+        let run = ["a", "b", "c", "d", "x"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect::<Vec<_>>();
+        approx(recall_any_at_k(&run, &qrels(&["x"]), 3), 0.0);
+    }
+
+    #[test]
+    fn recall_any_at_k_returns_zero_when_qrels_empty() {
+        let run = vec!["a".to_string()];
+        approx(recall_any_at_k(&run, &qrels(&[]), 5), 0.0);
+    }
+
+    #[test]
+    fn recall_all_at_k_returns_one_when_all_in_top_k() {
+        let run = vec!["a".to_string(), "b".to_string(), "c".to_string()];
+        approx(recall_all_at_k(&run, &qrels(&["a", "c"]), 3), 1.0);
+    }
+
+    #[test]
+    fn recall_all_at_k_returns_zero_when_partial() {
+        // qrels = {a, x}, top-3 = {a, b, c}, x missing -> 0.0 (not 0.5)
+        let run = vec!["a".to_string(), "b".to_string(), "c".to_string()];
+        approx(recall_all_at_k(&run, &qrels(&["a", "x"]), 3), 0.0);
+    }
+
+    #[test]
+    fn recall_all_at_k_returns_zero_when_none_in_top_k() {
+        let run = vec!["a".to_string(), "b".to_string()];
+        approx(recall_all_at_k(&run, &qrels(&["x", "y"]), 2), 0.0);
+    }
+
+    #[test]
+    fn recall_all_at_k_returns_zero_when_qrels_empty() {
+        // Empty qrels: vacuous "all" is 0 by our convention (avoids
+        // divide-by-zero corner; mempalace also returns 0 here).
+        let run = vec!["a".to_string()];
+        approx(recall_all_at_k(&run, &qrels(&[]), 5), 0.0);
     }
 }
