@@ -61,8 +61,11 @@ fn parse_role(s: &str) -> MessageRole {
     MessageRole::from_db_str(s).unwrap_or(MessageRole::User)
 }
 
-/// Parse an ISO-8601 timestamp like "2024-03-15T00:00:00" into ms since epoch.
-/// Returns None on parse failure; caller falls back to a stable seed.
+/// Parse an ISO-8601 timestamp like "2024-03-15T00:00:00" into a naive
+/// monotonic millisecond seed. NOT a real Unix epoch — leap years and
+/// month-length variation are ignored. Sufficient for the bench's
+/// ordering needs (turns within a session are monotonic, sessions
+/// across the corpus span ~90 days). Returns None on parse failure.
 fn parse_started_at_to_ms(s: Option<&str>) -> Option<u64> {
     let s = s?;
     // Best-effort: extract YYYY-MM-DD prefix and convert to ms.
@@ -255,14 +258,6 @@ pub struct BenchReport {
     pub rungs: Vec<RungReport>,
 }
 
-fn provider_kind_str(kind: EmbeddingProviderKind) -> &'static str {
-    match kind {
-        EmbeddingProviderKind::Fake => "fake",
-        EmbeddingProviderKind::EmbedAnything => "embedanything",
-        EmbeddingProviderKind::OpenAi => "openai",
-    }
-}
-
 /// Run the full LongMemEval bench across the given questions.
 /// For each question: ingest once, retrieve under each of the 3 rungs,
 /// score against the gold answer_session_ids, aggregate into RungReports.
@@ -274,7 +269,7 @@ pub async fn run_longmemeval_bench(
     let embedder: Arc<dyn EmbeddingProvider> = arc_embedding_provider(&cfg.embedding)?;
     let embedding_dim = cfg.embedding.dim;
     let embedding_model = cfg.embedding.model.clone();
-    let provider_str = provider_kind_str(cfg.embedding.provider);
+    let provider_str = cfg.embedding.job_provider_id();
     if matches!(cfg.embedding.provider, EmbeddingProviderKind::Fake) {
         eprintln!(
             "WARNING: EMBEDDING_PROVIDER=fake — bench numbers will be \
@@ -697,5 +692,30 @@ mod tests {
             assert_eq!(rung_report.per_question.len(), 1);
         }
         assert_eq!(report.limit, 1);
+    }
+
+    #[test]
+    fn parse_started_at_to_ms_monotonic_across_consecutive_days() {
+        let day1 = super::parse_started_at_to_ms(Some("2024-03-15T00:00:00"));
+        let day2 = super::parse_started_at_to_ms(Some("2024-03-16T00:00:00"));
+        assert!(day1.is_some(), "day1 should parse");
+        assert!(day2.is_some(), "day2 should parse");
+        assert!(
+            day2.unwrap() > day1.unwrap(),
+            "day2 ({:?}) should be strictly greater than day1 ({:?})",
+            day2,
+            day1
+        );
+
+        assert_eq!(
+            super::parse_started_at_to_ms(None),
+            None,
+            "None input should return None"
+        );
+        assert_eq!(
+            super::parse_started_at_to_ms(Some("invalid")),
+            None,
+            "invalid input should return None"
+        );
     }
 }
