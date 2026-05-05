@@ -381,6 +381,174 @@ fn git_short_sha() -> Option<String> {
     Some(String::from_utf8_lossy(&out.stdout).trim().to_string())
 }
 
+use std::fmt::Write as _;
+use std::path::{Path, PathBuf};
+
+const MEMPALACE_BASELINES: &[(&str, &str)] = &[
+    ("longmemeval_raw", "raw    = 0.966 R@5"),
+    ("longmemeval_rooms", "rooms  = 0.894 R@5"),
+    ("longmemeval_full", "full   = (per README)"),
+];
+
+pub fn print_comparison_table(report: &BenchReport) {
+    let mut out = String::new();
+    let _ = writeln!(
+        &mut out,
+        "=== Mem vs MemPalace LongMemEval ({} questions, run {}) ===",
+        report.limit, report.timestamp_ms
+    );
+    let _ = writeln!(
+        &mut out,
+        "                    R@5(any) R@10(any) NDCG@10  | mempalace baseline"
+    );
+    for r in &report.rungs {
+        let baseline = MEMPALACE_BASELINES
+            .iter()
+            .find(|(id, _)| *id == r.rung_id)
+            .map(|(_, b)| *b)
+            .unwrap_or("(no baseline)");
+        let _ = writeln!(
+            &mut out,
+            "{:<19}   {:.3}     {:.3}    {:.3}  | mempalace {}",
+            r.rung_id,
+            r.aggregate_recall_any_at_5,
+            r.aggregate_recall_any_at_10,
+            r.aggregate_ndcg_at_10,
+            baseline
+        );
+    }
+    let _ = writeln!(&mut out);
+    let _ = writeln!(
+        &mut out,
+        "! Embedding-model parity caveat: mem uses {} while mempalace",
+        report.embedding_model
+    );
+    let _ = writeln!(
+        &mut out,
+        "  uses all-MiniLM-L6-v2 (384-dim). The Δ between rungs IS reliable;"
+    );
+    let _ = writeln!(
+        &mut out,
+        "  absolute Δ vs mempalace baselines includes both ranking and"
+    );
+    let _ = writeln!(&mut out, "  embedding-model contributions.");
+    print!("{}", out);
+}
+
+pub fn write_per_rung_json(
+    report: &BenchReport,
+    out_dir: &Path,
+) -> Result<Vec<PathBuf>, std::io::Error> {
+    std::fs::create_dir_all(out_dir)?;
+    let mut paths = Vec::with_capacity(report.rungs.len());
+    let ts = report.timestamp_ms;
+    for r in &report.rungs {
+        let filename = format!("results_mem_{}_{}.json", r.rung_id, ts);
+        let path = out_dir.join(&filename);
+        let payload = serde_json::json!({
+            "benchmark": "longmemeval",
+            "mode": r.mempalace_label,
+            "system": "mem",
+            "embedding_model": report.embedding_model,
+            "system_version": report.system_version,
+            "timestamp_ms": report.timestamp_ms,
+            "limit": report.limit,
+            "aggregate": {
+                "recall_any_at_5": r.aggregate_recall_any_at_5,
+                "recall_any_at_10": r.aggregate_recall_any_at_10,
+                "recall_all_at_5": r.aggregate_recall_all_at_5,
+                "recall_all_at_10": r.aggregate_recall_all_at_10,
+                "ndcg_at_10": r.aggregate_ndcg_at_10,
+            },
+            "per_question": r.per_question.iter().map(|p| serde_json::json!({
+                "question_id": p.question_id,
+                "recall_any_at_5": p.recall_any_at_5,
+                "recall_any_at_10": p.recall_any_at_10,
+                "recall_all_at_5": p.recall_all_at_5,
+                "recall_all_at_10": p.recall_all_at_10,
+                "ndcg_at_10": p.ndcg_at_10,
+                "ranked_session_ids": p.ranked_session_ids,
+                "answer_session_ids": p.answer_session_ids,
+                "elapsed_ms": p.elapsed_ms,
+            })).collect::<Vec<_>>(),
+        });
+        std::fs::write(&path, serde_json::to_string_pretty(&payload)?)?;
+        paths.push(path);
+    }
+    Ok(paths)
+}
+
+#[cfg(test)]
+mod output_tests {
+    use super::*;
+
+    fn fixture_report() -> BenchReport {
+        BenchReport {
+            system_version: "abcd1234".to_string(),
+            embedding_model: "Qwen3-test".to_string(),
+            timestamp_ms: 1730000000000,
+            limit: 50,
+            rungs: vec![RungReport {
+                rung_id: "longmemeval_raw".to_string(),
+                mempalace_label: "raw".to_string(),
+                aggregate_recall_any_at_5: 0.876,
+                aggregate_recall_any_at_10: 0.912,
+                aggregate_recall_all_at_5: 0.500,
+                aggregate_recall_all_at_10: 0.640,
+                aggregate_ndcg_at_10: 0.821,
+                per_question: vec![PerQuestionMetrics {
+                    question_id: "lme_q_0001".to_string(),
+                    recall_any_at_5: 1.0,
+                    recall_any_at_10: 1.0,
+                    recall_all_at_5: 0.0,
+                    recall_all_at_10: 1.0,
+                    ndcg_at_10: 0.85,
+                    ranked_session_ids: vec!["s1".into(), "s2".into()],
+                    answer_session_ids: vec!["s2".into()],
+                    elapsed_ms: 320,
+                }],
+            }],
+        }
+    }
+
+    #[test]
+    fn print_comparison_table_does_not_panic() {
+        let report = fixture_report();
+        // Smoke-test the print path; the function writes to stdout so we
+        // can't easily capture, but at minimum it should not panic.
+        print_comparison_table(&report);
+    }
+
+    #[test]
+    fn write_per_rung_json_creates_one_file_per_rung() {
+        let report = fixture_report();
+        let tmp = tempfile::TempDir::new().unwrap();
+        let paths = write_per_rung_json(&report, tmp.path()).unwrap();
+        assert_eq!(paths.len(), 1);
+        let bytes = std::fs::read(&paths[0]).unwrap();
+        let parsed: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(parsed["benchmark"], "longmemeval");
+        assert_eq!(parsed["mode"], "raw");
+        assert_eq!(parsed["system"], "mem");
+        assert_eq!(parsed["aggregate"]["recall_any_at_5"], 0.876);
+        assert_eq!(parsed["per_question"].as_array().unwrap().len(), 1);
+        assert_eq!(parsed["per_question"][0]["question_id"], "lme_q_0001");
+    }
+
+    #[test]
+    fn write_per_rung_json_filename_has_mem_prefix() {
+        let report = fixture_report();
+        let tmp = tempfile::TempDir::new().unwrap();
+        let paths = write_per_rung_json(&report, tmp.path()).unwrap();
+        let filename = paths[0].file_name().unwrap().to_string_lossy().to_string();
+        assert!(
+            filename.starts_with("results_mem_longmemeval_raw_"),
+            "expected results_mem_ prefix, got {filename}"
+        );
+        assert!(filename.ends_with(".json"));
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
