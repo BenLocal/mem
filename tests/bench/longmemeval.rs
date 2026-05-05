@@ -213,6 +213,174 @@ pub async fn retrieve_for_rung(
     Ok(run)
 }
 
+use mem::config::{Config, EmbeddingProviderKind};
+use mem::embedding::arc_embedding_provider;
+use mem::pipeline::eval_metrics::{ndcg_at_k, recall_all_at_k, recall_any_at_k};
+use std::time::Instant;
+
+#[derive(Debug, Clone)]
+#[allow(dead_code)] // fields consumed by Task 7 (pretty table + JSON output)
+pub struct PerQuestionMetrics {
+    pub question_id: String,
+    pub recall_any_at_5: f64,
+    pub recall_any_at_10: f64,
+    pub recall_all_at_5: f64,
+    pub recall_all_at_10: f64,
+    pub ndcg_at_10: f64,
+    pub ranked_session_ids: Vec<String>,
+    pub answer_session_ids: Vec<String>,
+    pub elapsed_ms: u128,
+}
+
+#[derive(Debug, Clone)]
+#[allow(dead_code)] // fields consumed by Task 7 (pretty table + JSON output)
+pub struct RungReport {
+    pub rung_id: String,
+    pub mempalace_label: String,
+    pub aggregate_recall_any_at_5: f64,
+    pub aggregate_recall_any_at_10: f64,
+    pub aggregate_recall_all_at_5: f64,
+    pub aggregate_recall_all_at_10: f64,
+    pub aggregate_ndcg_at_10: f64,
+    pub per_question: Vec<PerQuestionMetrics>,
+}
+
+#[derive(Debug, Clone)]
+#[allow(dead_code)] // fields consumed by Task 7 (pretty table + JSON output)
+pub struct BenchReport {
+    pub system_version: String,
+    pub embedding_model: String,
+    pub timestamp_ms: u128,
+    pub limit: usize,
+    pub rungs: Vec<RungReport>,
+}
+
+fn provider_kind_str(kind: EmbeddingProviderKind) -> &'static str {
+    match kind {
+        EmbeddingProviderKind::Fake => "fake",
+        EmbeddingProviderKind::EmbedAnything => "embedanything",
+        EmbeddingProviderKind::OpenAi => "openai",
+    }
+}
+
+/// Run the full LongMemEval bench across the given questions.
+/// For each question: ingest once, retrieve under each of the 3 rungs,
+/// score against the gold answer_session_ids, aggregate into RungReports.
+pub async fn run_longmemeval_bench(
+    questions: Vec<LongMemEvalQuestion>,
+) -> Result<BenchReport, Box<dyn std::error::Error>> {
+    // Build the production embedding provider from env-var config.
+    let cfg = Config::from_env()?;
+    let embedder: Arc<dyn EmbeddingProvider> = arc_embedding_provider(&cfg.embedding)?;
+    let embedding_dim = cfg.embedding.dim;
+    let embedding_model = cfg.embedding.model.clone();
+    let provider_str = provider_kind_str(cfg.embedding.provider);
+    if matches!(cfg.embedding.provider, EmbeddingProviderKind::Fake) {
+        eprintln!(
+            "WARNING: EMBEDDING_PROVIDER=fake — bench numbers will be \
+             meaningless for cross-system comparison. Set \
+             EMBEDDING_PROVIDER=embedanything (or similar) before running."
+        );
+    }
+
+    let mut per_rung_metrics: Vec<Vec<PerQuestionMetrics>> = vec![vec![]; RUNGS.len()];
+    let total_qs = questions.len();
+    eprintln!(
+        "[bench] running LongMemEval over {} questions x 3 rungs",
+        total_qs
+    );
+
+    for (q_idx, question) in questions.iter().enumerate() {
+        if q_idx % 25 == 0 {
+            eprintln!("[bench] progress: {}/{}", q_idx, total_qs);
+        }
+        let q_start = Instant::now();
+
+        // Per-question fresh DB + index. Ingest once.
+        let tmp = tempfile::TempDir::new()?;
+        let repo = DuckDbRepository::open(&tmp.path().join("bench.duckdb")).await?;
+        repo.set_transcript_job_provider(provider_str);
+        let total_blocks: usize = question
+            .haystack_sessions
+            .iter()
+            .map(|s| s.turns.len())
+            .sum();
+        let index = VectorIndex::new_in_memory(
+            embedding_dim,
+            "bench",
+            &embedding_model,
+            total_blocks.max(8),
+        );
+        ingest_corpus(&repo, &index, &embedder, question).await?;
+
+        // Re-rank under each rung.
+        let qrels: HashSet<String> = question.answer_session_ids.iter().cloned().collect();
+        for (rung_idx, rung) in RUNGS.iter().enumerate() {
+            let run = retrieve_for_rung(&repo, &index, &embedder, &question.question, rung).await?;
+            let elapsed_ms = q_start.elapsed().as_millis();
+            let metrics = PerQuestionMetrics {
+                question_id: question.question_id.clone(),
+                recall_any_at_5: recall_any_at_k(&run, &qrels, 5),
+                recall_any_at_10: recall_any_at_k(&run, &qrels, 10),
+                recall_all_at_5: recall_all_at_k(&run, &qrels, 5),
+                recall_all_at_10: recall_all_at_k(&run, &qrels, 10),
+                ndcg_at_10: ndcg_at_k(&run, &qrels, 10),
+                ranked_session_ids: run.clone(),
+                answer_session_ids: question.answer_session_ids.clone(),
+                elapsed_ms,
+            };
+            per_rung_metrics[rung_idx].push(metrics);
+        }
+    }
+
+    let mut rung_reports: Vec<RungReport> = Vec::with_capacity(RUNGS.len());
+    for (rung_idx, rung) in RUNGS.iter().enumerate() {
+        let pqs = &per_rung_metrics[rung_idx];
+        let n = pqs.len() as f64;
+        let mean = |sel: fn(&PerQuestionMetrics) -> f64| -> f64 {
+            if n == 0.0 {
+                0.0
+            } else {
+                pqs.iter().map(sel).sum::<f64>() / n
+            }
+        };
+        rung_reports.push(RungReport {
+            rung_id: rung.rung_id.to_string(),
+            mempalace_label: rung.mempalace_label.to_string(),
+            aggregate_recall_any_at_5: mean(|p| p.recall_any_at_5),
+            aggregate_recall_any_at_10: mean(|p| p.recall_any_at_10),
+            aggregate_recall_all_at_5: mean(|p| p.recall_all_at_5),
+            aggregate_recall_all_at_10: mean(|p| p.recall_all_at_10),
+            aggregate_ndcg_at_10: mean(|p| p.ndcg_at_10),
+            per_question: pqs.clone(),
+        });
+    }
+
+    Ok(BenchReport {
+        system_version: git_short_sha().unwrap_or_else(|| "unknown".to_string()),
+        embedding_model,
+        timestamp_ms: std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis())
+            .unwrap_or(0),
+        limit: total_qs,
+        rungs: rung_reports,
+    })
+}
+
+/// Best-effort git short SHA via `git rev-parse`. Returns None if git
+/// isn't available or this isn't a repo.
+fn git_short_sha() -> Option<String> {
+    let out = std::process::Command::new("git")
+        .args(["rev-parse", "--short=8", "HEAD"])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    Some(String::from_utf8_lossy(&out.stdout).trim().to_string())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -337,5 +505,29 @@ mod tests {
         // Session ids are unique (no duplicates from session-level projection).
         let unique: HashSet<&String> = run.iter().collect();
         assert_eq!(unique.len(), run.len());
+    }
+
+    #[tokio::test]
+    async fn run_longmemeval_bench_returns_3_rungs_for_tiny_input() {
+        // Uses production Config::from_env. Set EMBEDDING_PROVIDER=fake for
+        // this test to avoid model download. Other env vars must be valid.
+        std::env::set_var("EMBEDDING_PROVIDER", "fake");
+        std::env::set_var("EMBEDDING_MODEL", "fake");
+        std::env::set_var("EMBEDDING_DIM", "64");
+
+        let mut q = make_question(
+            "lme_q_smoke",
+            vec![
+                ("sess_a", vec![("user", "tokio rust async")]),
+                ("sess_b", vec![("user", "duckdb columnar")]),
+            ],
+        );
+        q.answer_session_ids = vec!["sess_a".to_string()];
+        let report = run_longmemeval_bench(vec![q]).await.unwrap();
+        assert_eq!(report.rungs.len(), 3);
+        for rung_report in &report.rungs {
+            assert_eq!(rung_report.per_question.len(), 1);
+        }
+        assert_eq!(report.limit, 1);
     }
 }
