@@ -122,3 +122,41 @@ async fn longmemeval_format_probe() {
         "PROBE COMPLETE — copy the field names above into LongMemEvalQuestion struct in Task 3"
     );
 }
+
+use bench::longmemeval::{print_comparison_table, run_longmemeval_bench, write_per_rung_json};
+use bench::longmemeval_dataset::load_from_env_or_skip;
+use std::path::PathBuf;
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "external dataset; set MEM_LONGMEMEVAL_PATH=..."]
+async fn longmemeval() {
+    let questions = match load_from_env_or_skip() {
+        Some(qs) => qs,
+        None => {
+            eprintln!("MEM_LONGMEMEVAL_PATH not set; skipping bench");
+            return;
+        }
+    };
+    let limit = std::env::var("MEM_LONGMEMEVAL_LIMIT")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(usize::MAX);
+    let questions: Vec<_> = questions.into_iter().take(limit).collect();
+    eprintln!(
+        "[bench] loaded {} questions (limit applied)",
+        questions.len()
+    );
+
+    let report = run_longmemeval_bench(questions)
+        .await
+        .expect("run_longmemeval_bench");
+
+    print_comparison_table(&report);
+
+    let out_dir = PathBuf::from("target/bench-out");
+    let paths = write_per_rung_json(&report, &out_dir).expect("write json");
+    for p in &paths {
+        eprintln!("[bench] wrote {}", p.display());
+    }
+    // No assertions — informational only (manual decision tool).
+}
