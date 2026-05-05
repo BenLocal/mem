@@ -89,10 +89,133 @@ fn stable_session_seed_ms(session_id: &str) -> u64 {
     1_700_000_000_000 + (h % (90 * 86_400_000))
 }
 
+use super::runner::SourceMix;
+use mem::pipeline::transcript_recall::{score_candidates, ScoringOpts};
+use std::collections::{HashMap, HashSet};
+
+const TOP_K_CANDIDATES: usize = 50;
+
+#[derive(Debug, Clone, Copy)]
+#[allow(dead_code)] // rung_id + mempalace_label used by Task 8 bench harness
+pub struct LongMemEvalRung {
+    pub rung_id: &'static str,
+    pub mempalace_label: &'static str,
+    pub source: SourceMix,
+    pub disable_session_cooc: bool,
+    pub disable_anchor: bool,
+    pub disable_freshness: bool,
+}
+
+#[rustfmt::skip]
+pub const RUNGS: &[LongMemEvalRung] = &[
+    LongMemEvalRung {
+        rung_id: "longmemeval_raw",
+        mempalace_label: "raw",
+        source: SourceMix::HnswOnly,
+        disable_session_cooc: true,
+        disable_anchor: true,
+        disable_freshness: true,
+    },
+    LongMemEvalRung {
+        rung_id: "longmemeval_rooms",
+        mempalace_label: "rooms",
+        source: SourceMix::HnswOnly,
+        disable_session_cooc: false,
+        disable_anchor: true,
+        disable_freshness: true,
+    },
+    LongMemEvalRung {
+        rung_id: "longmemeval_full",
+        mempalace_label: "full",
+        source: SourceMix::Both,
+        disable_session_cooc: false,
+        disable_anchor: false,
+        disable_freshness: false,
+    },
+];
+
+/// Retrieve and rank under the given rung's config; project to session-level
+/// top-K. Caller supplies an already-populated repo + vector index for the
+/// current question's corpus.
+pub async fn retrieve_for_rung(
+    repo: &DuckDbRepository,
+    index: &VectorIndex,
+    embedder: &Arc<dyn EmbeddingProvider>,
+    query_text: &str,
+    rung: &LongMemEvalRung,
+) -> Result<Vec<String>, Box<dyn std::error::Error>> {
+    // 1. Get candidates per source mix.
+    let bm25 = match rung.source {
+        SourceMix::Bm25Only | SourceMix::Both => repo
+            .bm25_transcript_candidates(TENANT, query_text, TOP_K_CANDIDATES)
+            .await
+            .unwrap_or_default(),
+        SourceMix::HnswOnly => vec![],
+    };
+    let hnsw_ids: Vec<(String, f32)> = match rung.source {
+        SourceMix::HnswOnly | SourceMix::Both => {
+            let qv = embedder.embed_text(query_text).await?;
+            index
+                .search(&qv, TOP_K_CANDIDATES)
+                .await
+                .unwrap_or_default()
+        }
+        SourceMix::Bm25Only => vec![],
+    };
+
+    // 2. Build rank maps (rank starts at 1).
+    let mut lex_ranks: HashMap<String, usize> = HashMap::new();
+    for (i, m) in bm25.iter().enumerate() {
+        lex_ranks.insert(m.message_block_id.clone(), i + 1);
+    }
+    let mut sem_ranks: HashMap<String, usize> = HashMap::new();
+    for (i, (id, _)) in hnsw_ids.iter().enumerate() {
+        sem_ranks.insert(id.clone(), i + 1);
+    }
+
+    // 3. Hydrate HNSW candidates back to ConversationMessage. BM25 already
+    // returned full records; for HNSW-only ids, fetch from repo by id.
+    let mut by_id: HashMap<String, mem::domain::ConversationMessage> = HashMap::new();
+    for m in bm25.into_iter() {
+        by_id.entry(m.message_block_id.clone()).or_insert(m);
+    }
+    for (id, _) in &hnsw_ids {
+        if !by_id.contains_key(id) {
+            if let Ok(Some(m)) = repo.get_conversation_message_by_id(TENANT, id).await {
+                by_id.insert(id.clone(), m);
+            }
+        }
+    }
+    let candidates: Vec<mem::domain::ConversationMessage> = by_id.into_values().collect();
+
+    // 4. Score via production pipeline.
+    let opts = ScoringOpts {
+        anchor_session_id: None, // LongMemEval has no anchor concept
+        disable_session_cooc: rung.disable_session_cooc,
+        disable_anchor: rung.disable_anchor,
+        disable_freshness: rung.disable_freshness,
+    };
+    let scored = score_candidates(candidates, &lex_ranks, &sem_ranks, opts);
+
+    // 5. Project to session-level top-K (highest-score block per session).
+    let mut session_seen: HashSet<String> = HashSet::new();
+    let mut run: Vec<String> = Vec::with_capacity(20);
+    for sb in scored {
+        if let Some(sid) = sb.message.session_id.clone() {
+            if session_seen.insert(sid.clone()) {
+                run.push(sid);
+                if run.len() >= 20 {
+                    break;
+                }
+            }
+        }
+    }
+    Ok(run)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::collections::HashSet;
 
     pub(super) fn make_question(
         qid: &str,
@@ -178,5 +301,41 @@ mod tests {
         };
         let count = ingest_corpus(&repo, &index, &embedder, &q).await.unwrap();
         assert_eq!(count, 1);
+    }
+
+    #[tokio::test]
+    async fn retrieve_for_rung_returns_session_level_run() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let repo = DuckDbRepository::open(&tmp.path().join("ret.duckdb"))
+            .await
+            .unwrap();
+        repo.set_transcript_job_provider("fake");
+        let index = VectorIndex::new_in_memory(64, "fake", "fake", 16);
+        let embedder: Arc<dyn EmbeddingProvider> = Arc::new(FakeEmbeddingProvider::new("fake", 64));
+
+        let q = make_question(
+            "lme_q_test",
+            vec![
+                ("sess_a", vec![("user", "tokio rust async runtime")]),
+                ("sess_b", vec![("user", "duckdb columnar storage")]),
+                ("sess_c", vec![("user", "tokio futures")]),
+            ],
+        );
+        ingest_corpus(&repo, &index, &embedder, &q).await.unwrap();
+
+        let rung = RUNGS[0]; // longmemeval_raw
+        let run = retrieve_for_rung(&repo, &index, &embedder, "tokio runtime", &rung)
+            .await
+            .unwrap();
+        assert!(!run.is_empty(), "raw rung should return some sessions");
+        assert!(
+            run.iter()
+                .all(|s| ["sess_a", "sess_b", "sess_c"].contains(&s.as_str())),
+            "all returned ids should be from the ingested sessions, got {:?}",
+            run
+        );
+        // Session ids are unique (no duplicates from session-level projection).
+        let unique: HashSet<&String> = run.iter().collect();
+        assert_eq!(unique.len(), run.len());
     }
 }
