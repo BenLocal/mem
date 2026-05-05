@@ -233,7 +233,7 @@ pub fn merge_windows(items: Vec<PrimaryWithContext>) -> Vec<MergedWindow> {
         }
     }
 
-    windows.sort_by(|a, b| b.score.cmp(&a.score));
+    windows.sort_by_key(|b| std::cmp::Reverse(b.score));
     windows
 }
 

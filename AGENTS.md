@@ -32,6 +32,7 @@ cross build --release                          # cross-compile (reads ./Cross.to
 - **Tests:** integration tests live in `tests/` at the repo root (e.g. `tests/search_api.rs`, `tests/vector_index.rs`). Unit tests sit inline as `#[cfg(test)] mod tests` at the bottom of source files. **No** colocated `*_test.rs` convention in this codebase.
 - **Schema migrations:** `db/schema/*.sql` files are append-only; never edit historical files in-place. Add a new numbered file for new tables / columns.
 - **Commit scope tags:** `feat(area)`, `fix(area)`, `docs(area)`, `test(area)`, `refactor(area)`, `chore`. When closing a roadmap item: `… (closes mempalace-diff §8 #N)`.
+- **Pre-commit CI check:** Before every commit, run `cargo fmt --check && cargo clippy --all-targets -- -D warnings` to ensure CI will pass. Never commit code that fails these checks.
 
 ---
 
