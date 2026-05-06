@@ -266,7 +266,7 @@ async fn retrieve_and_rank(
 
     // Step 3: Union of candidates, deduplicated by message_block_id.
     let mut by_id: HashMap<String, ConversationMessage> = HashMap::new();
-    for m in bm25.into_iter().chain(hnsw.into_iter()) {
+    for m in bm25.into_iter().chain(hnsw) {
         by_id.entry(m.message_block_id.clone()).or_insert(m);
     }
     let candidates: Vec<ConversationMessage> = by_id.into_values().collect();

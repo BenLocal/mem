@@ -32,7 +32,11 @@ cross build --release                          # cross-compile (reads ./Cross.to
 - **Tests:** integration tests live in `tests/` at the repo root (e.g. `tests/search_api.rs`, `tests/vector_index.rs`). Unit tests sit inline as `#[cfg(test)] mod tests` at the bottom of source files. **No** colocated `*_test.rs` convention in this codebase.
 - **Schema migrations:** `db/schema/*.sql` files are append-only; never edit historical files in-place. Add a new numbered file for new tables / columns.
 - **Commit scope tags:** `feat(area)`, `fix(area)`, `docs(area)`, `test(area)`, `refactor(area)`, `chore`. When closing a roadmap item: `… (closes mempalace-diff §8 #N)`.
-- **Pre-commit CI check:** Before every commit, run `cargo fmt --check && cargo clippy --all-targets -- -D warnings` to ensure CI will pass. Never commit code that fails these checks.
+- **Pre-commit CI check (mandatory):** Before EVERY commit, run BOTH:
+  1. `cargo fmt --check`
+  2. `cargo clippy --all-targets -- -D warnings`
+
+  CI runs both gates on the full crate including `tests/` (note `--all-targets`); a clippy lint inside an integration test or bench file (e.g. `tests/bench/runner.rs`) will fail CI just like one in `src/`. Never commit if either check fails. If clippy flags a lint, fix the lint — do not silence with `#[allow(...)]` unless you have a documented reason.
 
 ---
 
