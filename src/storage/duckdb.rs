@@ -486,6 +486,12 @@ impl DuckDbRepository {
 
     /// Claims the next eligible job, moving it to `processing`. Eligible means `pending`, or
     /// `failed` with `attempt_count < max_retries` (configured retry budget).
+    ///
+    /// Before claiming, sweeps any orphan jobs (memory_id no longer in `memories`) into a
+    /// terminal `failed` state with `attempt_count = max_retries`. This guards against
+    /// supersede / delete edge cases where an embedding_jobs row outlives its parent memory:
+    /// without this sweep, the worker would claim the orphan, hit a FK violation on the
+    /// status UPDATE, and retry forever in a tight 1Hz loop.
     pub async fn claim_next_embedding_job(
         &self,
         now: &str,
@@ -494,6 +500,24 @@ impl DuckDbRepository {
         let mut conn = self.conn()?;
         let tx = conn.transaction()?;
         let max_r = i64::from(max_retries);
+
+        // Sweep orphan jobs (memory_id has no row in memories) into a terminal failed state.
+        // The UPDATE filters by job_id (the PK) only, so it does not re-touch the FK column.
+        tx.execute(
+            "update embedding_jobs
+             set status = 'failed',
+                 attempt_count = ?1,
+                 last_error = coalesce(last_error, 'memory row missing for embedding job (orphan FK)'),
+                 updated_at = ?2
+             where job_id in (
+                 select j.job_id
+                 from embedding_jobs j
+                 left join memories m on m.memory_id = j.memory_id
+                 where m.memory_id is null
+                   and (j.status = 'pending' or (j.status = 'failed' and j.attempt_count < ?1))
+             )",
+            params![max_r, now],
+        )?;
 
         let job_id: Option<String> = tx
             .query_row(
