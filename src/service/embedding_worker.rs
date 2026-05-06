@@ -35,11 +35,34 @@ pub async fn tick(
     settings: &EmbeddingSettings,
 ) -> Result<(), StorageError> {
     let now = current_timestamp();
-    let Some(job) = repo
+    let job = match repo
         .claim_next_embedding_job(&now, settings.max_retries)
-        .await?
-    else {
-        return Ok(());
+        .await
+    {
+        Ok(Some(j)) => j,
+        Ok(None) => return Ok(()),
+        Err(err) => {
+            // Last-resort defense against orphan FK violations: if claim raises
+            // a "key does not exist in the referenced table" error, the
+            // open-time sweep failed to catch this row (stale binary, multiple
+            // processes, or fresh orphan inserted after sweep). Parse the
+            // memory_id out of the error message and direct-delete every job
+            // referencing it. DELETE-by-memory_id has no INSERT half so it
+            // does not re-fire FK; the loop dies on the next tick.
+            if let Some(mid) = extract_orphan_memory_id(&err.to_string()) {
+                let deleted = repo
+                    .delete_embedding_jobs_by_memory_id(&mid)
+                    .await
+                    .unwrap_or(0);
+                warn!(
+                    memory_id = %mid,
+                    deleted_jobs = deleted,
+                    "FK violation in claim_next_embedding_job; direct-deleted orphan jobs by memory_id (open-time sweep apparently missed this row)"
+                );
+                return Ok(());
+            }
+            return Err(err);
+        }
     };
     info!(
         job_id = %job.job_id,
@@ -213,4 +236,46 @@ async fn record_failure(
             .await?;
     }
     Ok(())
+}
+
+/// Parse a memory_id out of a DuckDB FK violation error message of the form
+/// `... key "memory_id: <id>" does not exist in the referenced table ...`.
+/// Returns None if the pattern doesn't match (caller propagates the error).
+fn extract_orphan_memory_id(err: &str) -> Option<String> {
+    // Look for the literal sentinel `key "memory_id: ` followed by id then `"`.
+    let needle = r#"key "memory_id: "#;
+    let start = err.find(needle)? + needle.len();
+    let rest = &err[start..];
+    let end = rest.find('"')?;
+    let id = &rest[..end];
+    if id.is_empty() {
+        None
+    } else {
+        Some(id.to_string())
+    }
+}
+
+#[cfg(test)]
+mod parse_tests {
+    use super::*;
+
+    #[test]
+    fn extracts_memory_id_from_fk_error() {
+        let err = "duckdb error: Constraint Error: Violates foreign key constraint because key \"memory_id: mem_019de690-431d-7133-8b5a-2becc0e2ea43\" does not exist in the referenced table";
+        assert_eq!(
+            extract_orphan_memory_id(err).as_deref(),
+            Some("mem_019de690-431d-7133-8b5a-2becc0e2ea43")
+        );
+    }
+
+    #[test]
+    fn returns_none_for_unrelated_error() {
+        assert!(extract_orphan_memory_id("some other error").is_none());
+    }
+
+    #[test]
+    fn returns_none_when_no_id_after_marker() {
+        let err = "key \"memory_id: \"";
+        assert_eq!(extract_orphan_memory_id(err), None);
+    }
 }

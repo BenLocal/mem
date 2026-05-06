@@ -1088,6 +1088,25 @@ impl DuckDbRepository {
         Ok(())
     }
 
+    /// Last-resort orphan cleanup: DELETE every `embedding_jobs` row matching
+    /// the argument's `memory_id`. Used by the worker's defensive fallback
+    /// when `claim_next_embedding_job` returns a FK violation the upstream
+    /// sweep didn't catch (stale binary, multiple processes, or fresh orphan
+    /// inserted between sweep and claim). Returns the number of rows deleted.
+    /// DELETE-by-memory_id has no INSERT half, so it cannot re-fire FK on a
+    /// missing parent.
+    pub async fn delete_embedding_jobs_by_memory_id(
+        &self,
+        memory_id: &str,
+    ) -> Result<usize, StorageError> {
+        let conn = self.conn()?;
+        let n = conn.execute(
+            "delete from embedding_jobs where memory_id = ?1",
+            params![memory_id],
+        )?;
+        Ok(n)
+    }
+
     pub async fn get_memory(
         &self,
         memory_id: String,
