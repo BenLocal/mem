@@ -77,6 +77,23 @@ async fn remove_unknown_id_is_noop() {
     assert_eq!(idx.size(), 0);
 }
 
+#[tokio::test]
+async fn upsert_grows_capacity_past_initial_hint() {
+    // Regression for: WARN "vector index upsert failed; ... usearch error:
+    // Reserve capacity ahead of insertions!" — usearch HNSW does NOT
+    // auto-grow capacity. Before the fix, the 9th unique insert (capacity
+    // hint floors at 8) failed silently and the embedding row was written
+    // only to DuckDB, falling out of the sidecar until `mem repair --rebuild`.
+    // capacity_hint of 4 is floored to 8 inside new_in_memory.
+    let idx = VectorIndex::new_in_memory(64, "fake", "fake", 4);
+    for i in 0..32u8 {
+        idx.upsert(&format!("mem_{i}"), &unit_vector(64, i))
+            .await
+            .unwrap_or_else(|e| panic!("upsert mem_{i} failed past hint: {e}"));
+    }
+    assert_eq!(idx.size(), 32);
+}
+
 use mem::storage::vector_index::VectorIndexMeta;
 
 #[test]

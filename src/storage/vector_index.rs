@@ -254,6 +254,22 @@ impl VectorIndex {
         let index = self.lock_index_write()?;
         // remove is idempotent; ignore "not found" semantics
         let _ = index.remove(key);
+
+        // Grow capacity before `add`. usearch HNSW does NOT auto-grow:
+        // calling `add` past current `capacity()` returns the error
+        // "Reserve capacity ahead of insertions!". The initial `reserve` is
+        // only set at construction (`new_in_memory`) or open
+        // (`from_existing` path); without this guard, the very first new
+        // memory beyond the boot-time row_count silently falls out of the
+        // sidecar and only the DuckDB row remains. Geometric (×2) growth
+        // amortises reserve cost.
+        if index.size() + 1 > index.capacity() {
+            let new_cap = index.capacity().max(8).saturating_mul(2);
+            index
+                .reserve(new_cap)
+                .map_err(|e| VectorIndexError::UsearchOp(e.to_string()))?;
+        }
+
         index
             .add(key, embedding)
             .map_err(|e| VectorIndexError::UsearchOp(e.to_string()))?;
