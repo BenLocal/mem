@@ -1330,19 +1330,10 @@ impl DuckDbRepository {
             return Ok(());
         }
         let conn = self.conn()?;
-        // `LOAD fts;` is normally done at bootstrap, but defensive in case
-        // the extension state was reset. The bundled FTS extension does not
-        // accept the `overwrite := 1` named arg, so we drop-then-create for
-        // idempotency. `drop_fts_index` is best-effort: it errors on first
-        // run when the index doesn't exist yet, which we tolerate.
-        let _ = conn.execute_batch("load fts;");
-        let _ = conn.execute_batch("pragma drop_fts_index('memories');");
-        if let Err(e) = conn.execute_batch(
-            "pragma create_fts_index('memories', 'memory_id', 'summary', 'content');",
-        ) {
+        if let Err(e) = rebuild_memories_fts(&conn) {
             // Restore the flag so the next caller retries the build.
             self.fts_dirty.store(true, Ordering::Release);
-            return Err(StorageError::DuckDb(e));
+            return Err(e);
         }
         Ok(())
     }
@@ -2039,6 +2030,81 @@ pub(crate) fn sweep_orphan_embeddings(conn: &Connection) -> Result<usize, Storag
     Ok(deleted)
 }
 
+/// Rebuild the FTS index for the `memories` table, with a fallback path for
+/// the bundled DuckDB FTS 1.x dependency-tracker bug.
+///
+/// Background: in 2026-05 we observed `/memories/search` returning
+///   `Failed to commit: Could not commit creation of dependency,
+///    subject "stopwords" has been deleted`
+/// reliably on the second-or-later rebuild against a single long-lived
+/// connection. Root cause: the bundled FTS extension's in-memory catalog
+/// keeps a stale dependency edge to the just-dropped `stopwords` macro.
+/// `CHECKPOINT` does not clear this state, and `create_fts_index(...,
+/// overwrite := 1)` is rejected by the bundled binder (only the
+/// 2-positional-arg form is recognised).
+///
+/// Strategy: try the normal drop+create path. If create fails with the
+/// stopwords-dependency signature, force a full extension reload
+/// (`INSTALL fts; LOAD fts;`) which resets the in-memory dependency
+/// catalog, then retry the create. If the second attempt still fails the
+/// caller observes the original error (and `fts_dirty` stays set so the
+/// next BM25 query retries — without a successful retry the search path
+/// still falls back to non-BM25 lexical via `lexical_candidates`).
+fn rebuild_memories_fts(conn: &Connection) -> Result<(), StorageError> {
+    fts_rebuild_with_reload_fallback(
+        conn,
+        "memories",
+        "pragma create_fts_index('memories', 'memory_id', 'summary', 'content');",
+    )
+}
+
+/// Mirror of [`rebuild_memories_fts`] for the transcript archive's
+/// `conversation_messages` FTS index.
+pub(crate) fn rebuild_transcripts_fts(conn: &Connection) -> Result<(), StorageError> {
+    fts_rebuild_with_reload_fallback(
+        conn,
+        "conversation_messages",
+        "pragma create_fts_index('conversation_messages', 'message_block_id', 'content');",
+    )
+}
+
+fn fts_rebuild_with_reload_fallback(
+    conn: &Connection,
+    table: &str,
+    create_sql: &str,
+) -> Result<(), StorageError> {
+    let drop_sql = format!("pragma drop_fts_index('{table}');");
+    // First attempt: load (idempotent), drop (best-effort — errors first time
+    // when no index exists, swallow), create.
+    let _ = conn.execute_batch("load fts;");
+    let _ = conn.execute_batch(&drop_sql);
+    match conn.execute_batch(create_sql) {
+        Ok(()) => return Ok(()),
+        Err(e) if is_fts_dependency_error(&e.to_string()) => {
+            // Fall through to the reload-and-retry path.
+        }
+        Err(e) => return Err(StorageError::DuckDb(e)),
+    }
+
+    // Second attempt: forcibly reload the FTS extension to drop the bundled
+    // catalog's stale dependency edges, then drop+create again. INSTALL is a
+    // no-op when the extension is already on disk; LOAD re-binds the per-
+    // connection extension state and (empirically) clears the dependency
+    // tracker. CHECKPOINT alone does not clear this state.
+    let _ = conn.execute_batch("install fts;");
+    let _ = conn.execute_batch("load fts;");
+    let _ = conn.execute_batch(&drop_sql);
+    conn.execute_batch(create_sql).map_err(StorageError::DuckDb)
+}
+
+fn is_fts_dependency_error(msg: &str) -> bool {
+    // Match on the stable identifying substring: `subject "stopwords"`. The
+    // surrounding text varies ("Failed to commit:", "Could not commit
+    // creation of dependency, subject 'stopwords' has been deleted"), but
+    // the subject-of-the-broken-dep is invariant across DuckDB 1.x.
+    msg.contains("\"stopwords\"") || msg.contains("'stopwords'")
+}
+
 fn delete_embedding_references(conn: &Connection, memory_id: &str) -> Result<(), StorageError> {
     conn.execute(
         "delete from embedding_jobs where memory_id = ?1",
@@ -2346,5 +2412,33 @@ fn decode_feedback_kind(value: &str) -> Option<FeedbackKind> {
         "applies_here" => Some(FeedbackKind::AppliesHere),
         "does_not_apply_here" => Some(FeedbackKind::DoesNotApplyHere),
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod fts_recovery_tests {
+    use super::is_fts_dependency_error;
+
+    #[test]
+    fn detects_double_quoted_subject() {
+        let msg = r#"duckdb error: TransactionContext Error: Failed to commit: Could not commit creation of dependency, subject "stopwords" has been deleted"#;
+        assert!(is_fts_dependency_error(msg));
+    }
+
+    #[test]
+    fn detects_single_quoted_subject() {
+        let msg = "Could not commit creation of dependency, subject 'stopwords' has been deleted";
+        assert!(is_fts_dependency_error(msg));
+    }
+
+    #[test]
+    fn does_not_match_unrelated_errors() {
+        assert!(!is_fts_dependency_error(
+            "Constraint Error: Violates foreign key constraint"
+        ));
+        assert!(!is_fts_dependency_error(
+            "Binder Error: No function matches"
+        ));
+        assert!(!is_fts_dependency_error(""));
     }
 }

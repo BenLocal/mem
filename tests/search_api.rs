@@ -517,3 +517,91 @@ async fn negative_feedback_penalizes_future_recall() {
     assert_eq!(after.status(), 200);
     assert_eq!(after.json()["relevant_facts"][0]["memory_id"], "mem_backup");
 }
+
+// Regression for the FTS rebuild "stopwords has been deleted" failure mode
+// (docs/api-data-flow.md §5.1, observed 2026-05-06). The bundled DuckDB FTS
+// 1.x dependency tracker keeps a stale edge to the just-dropped `stopwords`
+// macro, so the second-and-onward rebuild on a long-lived connection used to
+// 500 with the dependency-commit error. Fix: detect that error class and
+// retry once after `INSTALL fts; LOAD fts;` to reset extension state. This
+// test exercises the repeat-rebuild scenario via the public HTTP surface —
+// two dirtying writes followed by two searches against the same `AppState`
+// (and therefore the same long-lived DuckDB connection).
+#[tokio::test]
+async fn fts_rebuild_survives_repeat_dirty_cycles() {
+    let app = seeded_search_app(vec![memory(MemorySpec {
+        tenant: "local",
+        memory_id: "mem_first",
+        memory_type: MemoryType::Implementation,
+        scope: Scope::Repo,
+        repo: Some("mem"),
+        project: Some("mem"),
+        module: Some("storage"),
+        content: "first round payload for the FTS rebuild probe",
+        summary: "first round summary",
+        updated_at: "2026-05-06T00:00:01Z",
+        decay_score: 0.0,
+    })])
+    .await;
+
+    // First search: triggers the initial drop+create cycle inside
+    // `ensure_fts_index_fresh`.
+    let first = app
+        .post_json(
+            "/memories/search",
+            json!({
+                "query": "rebuild probe",
+                "intent": "debugging",
+                "scope_filters": [],
+                "token_budget": 300,
+                "caller_agent": "codex-worker",
+                "expand_graph": false,
+                "tenant": "local",
+            }),
+        )
+        .await;
+    assert_eq!(first.status(), 200, "first search must succeed");
+
+    // Insert another memory through the public API — this writes a row into
+    // `memories` and flips the `fts_dirty` flag back to true.
+    let ingest = app
+        .post_json(
+            "/memories",
+            json!({
+                "memory_type": "implementation",
+                "content": "second round payload for the FTS rebuild probe",
+                "scope": "repo",
+                "visibility": "shared",
+                "repo": "mem",
+                "module": "storage",
+                "source_agent": "test",
+                "tenant": "local",
+            }),
+        )
+        .await;
+    assert_eq!(ingest.status(), 201, "ingest must succeed");
+
+    // Second search: triggers `ensure_fts_index_fresh` a second time on the
+    // same connection. Pre-fix this would 500 with
+    //   "Could not commit creation of dependency, subject \"stopwords\" has
+    //    been deleted".
+    let second = app
+        .post_json(
+            "/memories/search",
+            json!({
+                "query": "rebuild probe",
+                "intent": "debugging",
+                "scope_filters": [],
+                "token_budget": 300,
+                "caller_agent": "codex-worker",
+                "expand_graph": false,
+                "tenant": "local",
+            }),
+        )
+        .await;
+    assert_eq!(
+        second.status(),
+        200,
+        "second search must succeed (FTS dependency-tracker workaround)"
+    );
+}

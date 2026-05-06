@@ -389,17 +389,9 @@ impl DuckDbRepository {
             return Ok(());
         }
         let conn = self.conn()?;
-        // `LOAD fts;` is idempotent; defensive against state reset.
-        let _ = conn.execute_batch("load fts;");
-        // Drop existing index (errors first time when none exists; ignore).
-        let _ = conn.execute_batch("pragma drop_fts_index('conversation_messages');");
-        // Build full-table index (no `where := '...'` per Task 2 probe).
-        if let Err(e) = conn.execute_batch(
-            "pragma create_fts_index('conversation_messages', 'message_block_id', 'content');",
-        ) {
-            // Restore the flag so the next caller retries.
+        if let Err(e) = super::duckdb::rebuild_transcripts_fts(&conn) {
             self.transcripts_fts_dirty.store(true, Ordering::Release);
-            return Err(StorageError::DuckDb(e));
+            return Err(e);
         }
         Ok(())
     }

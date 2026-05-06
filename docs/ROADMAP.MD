@@ -48,7 +48,7 @@ ROADMAP #1–#15 全部完成；新增项的触发条件，按性质分两条：
 
 已知 incident TODO（不计入 ROADMAP，但留档）：
 1. 找出 `embedding_jobs` orphan 行的产生路径（疑在某条 supersede / delete pipeline）
-2. 修复 `migrate_content_hash_to_sha256` 在带子表行时的 FK 失败（DuckDB UPDATE = DELETE+INSERT）
+2. ~~修复 `migrate_content_hash_to_sha256` 在带子表行时的 FK 失败~~ ✅ `6af5a3e`（load/delete/restore dance）
 3. 检测同一 `.duckdb` 文件多进程写入（advisory lock / pid file）
 
 详见 mem incident memory `mem_019dfba4-9e08-71b2-a676-f0218c01f9b6`。
