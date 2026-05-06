@@ -254,7 +254,8 @@ pub struct BenchReport {
     pub system_version: String,
     pub embedding_model: String,
     pub timestamp_ms: u128,
-    pub limit: usize,
+    pub question_count: usize,
+    pub used_fake_embedder: bool,
     pub rungs: Vec<RungReport>,
 }
 
@@ -270,7 +271,8 @@ pub async fn run_longmemeval_bench(
     let embedding_dim = cfg.embedding.dim;
     let embedding_model = cfg.embedding.model.clone();
     let provider_str = cfg.embedding.job_provider_id();
-    if matches!(cfg.embedding.provider, EmbeddingProviderKind::Fake) {
+    let used_fake_embedder = matches!(cfg.embedding.provider, EmbeddingProviderKind::Fake);
+    if used_fake_embedder {
         eprintln!(
             "WARNING: EMBEDDING_PROVIDER=fake — bench numbers will be \
              meaningless for cross-system comparison. Set \
@@ -352,13 +354,15 @@ pub async fn run_longmemeval_bench(
     }
 
     Ok(BenchReport {
-        system_version: git_short_sha().unwrap_or_else(|| "unknown".to_string()),
+        system_version: git_short_sha()
+            .unwrap_or_else(|| format!("v{}", env!("CARGO_PKG_VERSION"))),
         embedding_model,
         timestamp_ms: std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_millis())
             .unwrap_or(0),
-        limit: total_qs,
+        question_count: total_qs,
+        used_fake_embedder,
         rungs: rung_reports,
     })
 }
@@ -387,14 +391,29 @@ const MEMPALACE_BASELINES: &[(&str, &str)] = &[
 
 pub fn print_comparison_table(report: &BenchReport) {
     let mut out = String::new();
+    let max_rung_id_width = report
+        .rungs
+        .iter()
+        .map(|r| r.rung_id.len())
+        .max()
+        .unwrap_or(19);
+    let max_rung_id_width = max_rung_id_width.max(19);
     let _ = writeln!(
         &mut out,
         "=== Mem vs MemPalace LongMemEval ({} questions, run {}) ===",
-        report.limit, report.timestamp_ms
+        report.question_count, report.timestamp_ms
     );
+    if report.used_fake_embedder {
+        let _ = writeln!(
+            &mut out,
+            "! WARNING: EMBEDDING_PROVIDER=fake — numbers below are meaningless for cross-system comparison"
+        );
+    }
     let _ = writeln!(
         &mut out,
-        "                    R@5(any) R@10(any) NDCG@10  | mempalace baseline"
+        "{:<width$}   R@5(any) R@10(any) NDCG@10  | mempalace baseline",
+        "",
+        width = max_rung_id_width
     );
     for r in &report.rungs {
         let baseline = MEMPALACE_BASELINES
@@ -404,12 +423,13 @@ pub fn print_comparison_table(report: &BenchReport) {
             .unwrap_or("(no baseline)");
         let _ = writeln!(
             &mut out,
-            "{:<19}   {:.3}     {:.3}    {:.3}  | mempalace {}",
+            "{:<width$}   {:.3}     {:.3}    {:.3}  | mempalace {}",
             r.rung_id,
             r.aggregate_recall_any_at_5,
             r.aggregate_recall_any_at_10,
             r.aggregate_ndcg_at_10,
-            baseline
+            baseline,
+            width = max_rung_id_width
         );
     }
     let _ = writeln!(&mut out);
@@ -447,7 +467,8 @@ pub fn write_per_rung_json(
             "embedding_model": report.embedding_model,
             "system_version": report.system_version,
             "timestamp_ms": report.timestamp_ms,
-            "limit": report.limit,
+            "question_count": report.question_count,
+            "used_fake_embedder": report.used_fake_embedder,
             "aggregate": {
                 "recall_any_at_5": r.aggregate_recall_any_at_5,
                 "recall_any_at_10": r.aggregate_recall_any_at_10,
@@ -482,7 +503,8 @@ mod output_tests {
             system_version: "abcd1234".to_string(),
             embedding_model: "Qwen3-test".to_string(),
             timestamp_ms: 1730000000000,
-            limit: 50,
+            question_count: 50,
+            used_fake_embedder: false,
             rungs: vec![RungReport {
                 rung_id: "longmemeval_raw".to_string(),
                 mempalace_label: "raw".to_string(),
@@ -674,6 +696,9 @@ mod tests {
     async fn run_longmemeval_bench_returns_3_rungs_for_tiny_input() {
         // Uses production Config::from_env. Set EMBEDDING_PROVIDER=fake for
         // this test to avoid model download. Other env vars must be valid.
+        let prev_provider = std::env::var("EMBEDDING_PROVIDER").ok();
+        let prev_model = std::env::var("EMBEDDING_MODEL").ok();
+        let prev_dim = std::env::var("EMBEDDING_DIM").ok();
         std::env::set_var("EMBEDDING_PROVIDER", "fake");
         std::env::set_var("EMBEDDING_MODEL", "fake");
         std::env::set_var("EMBEDDING_DIM", "64");
@@ -691,7 +716,20 @@ mod tests {
         for rung_report in &report.rungs {
             assert_eq!(rung_report.per_question.len(), 1);
         }
-        assert_eq!(report.limit, 1);
+        assert_eq!(report.question_count, 1);
+
+        match prev_provider {
+            Some(v) => std::env::set_var("EMBEDDING_PROVIDER", v),
+            None => std::env::remove_var("EMBEDDING_PROVIDER"),
+        }
+        match prev_model {
+            Some(v) => std::env::set_var("EMBEDDING_MODEL", v),
+            None => std::env::remove_var("EMBEDDING_MODEL"),
+        }
+        match prev_dim {
+            Some(v) => std::env::set_var("EMBEDDING_DIM", v),
+            None => std::env::remove_var("EMBEDDING_DIM"),
+        }
     }
 
     #[test]
