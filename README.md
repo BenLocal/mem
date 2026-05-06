@@ -248,6 +248,23 @@ Response shape: `{ "windows": [{ "session_id": "...", "blocks": [...], "primary_
 
 `mem repair --check|--rebuild` covers both sidecars (memories and transcripts) in one pass.
 
+## Benches: Two Different Tools, Different Questions
+
+Mem ships two benches that look similar (both use `tests/bench/` plumbing,
+both produce per-rung JSON in `target/bench-out/`) but answer different
+questions. Pick the right one:
+
+| Bench | Question | When to use | Where |
+|---|---|---|---|
+| **Recall Quality Bench** | Internal: do mem's own ranking signals each carry weight? Should we invest in cross-encoder rerank? | When tuning mem's stack; CI regression smoke | `tests/recall_bench.rs`, 10-rung ablation, synthetic + real fixtures |
+| **MemPalace LongMemEval Parity** | External: how does mem's stack score on the same dataset + protocol that mempalace published baselines for? | Cross-system comparison; manual decision tool | `tests/mempalace_bench.rs`, 3-rung mapping (raw / rooms / full), LongMemEval dataset |
+
+The recall-quality bench uses `FakeEmbeddingProvider` (CI-cheap, deterministic,
+ablation-only); the LongMemEval parity bench uses production embedding
+(`Config::from_env()`) so the numbers are real. Don't compare absolute
+NDCG values across the two — different fixtures, different judgments,
+different embedders.
+
 ## Recall Quality Bench (transcripts)
 
 A 10-rung ablation harness for the transcript recall pipeline. Quantifies
