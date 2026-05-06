@@ -66,11 +66,16 @@ lint: fmt-check clippy ## fmt-check + clippy
 
 check: fmt-check clippy test ## pre-commit gate：fmt-check + clippy + 全套测试
 
-watch: ## 文件改动自动重启 mem serve + 显示服务日志（需 `cargo install cargo-watch`）
-	$(CARGO) watch -x 'run -- serve'
+# 只观察影响 binary 输出的路径，避免 docs / Dockerfile / .github / hooks
+# 等改动把 mem serve mid-handler SIGTERM 了。`db/schema/*.sql` 经
+# `include_str!` 编入二进制，必须看；tests/ 不影响 `cargo run` 产物，跳过。
+WATCH_PATHS := -w src -w Cargo.toml -w Cargo.lock -w db
 
-watch-check: ## 文件改动只跑 cargo check --all-targets（快速类型反馈，不启服务）
-	$(CARGO) watch -x 'check --all-targets'
+watch: ## 仅 src/ Cargo.* db/ 改动时自动重启 mem serve（需 `cargo install cargo-watch`）
+	$(CARGO) watch $(WATCH_PATHS) -x 'run -- serve'
+
+watch-check: ## 仅 src/ Cargo.* db/ 改动时跑 cargo check --all-targets（快速类型反馈，不启服务）
+	$(CARGO) watch $(WATCH_PATHS) -x 'check --all-targets'
 
 # ==== 跨平台（Cross.toml） ====
 
