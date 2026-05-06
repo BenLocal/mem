@@ -7,7 +7,26 @@ mod common;
 
 #[tokio::test]
 async fn test_mine_and_wake_up_flow() {
-    let config = mem::config::Config::from_env().unwrap();
+    // Use a tempdir + Fake provider instead of `Config::from_env()`, which
+    // resolves to `$MEM_DB_PATH` or `~/.mem/mem.duckdb` and conflicts with a
+    // running `mem serve` holding the DuckDB file lock. Also avoids the
+    // `EmbedAnything` (Qwen3-1024) model load that `development_defaults`
+    // wires in by default.
+    let tmp = TempDir::new().unwrap();
+    let mut embedding = mem::config::EmbeddingSettings::development_defaults();
+    embedding.provider = mem::config::EmbeddingProviderKind::Fake;
+    embedding.model = "fake".to_string();
+    embedding.dim = 8;
+    embedding.transcript_disabled = true;
+    // Default 1000 ms poll interval makes the post-mine `sleep(200ms)` race
+    // the first tick. Tighten so the worker drains the queue inside the
+    // test's wait window.
+    embedding.worker_poll_interval_ms = 50;
+    let config = mem::config::Config {
+        bind_addr: "127.0.0.1:0".to_string(),
+        db_path: tmp.path().join("mem.duckdb"),
+        embedding,
+    };
     let app = mem::app::router_with_config(config.clone()).await.unwrap();
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
@@ -33,8 +52,10 @@ async fn test_mine_and_wake_up_flow() {
     let exit_code = mem::cli::mine::run(mine_args).await;
     assert_eq!(exit_code, 0);
 
-    // Give embedding worker time to process
-    tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
+    // Give embedding worker time to drain the queued job. With
+    // `worker_poll_interval_ms = 50` and the Fake provider, several ticks
+    // run inside this window. Increase if the test starts flaking.
+    tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
 
     let wake_args = mem::cli::wake_up::WakeUpArgs {
         tenant: "local".to_string(),
