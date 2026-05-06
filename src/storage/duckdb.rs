@@ -2153,6 +2153,14 @@ fn cosine_similarity(a: &[f32], b: &[f32]) -> f32 {
 /// jobs targeting old hashes will be marked `stale` by the worker on the next
 /// tick (it compares against the now-fresh `memories.content_hash`), which is
 /// exactly the desired outcome.
+///
+/// FK handling: a naive `UPDATE memories SET content_hash = …` would FK-fail
+/// on any legacy row that has children, because DuckDB implements parent
+/// UPDATE as DELETE+INSERT internally and the DELETE half hits RESTRICT. We
+/// use the `load → delete children → UPDATE parent → restore children` dance
+/// (the same one `replace_pending_with_successor` / `update_status` use) so
+/// the migration is idempotent and FK-safe regardless of which legacy rows
+/// already have `embedding_jobs` / `memory_embeddings` references.
 pub(crate) fn migrate_content_hash_to_sha256(conn: &Connection) -> Result<usize, StorageError> {
     let mut stmt = conn.prepare(
         "select
@@ -2171,16 +2179,33 @@ pub(crate) fn migrate_content_hash_to_sha256(conn: &Connection) -> Result<usize,
         return Ok(0);
     }
     let n = legacy.len();
-    for record in legacy {
-        let new_hash = compute_content_hash_from_record(&record);
+    for record in &legacy {
+        let new_hash = compute_content_hash_from_record(record);
+
+        // DuckDB implements parent UPDATE as DELETE+INSERT internally; the
+        // DELETE half raises FK RESTRICT if any child rows reference this
+        // memory_id (`embedding_jobs` / `memory_embeddings`). Lift the
+        // children out, do the parent UPDATE, then restore them — same dance
+        // used by `replace_pending_with_successor` / `update_status`.
+        //
+        // The restored `memory_embeddings` row gets the new sha256 in its
+        // `content_hash` column (vector contents are unchanged, only the
+        // staleness sentinel is refreshed — see docstring above).
+        // `embedding_jobs.target_content_hash` is intentionally restored
+        // verbatim so the worker can mark stale jobs on the next tick.
+        let (jobs, embedding) = load_embedding_references(conn, &record.memory_id)?;
+        delete_embedding_references(conn, &record.memory_id)?;
+
         conn.execute(
             "update memories set content_hash = ?1 where memory_id = ?2",
-            params![new_hash, record.memory_id],
+            params![&new_hash, &record.memory_id],
         )?;
-        conn.execute(
-            "update memory_embeddings set content_hash = ?1 where memory_id = ?2",
-            params![new_hash, record.memory_id],
-        )?;
+
+        let refreshed_embedding = embedding.map(|mut e| {
+            e.content_hash = new_hash.clone();
+            e
+        });
+        restore_embedding_references(conn, &jobs, refreshed_embedding.as_ref())?;
     }
     Ok(n)
 }

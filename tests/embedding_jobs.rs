@@ -234,6 +234,86 @@ async fn iter_memory_embeddings_visits_each_row() {
 }
 
 #[tokio::test]
+async fn migrate_content_hash_handles_legacy_row_with_children() {
+    // Regression for incident TODO #2 (see mem incident memory
+    // mem_019dfba4-9e08-71b2-a676-f0218c01f9b6). Pre-fix the legacy
+    // content_hash → sha256 migration ran a naive `UPDATE memories SET
+    // content_hash = …`, which DuckDB implements as DELETE+INSERT on the
+    // parent — and the DELETE half raises FK RESTRICT whenever any
+    // `embedding_jobs` / `memory_embeddings` row references the memory.
+    //
+    // Result: any legacy DB that already had children failed to bootstrap
+    // (`mem serve` could not start). The fix lifts the children out, runs
+    // the parent UPDATE, then restores the children with the new sha256
+    // propagated to `memory_embeddings.content_hash`.
+    let dir = tempdir().unwrap();
+    let db = dir.path().join("legacy-hash.duckdb");
+    let repo = DuckDbRepository::open(&db).await.unwrap();
+
+    // 16 hex chars = the legacy DefaultHasher digest size, triggers
+    // `length(content_hash) != CONTENT_HASH_LEN` in the migration.
+    let legacy_hash = "abcdef0123456789";
+    repo.insert_memory(sample_active_memory("mem_legacy", "tL", legacy_hash))
+        .await
+        .unwrap();
+
+    let now = "20260000000000000001".to_string();
+    assert!(repo
+        .try_enqueue_embedding_job(EmbeddingJobInsert {
+            job_id: "ej_legacy".into(),
+            tenant: "tL".into(),
+            memory_id: "mem_legacy".into(),
+            target_content_hash: legacy_hash.into(),
+            provider: "fake".into(),
+            available_at: now.clone(),
+            created_at: now.clone(),
+            updated_at: now.clone(),
+        })
+        .await
+        .unwrap());
+
+    // Seeds a `memory_embeddings` row (the parent insert is skipped via
+    // `INSERT OR IGNORE` because mem_legacy already exists).
+    repo.seed_memory_embedding_for_test("mem_legacy", "tL", &[1.0, 0.0, 0.0])
+        .await
+        .unwrap();
+    drop(repo);
+
+    // Re-open. Pre-fix this would propagate
+    //   "Constraint Error: \"memories\" is still referenced by a foreign key"
+    // out of `bootstrap()` and the open call would fail.
+    let repo = DuckDbRepository::open(&db).await.unwrap();
+
+    let migrated = repo
+        .get_memory_for_tenant("tL", "mem_legacy")
+        .await
+        .unwrap()
+        .expect("memory must survive migration");
+    assert_eq!(
+        migrated.content_hash.len(),
+        64,
+        "content_hash must be sha256 (64 hex chars) after migration"
+    );
+    assert_ne!(
+        migrated.content_hash, legacy_hash,
+        "content_hash must have changed from legacy form"
+    );
+
+    assert_eq!(
+        repo.count_embedding_jobs_for_memory("mem_legacy")
+            .await
+            .unwrap(),
+        1,
+        "embedding_jobs child must survive the legacy-hash migration"
+    );
+    assert_eq!(
+        repo.count_total_memory_embeddings().await.unwrap(),
+        1,
+        "memory_embeddings child must survive the legacy-hash migration"
+    );
+}
+
+#[tokio::test]
 async fn open_time_sweep_is_idempotent_on_healthy_db() {
     // Sanity check: the open-time orphan sweep (added in 4ca5a75 to break the
     // FK retry loop) must not delete anything on a healthy DB. Regression guard
