@@ -1,13 +1,15 @@
 # mem 改造路线图
 
 > 本文件是 [`mempalace-diff.md`](./mempalace-diff.md) 抽取出来的执行面板，便于单独维护与外发。
-> **新增 / 调整路线图项请先回 `mempalace-diff.md` 改对应章节，再同步更新本文件。** 设计原则、每项的论证、不做的事见原文档对应章节号（§5、§7、§8、§11、§12、§13 等）。
+> **新增 / 调整路线图项请先回 `mempalace-diff.md` 改对应章节，再同步更新本文件。** 设计原则、每项的论证、不做的事见原文档对应章节号（§5、§7、§8、§11、§12、§13、§14 等）。"现在差异快照"看 [§15](./mempalace-diff.md#15-当前差异快照2026-05-06)。
+>
+> **状态（2026-05-06）**：#1–#15 全部 ✅。新增项触发条件见文末"下一阶段"。
 
 ## 路线图
 
 | # | 层 | 项 | 价值 | 工作量 | 风险 | 触点 |
 |---|---|---|---|---|---|---|
-| 1 | ⚙️ | ✅ `embedding_jobs` dedupe 复核（实际已被 Mutex + 事务覆盖，仅修注释/文档）| 🔴 修并发 bug | S（0.5h） | 低 | `storage/duckdb.rs`、`db/schema/002_embeddings.sql` |
+| 1 | ⚙️ | ✅ `embedding_jobs` dedupe 复核（单进程被 `Arc<Mutex<Connection>>` + 事务覆盖，仅修注释/文档）⚠️ 多进程并发写同一 `.duckdb` 是另一类问题，2026-05-06 FK 循环事故已沉淀为 mem incident memory + worker 三层防御（open-time / claim-time / tick last-resort sweep）| 🔴 修并发 bug | S（0.5h） | 低 | `storage/duckdb.rs`、`db/schema/002_embeddings.sql` |
 | 2 | 🔍 | ✅ 引入 `usearch` sidecar ANN（消除 `semantic_search_memories` 的 `limit 2000` 隐式截断）| 🟠 性能基础设施 + 🔴 修隐式正确性边界 | M（1–2 天） | 中（需要 repair 路径） | `Cargo.toml`、`storage/`、新增 `vector_index.rs` |
 | 3 | ⚙️ | ✅ HNSW 健康度自检 + repair 子命令（`mem repair --check` / `--rebuild`，JSON 输出可选）| 🟠 配套 #2 | S（4h） | 低 | `src/cli/repair.rs`、`src/storage/vector_index_diagnose.rs` |
 | 4 | 🔍 | ✅ 图边时序化（valid_from/to）+ 全量迁到 DuckDB（删 IndraDB 依赖与 GraphStore trait）| 🟠 表达力 | L（实际 ~1.5 天，scope 比原 M 大）| 中 | `domain/memory.rs`、`storage/graph_store.rs`、`db/schema/003_graph.sql`、`pipeline/ingest.rs` |
@@ -26,14 +28,34 @@
 > **价值**：🔴 = 修 bug；🟠 = 架构升级；🟡 = 体验优化；🟢 = nice-to-have。
 > **工作量**：S ≤ 4h，M = 0.5–2 天，L > 2 天。
 
-> **建议批次**：
-> - **批 A（修 bug）** ✅ 完成（sha2 迁移 + `embedding_jobs` dedupe 复核 / 注释澄清）。
-> - **批 B（Verbatim 纪律落地，3h）** #9 + #6 + 文档化 — 把"设计原则"刻进代码。
-> - **批 C（数据模型扩展，1 天）** #4 + #10 同期做，省一次 schema 迁移阵痛。
-> - **批 D（检索现代化，2–3 天）** #2 + #3 + #5 → **#11**。前三项是 #11 的前置条件（先有 HNSW 召回 + RRF，再做三段式重构）。
-> - **批 E（生命周期 / 卫生，半天–1 天）** #7 + #8。
-> - **批 F（无感集成，1.5 天）** **#12**。前置依赖批 C（#10 Sessions），因为 wake-up 的 essential story 必须按 session 切片才不混乱。
+> **批次执行历史**（全部 ✅ 完成）：
+> - **批 A（修 bug）** ✅ sha2 迁移 + `embedding_jobs` dedupe 复核 / 注释澄清。
+> - **批 B（Verbatim 纪律落地）** ✅ #9 + #6 + 文档化 — 把"设计原则"刻进代码。
+> - **批 C（数据模型扩展）** ✅ #4 + #10 同期做，省一次 schema 迁移阵痛。
+> - **批 D（检索现代化）** ✅ #2 + #3 + #5 → #11。HNSW 召回 + RRF + 三段式 Stage 2 拆分。
+> - **批 E（生命周期 / 卫生）** ✅ #7 + #8（decay worker + entity registry）。
+> - **批 F（无感集成）** ✅ #12（hooks + `mem mine` + `mem wake-up`）。
+> - **批 G（评估基础设施）** ✅ #14 + #15（recall ablation bench + LongMemEval parity bench）。
 
 ---
 
-> 维护建议：每完成一项，更新对应行的状态（✅ done / 🚧 in progress），并在 git commit message 里引用本文件中的编号（例如 `feat(retrieve): introduce usearch sidecar ANN (closes ROADMAP #2)`）。
+## 下一阶段
+
+ROADMAP #1–#15 全部完成；新增项的触发条件，按性质分两条：
+
+- **本质形态差异** — `mempalace-diff §15.1` 列举（HTTP vs MCP / DuckDB vs Chroma / lifecycle vs verbatim）。这些**不会主动消除**；改变只能在哲学路线整体重定义时讨论。
+- **新对齐项** — 当 mempalace 主仓有新设计或 mem 实测出新 gap 时：先回 `mempalace-diff.md` 加 / 改章节做论证，再回本文件追加新行号（#16+），同时更新 `mempalace-diff §15.2/15.3/15.4` 三张映射表保持一致。
+
+已知 incident TODO（不计入 ROADMAP，但留档）：
+1. 找出 `embedding_jobs` orphan 行的产生路径（疑在某条 supersede / delete pipeline）
+2. 修复 `migrate_content_hash_to_sha256` 在带子表行时的 FK 失败（DuckDB UPDATE = DELETE+INSERT）
+3. 检测同一 `.duckdb` 文件多进程写入（advisory lock / pid file）
+
+详见 mem incident memory `mem_019dfba4-9e08-71b2-a676-f0218c01f9b6`。
+
+---
+
+> **维护规则**：
+> 1. 每完成一项，更新对应行的状态（✅ done / 🚧 in progress）。
+> 2. git commit message 引用编号：`feat(retrieve): introduce usearch sidecar ANN (closes ROADMAP #2)`。
+> 3. 新增 ROADMAP 行后，**同步更新 `mempalace-diff §15.2`（已吸收）/ `§15.3`（mem 独有）/ `§15.4`（不引入）三张映射表**——否则"现在差异快照"会与 ROADMAP 漂移。

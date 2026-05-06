@@ -656,3 +656,59 @@ M（1.5 天，前提是 #11 完成）：
 §7 verbatim 纪律的自然延伸：`memories.content` 守护事实级原文，`conversation_messages.content` 守护对话级原文。两条管道共用一个 `session_id` 锚点（§11 Sessions），但 ranking / lifecycle / compress / verbatim guard 全部不动。新增 env：`MEM_TRANSCRIPT_EMBED_DISABLED=1`（停 transcript embedding worker，避免 OpenAI 用户成本翻倍）、`MEM_TRANSCRIPT_VECTOR_INDEX_FLUSH_EVERY`（默认 256，低于 memories sidecar 的 1024，因为单 session 写入 burst 更大）。
 
 > commit 时引用：`feat(transcripts): add conversation_messages archive pipeline alongside memories (closes mempalace-diff §14)`
+
+---
+
+## 15. 当前差异快照（2026-05-06）
+
+> ROADMAP 上 #1–#15 已全部 ✅，能借鉴的项基本吸收完。本节是给"半年后再看"的人做一个快速定位：剩下的差异是哪些、属于哪个层级、为什么不再缩小。
+>
+> 维护建议：每完成新的对齐项 / 新增本质差异时，更新本节的"已吸收"或"mem 独有"表，避免再读 ROADMAP 才知道边界。
+
+### 15.1 本质形态差异（不会消除）
+
+| 维度 | mem | MemPalace | 论证位置 |
+|---|---|---|---|
+| 服务模型 | 长驻 HTTP（axum :3000）+ 多 agent 共享 | MCP server（stdio）+ CLI，单用户单机 | §0 |
+| 存储引擎 | DuckDB 单文件 + usearch HNSW sidecar + 内置 `graph_edges` 表 | ChromaDB（SQLite + HNSW 段）+ 独立 SQLite KG | §0 / §2 |
+| 语言/栈 | Rust + axum + tokio + DuckDB-rs | Python + ChromaDB + SQLite | §0 |
+| 核心哲学 | 结构化记忆**生命周期**（status / supersedes / feedback / decay） | **Verbatim** 不改写、只压缩索引层 | §0 / §6 / §7 |
+| 输出形态 | token-budgeted 四段式（directives / facts / patterns / workflow） | 返回 drawer 列表，让 caller LLM 自己整合 | §3 / §12 |
+
+> 两条哲学路线 mem 已经做了**双轴叠加**：📦 存储层吸收 verbatim 纪律（§7 / §14），🔍 索引/排序/lifecycle 保留 mem 路线（§6 / §12）。判定一项改造能不能做仍按 §8 的"会改写或丢失原话 = 禁止；只改排序/打分/元数据 = 允许"分流。
+
+### 15.2 已吸收的 MemPalace 设计
+
+| 来源（MemPalace 概念） | mem 落地 | ROADMAP # | 章节 |
+|---|---|---|---|
+| 时序图 `valid_from` / `valid_to` | `graph_edges` 表内置 | #4 | §5 |
+| HNSW ANN（消除全表扫 + `limit 2000` 隐式截断）| usearch sidecar | #2 | §3 / §4 |
+| HNSW 健康自检 + repair CLI | `mem repair --check / --rebuild` | #3 | §3 |
+| BM25 + 向量 RRF | `pipeline/retrieve.rs` 两路 RRF（k=60） | #5 | §3 |
+| Entity registry（人/项目消歧） | `entities` + `entity_aliases` 表 | #8 | §2 |
+| Verbatim 纪律（token 计数 + summary 守护）| tiktoken-rs / ingest 校验 `summary != content` | #6 / #9 | §7 |
+| Sessions（≈ Room，与 episodes 正交） | `sessions` 表 + auto-bucket on ingest | #10 | §11 |
+| Hook + miner + wake-up "无感"集成 | Stop/PreCompact/SessionStart hooks + `mem mine` + `mem wake-up` | #12 | §13 |
+| Verbatim 对话归档 | `conversation_messages` 独立管道（与 memories 完全隔离） | — | §14 |
+| LongMemEval 横向对标 | Rust port of `longmemeval_bench.py`，3-rung 输出对齐 mempalace `raw / rooms / full` | #15 | — |
+
+### 15.3 mem 独有（MemPalace 没有）
+
+- **`embedding_jobs` 持久化队列** + 后台 worker + attempt 重试 + content_hash 失效检测——比 MemPalace 内联 embed 更工业化（§4）
+- **`MemoryStatus` 三态**（Provisional / Active / PendingConfirmation）+ `WriteMode::Confirm` 评审流（§6）
+- **`feedback_events`** 调权 `confidence` / `decay_score`（§6）
+- **`decay_worker`** 后台时间衰减（ROADMAP #7）
+- **加性 lifecycle 重排层**（intent × memory_type / scope / freshness / graph_boost）—— RRF 融合后又叠了一层 mem 特色信号（§3 / §12）
+- **Recall quality bench**（10-rung ablation；ROADMAP #14）
+
+### 15.4 已论证不引入的 MemPalace 概念
+
+详见 §9，简列：
+
+- **Wing / Drawer 隐喻**：mem 已有等价物（`project` / `repo` / `module` 字段做 Wing，`memories` 行做 Drawer）；改名只增加心智负担。**Room 例外，已落地为 §11 Sessions**。
+- **AAAK 服务端烧 LLM**：mem 是 HTTP 服务，caller 已有自己的 LLM；服务端再烧 = 双重计算 + 双重账单。精神已通过"返回更丰富候选包让 caller 自精排"吸收（§12 Stage 3）。
+- **L0–L3 唤醒栈**：caller 各自有开场注入逻辑；服务端通过 `mem wake-up` 注入 SessionStart，**让 caller 决定怎么用**而非在服务端预定义层级（§13）。
+
+### 15.5 一句话总结
+
+> mempalace-diff 路线图（#1–#15）已全部 ✅。剩下的差异是**有意保留的形态/哲学差异**——服务模型（HTTP vs MCP）、存储栈（Rust+DuckDB vs Python+Chroma）、哲学侧重（lifecycle 治理 vs verbatim 档案），不是落后或缺口。新对齐项请先回 §5 / §7 / §11 / §12 / §13 / §14 等加章节，再同步更新本节 15.2/15.3/15.4 表格 + ROADMAP.MD。
