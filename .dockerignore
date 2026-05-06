@@ -1,3 +1,20 @@
 target/
 .git/
 **/.DS_Store
+
+# build context speed-ups — these are not needed for `cargo build --release`
+docs/
+tests/
+benches/
+examples/
+.github/
+.claude-plugin/
+.codex-plugin/
+hooks/
+README.md
+AGENTS.md
+CLAUDE.md
+CHANGELOG*
+LICENSE*
+Makefile
+*.md
