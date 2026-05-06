@@ -39,8 +39,13 @@ ARG MODEL_ID=Qwen/Qwen3-Embedding-0.6B
 ENV HF_HOME=/opt/hf-cache \
     HF_HUB_DISABLE_PROGRESS_BARS=1
 RUN pip install --no-cache-dir "huggingface-hub>=0.24"
+# Use the Python API directly. The legacy `huggingface-cli download <id>`
+# subcommand was deprecated/renamed in hub-cli ≥0.34 (the new CLI is `hf
+# download …`); calling `snapshot_download` cuts that drift out and writes
+# exactly the same `<HF_HOME>/hub/models--…` layout the Rust `hf-hub` crate
+# (and embed_anything) expect at runtime.
 RUN mkdir -p "$HF_HOME" \
- && huggingface-cli download "$MODEL_ID" >/dev/null \
+ && python -c "from huggingface_hub import snapshot_download; snapshot_download('${MODEL_ID}')" \
  && du -sh "$HF_HOME"
 
 # ─────────────────────────────────────────────────────────────────────────
