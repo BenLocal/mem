@@ -1,0 +1,31 @@
+{
+  "name": "mem",
+  "version": "0.1.0",
+  "description": "Local-first Rust memory service for multi-agent workflows. Provides MCP tools (memory_ingest/search/...) and Codex hooks that mine transcripts and inject wake-up context.",
+  "author": { "name": "BenLocal", "url": "https://github.com/BenLocal" },
+  "homepage": "https://github.com/BenLocal/mem",
+  "repository": "https://github.com/BenLocal/mem",
+  "license": "MIT",
+  "keywords": [
+    "memory",
+    "mcp",
+    "rust",
+    "duckdb",
+    "agent-memory",
+    "codex"
+  ],
+  "interface": {
+    "displayName": "mem",
+    "developerName": "BenLocal",
+    "shortDescription": "Shared memory for multi-agent workflows (MCP + transcript mining + wake-up).",
+    "longDescription": "Local-first Rust service that stores agent memories in DuckDB with HNSW vector search, life-cycle metadata (status / supersedes / feedback / decay), and a token-budgeted retrieval pipeline. Codex hooks mine session transcripts in the background and inject relevant memories at session start.",
+    "category": "Productivity",
+    "capabilities": ["Read", "Write"],
+    "websiteURL": "https://github.com/BenLocal/mem",
+    "defaultPrompt": [
+      "Search shared memory for prior decisions on this topic",
+      "Save this fix as a memory tagged with the affected module",
+      "Inject relevant past context for the current session"
+    ]
+  }
+}
