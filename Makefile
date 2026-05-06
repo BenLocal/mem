@@ -3,7 +3,7 @@
 
 .DEFAULT_GOAL := help
 .PHONY: help build release install run serve mcp repair-check repair-rebuild \
-        test test-unit test-fast fmt fmt-check clippy lint check watch \
+        test test-unit test-fast fmt fmt-check clippy lint check watch watch-check \
         cross cross-linux-gnu cross-linux-musl cross-arm64 \
         clean
 
@@ -66,7 +66,10 @@ lint: fmt-check clippy ## fmt-check + clippy
 
 check: fmt-check clippy test ## pre-commit gate：fmt-check + clippy + 全套测试
 
-watch: ## 文件改动自动 cargo check --all-targets（需 `cargo install cargo-watch`）
+watch: ## 文件改动自动重启 mem serve + 显示服务日志（需 `cargo install cargo-watch`）
+	$(CARGO) watch -x 'run -- serve'
+
+watch-check: ## 文件改动只跑 cargo check --all-targets（快速类型反馈，不启服务）
 	$(CARGO) watch -x 'check --all-targets'
 
 # ==== 跨平台（Cross.toml） ====
