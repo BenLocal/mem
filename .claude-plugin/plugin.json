@@ -1,0 +1,9 @@
+{
+  "name": "mem",
+  "description": "Local-first Rust memory service for multi-agent workflows. Provides MCP tools (memory_ingest/search/...) and Claude Code hooks that mine transcripts and inject wake-up context.",
+  "version": "0.1.0",
+  "author": { "name": "BenLocal" },
+  "homepage": "https://github.com/BenLocal/mem",
+  "repository": "https://github.com/BenLocal/mem",
+  "license": "MIT"
+}
