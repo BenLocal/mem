@@ -209,6 +209,33 @@ impl DuckDbRepository {
         let conn = Connection::open(path)?;
         schema::bootstrap(&conn)?;
 
+        // One-shot cleanup of orphan embedding_jobs/memory_embeddings rows whose
+        // memory_id no longer has a row in `memories`. This handles DBs that pre-date
+        // the per-tick sweep in `claim_next_embedding_job`, or that accumulated orphans
+        // through the supersede edge case the FK couldn't catch. Operators see how
+        // many orphans were cleaned via the `tracing::info!` below.
+        let orphan_jobs_deleted = conn.execute(
+            "delete from embedding_jobs
+             where not exists (
+                 select 1 from memories where memories.memory_id = embedding_jobs.memory_id
+             )",
+            [],
+        )?;
+        let orphan_embeds_deleted = conn.execute(
+            "delete from memory_embeddings
+             where not exists (
+                 select 1 from memories where memories.memory_id = memory_embeddings.memory_id
+             )",
+            [],
+        )?;
+        if orphan_jobs_deleted > 0 || orphan_embeds_deleted > 0 {
+            tracing::info!(
+                orphan_embedding_jobs_deleted = orphan_jobs_deleted,
+                orphan_memory_embeddings_deleted = orphan_embeds_deleted,
+                "swept orphan embedding rows on DB open"
+            );
+        }
+
         Ok(Self {
             conn: Arc::new(Mutex::new(conn)),
             vector_index: Arc::new(RwLock::new(None)),
@@ -487,11 +514,17 @@ impl DuckDbRepository {
     /// Claims the next eligible job, moving it to `processing`. Eligible means `pending`, or
     /// `failed` with `attempt_count < max_retries` (configured retry budget).
     ///
-    /// Before claiming, sweeps any orphan jobs (memory_id no longer in `memories`) into a
-    /// terminal `failed` state with `attempt_count = max_retries`. This guards against
-    /// supersede / delete edge cases where an embedding_jobs row outlives its parent memory:
-    /// without this sweep, the worker would claim the orphan, hit a FK violation on the
-    /// status UPDATE, and retry forever in a tight 1Hz loop.
+    /// Before claiming, sweeps any orphan jobs (memory_id no longer in `memories`) by
+    /// deleting them. This guards against supersede / delete edge cases where an
+    /// embedding_jobs row outlives its parent memory: without this sweep, the worker would
+    /// claim the orphan, hit a FK violation on the status UPDATE, and retry forever in a
+    /// tight 1Hz loop.
+    ///
+    /// We use DELETE rather than UPDATE because DuckDB re-validates FK on UPDATE of any
+    /// column (not only the FK column itself); UPDATEing an orphan row therefore also
+    /// FK-errors. DELETE has no such issue — a row that is gone has no constraints to
+    /// satisfy. Operators see the cleanup via the `embedding_jobs orphans deleted` log
+    /// emitted by the worker startup sweep (`cleanup_orphan_embedding_jobs`).
     pub async fn claim_next_embedding_job(
         &self,
         now: &str,
@@ -501,22 +534,14 @@ impl DuckDbRepository {
         let tx = conn.transaction()?;
         let max_r = i64::from(max_retries);
 
-        // Sweep orphan jobs (memory_id has no row in memories) into a terminal failed state.
-        // The UPDATE filters by job_id (the PK) only, so it does not re-touch the FK column.
+        // Sweep orphan jobs by deletion (UPDATE would itself FK-error in DuckDB).
         tx.execute(
-            "update embedding_jobs
-             set status = 'failed',
-                 attempt_count = ?1,
-                 last_error = coalesce(last_error, 'memory row missing for embedding job (orphan FK)'),
-                 updated_at = ?2
-             where job_id in (
-                 select j.job_id
-                 from embedding_jobs j
-                 left join memories m on m.memory_id = j.memory_id
-                 where m.memory_id is null
-                   and (j.status = 'pending' or (j.status = 'failed' and j.attempt_count < ?1))
+            "delete from embedding_jobs
+             where not exists (
+                 select 1 from memories
+                 where memories.memory_id = embedding_jobs.memory_id
              )",
-            params![max_r, now],
+            [],
         )?;
 
         let job_id: Option<String> = tx
