@@ -7,6 +7,7 @@ pub mod transcript_repo;
 pub mod vector_index;
 pub mod vector_index_diagnose;
 
+pub(crate) use duckdb::{sweep_orphan_embeddings, sweep_orphan_jobs};
 pub use duckdb::{
     ClaimedEmbeddingJob, DuckDbRepository, EmbeddingJobInsert, EntityRegistry, FeedbackEvent,
     StorageError,

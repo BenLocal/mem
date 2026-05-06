@@ -214,20 +214,15 @@ impl DuckDbRepository {
         // the per-tick sweep in `claim_next_embedding_job`, or that accumulated orphans
         // through the supersede edge case the FK couldn't catch. Operators see how
         // many orphans were cleaned via the `tracing::info!` below.
-        let orphan_jobs_deleted = conn.execute(
-            "delete from embedding_jobs
-             where not exists (
-                 select 1 from memories where memories.memory_id = embedding_jobs.memory_id
-             )",
-            [],
-        )?;
-        let orphan_embeds_deleted = conn.execute(
-            "delete from memory_embeddings
-             where not exists (
-                 select 1 from memories where memories.memory_id = memory_embeddings.memory_id
-             )",
-            [],
-        )?;
+        //
+        // Implementation note: we materialise orphan IDs to a temp Vec first and then
+        // DELETE BY job_id. DuckDB's correlated `NOT EXISTS` subquery in a DELETE
+        // sometimes synthesises a plan that the FK enforcer mis-reads (the bundled
+        // version raises "is still referenced by a foreign key in a different table"
+        // even on healthy DBs). Two-step (SELECT ids, then DELETE WHERE id IN) avoids
+        // the planner ambiguity entirely.
+        let orphan_jobs_deleted = sweep_orphan_jobs(&conn)?;
+        let orphan_embeds_deleted = sweep_orphan_embeddings(&conn)?;
         if orphan_jobs_deleted > 0 || orphan_embeds_deleted > 0 {
             tracing::info!(
                 orphan_embedding_jobs_deleted = orphan_jobs_deleted,
@@ -534,15 +529,23 @@ impl DuckDbRepository {
         let tx = conn.transaction()?;
         let max_r = i64::from(max_retries);
 
-        // Sweep orphan jobs by deletion (UPDATE would itself FK-error in DuckDB).
-        tx.execute(
-            "delete from embedding_jobs
-             where not exists (
-                 select 1 from memories
-                 where memories.memory_id = embedding_jobs.memory_id
-             )",
-            [],
-        )?;
+        // Sweep orphan jobs by deletion (UPDATE would itself FK-error). Use the
+        // two-step pattern (SELECT ids → DELETE BY id) to dodge a DuckDB
+        // correlated-NOT-EXISTS planner quirk; see `sweep_orphan_jobs` for the
+        // explanation.
+        let orphan_ids: Vec<String> = {
+            let mut stmt = tx.prepare(
+                "select j.job_id
+                 from embedding_jobs j
+                 left join memories m on m.memory_id = j.memory_id
+                 where m.memory_id is null",
+            )?;
+            stmt.query_map([], |row| row.get::<_, String>(0))?
+                .collect::<Result<Vec<_>, _>>()?
+        };
+        for id in &orphan_ids {
+            tx.execute("delete from embedding_jobs where job_id = ?1", params![id])?;
+        }
 
         let job_id: Option<String> = tx
             .query_row(
@@ -1965,6 +1968,56 @@ fn load_embedding_references(
         .optional()?;
 
     Ok((jobs, embedding))
+}
+
+/// Two-step orphan sweep for `embedding_jobs`. Step 1: SELECT job_ids whose
+/// memory_id is not in `memories` (single SELECT, read-only). Step 2: DELETE by
+/// job_id in batches.
+///
+/// We avoid `DELETE FROM embedding_jobs WHERE NOT EXISTS (...)` because DuckDB's
+/// correlated subquery planner sometimes synthesises an internal join that the
+/// FK enforcer mis-reads, raising `"is still referenced by a foreign key in a
+/// different table"` even on healthy DBs (it confuses the parent-table FK
+/// validation with the child-table DELETE).
+pub(crate) fn sweep_orphan_jobs(conn: &Connection) -> Result<usize, StorageError> {
+    let mut stmt = conn.prepare(
+        "select j.job_id
+         from embedding_jobs j
+         left join memories m on m.memory_id = j.memory_id
+         where m.memory_id is null",
+    )?;
+    let ids: Vec<String> = stmt
+        .query_map([], |row| row.get::<_, String>(0))?
+        .collect::<Result<Vec<_>, _>>()?;
+    let mut deleted = 0usize;
+    for id in &ids {
+        let n = conn.execute("delete from embedding_jobs where job_id = ?1", params![id])?;
+        deleted += n;
+    }
+    Ok(deleted)
+}
+
+/// Two-step orphan sweep for `memory_embeddings`. Same rationale as
+/// [`sweep_orphan_jobs`]: avoid DuckDB's correlated NOT EXISTS planner.
+pub(crate) fn sweep_orphan_embeddings(conn: &Connection) -> Result<usize, StorageError> {
+    let mut stmt = conn.prepare(
+        "select e.memory_id
+         from memory_embeddings e
+         left join memories m on m.memory_id = e.memory_id
+         where m.memory_id is null",
+    )?;
+    let ids: Vec<String> = stmt
+        .query_map([], |row| row.get::<_, String>(0))?
+        .collect::<Result<Vec<_>, _>>()?;
+    let mut deleted = 0usize;
+    for id in &ids {
+        let n = conn.execute(
+            "delete from memory_embeddings where memory_id = ?1",
+            params![id],
+        )?;
+        deleted += n;
+    }
+    Ok(deleted)
 }
 
 fn delete_embedding_references(conn: &Connection, memory_id: &str) -> Result<(), StorageError> {

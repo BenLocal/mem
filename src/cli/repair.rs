@@ -32,6 +32,13 @@ pub struct RepairMode {
     /// single-writer.
     #[arg(long)]
     pub rebuild_graph: bool,
+    /// Delete orphan rows in `embedding_jobs` and `memory_embeddings` whose
+    /// `memory_id` no longer has a row in `memories`. Fixes the FK retry-loop
+    /// bug where the embedding worker would log `Constraint Error: Violates
+    /// foreign key constraint` ~once/second forever. Idempotent. Requires
+    /// `mem serve` to be stopped (DuckDB is single-writer). Reports counts.
+    #[arg(long)]
+    pub prune_embedding_orphans: bool,
 }
 
 /// Render a human-readable summary of a [`DiagnosticReport`].
@@ -206,6 +213,35 @@ impl RebuildGraphOutcome {
     }
 }
 
+/// Outcome of `mem repair --prune-embedding-orphans`.
+#[derive(Debug, Clone)]
+pub enum PruneOrphansOutcome {
+    Pruned {
+        embedding_jobs_deleted: usize,
+        memory_embeddings_deleted: usize,
+        elapsed_ms: u64,
+    },
+    Failed {
+        reason: String,
+    },
+}
+
+impl PruneOrphansOutcome {
+    pub fn exit_code(&self) -> i32 {
+        match self {
+            PruneOrphansOutcome::Pruned { .. } => 0,
+            PruneOrphansOutcome::Failed { .. } => 2,
+        }
+    }
+
+    pub fn coarse_status(&self) -> &'static str {
+        match self {
+            PruneOrphansOutcome::Pruned { .. } => "pruned",
+            PruneOrphansOutcome::Failed { .. } => "prune_failed",
+        }
+    }
+}
+
 pub fn format_check_json(report: &DiagnosticReport) -> Value {
     json!({
         "command": "check",
@@ -373,7 +409,10 @@ pub async fn run(args: RepairArgs) -> i32 {
         dim: config.embedding.dim,
     };
 
-    if args.mode.rebuild_graph {
+    if args.mode.prune_embedding_orphans {
+        let outcome = compute_prune_orphans_outcome(&config).await;
+        emit_prune_orphans(&outcome, args.json)
+    } else if args.mode.rebuild_graph {
         let outcome = match compute_rebuild_graph_outcome(&config).await {
             Ok(o) => o,
             Err(e) => RebuildGraphOutcome::Failed {
@@ -505,6 +544,118 @@ pub fn format_rebuild_graph_json(outcome: &RebuildGraphOutcome) -> Value {
         }),
         RebuildGraphOutcome::Failed { reason } => json!({
             "command": "rebuild-graph",
+            "status": outcome.coarse_status(),
+            "exit_code": outcome.exit_code(),
+            "details": {"reason": reason},
+        }),
+    }
+}
+
+/// Run the orphan sweep against `config.db_path` and report counts.
+///
+/// Deletes rows in `embedding_jobs` and `memory_embeddings` whose `memory_id`
+/// no longer has a row in `memories`. This is the manual equivalent of the
+/// open-time sweep added in 4ca5a75 — useful when the user wants explicit
+/// counts in stdout/JSON instead of relying on a tracing log line, or when
+/// running on a tree that doesn't yet have the open-time sweep.
+///
+/// Idempotent. Requires `mem serve` to be stopped (DuckDB is single-writer).
+pub async fn compute_prune_orphans_outcome(config: &Config) -> PruneOrphansOutcome {
+    let started = std::time::Instant::now();
+    // Use a raw Connection (not DuckDbRepository::open) so we can report counts
+    // BEFORE the open-time sweep would also run. The bundled DuckDB is single-
+    // writer per file, so a separate `mem serve` process must be stopped.
+    let conn = match duckdb::Connection::open(&config.db_path) {
+        Ok(c) => c,
+        Err(e) => {
+            return PruneOrphansOutcome::Failed {
+                reason: format!("open {}: {e}", config.db_path.display()),
+            };
+        }
+    };
+    // Use the same two-step pattern (SELECT orphan ids, then DELETE BY id)
+    // exposed by `crate::storage::sweep_orphan_jobs` / `sweep_orphan_embeddings`
+    // to dodge DuckDB's correlated-NOT-EXISTS planner quirk that otherwise
+    // FK-errors even on healthy DBs.
+    let jobs_deleted = match crate::storage::sweep_orphan_jobs(&conn) {
+        Ok(n) => n,
+        Err(e) => {
+            return PruneOrphansOutcome::Failed {
+                reason: format!("sweep orphan embedding_jobs: {e}"),
+            };
+        }
+    };
+    let embeds_deleted = match crate::storage::sweep_orphan_embeddings(&conn) {
+        Ok(n) => n,
+        Err(e) => {
+            return PruneOrphansOutcome::Failed {
+                reason: format!("sweep orphan memory_embeddings: {e}"),
+            };
+        }
+    };
+    PruneOrphansOutcome::Pruned {
+        embedding_jobs_deleted: jobs_deleted,
+        memory_embeddings_deleted: embeds_deleted,
+        elapsed_ms: started.elapsed().as_millis() as u64,
+    }
+}
+
+fn emit_prune_orphans(outcome: &PruneOrphansOutcome, as_json: bool) -> i32 {
+    if as_json {
+        let v = format_prune_orphans_json(outcome);
+        println!("{}", serde_json::to_string_pretty(&v).unwrap());
+    } else {
+        print!("{}", format_prune_orphans_text(outcome));
+    }
+    outcome.exit_code()
+}
+
+/// Render a human-readable summary of a [`PruneOrphansOutcome`].
+pub fn format_prune_orphans_text(outcome: &PruneOrphansOutcome) -> String {
+    use std::fmt::Write;
+    let mut s = String::new();
+    match outcome {
+        PruneOrphansOutcome::Pruned {
+            embedding_jobs_deleted,
+            memory_embeddings_deleted,
+            elapsed_ms,
+        } => {
+            writeln!(&mut s, "Pruned orphan embedding rows.").unwrap();
+            writeln!(
+                &mut s,
+                "   embedding_jobs deleted    : {embedding_jobs_deleted}\n   memory_embeddings deleted : {memory_embeddings_deleted}\n   elapsed                   : {elapsed_ms}ms"
+            )
+            .unwrap();
+        }
+        PruneOrphansOutcome::Failed { reason } => {
+            writeln!(&mut s, "Prune-embedding-orphans failed: {reason}").unwrap();
+            writeln!(
+                &mut s,
+                "   Is `mem serve` running? Stop the service before running this command."
+            )
+            .unwrap();
+        }
+    }
+    s
+}
+
+/// Render a structured JSON summary of a [`PruneOrphansOutcome`].
+pub fn format_prune_orphans_json(outcome: &PruneOrphansOutcome) -> Value {
+    match outcome {
+        PruneOrphansOutcome::Pruned {
+            embedding_jobs_deleted,
+            memory_embeddings_deleted,
+            elapsed_ms,
+        } => json!({
+            "command": "prune-embedding-orphans",
+            "status": outcome.coarse_status(),
+            "exit_code": outcome.exit_code(),
+            "embedding_jobs_deleted": embedding_jobs_deleted,
+            "memory_embeddings_deleted": memory_embeddings_deleted,
+            "elapsed_ms": elapsed_ms,
+        }),
+        PruneOrphansOutcome::Failed { reason } => json!({
+            "command": "prune-embedding-orphans",
             "status": outcome.coarse_status(),
             "exit_code": outcome.exit_code(),
             "details": {"reason": reason},

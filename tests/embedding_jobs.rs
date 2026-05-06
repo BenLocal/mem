@@ -232,3 +232,51 @@ async fn iter_memory_embeddings_visits_each_row() {
     assert!(ids.contains("mem_a"));
     assert!(ids.contains("mem_b"));
 }
+
+#[tokio::test]
+async fn open_time_sweep_is_idempotent_on_healthy_db() {
+    // Sanity check: the open-time orphan sweep (added in 4ca5a75 to break the
+    // FK retry loop) must not delete anything on a healthy DB. Regression guard
+    // confirming we don't accidentally delete legitimate embedding_jobs rows.
+    //
+    // The actual orphan-deletion path can't be unit-tested without bypassing
+    // DuckDB FK (PRAGMA foreign_keys=OFF is unsupported by the bundled version),
+    // so the destructive path is exercised manually via `mem repair
+    // --prune-embedding-orphans`.
+    let dir = tempdir().unwrap();
+    let db = dir.path().join("healthy-open.duckdb");
+    // Use a 64-char SHA-256-shaped hash so re-open does NOT trigger
+    // migrate_content_hash_to_sha256, whose `UPDATE memories SET content_hash`
+    // would otherwise FK-error (DuckDB implements UPDATE-on-parent as
+    // DELETE+INSERT internally; the DELETE half fires FK when children exist).
+    // That migration path is orthogonal to the open-time orphan sweep we want
+    // to exercise here.
+    let sha = "0".repeat(64);
+    let repo = DuckDbRepository::open(&db).await.unwrap();
+    repo.insert_memory(sample_active_memory("mem_h_1", "tA", &sha))
+        .await
+        .unwrap();
+    let now = "20260000000000000001".to_string();
+    let insert = EmbeddingJobInsert {
+        job_id: "ej_h_1".into(),
+        tenant: "tA".into(),
+        memory_id: "mem_h_1".into(),
+        target_content_hash: sha.clone(),
+        provider: "fake".into(),
+        available_at: now.clone(),
+        created_at: now.clone(),
+        updated_at: now,
+    };
+    assert!(repo.try_enqueue_embedding_job(insert).await.unwrap());
+    drop(repo);
+
+    // Re-open: the open-time sweep runs. The healthy job must survive.
+    let repo = DuckDbRepository::open(&db).await.unwrap();
+    assert_eq!(
+        repo.count_embedding_jobs_for_memory("mem_h_1")
+            .await
+            .unwrap(),
+        1,
+        "open-time sweep must not touch healthy embedding_jobs rows"
+    );
+}
