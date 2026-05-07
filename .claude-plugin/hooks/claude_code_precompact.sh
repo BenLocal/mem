@@ -9,7 +9,7 @@
 set -uo pipefail
 
 INPUT=$(cat 2>/dev/null || echo '{}')
-TRANSCRIPT=$(echo "$INPUT" | jq -r '.transcriptPath // empty' 2>/dev/null || echo "")
+TRANSCRIPT=$(echo "$INPUT" | jq -r '.transcript_path // empty' 2>/dev/null || echo "")
 
 if [ -z "$TRANSCRIPT" ] || [ ! -f "$TRANSCRIPT" ]; then
     echo '{}'
@@ -24,8 +24,8 @@ MINE_OUT=$(timeout 90 mem mine "$TRANSCRIPT" --agent claude-code 2>&1 || true)
 FEEDBACK_OUT=$(timeout 30 mem feedback-from-transcript "$TRANSCRIPT" --tenant local 2>&1 || true)
 FEEDBACK_SENT=$(echo "$FEEDBACK_OUT" | sed -n 's/.*sent=\([0-9]*\).*/\1/p' | head -1)
 
-MEMS=$(echo "$MINE_OUT" | sed -n 's/.*memories sent=\([0-9]*\).*/\1/p' | head -1)
-BLOCKS=$(echo "$MINE_OUT" | sed -n 's/.*blocks sent=\([0-9]*\).*/\1/p' | head -1)
+MEMS=$(echo "$MINE_OUT" | sed -n 's/.*memories sent=\([0-9]*\/[0-9]*\).*/\1/p' | head -1)
+BLOCKS=$(echo "$MINE_OUT" | sed -n 's/.*blocks sent=\([0-9]*\/[0-9]*\).*/\1/p' | head -1)
 
 if [ -n "$MEMS" ] && [ -n "$BLOCKS" ]; then
     if [ -n "$FEEDBACK_SENT" ] && [ "$FEEDBACK_SENT" != "0" ]; then

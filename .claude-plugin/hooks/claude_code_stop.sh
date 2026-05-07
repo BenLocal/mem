@@ -9,8 +9,16 @@
 # transient mem-serve outage never breaks the Stop event itself.
 set -uo pipefail
 
+LOG=/tmp/mem-stop-hook.log
+# Self-rotate: if log > 256 KB, keep only the last 200 lines.
+if [ -f "$LOG" ] && [ "$(stat -c %s "$LOG" 2>/dev/null || echo 0)" -gt 262144 ]; then
+    tail -n 200 "$LOG" > "$LOG.tmp" && mv "$LOG.tmp" "$LOG"
+fi
+echo "$(date -Iseconds) stop fired pid=$$" >> "$LOG"
+
 INPUT=$(cat 2>/dev/null || echo '{}')
-TRANSCRIPT=$(echo "$INPUT" | jq -r '.transcriptPath // empty' 2>/dev/null || echo "")
+echo "$(date -Iseconds) input=$INPUT" >> "$LOG"
+TRANSCRIPT=$(echo "$INPUT" | jq -r '.transcript_path // empty' 2>/dev/null || echo "")
 SESSION_ID=$(echo "$INPUT" | jq -r '.session_id // empty' 2>/dev/null || echo "")
 
 if [ -z "$TRANSCRIPT" ] || [ ! -f "$TRANSCRIPT" ]; then
@@ -46,8 +54,8 @@ echo "$EXCHANGE_COUNT" > "$LAST_SAVE_FILE"
 FEEDBACK_OUT=$(timeout 30 mem feedback-from-transcript "$TRANSCRIPT" --tenant local 2>&1 || true)
 FEEDBACK_SENT=$(echo "$FEEDBACK_OUT" | sed -n 's/.*sent=\([0-9]*\).*/\1/p' | head -1)
 
-MEMS=$(echo "$MINE_OUT" | sed -n 's/.*memories sent=\([0-9]*\).*/\1/p' | head -1)
-BLOCKS=$(echo "$MINE_OUT" | sed -n 's/.*blocks sent=\([0-9]*\).*/\1/p' | head -1)
+MEMS=$(echo "$MINE_OUT" | sed -n 's/.*memories sent=\([0-9]*\/[0-9]*\).*/\1/p' | head -1)
+BLOCKS=$(echo "$MINE_OUT" | sed -n 's/.*blocks sent=\([0-9]*\/[0-9]*\).*/\1/p' | head -1)
 
 if [ -n "$MEMS" ] && [ -n "$BLOCKS" ]; then
     if [ -n "$FEEDBACK_SENT" ] && [ "$FEEDBACK_SENT" != "0" ]; then
