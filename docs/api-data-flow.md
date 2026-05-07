@@ -288,17 +288,17 @@ score = round(1000 × (1/(60 + rank_lex) + 1/(60 + rank_sem)))   # 召回融合
 
 ## 4. 可优化方向（按优先级）
 
-### 4.1 🟡 FTS rebuild thrashing（dependency bug 已修 §5.1，剩余的是性能层）
+### 4.1 ✅ FTS rebuild thrashing — async worker 已落（剩余仅极端规模）
 
-每条 ingest 都把 FTS 标 dirty；下一次 search 整表 drop + rebuild。stopwords dependency bug 已经处理掉（§5.1，reload-extension fallback path）。**剩余的痛**仅在大表场景才出现：
-- rebuild 本身随 memories 行数线性，10k 行起耗时显著
-- ingest 高频 + search 高频 → FTS rebuild 抖动
+`src/service/fts_worker.rs`（`MEM_FTS_REBUILD_INTERVAL_MS` 默认 2000）背景 tick，每次扫两个 dirty flag（memories + conversation_messages）并 rebuild。`bm25_candidates` 路径的同步 `ensure_fts_index_fresh` 保留作为兜底（rare race window：写完到下次 worker tick 之间正好来了 search）。worker 跑过的 swap-and-drain 操作是原子的，与 reader fallback 不会双 rebuild。
 
-**思路（性能层，未必现在做）**：
-1. **debounce**：dirty flag 加时间戳，rebuild 至少间隔 N 秒（trade-off：命中新 ingest 的延迟）
-2. **incremental**：DuckDB FTS 1.x 不支持增量，等 2.x 或换实现（tantivy？）
+**Trade-off**：BM25 命中新写入 memory 的排名延迟 ≤ 1 tick interval。HNSW 语义一路不受影响（embedding worker 自己负责），所以新 memory **依然立即可被找到**——只是缺 BM25 boost ≤ 2s。
 
-**触发条件**：当 P95 `/memories/search` 延迟 >200ms 或 memories.count > 5k 时再做。
+**触发更深优化的条件**（仍然可能要做）：
+1. 即使 worker 跑了，rebuild 本身随 memories 行数线性。10k 行起单次 rebuild 也吃 CPU，影响 worker tick 间隔之外的其他 worker（embedding 也在同一连接 mutex 上）
+2. **incremental FTS**：DuckDB FTS 1.x 不支持。等 2.x 或换 tantivy
+
+**触发条件**：当 P95 `/memories/search` 仍 >200ms 或 memories.count > 5k 时再考虑。
 
 ### 4.2 🟠 search 关键路径顺序执行 → 并行化
 

@@ -1389,8 +1389,10 @@ impl DuckDbRepository {
     }
 
     /// Rebuilds the FTS index if any write since the last build set the dirty
-    /// flag. Cheap when clean. Only invoked on the BM25 read path.
-    fn ensure_fts_index_fresh(&self) -> Result<(), StorageError> {
+    /// flag. Cheap when clean. Invoked by the BM25 read path AND by the
+    /// background `fts_worker` (which periodically drains the flag so reads
+    /// rarely have to rebuild themselves).
+    pub(crate) fn ensure_fts_index_fresh(&self) -> Result<(), StorageError> {
         if !self.fts_dirty.swap(false, Ordering::AcqRel) {
             return Ok(());
         }

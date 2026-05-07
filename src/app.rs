@@ -81,6 +81,20 @@ impl AppState {
             crate::service::decay_worker::start_decay_worker(Arc::new(repo_decay)).await;
         });
 
+        // FTS rebuild worker: ticks every MEM_FTS_REBUILD_INTERVAL_MS
+        // (default 2000) and drains the dirty flags on both `memories` and
+        // `conversation_messages` FTS so the BM25 read path almost never
+        // has to rebuild on demand. See `service::fts_worker` for the
+        // trade-off (BM25 results may lag a fresh write by up to one tick).
+        let repo_fts = repository.clone();
+        let fts_interval_ms = std::env::var("MEM_FTS_REBUILD_INTERVAL_MS")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .unwrap_or(2000);
+        tokio::spawn(async move {
+            crate::service::fts_worker::run(repo_fts, fts_interval_ms).await;
+        });
+
         if !config.embedding.transcript_disabled {
             let provider_transcript = provider.clone();
             let repo_transcript = repository.clone();

@@ -399,7 +399,7 @@ impl DuckDbRepository {
     /// Rebuild the transcripts FTS index iff the dirty flag is set. Cheap
     /// when clean. Mirror of `ensure_fts_index_fresh` for memories — see
     /// that method's docs for the drop-then-create rationale.
-    fn ensure_transcript_fts_index_fresh(&self) -> Result<(), StorageError> {
+    pub(crate) fn ensure_transcript_fts_index_fresh(&self) -> Result<(), StorageError> {
         if !self.transcripts_fts_dirty.swap(false, Ordering::AcqRel) {
             return Ok(());
         }
