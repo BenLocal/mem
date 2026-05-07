@@ -4,8 +4,9 @@ use mem::{
         IngestMemoryRequest, MemoryRecord, MemoryStatus, MemoryType, Scope, Visibility, WriteMode,
     },
     embedding::arc_embedding_provider,
-    service::{embedding_worker, MemoryService},
+    service::MemoryService,
     storage::{DuckDbRepository, EmbeddingJobInsert},
+    worker::embedding_worker,
 };
 use std::sync::Arc;
 use tempfile::tempdir;

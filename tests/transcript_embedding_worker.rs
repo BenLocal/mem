@@ -9,8 +9,8 @@ use async_trait::async_trait;
 use mem::config::{EmbeddingProviderKind, EmbeddingSettings};
 use mem::domain::{BlockType, ConversationMessage, MessageRole};
 use mem::embedding::{EmbeddingError, EmbeddingProvider, FakeEmbeddingProvider};
-use mem::service::transcript_embedding_worker;
 use mem::storage::{DuckDbRepository, VectorIndex, VectorIndexFingerprint};
+use mem::worker::transcript_embedding_worker;
 use tempfile::TempDir;
 
 /// Build an `EmbeddingSettings` with `provider = EmbedAnything` so the worker's
@@ -128,7 +128,8 @@ impl EmbeddingProvider for AlwaysFailingProvider {
 async fn worker_failure_does_not_affect_memories_pipeline() {
     use mem::domain::memory::{IngestMemoryRequest, MemoryType, Scope, Visibility, WriteMode};
     use mem::embedding::arc_embedding_provider;
-    use mem::service::{embedding_worker, MemoryService};
+    use mem::service::MemoryService;
+    use mem::worker::embedding_worker;
 
     let tmp = TempDir::new().unwrap();
     let db = tmp.path().join("mem.duckdb");

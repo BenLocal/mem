@@ -1,8 +1,9 @@
 use mem::config::{EmbeddingProviderKind, EmbeddingSettings};
 use mem::domain::memory::{IngestMemoryRequest, MemoryType, Scope, Visibility, WriteMode};
 use mem::embedding::arc_embedding_provider;
-use mem::service::{embedding_worker, MemoryService};
+use mem::service::MemoryService;
 use mem::storage::{DuckDbRepository, VectorIndex, VectorIndexFingerprint};
+use mem::worker::embedding_worker;
 use std::sync::Arc;
 use tempfile::tempdir;
 

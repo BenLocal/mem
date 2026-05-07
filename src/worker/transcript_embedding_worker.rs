@@ -1,6 +1,6 @@
 //! Transcript embedding worker.
 //!
-//! Structural mirror of [`crate::service::embedding_worker`] for the
+//! Structural mirror of [`crate::worker::embedding_worker`] for the
 //! `transcript_embedding_jobs` queue. Differences from the memories worker:
 //!
 //! - Polls `transcript_embedding_jobs` via
