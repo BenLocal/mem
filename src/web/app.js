@@ -17,6 +17,25 @@ const modalId    = document.getElementById('modal-id');
 const btnYes     = document.getElementById('btn-confirm');
 const btnNo      = document.getElementById('btn-cancel');
 const toast      = document.getElementById('toast');
+// ─── transcripts view ────────────────────────────────────────
+const tabs           = document.getElementById('tabs');
+const viewArchive    = document.getElementById('view-archive');
+const viewTranscripts = document.getElementById('view-transcripts');
+const titleMode      = document.getElementById('title-mode');
+const titleSub       = document.getElementById('title-sub');
+const countLabel     = document.getElementById('count-label');
+const sessionsList   = document.getElementById('sessions-list');
+const txSearch       = document.getElementById('tx-search');
+const transcriptBg   = document.getElementById('transcript-bg');
+const transcriptBody = document.getElementById('transcript-body');
+const transcriptMeta = document.getElementById('transcript-meta');
+const transcriptClose = document.getElementById('transcript-close');
+
+let currentView = 'archive';
+let allSessions = [];
+let txFilterText = '';
+let openTranscriptSession = null;
+
 const detailBg       = document.getElementById('detail-bg');
 const detailBody     = document.getElementById('detail-body');
 const detailClose    = document.getElementById('detail-close');
@@ -48,12 +67,23 @@ function showToast(msg, err = false) {
 
 function fmtDate(s) {
   if (!s) return '—';
-  // mem stores milliseconds-since-epoch zero-padded to 20 digits
-  // (`current_timestamp()` in src/storage/time.rs uses `{millis:020}`).
-  // Just parse the whole string as a number — leading zeros are fine.
-  const ms = Number(String(s).trim());
-  if (!Number.isFinite(ms) || ms <= 0) return s;
-  const d = new Date(ms);
+  // Two formats land here:
+  //   1. memories side — `current_timestamp()` (src/storage/time.rs)
+  //      writes `{millis:020}`, so a 20-digit zero-padded epoch millis
+  //      string like "00000001778060883021".
+  //   2. transcripts side — `conversation_messages.created_at` is the
+  //      verbatim ISO-8601 timestamp ingested from the transcript
+  //      JSONL ("2026-04-30T06:53:13.501Z").
+  // Detect by content: pure digits → epoch ms; otherwise ISO-8601.
+  const str = String(s).trim();
+  let d;
+  if (/^\d+$/.test(str)) {
+    const ms = Number(str);
+    if (!Number.isFinite(ms) || ms <= 0) return s;
+    d = new Date(ms);
+  } else {
+    d = new Date(str);
+  }
   if (isNaN(d)) return s;
   const yyyy = d.getUTCFullYear();
   const mm   = String(d.getUTCMonth() + 1).padStart(2, '0');
@@ -540,5 +570,247 @@ async function load() {
     grid.appendChild(buildPlaceholder('could not reach the archive', e.message, 'error'));
   }
 }
+
+// ============================================================
+// transcripts view
+// ============================================================
+
+const VIEW_LABELS = {
+  archive:     { mode: 'archive',     sub: 'a register of remembered things, kept by hand', count: 'records on file' },
+  transcripts: { mode: 'transcripts', sub: 'verbatim conversation logs, bound and shelved', count: 'sessions on file' },
+};
+
+function setView(name) {
+  if (name === currentView) return;
+  currentView = name;
+  for (const t of tabs.querySelectorAll('.tab')) {
+    const on = t.dataset.view === name;
+    t.classList.toggle('active', on);
+    t.setAttribute('aria-selected', on ? 'true' : 'false');
+  }
+  viewArchive.hidden     = name !== 'archive';
+  viewTranscripts.hidden = name !== 'transcripts';
+  const lbl = VIEW_LABELS[name];
+  titleMode.textContent  = lbl.mode;
+  titleSub.textContent   = lbl.sub;
+  countLabel.textContent = lbl.count;
+  if (name === 'archive') {
+    countEl.textContent = String(allMemories.filter(matchesFilter).length).padStart(3, '0');
+  } else if (allSessions.length === 0) {
+    loadSessions();
+  } else {
+    renderSessions();
+  }
+}
+
+tabs.addEventListener('click', e => {
+  const btn = e.target.closest('.tab');
+  if (btn) setView(btn.dataset.view);
+});
+
+function fmtDateShort(s) {
+  // Same format-detection contract as fmtDate, just returns the UTC date
+  // without the "UTC" suffix (used in dense block-stripe layouts where
+  // the column is already labelled).
+  if (!s) return '—';
+  const str = String(s).trim();
+  let d;
+  if (/^\d+$/.test(str)) {
+    const ms = Number(str);
+    if (!Number.isFinite(ms) || ms <= 0) return s;
+    d = new Date(ms);
+  } else {
+    d = new Date(str);
+  }
+  if (isNaN(d)) return s;
+  return `${d.getUTCFullYear()}-${String(d.getUTCMonth()+1).padStart(2,'0')}-${String(d.getUTCDate()).padStart(2,'0')} ${String(d.getUTCHours()).padStart(2,'0')}:${String(d.getUTCMinutes()).padStart(2,'0')}`;
+}
+
+function matchesSession(s) {
+  if (!txFilterText) return true;
+  const hay = `${s.session_id || ''} ${s.caller_agent || ''}`.toLowerCase();
+  return hay.includes(txFilterText);
+}
+
+function buildSessionRow(s) {
+  const row = el('div', {
+    class: 'session-row', tabindex: '0', role: 'button',
+    'aria-label': `open transcript for ${s.session_id}`,
+    'data-id': s.session_id,
+  });
+  const id = el('div', { class: 'session-id' });
+  id.appendChild(el('span', { class: 'lead', text: '⟶' }));
+  id.appendChild(document.createTextNode(s.session_id || '—'));
+  row.appendChild(id);
+
+  row.appendChild(el('span', { class: 'session-agent', text: s.caller_agent || 'unknown' }));
+
+  const cnt = el('div', { class: 'session-count' });
+  cnt.appendChild(document.createTextNode(String(s.block_count ?? 0)));
+  cnt.appendChild(el('span', { class: 'lbl', text: 'blocks' }));
+  row.appendChild(cnt);
+
+  const when = el('div', { class: 'session-when' });
+  when.appendChild(document.createTextNode(fmtDateShort(s.first_at)));
+  when.appendChild(el('span', { class: 'arrow', text: ' → ' }));
+  when.appendChild(document.createTextNode(fmtDateShort(s.last_at)));
+  row.appendChild(when);
+  return row;
+}
+
+function renderSessions() {
+  const rows = allSessions.filter(matchesSession);
+  countEl.textContent = String(rows.length).padStart(3, '0');
+  while (sessionsList.firstChild) sessionsList.removeChild(sessionsList.firstChild);
+  if (rows.length === 0) {
+    const empty = allSessions.length === 0
+      ? 'no conversation logs in the archive yet'
+      : 'nothing in the volume matches that';
+    sessionsList.appendChild(buildPlaceholder(empty, txFilterText ? `filter: "${txFilterText}"` : ''));
+    return;
+  }
+  for (const s of rows) sessionsList.appendChild(buildSessionRow(s));
+  for (const row of sessionsList.querySelectorAll('.session-row')) {
+    row.addEventListener('click', () => openTranscript(row.dataset.id));
+    row.addEventListener('keydown', e => {
+      if (e.key === 'Enter' || e.key === ' ') {
+        e.preventDefault();
+        openTranscript(row.dataset.id);
+      }
+    });
+  }
+}
+
+async function loadSessions() {
+  while (sessionsList.firstChild) sessionsList.removeChild(sessionsList.firstChild);
+  sessionsList.appendChild(buildPlaceholder('retrieving the conversation logs', null, 'loading'));
+  try {
+    const r = await fetch(`/transcripts/sessions?tenant=${encodeURIComponent(TENANT)}`);
+    if (!r.ok) throw new Error(`HTTP ${r.status}: ${(await r.text()).slice(0, 160)}`);
+    allSessions = await r.json();
+    renderSessions();
+  } catch (e) {
+    while (sessionsList.firstChild) sessionsList.removeChild(sessionsList.firstChild);
+    sessionsList.appendChild(buildPlaceholder('could not reach the conversation logs', e.message, 'error'));
+  }
+}
+
+let txSearchTimer = null;
+txSearch.addEventListener('input', () => {
+  clearTimeout(txSearchTimer);
+  txSearchTimer = setTimeout(() => {
+    txFilterText = txSearch.value.trim().toLowerCase();
+    renderSessions();
+  }, 120);
+});
+
+// ─── transcript drawer (block stream) ──────────────────────────
+
+const TYPE_GLYPHS = {
+  text: '✦', thinking: '≈', tool_use: '▣', tool_result: '↳', image: '◧',
+};
+
+function buildBlock(b) {
+  const role = (b.role || 'unknown').toLowerCase();
+  const type = (b.block_type || 'text').toLowerCase();
+  const wrap = el('div', { class: `block ${type}` });
+
+  const stripe = el('div', { class: 'block-stripe' });
+  stripe.appendChild(el('span', { class: `role ${role}`, text: role }));
+  stripe.appendChild(el('span', { class: 'type', text: type.replace('_', ' ') }));
+  stripe.appendChild(el('span', { class: 'when', text: fmtDateShort(b.created_at) }));
+  wrap.appendChild(stripe);
+
+  const body = el('div', { class: 'block-body' });
+  const glyph = TYPE_GLYPHS[type] || '·';
+  body.appendChild(el('span', { class: 'glyph', text: glyph }));
+
+  if (type === 'tool_use' || type === 'tool_result') {
+    if (b.tool_name) {
+      body.appendChild(el('span', {
+        class: 'tool-name',
+        text: b.tool_name + (b.tool_use_id ? ` (${String(b.tool_use_id).slice(0, 12)})` : ''),
+      }));
+    }
+    body.appendChild(el('div', { class: 'mono', text: b.content || '' }));
+  } else if (type === 'thinking' || type === 'text') {
+    body.appendChild(el('span', { class: 'text', text: b.content || '' }));
+  } else {
+    body.appendChild(el('div', { class: 'mono', text: b.content || '(no content)' }));
+  }
+  wrap.appendChild(body);
+  return wrap;
+}
+
+function buildTranscriptMeta(blocks, sessionId) {
+  while (transcriptMeta.firstChild) transcriptMeta.removeChild(transcriptMeta.firstChild);
+  if (blocks.length === 0) { transcriptMeta.hidden = true; return; }
+  transcriptMeta.hidden = false;
+  const first = blocks[0];
+  const last = blocks[blocks.length - 1];
+  for (const [k, v] of [
+    ['session', sessionId],
+    ['agent',   first.caller_agent || '—'],
+    ['blocks',  String(blocks.length)],
+    ['span',    `${fmtDateShort(first.created_at)}  →  ${fmtDateShort(last.created_at)}`],
+    ['source',  first.transcript_path || '—'],
+  ]) {
+    transcriptMeta.appendChild(el('dt', { text: k }));
+    const dd = el('dd');
+    dd.appendChild(el('code', { text: v }));
+    transcriptMeta.appendChild(dd);
+  }
+}
+
+async function openTranscript(sessionId) {
+  if (!sessionId) return;
+  openTranscriptSession = sessionId;
+  transcriptBg.classList.add('open');
+  transcriptBg.setAttribute('aria-hidden', 'false');
+  transcriptMeta.hidden = true;
+  while (transcriptBody.firstChild) transcriptBody.removeChild(transcriptBody.firstChild);
+  transcriptBody.appendChild(buildPlaceholder('unbinding the volume', sessionId, 'loading'));
+  try {
+    const r = await fetch(`/transcripts?session_id=${encodeURIComponent(sessionId)}&tenant=${encodeURIComponent(TENANT)}`);
+    if (!r.ok) throw new Error(`HTTP ${r.status}: ${(await r.text()).slice(0, 160)}`);
+    const data = await r.json();
+    if (openTranscriptSession !== sessionId) return;
+    const blocks = data.messages || [];
+    while (transcriptBody.firstChild) transcriptBody.removeChild(transcriptBody.firstChild);
+    buildTranscriptMeta(blocks, sessionId);
+    if (blocks.length === 0) {
+      transcriptBody.appendChild(buildPlaceholder('the volume is empty', sessionId));
+      return;
+    }
+    const frag = document.createDocumentFragment();
+    for (const b of blocks) frag.appendChild(buildBlock(b));
+    transcriptBody.appendChild(frag);
+    transcriptBody.scrollTop = 0;
+  } catch (e) {
+    while (transcriptBody.firstChild) transcriptBody.removeChild(transcriptBody.firstChild);
+    transcriptBody.appendChild(buildPlaceholder('could not retrieve the volume', e.message, 'error'));
+  }
+}
+
+function closeTranscript() {
+  transcriptBg.classList.remove('open');
+  transcriptBg.setAttribute('aria-hidden', 'true');
+  openTranscriptSession = null;
+}
+
+transcriptClose.addEventListener('click', closeTranscript);
+transcriptBg.addEventListener('click', e => { if (e.target === transcriptBg) closeTranscript(); });
+
+// extend Esc priority cascade: hard-delete > archive-confirm > detail
+// > transcript drawer. Earlier listener handles the first three; this
+// one is last so transcript only closes when no higher-priority overlay
+// is open.
+document.addEventListener('keydown', e => {
+  if (e.key !== 'Escape') return;
+  if (deleteModal.classList.contains('open')) return;
+  if (modal.classList.contains('open')) return;
+  if (detailBg.classList.contains('open')) return;
+  if (transcriptBg.classList.contains('open')) closeTranscript();
+});
 
 load();

@@ -32,7 +32,33 @@ pub fn router() -> Router<AppState> {
     Router::new()
         .route("/transcripts/messages", post(post_message))
         .route("/transcripts/search", post(post_search))
+        .route("/transcripts/sessions", get(get_sessions))
         .route("/transcripts", get(get_by_session))
+}
+
+// ---------------------------------------------------------------------------
+// GET /transcripts/sessions?tenant=… — admin web page transcript list
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Deserialize)]
+pub struct SessionsQuery {
+    #[serde(default = "default_tenant")]
+    pub tenant: String,
+}
+
+fn default_tenant() -> String {
+    "local".to_string()
+}
+
+async fn get_sessions(
+    State(state): State<AppState>,
+    Query(query): Query<SessionsQuery>,
+) -> Result<Json<Vec<crate::storage::TranscriptSessionSummary>>, AppError> {
+    let rows = state
+        .transcript_service
+        .list_sessions(&query.tenant)
+        .await?;
+    Ok(Json(rows))
 }
 
 // ---------------------------------------------------------------------------

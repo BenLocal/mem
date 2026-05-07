@@ -81,6 +81,16 @@ impl TranscriptService {
         self.repo.create_conversation_message(&msg).await
     }
 
+    /// Per-session aggregate summary of the transcript archive. Backs the
+    /// admin web page's transcripts list (one row per session, newest last
+    /// activity first).
+    pub async fn list_sessions(
+        &self,
+        tenant: &str,
+    ) -> Result<Vec<crate::storage::TranscriptSessionSummary>, StorageError> {
+        self.repo.list_transcript_sessions(tenant).await
+    }
+
     /// Returns every transcript block belonging to `session_id` in
     /// chronological order. Thin pass-through over the repo method; exists
     /// here so HTTP handlers depend on the service rather than the repo.

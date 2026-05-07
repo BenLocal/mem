@@ -14,34 +14,63 @@
 
 <header class="header">
   <h1 class="title">
-    mem<span class="dot"> · </span>archive
-    <span class="sub">a register of remembered things, kept by hand</span>
+    mem<span class="dot"> · </span><span id="title-mode">archive</span>
+    <span class="sub" id="title-sub">a register of remembered things, kept by hand</span>
   </h1>
   <div class="colophon">
     <span class="num" id="count">— —</span>
-    records on file
+    <span id="count-label">records on file</span>
   </div>
 </header>
 
-<section class="controls">
-  <div class="search-wrap">
-    <input id="search" class="search" type="search" placeholder="search the stacks…" autocomplete="off">
-  </div>
-  <div class="filter-group" id="filters">
-    <button class="filter-btn active" data-status="live">live</button>
-    <button class="filter-btn" data-status="active">active</button>
-    <button class="filter-btn" data-status="provisional">provisional</button>
-    <button class="filter-btn" data-status="archived">archived</button>
-    <button class="filter-btn" data-status="all">all</button>
-  </div>
-  <div class="tenant-badge">
-    tenant <span class="v" id="tenant">local</span>
-  </div>
+<nav class="tabs" id="tabs" role="tablist">
+  <button class="tab active" role="tab" data-view="archive" aria-selected="true">
+    <span class="tab-glyph">⌗</span> archive
+  </button>
+  <button class="tab" role="tab" data-view="transcripts" aria-selected="false">
+    <span class="tab-glyph">≣</span> transcripts
+  </button>
+</nav>
+
+<!-- ─── view: archive (memories) ────────────────────────────────────── -->
+<section class="view view-archive" id="view-archive" role="tabpanel">
+  <section class="controls">
+    <div class="search-wrap">
+      <input id="search" class="search" type="search" placeholder="search the stacks…" autocomplete="off">
+    </div>
+    <div class="filter-group" id="filters">
+      <button class="filter-btn active" data-status="live">live</button>
+      <button class="filter-btn" data-status="active">active</button>
+      <button class="filter-btn" data-status="provisional">provisional</button>
+      <button class="filter-btn" data-status="archived">archived</button>
+      <button class="filter-btn" data-status="all">all</button>
+    </div>
+    <div class="tenant-badge">
+      tenant <span class="v" id="tenant">local</span>
+    </div>
+  </section>
+
+  <main class="archive" id="grid">
+    <div class="placeholder loading">retrieving from the stacks</div>
+  </main>
 </section>
 
-<main class="archive" id="grid">
-  <div class="placeholder loading">retrieving from the stacks</div>
-</main>
+<!-- ─── view: transcripts (read-only conversation logs) ─────────────── -->
+<section class="view view-transcripts" id="view-transcripts" role="tabpanel" hidden>
+  <section class="controls controls-tx">
+    <div class="search-wrap">
+      <input id="tx-search" class="search" type="search" placeholder="filter by session id, agent, or content…" autocomplete="off">
+    </div>
+    <div class="tenant-badge">
+      tenant <span class="v">local</span>
+      <span class="ro-badge" title="conversation logs are verbatim, never edited or deleted">read only</span>
+    </div>
+  </section>
+
+  <main class="sessions-list" id="sessions-list">
+    <div class="placeholder loading">retrieving the conversation logs</div>
+  </main>
+</section>
 
 <!-- detail panel: slides in from the right, populated by GET /memories/{id} -->
 <aside class="detail-bg" id="detail-bg" aria-hidden="true" tabindex="-1">
@@ -89,6 +118,22 @@
     </div>
   </div>
 </div>
+
+<!-- transcript drawer: slides in from the LEFT (visually distinct from
+     the right-side memory detail drawer). Read-only, populated by
+     GET /transcripts?session_id=…&tenant=… -->
+<aside class="transcript-bg" id="transcript-bg" aria-hidden="true">
+  <section class="transcript-panel" role="dialog" aria-modal="true" aria-labelledby="transcript-title">
+    <header class="transcript-head">
+      <span class="transcript-eyebrow">conversation log</span>
+      <button class="transcript-close" id="transcript-close" type="button" aria-label="close">×</button>
+    </header>
+    <div class="transcript-meta" id="transcript-meta" hidden></div>
+    <div class="transcript-body" id="transcript-body">
+      <div class="placeholder loading">unbinding the volume</div>
+    </div>
+  </section>
+</aside>
 
 <div class="toast" id="toast" role="status" aria-live="polite"></div>
 

@@ -9,11 +9,26 @@ use std::collections::HashMap;
 use std::sync::atomic::Ordering;
 
 use duckdb::{params, OptionalExt};
+use serde::Serialize;
 
 use super::duckdb::{DuckDbRepository, StorageError};
 use super::time::current_timestamp;
 use super::vector_index::TranscriptEmbeddingRowSource;
 use crate::domain::ConversationMessage;
+
+/// Aggregate row used by the admin web page's transcripts list view.
+/// One per `(tenant, session_id)`. `caller_agent` is whatever
+/// `max(caller_agent)` returned — typical sessions have a single agent
+/// so this is unambiguous; in mixed-agent edge cases it picks one
+/// deterministically rather than blocking the listing.
+#[derive(Debug, Clone, Serialize)]
+pub struct TranscriptSessionSummary {
+    pub session_id: String,
+    pub block_count: i64,
+    pub first_at: String,
+    pub last_at: String,
+    pub caller_agent: Option<String>,
+}
 
 /// Row claimed by the transcript embedding worker (`status = processing`).
 ///
@@ -421,6 +436,43 @@ impl DuckDbRepository {
             )
             .optional()?;
         Ok(row)
+    }
+
+    /// Per-session summary used by the admin web page's transcripts view.
+    /// One row per `(tenant, session_id)` with block count + first/last
+    /// timestamp + an arbitrary representative caller_agent (the most
+    /// recently seen one — sessions are typically single-agent so the
+    /// `max(caller_agent)` is fine).
+    pub async fn list_transcript_sessions(
+        &self,
+        tenant: &str,
+    ) -> Result<Vec<TranscriptSessionSummary>, StorageError> {
+        let conn = self.conn()?;
+        let mut stmt = conn.prepare(
+            "select session_id,
+                    count(*)             as block_count,
+                    min(created_at)      as first_at,
+                    max(created_at)      as last_at,
+                    max(caller_agent)    as caller_agent
+             from conversation_messages
+             where tenant = ?1 and session_id is not null
+             group by session_id
+             order by last_at desc",
+        )?;
+        let rows = stmt.query_map(params![tenant], |row| {
+            Ok(TranscriptSessionSummary {
+                session_id: row.get(0)?,
+                block_count: row.get(1)?,
+                first_at: row.get(2)?,
+                last_at: row.get(3)?,
+                caller_agent: row.get(4).ok(),
+            })
+        })?;
+        let mut out = Vec::new();
+        for r in rows {
+            out.push(r?);
+        }
+        Ok(out)
     }
 
     /// Returns all `conversation_messages` rows for the given (tenant,
