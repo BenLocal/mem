@@ -34,6 +34,7 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 rust-embed = { version = "8", features = ["debug-embed"] }
 tantivy = "0.22"
+r2d2 = "0.8"
 
 [dev-dependencies]
 rand = "0.8"

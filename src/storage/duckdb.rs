@@ -103,6 +103,16 @@ pub struct DuckDbRepository {
     /// existing tick error path logs and retries on the next interval,
     /// which is acceptable for the rare-supersede workload.
     worker_write_conn: Arc<Mutex<Connection>>,
+    /// Optional r2d2 read pool. `Some` when `MEM_RW_POOL_ENABLED=1` is
+    /// set at startup; `None` falls back to locking
+    /// `conn` for SELECT methods that opted in to
+    /// [`Self::with_read`]. v1 opt-ins: `fetch_memories_by_ids` (the
+    /// hot path under both semantic and BM25 search).
+    ///
+    /// Pool size is hardcoded at 8. Pool checkout uses
+    /// `get_timeout(5s)` so an exhausted pool fails fast rather than
+    /// queueing indefinitely.
+    read_pool: Option<r2d2::Pool<crate::storage::conn_pool::DuckDbReadManager>>,
     vector_index: Arc<RwLock<Option<Arc<VectorIndex>>>>,
     /// Embedding provider id stored on `transcript_embedding_jobs.provider`
     /// rows enqueued by [`Self::create_conversation_message`]. Set once during
@@ -297,9 +307,42 @@ impl DuckDbRepository {
         let worker_conn = conn.try_clone()?;
         worker_conn.execute_batch("SET threads = 1")?;
 
+        let conn_arc = Arc::new(Mutex::new(conn));
+
+        // Optional read pool. Off by default; enable with
+        // `MEM_RW_POOL_ENABLED=1`. Same try_clone-from-template story
+        // as the worker conn: every checkout shares the same Database
+        // handle so committed writes are visible. Hardcoded size 8.
+        let read_pool = if std::env::var("MEM_RW_POOL_ENABLED")
+            .ok()
+            .map(|v| matches!(v.as_str(), "1" | "true" | "yes"))
+            .unwrap_or(false)
+        {
+            let manager = crate::storage::conn_pool::DuckDbReadManager::new(conn_arc.clone());
+            match r2d2::Pool::builder().max_size(8).build(manager) {
+                Ok(pool) => {
+                    tracing::info!(
+                        size = 8,
+                        "MEM_RW_POOL_ENABLED=1; SELECT routing for opted-in methods will use read pool"
+                    );
+                    Some(pool)
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        error = %e,
+                        "MEM_RW_POOL_ENABLED=1 but pool init failed; falling back to single-conn"
+                    );
+                    None
+                }
+            }
+        } else {
+            None
+        };
+
         Ok(Self {
-            conn: Arc::new(Mutex::new(conn)),
+            conn: conn_arc,
             worker_write_conn: Arc::new(Mutex::new(worker_conn)),
+            read_pool,
             vector_index: Arc::new(RwLock::new(None)),
             transcript_job_provider: Arc::new(RwLock::new(None)),
             memory_fts,
@@ -1509,7 +1552,6 @@ impl DuckDbRepository {
         if ids.is_empty() {
             return Ok(vec![]);
         }
-        let conn = self.conn()?;
 
         let placeholders = std::iter::repeat_n("?", ids.len())
             .collect::<Vec<_>>()
@@ -1527,19 +1569,25 @@ impl DuckDbRepository {
                and memory_id in ({placeholders})"
         );
 
-        let mut stmt = conn.prepare(&sql)?;
-        let mut params_vec: Vec<Box<dyn duckdb::ToSql>> = vec![Box::new(tenant.to_string())];
-        for id in ids {
-            params_vec.push(Box::new(id.to_string()));
-        }
-        let params_refs: Vec<&dyn duckdb::ToSql> = params_vec.iter().map(|b| b.as_ref()).collect();
-
-        let rows = stmt.query_map(&params_refs[..], map_memory_row)?;
-        let mut out = Vec::with_capacity(ids.len());
-        for row in rows {
-            out.push(row?);
-        }
-        Ok(out)
+        // read-pool ok: no read-own-write dependency. Callers
+        // (semantic_search_memories post-ANN, bm25_candidates post-FTS)
+        // hydrate already-committed memory_ids; never observe their own
+        // pending writes.
+        self.with_read(|read| {
+            let mut stmt = read.prepare(&sql)?;
+            let mut params_vec: Vec<Box<dyn duckdb::ToSql>> = vec![Box::new(tenant.to_string())];
+            for id in ids {
+                params_vec.push(Box::new(id.to_string()));
+            }
+            let params_refs: Vec<&dyn duckdb::ToSql> =
+                params_vec.iter().map(|b| b.as_ref()).collect();
+            let rows = stmt.query_map(&params_refs[..], map_memory_row)?;
+            let mut out = Vec::with_capacity(ids.len());
+            for row in rows {
+                out.push(row?);
+            }
+            Ok(out)
+        })
     }
 
     pub async fn accept_pending(
@@ -1960,6 +2008,28 @@ impl DuckDbRepository {
         self.worker_write_conn
             .lock()
             .map_err(|_| StorageError::InvalidData("duckdb worker connection mutex poisoned"))
+    }
+
+    /// Run a pure-SELECT closure against either a checked-out read-pool
+    /// connection (when `MEM_RW_POOL_ENABLED=1`) or the HTTP write
+    /// connection (fallback / default). Reserved for methods that have
+    /// been individually audited for read-own-write safety.
+    ///
+    /// Pool checkout has a 5 s timeout; on exhaustion the call returns
+    /// a `StorageError::InvalidData` rather than queueing indefinitely.
+    pub(crate) fn with_read<F, R>(&self, f: F) -> Result<R, StorageError>
+    where
+        F: FnOnce(crate::storage::conn_pool::ReadOnlyConn<'_>) -> Result<R, StorageError>,
+    {
+        if let Some(pool) = &self.read_pool {
+            let conn = pool
+                .get_timeout(std::time::Duration::from_secs(5))
+                .map_err(|_| StorageError::InvalidData("read pool checkout timeout"))?;
+            f(crate::storage::conn_pool::ReadOnlyConn::wrap(&conn))
+        } else {
+            let conn = self.conn()?;
+            f(crate::storage::conn_pool::ReadOnlyConn::wrap(&conn))
+        }
     }
 
     async fn update_status(
