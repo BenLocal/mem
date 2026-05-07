@@ -13,6 +13,71 @@ are organized by feature wave (merge commit ranges on `master`).
 
 ---
 
+## 2026-05-07 — `0.1.1`
+
+Storage-layer overhaul of the BM25 path, cursor-paged transcripts, and
+auto-feedback from transcripts. Foundation for the KG ingestion-surface
+work tracked in ROADMAP #16–#20 (still 🚧).
+
+### Added
+
+- **Tantivy-backed BM25** (`src/storage/fts.rs`) — incremental writes
+  per segment; no rebuild worker, no DuckDB dep-tracker bug. Lazy
+  `IndexWriter` so read-only repo opens (e.g. `mem repair
+  --rebuild-graph`) don't fight a running `mem serve` for the per-dir
+  lockfile. Bootstrap from existing rows on first open.
+- **`POST /transcripts` cursor pagination** (`limit` + structured
+  `cursor` + `since` / `until`). Composite cursor
+  `(created_at, line_number, block_index)` so ms-collisions don't drop
+  rows. `next_cursor` + `has_more` in response.
+- **Admin web — transcript drawer**: quick filter bar
+  (全部 / 24h / 今天 / 昨天) + IntersectionObserver-driven infinite
+  scroll, default page size 200.
+- **`mem feedback-from-transcript`** — scans a transcript for
+  `mcp__mem__memory_search*` calls, finds memory_ids whose returned
+  text reappears in subsequent assistant blocks, POSTs `applies_here`.
+  Wired into `Stop` and `PreCompact` hooks; closes the lifecycle loop
+  even when the agent forgets to call `memory_feedback` itself.
+- **`AGENTS.md` "Feedback discipline"** section — five `feedback_kind`
+  values, when to fire, the two MCP entry points
+  (`memory_feedback` / `memory_apply_feedback`).
+
+### Changed
+
+- `GET /transcripts?session_id=…` → `POST /transcripts` with JSON
+  body. Old GET form's `:`-separated string cursor shredded ISO-8601
+  timestamps; structured object cursor avoids the collision and the
+  URL-length issues.
+- `synthetic_recall_bench` regression bound widened from 0.06 to 0.25
+  for hybrid-vs-BM25: tantivy's BM25 alone now ≈0.98 NDCG@10, so
+  fake-embedding hybrid naturally trails it.
+
+### Fixed
+
+- **`mem mine` was dropping ~80 % of user-typed messages**: Claude
+  Code emits `message.content` as either an array of blocks
+  (tool-uses / attachments present) or a plain string (raw user text).
+  `parse_transcript_full` only handled the array form — string-shaped
+  payloads were silently skipped. After the fix, re-mining a 5097-block
+  session pulled 275 previously-lost rows in (191 user/text). Same
+  shape fix applied to `feedback-from-transcript`.
+
+### Removed
+
+- `src/worker/fts_worker.rs`, `fts_dirty` AtomicBool, `ensure_fts_index_fresh`,
+  `is_fts_dependency_error` recovery path. All obsolete with tantivy:
+  no rebuild cycle, no background catch-up task, no DuckDB FTS
+  dep-tracker bug to detect.
+
+### Docs
+
+- `docs/ROADMAP.MD` `#16–#20` — KG ingestion-surface widening (`tags`,
+  `supersedes`, transcript→memory, `code_refs`, content extraction).
+- `docs/mempalace-diff.md` `§5.1` — empirical evidence for the gap
+  (10 memories / 8 entities / ~3 edges-per-memory in the live tenant).
+
+---
+
 ## 2026-05-05 — MemPalace LongMemEval Parity Bench
 
 ### Added
