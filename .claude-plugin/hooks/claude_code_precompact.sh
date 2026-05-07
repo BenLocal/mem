@@ -18,11 +18,21 @@ fi
 
 MINE_OUT=$(timeout 90 mem mine "$TRANSCRIPT" --agent claude-code 2>&1 || true)
 
+# Same auto-feedback pass as the Stop hook, slightly tighter cap (30 s)
+# because pre-compact already gave mine 90 s and we don't want the total
+# to blow through a runtime hook ceiling.
+FEEDBACK_OUT=$(timeout 30 mem feedback-from-transcript "$TRANSCRIPT" --tenant local 2>&1 || true)
+FEEDBACK_SENT=$(echo "$FEEDBACK_OUT" | sed -n 's/.*sent=\([0-9]*\).*/\1/p' | head -1)
+
 MEMS=$(echo "$MINE_OUT" | sed -n 's/.*memories sent=\([0-9]*\).*/\1/p' | head -1)
 BLOCKS=$(echo "$MINE_OUT" | sed -n 's/.*blocks sent=\([0-9]*\).*/\1/p' | head -1)
 
 if [ -n "$MEMS" ] && [ -n "$BLOCKS" ]; then
-    MSG=$(printf '✦ mem · pre-compact · %s memories + %s blocks archived' "$MEMS" "$BLOCKS")
+    if [ -n "$FEEDBACK_SENT" ] && [ "$FEEDBACK_SENT" != "0" ]; then
+        MSG=$(printf '✦ mem · pre-compact · %s memories + %s blocks · %s feedback applied' "$MEMS" "$BLOCKS" "$FEEDBACK_SENT")
+    else
+        MSG=$(printf '✦ mem · pre-compact · %s memories + %s blocks archived' "$MEMS" "$BLOCKS")
+    fi
     jq -n --arg msg "$MSG" '{"systemMessage": $msg}'
 else
     echo '{}'

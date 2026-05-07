@@ -60,6 +60,37 @@ cross build --release                          # cross-compile (reads ./Cross.to
 
 ---
 
+## Feedback discipline (calling agent → MCP)
+
+When using `mem`'s MCP tools, **closing the feedback loop is part of the contract** — the lifecycle (`confidence` ↑, `decay_score` ↑, status → `Archived`) only moves when callers send signals back. A read-only consumer that never calls back means every memory's score is frozen at ingest, and ranking quality stops compounding.
+
+The two MCP entry points are equivalent over the same `POST /memories/feedback` backend:
+- `mcp__mem__memory_feedback` — canonical name; argument is `feedback_kind: string`.
+- `mcp__mem__memory_apply_feedback` — same body, argument renamed `kind`. Use either; pick one per session for consistency.
+
+The five `feedback_kind` values and what each does (`src/domain/memory.rs::FeedbackKind`):
+
+| `feedback_kind`         | confidence Δ | decay Δ | side effect           | when to send                                                                                       |
+|-------------------------|--------------|---------|-----------------------|----------------------------------------------------------------------------------------------------|
+| `useful`                | +0.10        | 0       | marks validated       | A retrieved memory **directly** unblocked / answered the current task. The strongest positive.    |
+| `applies_here`          | +0.05        | 0       | —                     | Memory was relevant context but not the load-bearing fact. The mild positive.                     |
+| `outdated`              | 0            | +0.20   | —                     | Memory was right at ingest but is now stale (renamed file, reverted decision, expired credential). |
+| `does_not_apply_here`   | 0            | +0.10   | —                     | Correct elsewhere but doesn't fit this scope/project. Don't archive — just deprioritize.          |
+| `incorrect`             | 0            | 0       | **status → Archived** | Memory contains a factual error. Permanent — same path as the admin UI's "delete".                 |
+
+### When to fire
+
+- Send **at most one** signal per memory per session — the strongest one. Don't spam the queue with `applies_here` for every search hit.
+- Only fire on memories you actually **read and used** — search-hit-but-skimmed-and-ignored is not feedback. Silence is a valid signal too.
+- `incorrect` is destructive (archives the row); reserve it for "I verified this is wrong," not "I disagree."
+- The `tenant` field is required by the HTTP layer but the MCP wrapper fills it from `MEM_TENANT` automatically — leave it out of the call and the resolver picks `local`.
+
+### What this does to ranking
+
+Per-memory scoring (`pipeline/retrieve.rs`) sums an integer-weighted blend of semantic + lexical + scope + intent + confidence + freshness − decay + graph signals. Feedback tweaks two of those (`confidence`, `decay_score`) on the underlying record, so the next retrieval that surfaces the same memory ranks differently. There is no offline batch that "applies" feedback later; the write is immediate and visible to the next `memory_search` call.
+
+---
+
 ## Where to find design context
 
 - **`docs/mempalace-diff.md`** — comparison with MemPalace + roadmap (§8 numbered items #1–#13). Completed items have ✅; commit messages reference them (e.g. `closes mempalace-diff §8 #3`). Read before non-trivial design changes.

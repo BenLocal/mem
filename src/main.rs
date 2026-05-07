@@ -25,6 +25,11 @@ enum Command {
     Mine(mem::cli::mine::MineArgs),
     /// Query and format memories for session start injection.
     WakeUp(mem::cli::wake_up::WakeUpArgs),
+    /// Scan a transcript and POST `applies_here` feedback for memories
+    /// whose retrieved text was referenced in subsequent assistant
+    /// blocks. Wired into the Stop / PreCompact hooks so the lifecycle
+    /// signals close even when the agent forgets to call `memory_feedback`.
+    FeedbackFromTranscript(mem::cli::feedback::FeedbackFromTranscriptArgs),
 }
 
 #[tokio::main]
@@ -55,6 +60,10 @@ async fn main() -> error::Result<()> {
                 std::process::exit(1);
             }
         },
+        Command::FeedbackFromTranscript(args) => {
+            let code = mem::cli::feedback::run(args).await;
+            std::process::exit(code);
+        }
     }
 }
 

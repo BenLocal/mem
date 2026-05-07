@@ -38,11 +38,23 @@ MINE_OUT=$(timeout 60 mem mine "$TRANSCRIPT" --agent claude-code 2>&1 || true)
 
 echo "$EXCHANGE_COUNT" > "$LAST_SAVE_FILE"
 
+# Auto-feedback: scan the same transcript for mcp__mem__memory_search
+# results whose text was referenced in subsequent assistant blocks, and
+# POST `applies_here` for each. Capped at 30 s; failures are logged to
+# stderr but never break the hook (we don't want a flaky feedback round
+# to hide a successful mine).
+FEEDBACK_OUT=$(timeout 30 mem feedback-from-transcript "$TRANSCRIPT" --tenant local 2>&1 || true)
+FEEDBACK_SENT=$(echo "$FEEDBACK_OUT" | sed -n 's/.*sent=\([0-9]*\).*/\1/p' | head -1)
+
 MEMS=$(echo "$MINE_OUT" | sed -n 's/.*memories sent=\([0-9]*\).*/\1/p' | head -1)
 BLOCKS=$(echo "$MINE_OUT" | sed -n 's/.*blocks sent=\([0-9]*\).*/\1/p' | head -1)
 
 if [ -n "$MEMS" ] && [ -n "$BLOCKS" ]; then
-    MSG=$(printf '✦ mem · %s memories + %s blocks woven into the archive' "$MEMS" "$BLOCKS")
+    if [ -n "$FEEDBACK_SENT" ] && [ "$FEEDBACK_SENT" != "0" ]; then
+        MSG=$(printf '✦ mem · %s memories + %s blocks archived · %s feedback applied' "$MEMS" "$BLOCKS" "$FEEDBACK_SENT")
+    else
+        MSG=$(printf '✦ mem · %s memories + %s blocks woven into the archive' "$MEMS" "$BLOCKS")
+    fi
     jq -n --arg msg "$MSG" '{"systemMessage": $msg}'
 else
     echo '{}'
