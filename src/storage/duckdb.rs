@@ -1,10 +1,7 @@
 use std::{
     collections::{HashMap, HashSet, VecDeque},
     path::Path,
-    sync::{
-        atomic::{AtomicBool, Ordering},
-        Arc, Mutex, MutexGuard, RwLock,
-    },
+    sync::{Arc, Mutex, MutexGuard, RwLock},
 };
 
 use duckdb::{params, Connection, OptionalExt};
@@ -94,17 +91,18 @@ pub struct DuckDbRepository {
     /// `create_conversation_message` errors loudly rather than silently using
     /// a default that may diverge from the configured provider.
     transcript_job_provider: Arc<RwLock<Option<String>>>,
-    /// Set whenever a row is inserted into `memories` whose summary/content
-    /// would change BM25 results. Cleared by `bm25_candidates` after a
-    /// successful index rebuild. DuckDB FTS is non-incremental, so we
-    /// rebuild lazily on the next BM25 query rather than after every write.
-    fts_dirty: Arc<AtomicBool>,
-    /// Same idea as `fts_dirty` but for the `conversation_messages` FTS
-    /// index. Independent flag — transcripts and memories share zero state.
-    /// Initial value is `true` so the first BM25 query after process
-    /// restart always rebuilds (defends against stale sidecars across
-    /// restarts).
-    pub(crate) transcripts_fts_dirty: Arc<AtomicBool>,
+    /// Tantivy-backed BM25 index for `memories`. Replaces the previous
+    /// DuckDB native FTS extension which required a full
+    /// `drop_fts_index` + `create_fts_index` cycle on every read after a
+    /// write (and exposed the `subject "stopwords" has been deleted`
+    /// catalog dep-tracker bug on long-lived connections). Tantivy is
+    /// incremental at the `add_document` level — each ingest writes a
+    /// segment, segments merge in the background, search reads all live
+    /// segments without rebuild ceremony.
+    memory_fts: Arc<crate::storage::fts::MemoryFts>,
+    /// Tantivy-backed BM25 index for `conversation_messages`. Same
+    /// rationale as `memory_fts` but for the transcript archive.
+    pub(crate) transcript_fts: Arc<crate::storage::fts::TranscriptFts>,
 }
 
 #[derive(Debug, Error)]
@@ -231,16 +229,48 @@ impl DuckDbRepository {
             );
         }
 
+        // Open the tantivy sidecars (creating empty indexes if missing).
+        // If the index is empty but the tables have rows, run a one-shot
+        // bootstrap so BM25 isn't silently zero on the first query —
+        // typical first run after the FTS replacement, or recovery after
+        // a manually-deleted sidecar.
+        use crate::storage::fts::{memory_fts_path, transcript_fts_path, MemoryFts, TranscriptFts};
+        let memory_fts = Arc::new(
+            MemoryFts::open(&memory_fts_path(path))
+                .map_err(|e| StorageError::InvalidInput(format!("memory fts open: {e}")))?,
+        );
+        let transcript_fts = Arc::new(
+            TranscriptFts::open(&transcript_fts_path(path))
+                .map_err(|e| StorageError::InvalidInput(format!("transcript fts open: {e}")))?,
+        );
+
+        if memory_fts
+            .doc_count()
+            .map_err(|e| StorageError::InvalidInput(format!("memory fts doc_count: {e}")))?
+            == 0
+        {
+            let bootstrapped = bootstrap_memory_fts(&conn, &memory_fts)?;
+            if bootstrapped > 0 {
+                tracing::info!(rows = bootstrapped, "bootstrapped memory tantivy fts");
+            }
+        }
+        if transcript_fts
+            .doc_count()
+            .map_err(|e| StorageError::InvalidInput(format!("transcript fts doc_count: {e}")))?
+            == 0
+        {
+            let bootstrapped = bootstrap_transcript_fts(&conn, &transcript_fts)?;
+            if bootstrapped > 0 {
+                tracing::info!(rows = bootstrapped, "bootstrapped transcript tantivy fts");
+            }
+        }
+
         Ok(Self {
             conn: Arc::new(Mutex::new(conn)),
             vector_index: Arc::new(RwLock::new(None)),
             transcript_job_provider: Arc::new(RwLock::new(None)),
-            // Force a build on the very first BM25 query so a freshly opened
-            // (or previously upgraded) DB doesn't silently miss results.
-            fts_dirty: Arc::new(AtomicBool::new(true)),
-            // Same rationale as `fts_dirty`: force a build on the first
-            // transcript BM25 query after process startup.
-            transcripts_fts_dirty: Arc::new(AtomicBool::new(true)),
+            memory_fts,
+            transcript_fts,
         })
     }
 
@@ -282,15 +312,6 @@ impl DuckDbRepository {
             .read()
             .expect("transcript_job_provider lock poisoned")
             .clone()
-    }
-
-    /// Marks the transcripts FTS index as needing a rebuild on the next
-    /// BM25 read. Mirrors the inline `self.fts_dirty.store(true, ...)`
-    /// pattern used by the memories side, but exposed as a method so
-    /// `transcript_repo.rs` can flip the flag without crossing module
-    /// boundaries on a private field.
-    pub(crate) fn set_transcripts_fts_dirty(&self) {
-        self.transcripts_fts_dirty.store(true, Ordering::Release);
     }
 
     pub async fn insert_memory(&self, memory: MemoryRecord) -> Result<MemoryRecord, StorageError> {
@@ -340,7 +361,14 @@ impl DuckDbRepository {
                 encode_json(&stored.topics)?,
             ],
         )?;
-        self.fts_dirty.store(true, Ordering::Release);
+        if let Err(e) = self.memory_fts.upsert(
+            &stored.memory_id,
+            &stored.tenant,
+            &stored.summary,
+            &stored.content,
+        ) {
+            tracing::warn!(error = %e, memory_id = %stored.memory_id, "memory fts upsert failed; row written without bm25 index entry — will be picked up by next bootstrap or rebuild");
+        }
 
         Ok(memory)
     }
@@ -727,7 +755,9 @@ impl DuckDbRepository {
             return Err(StorageError::InvalidData("memory not found"));
         }
 
-        self.fts_dirty.store(true, Ordering::Release);
+        if let Err(e) = self.memory_fts.delete(memory_id) {
+            tracing::warn!(error = %e, memory_id = %memory_id, "memory fts delete failed");
+        }
         Ok(())
     }
 
@@ -1371,73 +1401,36 @@ impl DuckDbRepository {
         if query.trim().is_empty() || k == 0 {
             return Ok(vec![]);
         }
-        // Rebuild best-effort: if it fails (DuckDB FTS 1.x dep tracker
-        // bug — see `is_fts_dependency_error`) keep using whatever index
-        // last existed on disk. Stale BM25 ranking is far better than
-        // returning 500 to the search caller; the `fts_worker` will keep
-        // attempting to rebuild on its own cadence and the dirty flag is
-        // restored inside `ensure_fts_index_fresh` so a future retry can
-        // succeed once the catalog state settles. Logged at debug only.
-        if let Err(e) = self.ensure_fts_index_fresh() {
-            tracing::debug!(error = %e, "bm25_candidates ignoring fts rebuild error; using prior index");
-        }
-
-        let scored: Vec<(String, f64)> = {
-            let conn = self.conn()?;
-            let mut stmt = conn.prepare(
-                "with scored as (
-                    select memory_id,
-                           fts_main_memories.match_bm25(memory_id, ?1, conjunctive := 0) as bm25
-                    from memories
-                    where tenant = ?2
-                      and status not in ('rejected', 'archived')
-                )
-                 select memory_id, bm25
-                 from scored
-                 where bm25 is not null
-                 order by bm25 desc
-                 limit ?3",
-            )?;
-            let rows = stmt.query_map(params![query, tenant, k as i64], |row| {
-                Ok((row.get::<_, String>(0)?, row.get::<_, f64>(1)?))
-            })?;
-            rows.collect::<Result<Vec<_>, _>>()?
+        // Tantivy returns memory_ids ranked by BM25 (oversampled — we
+        // ask for `k * 2` since some hits will be filtered out by the
+        // status check below). `fetch_memories_by_ids` then drops
+        // archived/rejected rows and we re-rank to preserve tantivy's
+        // ordering.
+        let oversample = k.saturating_mul(2).max(k);
+        let ids = match self.memory_fts.search(tenant, query, oversample) {
+            Ok(v) => v,
+            Err(e) => {
+                tracing::warn!(error = %e, "tantivy memory search failed; returning empty bm25");
+                return Ok(vec![]);
+            }
         };
-
-        if scored.is_empty() {
+        if ids.is_empty() {
             return Ok(vec![]);
         }
 
-        let id_refs: Vec<&str> = scored.iter().map(|(id, _)| id.as_str()).collect();
+        let id_refs: Vec<&str> = ids.iter().map(|s| s.as_str()).collect();
         let mut records = self.fetch_memories_by_ids(tenant, &id_refs).await?;
+        records.retain(|m| !matches!(m.status, MemoryStatus::Rejected | MemoryStatus::Archived));
 
-        // Preserve BM25 rank order — `fetch_memories_by_ids` returns rows in
-        // arbitrary order.
-        let rank_by_id: HashMap<&str, usize> = scored
+        let rank_by_id: HashMap<&str, usize> = ids
             .iter()
             .enumerate()
-            .map(|(i, (id, _))| (id.as_str(), i))
+            .map(|(i, id)| (id.as_str(), i))
             .collect();
         records.sort_by_key(|m| *rank_by_id.get(m.memory_id.as_str()).unwrap_or(&usize::MAX));
+        records.truncate(k);
 
         Ok(records)
-    }
-
-    /// Rebuilds the FTS index if any write since the last build set the dirty
-    /// flag. Cheap when clean. Invoked by the BM25 read path AND by the
-    /// background `fts_worker` (which periodically drains the flag so reads
-    /// rarely have to rebuild themselves).
-    pub(crate) fn ensure_fts_index_fresh(&self) -> Result<(), StorageError> {
-        if !self.fts_dirty.swap(false, Ordering::AcqRel) {
-            return Ok(());
-        }
-        let conn = self.conn()?;
-        if let Err(e) = rebuild_memories_fts(&conn) {
-            // Restore the flag so the next caller retries the build.
-            self.fts_dirty.store(true, Ordering::Release);
-            return Err(e);
-        }
-        Ok(())
     }
 
     /// Returns [`MemoryRecord`] rows for the given ids, filtered to a tenant and
@@ -1576,7 +1569,14 @@ impl DuckDbRepository {
                     encode_json(&stored.topics)?,
                 ],
             )?;
-            self.fts_dirty.store(true, Ordering::Release);
+            if let Err(e) = self.memory_fts.upsert(
+                &stored.memory_id,
+                &stored.tenant,
+                &stored.summary,
+                &stored.content,
+            ) {
+                tracing::warn!(error = %e, memory_id = %stored.memory_id, "memory fts upsert failed in supersede path");
+            }
             restore_embedding_references(&conn, &jobs, embedding.as_ref())?;
         }
 
@@ -2146,88 +2146,6 @@ pub(crate) fn sweep_orphan_embeddings(conn: &Connection) -> Result<usize, Storag
     Ok(deleted)
 }
 
-/// Rebuild the FTS index for the `memories` table, with a fallback path for
-/// the bundled DuckDB FTS 1.x dependency-tracker bug.
-///
-/// Background: in 2026-05 we observed `/memories/search` returning
-///   `Failed to commit: Could not commit creation of dependency,
-///    subject "stopwords" has been deleted`
-/// reliably on the second-or-later rebuild against a single long-lived
-/// connection. Root cause: the bundled FTS extension's in-memory catalog
-/// keeps a stale dependency edge to the just-dropped `stopwords` macro.
-/// `CHECKPOINT` does not clear this state, and `create_fts_index(...,
-/// overwrite := 1)` is rejected by the bundled binder (only the
-/// 2-positional-arg form is recognised).
-///
-/// Strategy: try the normal drop+create path. If create fails with the
-/// stopwords-dependency signature, force a full extension reload
-/// (`INSTALL fts; LOAD fts;`) which resets the in-memory dependency
-/// catalog, then retry the create. If the second attempt still fails the
-/// caller observes the original error (and `fts_dirty` stays set so the
-/// next BM25 query retries — without a successful retry the search path
-/// still falls back to non-BM25 lexical via `lexical_candidates`).
-fn rebuild_memories_fts(conn: &Connection) -> Result<(), StorageError> {
-    fts_rebuild_with_reload_fallback(
-        conn,
-        "memories",
-        "pragma create_fts_index('memories', 'memory_id', 'summary', 'content');",
-    )
-}
-
-/// Mirror of [`rebuild_memories_fts`] for the transcript archive's
-/// `conversation_messages` FTS index.
-pub(crate) fn rebuild_transcripts_fts(conn: &Connection) -> Result<(), StorageError> {
-    fts_rebuild_with_reload_fallback(
-        conn,
-        "conversation_messages",
-        "pragma create_fts_index('conversation_messages', 'message_block_id', 'content');",
-    )
-}
-
-fn fts_rebuild_with_reload_fallback(
-    conn: &Connection,
-    table: &str,
-    create_sql: &str,
-) -> Result<(), StorageError> {
-    let drop_sql = format!("pragma drop_fts_index('{table}');");
-    // First attempt: load (idempotent), drop (best-effort — errors first time
-    // when no index exists, swallow), create.
-    let _ = conn.execute_batch("load fts;");
-    let _ = conn.execute_batch(&drop_sql);
-    match conn.execute_batch(create_sql) {
-        Ok(()) => return Ok(()),
-        Err(e) if is_fts_dependency_error(&e.to_string()) => {
-            // Fall through to the reload-and-retry path.
-        }
-        Err(e) => return Err(StorageError::DuckDb(e)),
-    }
-
-    // Second attempt: forcibly reload the FTS extension to drop the bundled
-    // catalog's stale dependency edges, then drop+create again. INSTALL is a
-    // no-op when the extension is already on disk; LOAD re-binds the per-
-    // connection extension state and (empirically) clears the dependency
-    // tracker. CHECKPOINT alone does not clear this state.
-    let _ = conn.execute_batch("install fts;");
-    let _ = conn.execute_batch("load fts;");
-    let _ = conn.execute_batch(&drop_sql);
-    conn.execute_batch(create_sql).map_err(StorageError::DuckDb)
-}
-
-/// Detects the DuckDB FTS 1.x dependency-tracker bug:
-///   "Failed to commit: Could not commit creation of dependency,
-///    subject \"stopwords\" has been deleted"
-/// Match on the stable identifying substring `stopwords` (single- and
-/// double-quoted variants). Surrounding text varies across DuckDB
-/// minor versions but the broken-dep subject is invariant.
-///
-/// `pub(crate)` so the FTS worker can downgrade this error class to
-/// debug-level logging — the read path already keeps the prior index
-/// alive when this error fires (`bm25_candidates` swallows), so the
-/// worker spamming WARN every tick is just noise.
-pub(crate) fn is_fts_dependency_error(msg: &str) -> bool {
-    msg.contains("\"stopwords\"") || msg.contains("'stopwords'")
-}
-
 fn delete_embedding_references(conn: &Connection, memory_id: &str) -> Result<(), StorageError> {
     conn.execute(
         "delete from embedding_jobs where memory_id = ?1",
@@ -2538,30 +2456,50 @@ fn decode_feedback_kind(value: &str) -> Option<FeedbackKind> {
     }
 }
 
-#[cfg(test)]
-mod fts_recovery_tests {
-    use super::is_fts_dependency_error;
-
-    #[test]
-    fn detects_double_quoted_subject() {
-        let msg = r#"duckdb error: TransactionContext Error: Failed to commit: Could not commit creation of dependency, subject "stopwords" has been deleted"#;
-        assert!(is_fts_dependency_error(msg));
+/// One-shot upsert from `memories` into a freshly-opened (empty)
+/// tantivy index. Triggered by `DuckDbRepository::open` on first run
+/// after the FTS replacement landed and on sidecar recovery.
+fn bootstrap_memory_fts(
+    conn: &Connection,
+    fts: &crate::storage::fts::MemoryFts,
+) -> Result<usize, StorageError> {
+    let mut stmt = conn.prepare("select memory_id, tenant, summary, content from memories")?;
+    let rows: Vec<(String, String, String, String)> = stmt
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+            ))
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+    if rows.is_empty() {
+        return Ok(0);
     }
+    fts.bootstrap_batch(rows)
+        .map_err(|e| StorageError::InvalidInput(format!("memory fts bootstrap: {e}")))
+}
 
-    #[test]
-    fn detects_single_quoted_subject() {
-        let msg = "Could not commit creation of dependency, subject 'stopwords' has been deleted";
-        assert!(is_fts_dependency_error(msg));
+/// Same as `bootstrap_memory_fts` for the transcripts index.
+fn bootstrap_transcript_fts(
+    conn: &Connection,
+    fts: &crate::storage::fts::TranscriptFts,
+) -> Result<usize, StorageError> {
+    let mut stmt =
+        conn.prepare("select message_block_id, tenant, content from conversation_messages")?;
+    let rows: Vec<(String, String, String)> = stmt
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+            ))
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+    if rows.is_empty() {
+        return Ok(0);
     }
-
-    #[test]
-    fn does_not_match_unrelated_errors() {
-        assert!(!is_fts_dependency_error(
-            "Constraint Error: Violates foreign key constraint"
-        ));
-        assert!(!is_fts_dependency_error(
-            "Binder Error: No function matches"
-        ));
-        assert!(!is_fts_dependency_error(""));
-    }
+    fts.bootstrap_batch(rows)
+        .map_err(|e| StorageError::InvalidInput(format!("transcript fts bootstrap: {e}")))
 }

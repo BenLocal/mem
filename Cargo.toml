@@ -33,6 +33,7 @@ usearch = { version = "2", default-features = false }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 rust-embed = { version = "8", features = ["debug-embed"] }
+tantivy = "0.22"
 
 [dev-dependencies]
 rand = "0.8"

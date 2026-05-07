@@ -6,7 +6,6 @@
 //! a separate `impl DuckDbRepository` block in this file.
 
 use std::collections::HashMap;
-use std::sync::atomic::Ordering;
 
 use duckdb::{params, OptionalExt};
 use serde::Serialize;
@@ -147,29 +146,38 @@ impl DuckDbRepository {
                     ],
                 )?;
             }
-            // Mark the transcripts FTS index dirty so the next BM25 read
-            // rebuilds. Done unconditionally on a successful insert (not only
-            // for embed-eligible rows) because the FTS index covers the full
-            // `conversation_messages` table per the Task 2 probe outcome —
-            // even ineligible rows go into the index, and the SELECT filters
-            // by `embed_eligible = true` at query time.
-            self.set_transcripts_fts_dirty();
+            // Incremental tantivy upsert. Replaces the legacy
+            // `transcripts_fts_dirty` flag (which gated a full DuckDB FTS
+            // rebuild on the next BM25 read). Tantivy's add_document is
+            // segment-level so this scales linearly with writes — no
+            // amortised whole-table rebuild needed.
+            //
+            // We index every block (not only `embed_eligible`) because the
+            // FTS index covers the full `conversation_messages` table per
+            // the Task 2 probe; the BM25 query itself filters by eligibility
+            // at search time.
+            if let Err(e) =
+                self.transcript_fts
+                    .upsert(&msg.message_block_id, &msg.tenant, &msg.content)
+            {
+                tracing::warn!(
+                    error = %e,
+                    message_block_id = %msg.message_block_id,
+                    "transcript fts upsert failed; row written without bm25 index entry"
+                );
+            }
         }
 
         Ok(())
     }
 
-    /// BM25 lexical candidates over `conversation_messages.content`,
-    /// filtered to `embed_eligible = true` rows (matching the HNSW
-    /// pipeline's coverage). Returns up to `k` rows ordered by BM25
-    /// score descending.
+    /// BM25 lexical candidates over `conversation_messages.content`.
+    /// Returns up to `k` rows ordered by BM25 score descending.
     ///
-    /// The FTS index is built lazily by `ensure_transcript_fts_index_fresh`
-    /// on the first read after a write.
-    ///
-    /// Per the Task 2 probe, the bundled DuckDB FTS extension does NOT
-    /// support `where := '...'` predicate indexes, so the index covers
-    /// the full table and the SELECT filters at query time.
+    /// Backed by the tantivy index colocated with the DuckDB file
+    /// (`<db>.fts.transcripts/`). Tantivy is consulted for ranked
+    /// `message_block_id`s, then we hydrate via DuckDB and filter to
+    /// `embed_eligible = true` to match the HNSW pipeline's coverage.
     pub async fn bm25_transcript_candidates(
         &self,
         tenant: &str,
@@ -179,55 +187,36 @@ impl DuckDbRepository {
         if query.trim().is_empty() || k == 0 {
             return Ok(vec![]);
         }
-        // Best-effort rebuild — see `bm25_candidates` for the rationale.
-        if let Err(e) = self.ensure_transcript_fts_index_fresh() {
-            tracing::debug!(error = %e, "bm25_transcript_candidates ignoring fts rebuild error; using prior index");
-        }
-
-        let scored: Vec<(String, f64)> = {
-            let conn = self.conn()?;
-            let mut stmt = conn.prepare(
-                "with scored as (
-                    select message_block_id,
-                           fts_main_conversation_messages.match_bm25(message_block_id, ?1, conjunctive := 0) as bm25
-                    from conversation_messages
-                    where tenant = ?2
-                      and embed_eligible = true
-                )
-                 select message_block_id, bm25
-                 from scored
-                 where bm25 is not null
-                 order by bm25 desc
-                 limit ?3",
-            )?;
-            let rows = stmt.query_map(params![query, tenant, k as i64], |row| {
-                Ok((row.get::<_, String>(0)?, row.get::<_, f64>(1)?))
-            })?;
-            rows.collect::<Result<Vec<_>, _>>()?
+        // Oversample so the embed_eligible filter can drop some hits
+        // without immediately starving the result.
+        let oversample = k.saturating_mul(2).max(k);
+        let ids = match self.transcript_fts.search(tenant, query, oversample) {
+            Ok(v) => v,
+            Err(e) => {
+                tracing::warn!(error = %e, "tantivy transcript search failed; returning empty bm25");
+                return Ok(vec![]);
+            }
         };
-
-        if scored.is_empty() {
+        if ids.is_empty() {
             return Ok(vec![]);
         }
 
-        let id_strings: Vec<String> = scored.iter().map(|(id, _)| id.clone()).collect();
         let mut hydrated = self
-            .fetch_conversation_messages_by_ids(tenant, &id_strings)
+            .fetch_conversation_messages_by_ids(tenant, &ids)
             .await?;
+        hydrated.retain(|m| m.embed_eligible);
 
-        // Preserve BM25 rank order — `fetch_conversation_messages_by_ids`
-        // already orders by input slice, but we re-sort defensively in case
-        // that contract is ever relaxed.
-        let rank_by_id: HashMap<&str, usize> = scored
+        let rank_by_id: HashMap<&str, usize> = ids
             .iter()
             .enumerate()
-            .map(|(i, (id, _))| (id.as_str(), i))
+            .map(|(i, id)| (id.as_str(), i))
             .collect();
         hydrated.sort_by_key(|m| {
             *rank_by_id
                 .get(m.message_block_id.as_str())
                 .unwrap_or(&usize::MAX)
         });
+        hydrated.truncate(k);
         Ok(hydrated)
     }
 
@@ -397,21 +386,6 @@ impl DuckDbRepository {
             before,
             after,
         })
-    }
-
-    /// Rebuild the transcripts FTS index iff the dirty flag is set. Cheap
-    /// when clean. Mirror of `ensure_fts_index_fresh` for memories — see
-    /// that method's docs for the drop-then-create rationale.
-    pub(crate) fn ensure_transcript_fts_index_fresh(&self) -> Result<(), StorageError> {
-        if !self.transcripts_fts_dirty.swap(false, Ordering::AcqRel) {
-            return Ok(());
-        }
-        let conn = self.conn()?;
-        if let Err(e) = super::duckdb::rebuild_transcripts_fts(&conn) {
-            self.transcripts_fts_dirty.store(true, Ordering::Release);
-            return Err(e);
-        }
-        Ok(())
     }
 
     /// Singleton fetch by `(tenant, message_block_id)`. Used by the transcript

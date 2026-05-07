@@ -664,6 +664,11 @@ async fn repair_check_reports_status_for_both_sidecars() {
     config.db_path = db.clone();
     config.embedding = settings;
 
+    // Release the seed repo's tantivy IndexWriter lock before `run_check_for_test`
+    // opens a second repository on the same dir.
+    drop(repo);
+    drop(_tr_idx);
+
     let (text, exit) = run_check_for_test(&config, &fp).await;
 
     assert!(
@@ -741,6 +746,7 @@ async fn rebuild_graph_converts_legacy_to_entity_refs() {
         "write_mode": "auto"
     });
     let resp = app
+        .clone()
         .oneshot(
             Request::builder()
                 .method("POST")
@@ -778,6 +784,13 @@ async fn rebuild_graph_converts_legacy_to_entity_refs() {
         )
         .unwrap();
     }
+
+    // Drop the running app's repo before the repair CLI opens its own. The
+    // tantivy FTS index uses a per-directory lockfile and refuses a second
+    // IndexWriter on the same dir; in production `mem repair` runs while
+    // `mem serve` is stopped, so the constraint is fine — only tests need
+    // the explicit handoff.
+    drop(app);
 
     let outcome = compute_rebuild_graph_outcome(&cfg).await.unwrap();
     assert!(matches!(outcome, RebuildGraphOutcome::Rebuilt { .. }));
@@ -818,6 +831,7 @@ async fn rebuild_graph_is_idempotent() {
     cfg.db_path = tmp.path().join("mem.duckdb");
     let app = mem::app::router_with_config(cfg.clone()).await.unwrap();
     let resp = app
+        .clone()
         .oneshot(
             Request::builder()
                 .method("POST")
@@ -841,6 +855,10 @@ async fn rebuild_graph_is_idempotent() {
         .unwrap();
     assert_eq!(resp.status(), StatusCode::CREATED);
 
+    // Release the running app's tantivy IndexWriter lock before the repair
+    // CLI opens its own DuckDbRepository on the same dir.
+    drop(app);
+
     compute_rebuild_graph_outcome(&cfg).await.unwrap();
     let conn = duckdb::Connection::open(&cfg.db_path).unwrap();
     let count1: i64 = conn
@@ -863,8 +881,9 @@ async fn rebuild_graph_handles_empty_database() {
     let mut cfg = mem::config::Config::local();
     cfg.db_path = tmp.path().join("mem.duckdb");
     // Bootstrap schema by spinning up the router (which calls
-    // `DuckDbRepository::open` → schema migrations).
-    let _app = mem::app::router_with_config(cfg.clone()).await.unwrap();
+    // `DuckDbRepository::open` → schema migrations). Drop it immediately so
+    // the repair CLI can take the tantivy IndexWriter lock on the same dir.
+    drop(mem::app::router_with_config(cfg.clone()).await.unwrap());
 
     let outcome = compute_rebuild_graph_outcome(&cfg).await.unwrap();
     match outcome {
