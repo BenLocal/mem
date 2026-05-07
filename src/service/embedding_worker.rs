@@ -34,21 +34,20 @@ pub async fn tick(
     provider: &dyn EmbeddingProvider,
     settings: &EmbeddingSettings,
 ) -> Result<(), StorageError> {
+    let n = settings.batch_size.max(1);
     let now = current_timestamp();
-    let job = match repo
-        .claim_next_embedding_job(&now, settings.max_retries)
+
+    let jobs = match repo
+        .claim_next_n_embedding_jobs(&now, settings.max_retries, n)
         .await
     {
-        Ok(Some(j)) => j,
-        Ok(None) => return Ok(()),
+        Ok(jobs) => jobs,
         Err(err) => {
-            // Last-resort defense against orphan FK violations: if claim raises
-            // a "key does not exist in the referenced table" error, the
-            // open-time sweep failed to catch this row (stale binary, multiple
-            // processes, or fresh orphan inserted after sweep). Parse the
-            // memory_id out of the error message and direct-delete every job
-            // referencing it. DELETE-by-memory_id has no INSERT half so it
-            // does not re-fire FK; the loop dies on the next tick.
+            // Last-resort defense against orphan FK violations: see
+            // `claim_next_embedding_job` for the full root cause. Parses
+            // the memory_id out of the FK error and direct-deletes every
+            // job referencing it (DELETE-by-memory_id has no INSERT half
+            // so it cannot re-fire FK).
             if let Some(mid) = extract_orphan_memory_id(&err.to_string()) {
                 let deleted = repo
                     .delete_embedding_jobs_by_memory_id(&mid)
@@ -57,21 +56,95 @@ pub async fn tick(
                 warn!(
                     memory_id = %mid,
                     deleted_jobs = deleted,
-                    "FK violation in claim_next_embedding_job; direct-deleted orphan jobs by memory_id (open-time sweep apparently missed this row)"
+                    "FK violation during claim; direct-deleted orphan jobs by memory_id"
                 );
                 return Ok(());
             }
             return Err(err);
         }
     };
-    info!(
-        job_id = %job.job_id,
-        tenant = %job.tenant,
-        memory_id = %job.memory_id,
-        attempt = job.attempt_count,
-        "embedding worker claimed job"
-    );
+    if jobs.is_empty() {
+        return Ok(());
+    }
 
+    // Pre-embed phase: per-job validation. Filters out jobs that we resolve
+    // inline (wrong provider, missing parent memory, stale content_hash).
+    // Survivors carry their formatted text into the batch embed call.
+    let mut ready: Vec<PendingEmbed> = Vec::with_capacity(jobs.len());
+    for job in jobs {
+        info!(
+            job_id = %job.job_id,
+            tenant = %job.tenant,
+            memory_id = %job.memory_id,
+            attempt = job.attempt_count,
+            "embedding worker claimed job"
+        );
+        match pre_embed(repo, &job, settings).await? {
+            Some(text) => ready.push(PendingEmbed { job, text }),
+            None => continue,
+        }
+    }
+    if ready.is_empty() {
+        return Ok(());
+    }
+
+    // Batch embed. embed_batch returns Vec<Result<Vec<f32>>> of same len
+    // as inputs — one entry per pending job. A whole-batch failure
+    // collapses into per-job rescheduling so the queue self-heals on the
+    // next tick.
+    let texts: Vec<&str> = ready.iter().map(|p| p.text.as_str()).collect();
+    let results = match provider.embed_batch(&texts).await {
+        Ok(v) => v,
+        Err(err) => {
+            warn!(error = %err, batch = ready.len(), "embedding worker whole-batch failure; rescheduling each");
+            for p in &ready {
+                record_failure(repo, &p.job, settings, &err.to_string()).await?;
+            }
+            return Ok(());
+        }
+    };
+    if results.len() != ready.len() {
+        // Defensive: trait contract says "same length"; if a provider
+        // breaks it, treat as whole-batch failure so we don't index-misalign.
+        warn!(
+            expected = ready.len(),
+            got = results.len(),
+            "embedding provider returned wrong batch length"
+        );
+        for p in &ready {
+            record_failure(repo, &p.job, settings, "provider batch length mismatch").await?;
+        }
+        return Ok(());
+    }
+
+    // Post-embed phase: finalize each job independently.
+    for (p, result) in ready.into_iter().zip(results) {
+        match result {
+            Ok(embedding) => {
+                post_embed(repo, &p.job, &embedding, provider, settings).await?;
+            }
+            Err(err) => {
+                record_failure(repo, &p.job, settings, &err.to_string()).await?;
+            }
+        }
+    }
+    Ok(())
+}
+
+struct PendingEmbed {
+    job: crate::storage::ClaimedEmbeddingJob,
+    text: String,
+}
+
+/// Per-job pre-embed validation. Returns the embed-input text on
+/// success; `None` if the job was resolved inline (provider mismatch
+/// → permanent fail, missing parent → permanent fail, stale hash →
+/// mark stale).
+async fn pre_embed(
+    repo: &DuckDbRepository,
+    job: &crate::storage::ClaimedEmbeddingJob,
+    settings: &EmbeddingSettings,
+) -> Result<Option<String>, StorageError> {
     if job.provider != settings.job_provider_id() {
         let now = current_timestamp();
         repo.permanently_fail_embedding_job(
@@ -81,7 +154,7 @@ pub async fn tick(
             &now,
         )
         .await?;
-        return Ok(());
+        return Ok(None);
     }
 
     let Some(memory) = repo
@@ -96,28 +169,32 @@ pub async fn tick(
             &now,
         )
         .await?;
-        return Ok(());
+        return Ok(None);
     };
 
     if memory.content_hash != job.target_content_hash {
         let now = current_timestamp();
         repo.mark_embedding_job_stale(&job.job_id, &now).await?;
-        return Ok(());
+        return Ok(None);
     }
 
-    let text = format!("{}\n{}", memory.summary, memory.content);
-    let embedding = match provider.embed_text(&text).await {
-        Ok(v) => v,
-        Err(err) => {
-            record_failure(repo, &job, settings, &err.to_string()).await?;
-            return Ok(());
-        }
-    };
+    Ok(Some(format!("{}\n{}", memory.summary, memory.content)))
+}
 
+/// Per-job post-embed finalization: dim check, re-fetch memory to see
+/// if it changed underneath us, write the embedding row, upsert HNSW,
+/// complete the job. Mirrors the original sequential tick exactly.
+async fn post_embed(
+    repo: &DuckDbRepository,
+    job: &crate::storage::ClaimedEmbeddingJob,
+    embedding: &[f32],
+    provider: &dyn EmbeddingProvider,
+    settings: &EmbeddingSettings,
+) -> Result<(), StorageError> {
     if embedding.len() != provider.dim() {
         record_failure(
             repo,
-            &job,
+            job,
             settings,
             &format!(
                 "provider returned length {} (expected {})",
@@ -154,7 +231,7 @@ pub async fn tick(
         return Ok(());
     }
 
-    let blob = f32_slice_to_blob(&embedding);
+    let blob = f32_slice_to_blob(embedding);
     let now = current_timestamp();
     repo.upsert_memory_embedding(
         &job.memory_id,
@@ -169,7 +246,7 @@ pub async fn tick(
     .await?;
 
     if let Some(idx) = repo.vector_index() {
-        match idx.upsert(&job.memory_id, &embedding).await {
+        match idx.upsert(&job.memory_id, embedding).await {
             Ok(()) => {
                 let count = idx.dirty_count_increment();
                 if count >= settings.vector_index_flush_every {
@@ -181,8 +258,6 @@ pub async fn tick(
                 }
             }
             Err(crate::storage::VectorIndexError::HashCollision { existing, incoming }) => {
-                // Per spec: hash collisions are catastrophic data integrity events.
-                // Permanently fail the job rather than retry.
                 let now = current_timestamp();
                 let msg = format!("vector_index hash collision: {existing} vs {incoming}");
                 error!(memory_id = %job.memory_id, error = %msg, "vector index hash collision; permanently failing job");
@@ -197,7 +272,6 @@ pub async fn tick(
                     error = %err,
                     "vector index upsert failed; embedding row already written"
                 );
-                // Best effort: do not fail the job. Row+index reconciliation happens on next startup.
             }
         }
     }

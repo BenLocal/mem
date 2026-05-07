@@ -694,10 +694,11 @@ M（1.5 天，前提是 #11 完成）：
 
 ### 15.3 mem 独有（MemPalace 没有）
 
-- **`embedding_jobs` 持久化队列** + 后台 worker + attempt 重试 + content_hash 失效检测——比 MemPalace 内联 embed 更工业化（§4）
+- **`embedding_jobs` 持久化队列** + 后台 worker（含 batch 模式 `EMBEDDING_BATCH_SIZE`）+ attempt 重试 + content_hash 失效检测——比 MemPalace 内联 embed 更工业化（§4）
 - **`MemoryStatus` 三态**（Provisional / Active / PendingConfirmation）+ `WriteMode::Confirm` 评审流（§6）
 - **`feedback_events`** 调权 `confidence` / `decay_score`（§6）
 - **`decay_worker`** 后台时间衰减（ROADMAP #7）
+- **`fts_worker`** 后台 BM25 rebuild（`MEM_FTS_REBUILD_INTERVAL_MS`，把 FTS 重建移出 search 读路径）
 - **加性 lifecycle 重排层**（intent × memory_type / scope / freshness / graph_boost）—— RRF 融合后又叠了一层 mem 特色信号（§3 / §12）
 - **Recall quality bench**（10-rung ablation；ROADMAP #14）
 

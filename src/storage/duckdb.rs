@@ -507,6 +507,32 @@ impl DuckDbRepository {
     }
 
     /// Claims the next eligible job, moving it to `processing`. Eligible means `pending`, or
+    /// Claim up to `n` jobs in a single tick. Returns fewer when the
+    /// queue runs dry (callers stop draining as soon as the result is
+    /// shorter than `n`). Each iteration calls
+    /// `claim_next_embedding_job` which already runs the orphan sweep,
+    /// so the sweep happens once per claim — cheap (LEFT JOIN scan,
+    /// one DELETE per orphan).
+    ///
+    /// Used by the worker batching path: claim N → embed_batch(N) →
+    /// per-job result handling. With `batch_size=1` (default) it
+    /// behaves exactly like single-job claim.
+    pub async fn claim_next_n_embedding_jobs(
+        &self,
+        now: &str,
+        max_retries: u32,
+        n: usize,
+    ) -> Result<Vec<ClaimedEmbeddingJob>, StorageError> {
+        let mut out = Vec::with_capacity(n);
+        for _ in 0..n {
+            match self.claim_next_embedding_job(now, max_retries).await? {
+                Some(job) => out.push(job),
+                None => break,
+            }
+        }
+        Ok(out)
+    }
+
     /// `failed` with `attempt_count < max_retries` (configured retry budget).
     ///
     /// Before claiming, sweeps any orphan jobs (memory_id no longer in `memories`) by
