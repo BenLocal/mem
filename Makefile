@@ -71,8 +71,8 @@ check: fmt-check clippy test ## pre-commit gate：fmt-check + clippy + 全套测
 # `include_str!` 编入二进制，必须看；tests/ 不影响 `cargo run` 产物，跳过。
 WATCH_PATHS := -w src -w Cargo.toml -w Cargo.lock -w db
 
-watch: ## 仅 src/ Cargo.* db/ 改动时自动重启 mem serve（需 `cargo install cargo-watch`）
-	$(CARGO) watch $(WATCH_PATHS) -x 'run -- serve'
+watch: ## 仅 src/ Cargo.* db/ 改动时自动重启 mem serve（release 构建，避免 debug 模式下向量打分慢到把 SessionStart hook 拖死；需 `cargo install cargo-watch`）
+	$(CARGO) watch $(WATCH_PATHS) -x 'run --release -- serve'
 
 watch-check: ## 仅 src/ Cargo.* db/ 改动时跑 cargo check --all-targets（快速类型反馈，不启服务）
 	$(CARGO) watch $(WATCH_PATHS) -x 'check --all-targets'
