@@ -219,8 +219,9 @@ POST /transcripts/search → TranscriptService::search
   → fetch_conversation_messages_by_ids
   → score_candidates + merge_windows                    # 上下文窗口合并
 
-GET /transcripts?session_id=…&tenant=…
-  → get_conversation_messages_by_session
+POST /transcripts {session_id, tenant, [limit, cursor, since, until]}
+  → get_conversation_messages_by_session  (when limit omitted)
+  → get_conversation_messages_by_session_paged  (cursor scroll)
 ```
 
 **MCP 表面不暴露**——transcript 搜索 HTTP 独占，agent 走 `memory_search` → 命中后用 `session_id` 拉对应 transcript。

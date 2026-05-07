@@ -1,10 +1,11 @@
 //! HTTP routes for the transcript-archive surface.
 //!
-//! Three routes, all mounted by [`router`]:
+//! Routes mounted by [`router`]:
 //!
 //! - `POST /transcripts/messages` — ingest a single transcript block.
 //! - `POST /transcripts/search`   — ranked search with optional filters.
-//! - `GET  /transcripts`          — list every block for a session, ordered.
+//! - `POST /transcripts`          — list blocks for a session (paged).
+//! - `GET  /transcripts/sessions` — per-session aggregate.
 //!
 //! Error mapping uses the shared [`AppError`] umbrella (same as
 //! `http/memory.rs`): a bare `StorageError::InvalidInput` becomes 400,
@@ -33,7 +34,7 @@ pub fn router() -> Router<AppState> {
         .route("/transcripts/messages", post(post_message))
         .route("/transcripts/search", post(post_search))
         .route("/transcripts/sessions", get(get_sessions))
-        .route("/transcripts", get(get_by_session))
+        .route("/transcripts", post(post_get_by_session))
 }
 
 // ---------------------------------------------------------------------------
@@ -119,25 +120,44 @@ async fn post_message(
 }
 
 // ---------------------------------------------------------------------------
-// GET /transcripts?session_id=…&tenant=…
-//   &limit=200&cursor=<created_at>:<line>:<block>&since=<ts>&until=<ts>
+// POST /transcripts
+//
+// Body:
+//   { "session_id": "...", "tenant": "...",
+//     "limit": 200,                 // optional; omit → return everything
+//     "cursor": { "created_at": "2026-04-30T07:59:06.792Z",
+//                 "line_number": 309, "block_index": 0 },
+//     "since": "...", "until": "..." }
+//
+// Was a `GET` with the same parameters as query strings — switched to POST
+// because the cursor's `created_at` is ISO-8601 (`2026-04-30T07:59:06.792Z`)
+// and the URL-encoding plus the colon-collision in any string-cursor
+// scheme made the GET form fragile. JSON body sidesteps both.
 //
 // Pagination is opt-in: omitting `limit` returns every block (legacy
 // behavior the integration tests still exercise). Setting `limit` switches
 // to cursor-based scrolling — server returns up to `limit` rows plus
-// `next_cursor` (null when exhausted) and `has_more`. Cursor encodes the
-// last returned `(created_at, line_number, block_index)` tuple so ties on
+// `next_cursor` (null when exhausted) and `has_more`. The cursor is a
+// structured `(created_at, line_number, block_index)` tuple so ties on
 // `created_at` (multiple blocks ingested in the same millisecond) don't
-// drop or double-count rows. `since`/`until` are 20-digit ms strings,
-// independent of the cursor — a date-range filter on top of the scroll.
+// drop or double-count rows. `since`/`until` are passed through as-is
+// (any string DuckDB can lexically compare against the column),
+// independent of the cursor.
 // ---------------------------------------------------------------------------
 
 #[derive(Debug, Deserialize)]
-pub struct GetBySessionQuery {
+pub struct CursorTuple {
+    pub created_at: String,
+    pub line_number: i64,
+    pub block_index: i64,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct GetBySessionRequest {
     pub session_id: String,
     pub tenant: String,
     pub limit: Option<usize>,
-    pub cursor: Option<String>,
+    pub cursor: Option<CursorTuple>,
     pub since: Option<String>,
     pub until: Option<String>,
 }
@@ -146,43 +166,37 @@ pub struct GetBySessionQuery {
 pub struct GetBySessionResponse {
     pub messages: Vec<ConversationMessage>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub next_cursor: Option<String>,
+    pub next_cursor: Option<CursorTuple>,
     pub has_more: bool,
 }
 
-fn parse_cursor(s: &str) -> Result<(String, i64, i64), AppError> {
-    fn bad(msg: &str) -> AppError {
-        crate::storage::StorageError::InvalidInput(msg.to_string()).into()
+impl Serialize for CursorTuple {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeStruct;
+        let mut st = s.serialize_struct("CursorTuple", 3)?;
+        st.serialize_field("created_at", &self.created_at)?;
+        st.serialize_field("line_number", &self.line_number)?;
+        st.serialize_field("block_index", &self.block_index)?;
+        st.end()
     }
-    let mut parts = s.splitn(3, ':');
-    let at = parts
-        .next()
-        .ok_or_else(|| bad("cursor missing created_at"))?;
-    let line: i64 = parts
-        .next()
-        .ok_or_else(|| bad("cursor missing line_number"))?
-        .parse()
-        .map_err(|_| bad("cursor line_number not int"))?;
-    let idx: i64 = parts
-        .next()
-        .ok_or_else(|| bad("cursor missing block_index"))?
-        .parse()
-        .map_err(|_| bad("cursor block_index not int"))?;
-    Ok((at.to_string(), line, idx))
 }
 
-fn make_cursor(m: &ConversationMessage) -> String {
-    format!("{}:{}:{}", m.created_at, m.line_number, m.block_index)
+fn make_cursor(m: &ConversationMessage) -> CursorTuple {
+    CursorTuple {
+        created_at: m.created_at.clone(),
+        line_number: m.line_number as i64,
+        block_index: m.block_index as i64,
+    }
 }
 
-async fn get_by_session(
+async fn post_get_by_session(
     State(state): State<AppState>,
-    Query(q): Query<GetBySessionQuery>,
+    Json(req): Json<GetBySessionRequest>,
 ) -> Result<Json<GetBySessionResponse>, AppError> {
-    let Some(limit) = q.limit else {
+    let Some(limit) = req.limit else {
         let messages = state
             .transcript_service
-            .get_by_session(&q.tenant, &q.session_id)
+            .get_by_session(&req.tenant, &req.session_id)
             .await?;
         return Ok(Json(GetBySessionResponse {
             messages,
@@ -190,18 +204,17 @@ async fn get_by_session(
             has_more: false,
         }));
     };
-    let cursor_owned = match q.cursor.as_deref() {
-        Some(s) if !s.is_empty() => Some(parse_cursor(s)?),
-        _ => None,
-    };
-    let cursor_ref = cursor_owned.as_ref().map(|(a, l, i)| (a.as_str(), *l, *i));
+    let cursor_ref = req
+        .cursor
+        .as_ref()
+        .map(|c| (c.created_at.as_str(), c.line_number, c.block_index));
     let (messages, has_more) = state
         .transcript_service
         .get_by_session_paged(
-            &q.tenant,
-            &q.session_id,
-            q.since.as_deref(),
-            q.until.as_deref(),
+            &req.tenant,
+            &req.session_id,
+            req.since.as_deref(),
+            req.until.as_deref(),
             cursor_ref,
             limit,
         )

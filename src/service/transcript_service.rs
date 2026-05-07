@@ -140,7 +140,7 @@ impl TranscriptService {
     /// consistent (`Vec<MergedWindow>`).
     ///
     /// `limit` is capped to 100 in this layer (window merge is O(N²) in
-    /// primaries; anything more should use `GET /transcripts?session_id=…`).
+    /// primaries; anything more should use `POST /transcripts {session_id}`).
     pub async fn search(
         &self,
         tenant: &str,

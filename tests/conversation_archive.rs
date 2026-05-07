@@ -398,14 +398,19 @@ mod http_routes {
             assert_eq!(resp.status(), StatusCode::OK);
         }
 
-        // Fetch.
+        // Fetch — `POST /transcripts` with no `limit` returns everything
+        // (legacy unpaged shape preserved for callers that don't need
+        // pagination).
         let resp = app
             .clone()
             .oneshot(
                 Request::builder()
-                    .method("GET")
-                    .uri("/transcripts?session_id=sess-X&tenant=local")
-                    .body(Body::empty())
+                    .method("POST")
+                    .uri("/transcripts")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        json!({"session_id": "sess-X", "tenant": "local"}).to_string(),
+                    ))
                     .unwrap(),
             )
             .await
@@ -424,14 +429,18 @@ mod http_routes {
     /// exactly once, in chronological order, and the final page sets
     /// `has_more=false` and omits `next_cursor`. Also exercises the
     /// `since`/`until` window so a date-range filter narrows the set.
+    ///
+    /// Uses ISO-8601 timestamps to mirror what the ingest path actually
+    /// writes — a previous `:`-separated string cursor shredded these,
+    /// which is why the route is now POST + JSON body with a structured
+    /// cursor object.
     #[tokio::test]
-    async fn get_transcripts_paginates_with_cursor_and_range() {
+    async fn post_transcripts_paginates_with_cursor_and_range() {
         let (app, _dir, _repo) = build_router().await;
 
-        // Seed 5 blocks with strictly-increasing 20-digit ms timestamps so
-        // the server's row-tuple cursor advances monotonically.
+        // Seed 5 blocks with strictly-increasing ISO-8601 timestamps so the
+        // server's row-tuple cursor advances monotonically.
         for i in 0..5u64 {
-            let ms = 1_700_000_000_000u64 + i * 1000;
             let body = json!({
                 "session_id": "sess-P",
                 "tenant": "local",
@@ -443,7 +452,7 @@ mod http_routes {
                 "block_type": "text",
                 "content": format!("msg-{i}"),
                 "embed_eligible": false,
-                "created_at": format!("{ms:020}"),
+                "created_at": format!("2026-04-30T00:00:0{i}Z"),
             });
             let resp = app
                 .clone()
@@ -460,76 +469,69 @@ mod http_routes {
             assert_eq!(resp.status(), StatusCode::OK);
         }
 
+        async fn post_page(app: &axum::Router, body: Value) -> Value {
+            let resp = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri("/transcripts")
+                        .header("content-type", "application/json")
+                        .body(Body::from(body.to_string()))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), StatusCode::OK, "body: {body}");
+            serde_json::from_slice(&to_bytes(resp.into_body(), usize::MAX).await.unwrap()).unwrap()
+        }
+
         // Page 1 — limit=2, no cursor → first 2 chronologically.
-        let resp = app
-            .clone()
-            .oneshot(
-                Request::builder()
-                    .method("GET")
-                    .uri("/transcripts?session_id=sess-P&tenant=local&limit=2")
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(resp.status(), StatusCode::OK);
-        let bytes = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
-        let v: Value = serde_json::from_slice(&bytes).unwrap();
+        let v = post_page(
+            &app,
+            json!({"session_id": "sess-P", "tenant": "local", "limit": 2}),
+        )
+        .await;
         let msgs = v["messages"].as_array().unwrap();
         assert_eq!(msgs.len(), 2);
         assert_eq!(msgs[0]["content"], "msg-0");
         assert_eq!(msgs[1]["content"], "msg-1");
         assert_eq!(v["has_more"], json!(true));
-        let cursor1 = v["next_cursor"]
-            .as_str()
-            .expect("cursor on page 1")
-            .to_string();
+        let cursor1 = v["next_cursor"].clone();
+        assert!(cursor1.is_object(), "cursor must be a JSON object: {v:?}");
+        assert_eq!(cursor1["created_at"], "2026-04-30T00:00:01Z");
+        assert_eq!(cursor1["line_number"], 2);
+        assert_eq!(cursor1["block_index"], 0);
 
-        // Page 2 — same limit + cursor from page 1.
-        let resp = app
-            .clone()
-            .oneshot(
-                Request::builder()
-                    .method("GET")
-                    .uri(format!(
-                        "/transcripts?session_id=sess-P&tenant=local&limit=2&cursor={}",
-                        cursor1
-                    ))
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(resp.status(), StatusCode::OK);
-        let v: Value =
-            serde_json::from_slice(&to_bytes(resp.into_body(), usize::MAX).await.unwrap()).unwrap();
+        // Page 2 — feed cursor from page 1 back as the body field.
+        let v = post_page(
+            &app,
+            json!({
+                "session_id": "sess-P",
+                "tenant": "local",
+                "limit": 2,
+                "cursor": cursor1,
+            }),
+        )
+        .await;
         let msgs = v["messages"].as_array().unwrap();
         assert_eq!(msgs.len(), 2);
         assert_eq!(msgs[0]["content"], "msg-2");
         assert_eq!(msgs[1]["content"], "msg-3");
         assert_eq!(v["has_more"], json!(true));
-        let cursor2 = v["next_cursor"]
-            .as_str()
-            .expect("cursor on page 2")
-            .to_string();
+        let cursor2 = v["next_cursor"].clone();
 
         // Page 3 — final 1 block, has_more=false, no cursor.
-        let resp = app
-            .clone()
-            .oneshot(
-                Request::builder()
-                    .method("GET")
-                    .uri(format!(
-                        "/transcripts?session_id=sess-P&tenant=local&limit=2&cursor={}",
-                        cursor2
-                    ))
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        let v: Value =
-            serde_json::from_slice(&to_bytes(resp.into_body(), usize::MAX).await.unwrap()).unwrap();
+        let v = post_page(
+            &app,
+            json!({
+                "session_id": "sess-P",
+                "tenant": "local",
+                "limit": 2,
+                "cursor": cursor2,
+            }),
+        )
+        .await;
         let msgs = v["messages"].as_array().unwrap();
         assert_eq!(msgs.len(), 1);
         assert_eq!(msgs[0]["content"], "msg-4");
@@ -539,24 +541,19 @@ mod http_routes {
             "final page should not carry a cursor: {v:?}"
         );
 
-        // Range filter — `since` slices off the first 2 blocks (ts < boundary)
-        // even at full limit; bounds are inclusive lower / exclusive upper.
-        let since = format!("{:020}", 1_700_000_000_000u64 + 2_000);
-        let resp = app
-            .clone()
-            .oneshot(
-                Request::builder()
-                    .method("GET")
-                    .uri(format!(
-                        "/transcripts?session_id=sess-P&tenant=local&limit=10&since={since}"
-                    ))
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        let v: Value =
-            serde_json::from_slice(&to_bytes(resp.into_body(), usize::MAX).await.unwrap()).unwrap();
+        // Range filter — `since` slices off the first 2 blocks (lex compare
+        // against the `created_at` column). Bounds are inclusive lower /
+        // exclusive upper, matching Rust range semantics.
+        let v = post_page(
+            &app,
+            json!({
+                "session_id": "sess-P",
+                "tenant": "local",
+                "limit": 10,
+                "since": "2026-04-30T00:00:02Z",
+            }),
+        )
+        .await;
         let msgs = v["messages"].as_array().unwrap();
         assert_eq!(msgs.len(), 3);
         assert_eq!(msgs[0]["content"], "msg-2");

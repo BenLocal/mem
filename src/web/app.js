@@ -850,18 +850,26 @@ function buildTranscriptCounter(sessionId) {
 async function loadTranscriptPage(sessionId) {
   if (txPage.loading || !txPage.hasMore && txPage.count > 0) return;
   txPage.loading = true;
-  const params = new URLSearchParams({
+  const body = {
     session_id: sessionId,
     tenant: TENANT,
-    limit: String(TRANSCRIPT_PAGE_SIZE),
-  });
-  if (txPage.cursor) params.set('cursor', txPage.cursor);
+    limit: TRANSCRIPT_PAGE_SIZE,
+  };
+  if (txPage.cursor) body.cursor = txPage.cursor;
+  // Time filter: server compares `since`/`until` lexicographically against
+  // the `created_at` column. Block storage uses ISO-8601 strings so we
+  // hand it the same shape (Date.toISOString()) — pad20 was for the old
+  // 20-digit-ms scheme that turned out not to be what the data uses.
   const sinceMs = rangeSinceMs(txPage.range);
   const untilMs = rangeUntilMs(txPage.range);
-  if (sinceMs !== null) params.set('since', pad20(sinceMs));
-  if (untilMs !== null) params.set('until', pad20(untilMs));
+  if (sinceMs !== null) body.since = new Date(sinceMs).toISOString();
+  if (untilMs !== null) body.until = new Date(untilMs).toISOString();
   try {
-    const r = await fetch(`/transcripts?${params.toString()}`);
+    const r = await fetch('/transcripts', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify(body),
+    });
     if (!r.ok) throw new Error(`HTTP ${r.status}: ${(await r.text()).slice(0, 160)}`);
     const data = await r.json();
     if (openTranscriptSession !== sessionId) return; // user moved on

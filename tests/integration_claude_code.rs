@@ -71,7 +71,7 @@ async fn test_mine_and_wake_up_flow() {
 // Task 12 — End-to-end smoke for the transcript-archive pipeline.
 //
 // Exercises the full path from `mem mine` (CLI) through to
-// `/transcripts/search` and `GET /transcripts?session_id=…` over a real axum
+// `/transcripts/search` and `POST /transcripts {session_id}` over a real axum
 // HTTP server bound to a random port.
 //
 // Worker-handling strategy: **Option B** (manual `transcript_embedding_worker::tick`).
@@ -91,7 +91,9 @@ async fn test_mine_and_wake_up_flow() {
 //   3. Inspect rows:
 //        duckdb $MEM_DB_PATH "SELECT count(*) FROM conversation_messages"
 //        duckdb $MEM_DB_PATH "SELECT count(*) FROM transcript_embedding_jobs WHERE status='completed'"
-//   4. curl -s "http://127.0.0.1:3000/transcripts?session_id=<sid>&tenant=local" | jq
+//   4. curl -s -X POST -H 'content-type: application/json' \
+//        -d '{"session_id":"<sid>","tenant":"local"}' \
+//        http://127.0.0.1:3000/transcripts | jq
 //   5. curl -s -X POST http://127.0.0.1:3000/transcripts/search \
 //        -H 'content-type: application/json' \
 //        -d '{"query":"<some text from the session>","tenant":"local","limit":5}' | jq
@@ -198,19 +200,17 @@ async fn end_to_end_mine_then_search_then_get() {
         }
     }
 
-    // --- Step 3: GET by session_id returns time-ordered blocks (>=4 = the
+    // --- Step 3: list by session_id returns time-ordered blocks (>=4 = the
     //     four blocks in the fixture: 1 user/text + 1 assistant/text +
     //     1 assistant/tool_use + 1 user/tool_result).
     let client = reqwest::Client::new();
     let resp = client
-        .get(format!(
-            "http://{}/transcripts?session_id=S1&tenant=local",
-            addr
-        ))
+        .post(format!("http://{}/transcripts", addr))
+        .json(&serde_json::json!({"session_id": "S1", "tenant": "local"}))
         .send()
         .await
         .unwrap();
-    assert!(resp.status().is_success(), "GET /transcripts must 2xx");
+    assert!(resp.status().is_success(), "POST /transcripts must 2xx");
     let v: serde_json::Value = resp.json().await.unwrap();
     let messages = v["messages"].as_array().expect("messages array");
     assert!(
