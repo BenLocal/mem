@@ -53,8 +53,29 @@
     <div class="detail-body" id="detail-body">
       <div class="placeholder loading">retrieving record</div>
     </div>
+    <footer class="detail-actions" id="detail-actions" hidden>
+      <span class="detail-archive-note" id="detail-actions-note"></span>
+      <div class="detail-actions-buttons">
+        <button class="detail-archive-btn" id="detail-archive-btn" type="button">archive this record</button>
+        <button class="detail-delete-btn" id="detail-delete-btn" type="button" title="permanently delete — cannot be undone">delete forever</button>
+      </div>
+    </footer>
   </section>
 </aside>
+
+<!-- hard-delete confirmation modal -->
+<div class="modal-bg" id="delete-modal" aria-hidden="true">
+  <div class="modal" role="dialog" aria-modal="true" aria-labelledby="delete-modal-title">
+    <h2 id="delete-modal-title"><em>delete</em> this memory forever?</h2>
+    <p>This <strong>permanently removes</strong> the memory row, its embedding, all its embedding jobs, all feedback events, and all of its outgoing graph edges. <strong>Cannot be undone.</strong></p>
+    <p>If in doubt, prefer <code>archive</code> — same effect on search, but the row is preserved verbatim.</p>
+    <div class="id-quote" id="delete-modal-id">—</div>
+    <div class="modal-actions">
+      <button class="btn-cancel" id="delete-btn-cancel">never mind</button>
+      <button class="btn-confirm btn-confirm-danger" id="delete-btn-confirm">delete forever</button>
+    </div>
+  </div>
+</div>
 
 <!-- delete-confirmation modal -->
 <div class="modal-bg" id="modal" aria-hidden="true">

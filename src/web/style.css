@@ -536,31 +536,68 @@ body::before {
   color: var(--oxblood); font-size: 0.95rem; line-height: 1;
 }
 
+/* Footer of the detail panel — flex sibling of .detail-body, NOT sticky.
+   .detail is `display:flex; flex-direction:column` and .detail-body is
+   `flex: 1 1 auto; overflow-y: auto`, so this footer is always pinned at
+   the bottom of the panel regardless of scroll position. */
 .detail-actions {
-  position: sticky; bottom: 0;
-  margin: 1rem -2rem -2.5rem;
+  flex: 0 0 auto;
   padding: 0.6rem 2rem;
-  background: var(--card);                  /* opaque, no gradient */
+  background: var(--card);                  /* opaque */
   border-top: 1px solid var(--card-edge);
   display: flex; justify-content: space-between; align-items: center; gap: 1rem;
 }
-.detail-archive-btn {
-  background: var(--oxblood); color: var(--paper); border: none;
+.detail-actions[hidden] { display: none; }
+.detail-actions-buttons { display: flex; gap: 0.5rem; }
+.detail-archive-btn,
+.detail-delete-btn {
+  border: none;
   font-family: 'JetBrains Mono', monospace; font-size: 0.72rem;
   letter-spacing: 0.1em; text-transform: uppercase;
   padding: 0.45rem 1rem; cursor: pointer; font-weight: 600;
-  transition: background 0.15s, transform 0.1s;
+  transition: background 0.15s, transform 0.1s, color 0.15s;
 }
+.detail-archive-btn { background: var(--oxblood); color: var(--paper); }
 .detail-archive-btn:hover { background: #5e1f17; }
 .detail-archive-btn:active { transform: translateY(1px); }
 .detail-archive-btn:disabled {
   background: transparent; color: var(--ink-mute);
   border: 1px solid var(--card-edge); cursor: not-allowed;
 }
+.detail-delete-btn {
+  background: transparent;
+  color: var(--ink-mute);
+  border: 1px solid var(--ink-mute);
+}
+.detail-delete-btn:hover {
+  background: #1f1610;
+  color: var(--paper);
+  border-color: var(--ink);
+}
+.detail-delete-btn:active { transform: translateY(1px); }
+
 .detail-archive-note {
   font-family: 'Cormorant Garamond', serif; font-style: italic;
   color: var(--ink-fade); font-size: 0.85rem; line-height: 1.2;
+  flex: 1 1 auto;
 }
+
+/* Stronger danger styling on the hard-delete confirm button — visually
+   distinct from the regular oxblood "archive" confirm to telegraph
+   "this one really is irreversible". */
+.btn-confirm-danger {
+  background: #1f1610;
+  border: 2px solid var(--oxblood);
+  position: relative;
+}
+.btn-confirm-danger::before {
+  content: '✕';
+  margin-right: 0.5rem;
+  font-family: 'Cormorant Garamond', serif;
+  font-style: italic;
+  color: var(--oxblood);
+}
+.btn-confirm-danger:hover { background: #000; }
 
 /* responsive ------------------------------------------------- */
 
@@ -572,6 +609,8 @@ body::before {
   .filter-group { flex-wrap: wrap; }
   .tenant-badge { border-left: none; padding-left: 0; }
   .detail { width: 100vw; }
-  .detail-head, .detail-body { padding-left: 1.25rem; padding-right: 1.25rem; }
+  .detail-head, .detail-body, .detail-actions { padding-left: 1.25rem; padding-right: 1.25rem; }
+  .detail-actions { flex-direction: column; align-items: stretch; gap: 0.6rem; }
+  .detail-actions-buttons { justify-content: flex-end; }
   .feedback-grid { grid-template-columns: repeat(2, 1fr); }
 }

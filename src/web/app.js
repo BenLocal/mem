@@ -17,14 +17,24 @@ const modalId    = document.getElementById('modal-id');
 const btnYes     = document.getElementById('btn-confirm');
 const btnNo      = document.getElementById('btn-cancel');
 const toast      = document.getElementById('toast');
-const detailBg   = document.getElementById('detail-bg');
-const detailBody = document.getElementById('detail-body');
-const detailClose = document.getElementById('detail-close');
+const detailBg       = document.getElementById('detail-bg');
+const detailBody     = document.getElementById('detail-body');
+const detailClose    = document.getElementById('detail-close');
+const detailActions  = document.getElementById('detail-actions');
+const detailNote     = document.getElementById('detail-actions-note');
+const detailArchiveBtn = document.getElementById('detail-archive-btn');
+const detailDeleteBtn  = document.getElementById('detail-delete-btn');
+
+const deleteModal    = document.getElementById('delete-modal');
+const deleteModalId  = document.getElementById('delete-modal-id');
+const deleteBtnYes   = document.getElementById('delete-btn-confirm');
+const deleteBtnNo    = document.getElementById('delete-btn-cancel');
 
 let allMemories  = [];
 let filterStatus = 'live';   // live = active | provisional | pending_confirmation
 let filterText   = '';
 let pendingDelete = null;
+let pendingHardDelete = null;
 let openDetailId = null;
 
 // ------------------------------------------------------------ helpers
@@ -38,10 +48,11 @@ function showToast(msg, err = false) {
 
 function fmtDate(s) {
   if (!s) return '—';
-  // mem stores microsecond-padded numeric strings ("00000001778060883021");
-  // chop the trailing 3 chars to get milliseconds.
-  const ms = Number(String(s).slice(0, -3) || s);
-  if (!Number.isFinite(ms)) return s;
+  // mem stores milliseconds-since-epoch zero-padded to 20 digits
+  // (`current_timestamp()` in src/storage/time.rs uses `{millis:020}`).
+  // Just parse the whole string as a number — leading zeros are fine.
+  const ms = Number(String(s).trim());
+  if (!Number.isFinite(ms) || ms <= 0) return s;
   const d = new Date(ms);
   if (isNaN(d)) return s;
   const yyyy = d.getUTCFullYear();
@@ -187,9 +198,10 @@ function closeModal() {
 
 btnNo.addEventListener('click', closeModal);
 modal.addEventListener('click', e => { if (e.target === modal) closeModal(); });
-document.addEventListener('keydown', e => {
-  if (e.key === 'Escape' && modal.classList.contains('open')) closeModal();
-});
+// keydown for Escape is consolidated in the priority handler near the
+// detail-panel close logic — see `document.addEventListener('keydown',...)`
+// further down. Avoid registering a second listener here, otherwise Escape
+// would close the modal AND the detail panel under it in the same tick.
 
 btnYes.addEventListener('click', async () => {
   if (!pendingDelete) return;
@@ -385,25 +397,24 @@ function buildDetail(detail) {
     wrap.appendChild(section('feedback', grid));
   }
 
-  // archive button
-  const removed = ['archived', 'rejected'].includes(status);
-  const actions = el('div', { class: 'detail-actions' });
-  actions.appendChild(el('span', {
-    class: 'detail-archive-note',
-    text: removed
-      ? 'this record is already off-shelf'
-      : 'archiving keeps the row verbatim — only search drops it',
-  }));
-  const archiveBtn = el('button', {
-    class: 'detail-archive-btn', type: 'button',
-    text: removed ? 'already archived' : 'archive this record',
-  });
-  if (removed) archiveBtn.disabled = true;
-  else archiveBtn.addEventListener('click', () => openDelete(m.memory_id));
-  actions.appendChild(archiveBtn);
-  wrap.appendChild(actions);
-
   return wrap;
+}
+
+/// Populate the static footer slot with archive/delete buttons + note.
+/// The footer lives outside `.detail-body` so it always sits at the
+/// panel's bottom (flex sibling), no `position: sticky` games.
+function populateActions(detail) {
+  const m = detail.memory || {};
+  const status = m.status || 'active';
+  const removed = ['archived', 'rejected'].includes(status);
+  detailNote.textContent = removed
+    ? 'this record is already off-shelf — archive disabled, but you can still delete it forever'
+    : 'archiving keeps the row verbatim — only search drops it';
+  detailArchiveBtn.textContent = removed ? 'already archived' : 'archive this record';
+  detailArchiveBtn.disabled = removed;
+  detailArchiveBtn.onclick = removed ? null : () => openDelete(m.memory_id);
+  detailDeleteBtn.onclick = () => openHardDelete(m.memory_id);
+  detailActions.hidden = false;
 }
 
 async function openDetail(id) {
@@ -411,6 +422,7 @@ async function openDetail(id) {
   openDetailId = id;
   detailBg.classList.add('open');
   detailBg.setAttribute('aria-hidden', 'false');
+  detailActions.hidden = true;
   while (detailBody.firstChild) detailBody.removeChild(detailBody.firstChild);
   detailBody.appendChild(buildPlaceholder('retrieving record', id, 'loading'));
   try {
@@ -424,6 +436,7 @@ async function openDetail(id) {
     while (detailBody.firstChild) detailBody.removeChild(detailBody.firstChild);
     detailBody.appendChild(buildDetail(detail));
     detailBody.scrollTop = 0;
+    populateActions(detail);
   } catch (e) {
     while (detailBody.firstChild) detailBody.removeChild(detailBody.firstChild);
     detailBody.appendChild(buildPlaceholder('could not retrieve record', e.message, 'error'));
@@ -433,16 +446,62 @@ async function openDetail(id) {
 function closeDetail() {
   detailBg.classList.remove('open');
   detailBg.setAttribute('aria-hidden', 'true');
+  detailActions.hidden = true;
   openDetailId = null;
 }
+
+// ------------------------------------------------------------ hard delete
+
+function openHardDelete(id) {
+  pendingHardDelete = id;
+  deleteModalId.textContent = id;
+  deleteModal.classList.add('open');
+  deleteModal.setAttribute('aria-hidden', 'false');
+  deleteBtnYes.disabled = false;
+  deleteBtnYes.textContent = 'delete forever';
+}
+
+function closeDeleteModal() {
+  deleteModal.classList.remove('open');
+  deleteModal.setAttribute('aria-hidden', 'true');
+  pendingHardDelete = null;
+}
+
+deleteBtnNo.addEventListener('click', closeDeleteModal);
+deleteModal.addEventListener('click', e => { if (e.target === deleteModal) closeDeleteModal(); });
+
+deleteBtnYes.addEventListener('click', async () => {
+  if (!pendingHardDelete) return;
+  const id = pendingHardDelete;
+  deleteBtnYes.disabled = true;
+  deleteBtnYes.textContent = 'erasing…';
+  try {
+    const r = await fetch(`/memories/${encodeURIComponent(id)}?tenant=${encodeURIComponent(TENANT)}`, {
+      method: 'DELETE',
+    });
+    if (!r.ok) {
+      const t = await r.text();
+      throw new Error(`HTTP ${r.status}: ${t.slice(0, 160)}`);
+    }
+    closeDeleteModal();
+    if (openDetailId === id) closeDetail();
+    showToast('deleted forever. row erased.');
+    await load();
+  } catch (e) {
+    showToast(`failed: ${e.message}`, true);
+    deleteBtnYes.disabled = false;
+    deleteBtnYes.textContent = 'try again';
+  }
+});
 
 detailClose.addEventListener('click', closeDetail);
 detailBg.addEventListener('click', e => { if (e.target === detailBg) closeDetail(); });
 document.addEventListener('keydown', e => {
-  // detail panel takes priority; only close it if delete-confirm modal is not open
-  if (e.key === 'Escape' && detailBg.classList.contains('open') && !modal.classList.contains('open')) {
-    closeDetail();
-  }
+  if (e.key !== 'Escape') return;
+  // priority: hard-delete modal > archive-confirm modal > detail panel
+  if (deleteModal.classList.contains('open')) closeDeleteModal();
+  else if (modal.classList.contains('open')) closeModal();
+  else if (detailBg.classList.contains('open')) closeDetail();
 });
 
 // ------------------------------------------------------------ filters
