@@ -120,28 +120,102 @@ async fn post_message(
 
 // ---------------------------------------------------------------------------
 // GET /transcripts?session_id=…&tenant=…
+//   &limit=200&cursor=<created_at>:<line>:<block>&since=<ts>&until=<ts>
+//
+// Pagination is opt-in: omitting `limit` returns every block (legacy
+// behavior the integration tests still exercise). Setting `limit` switches
+// to cursor-based scrolling — server returns up to `limit` rows plus
+// `next_cursor` (null when exhausted) and `has_more`. Cursor encodes the
+// last returned `(created_at, line_number, block_index)` tuple so ties on
+// `created_at` (multiple blocks ingested in the same millisecond) don't
+// drop or double-count rows. `since`/`until` are 20-digit ms strings,
+// independent of the cursor — a date-range filter on top of the scroll.
 // ---------------------------------------------------------------------------
 
 #[derive(Debug, Deserialize)]
 pub struct GetBySessionQuery {
     pub session_id: String,
     pub tenant: String,
+    pub limit: Option<usize>,
+    pub cursor: Option<String>,
+    pub since: Option<String>,
+    pub until: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
 pub struct GetBySessionResponse {
     pub messages: Vec<ConversationMessage>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub next_cursor: Option<String>,
+    pub has_more: bool,
+}
+
+fn parse_cursor(s: &str) -> Result<(String, i64, i64), AppError> {
+    fn bad(msg: &str) -> AppError {
+        crate::storage::StorageError::InvalidInput(msg.to_string()).into()
+    }
+    let mut parts = s.splitn(3, ':');
+    let at = parts
+        .next()
+        .ok_or_else(|| bad("cursor missing created_at"))?;
+    let line: i64 = parts
+        .next()
+        .ok_or_else(|| bad("cursor missing line_number"))?
+        .parse()
+        .map_err(|_| bad("cursor line_number not int"))?;
+    let idx: i64 = parts
+        .next()
+        .ok_or_else(|| bad("cursor missing block_index"))?
+        .parse()
+        .map_err(|_| bad("cursor block_index not int"))?;
+    Ok((at.to_string(), line, idx))
+}
+
+fn make_cursor(m: &ConversationMessage) -> String {
+    format!("{}:{}:{}", m.created_at, m.line_number, m.block_index)
 }
 
 async fn get_by_session(
     State(state): State<AppState>,
     Query(q): Query<GetBySessionQuery>,
 ) -> Result<Json<GetBySessionResponse>, AppError> {
-    let messages = state
+    let Some(limit) = q.limit else {
+        let messages = state
+            .transcript_service
+            .get_by_session(&q.tenant, &q.session_id)
+            .await?;
+        return Ok(Json(GetBySessionResponse {
+            messages,
+            next_cursor: None,
+            has_more: false,
+        }));
+    };
+    let cursor_owned = match q.cursor.as_deref() {
+        Some(s) if !s.is_empty() => Some(parse_cursor(s)?),
+        _ => None,
+    };
+    let cursor_ref = cursor_owned.as_ref().map(|(a, l, i)| (a.as_str(), *l, *i));
+    let (messages, has_more) = state
         .transcript_service
-        .get_by_session(&q.tenant, &q.session_id)
+        .get_by_session_paged(
+            &q.tenant,
+            &q.session_id,
+            q.since.as_deref(),
+            q.until.as_deref(),
+            cursor_ref,
+            limit,
+        )
         .await?;
-    Ok(Json(GetBySessionResponse { messages }))
+    let next_cursor = if has_more {
+        messages.last().map(make_cursor)
+    } else {
+        None
+    };
+    Ok(Json(GetBySessionResponse {
+        messages,
+        next_cursor,
+        has_more,
+    }))
 }
 
 // ---------------------------------------------------------------------------

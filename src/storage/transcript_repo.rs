@@ -478,6 +478,77 @@ impl DuckDbRepository {
         Ok(out)
     }
 
+    /// Paginated variant of [`Self::get_conversation_messages_by_session`].
+    ///
+    /// Ordering is the same composite ASC tuple — `(created_at, line_number,
+    /// block_index)` — so a cursor of `(after_created_at, after_line,
+    /// after_idx)` produces a strict "next page" using row-tuple comparison.
+    /// `since`/`until` apply to `created_at` only (inclusive lower, exclusive
+    /// upper); they're independent of the cursor and intended for a date-range
+    /// filter on top of the cursor scroll.
+    ///
+    /// Fetches `limit + 1` rows so the caller can detect whether more pages
+    /// exist without a separate `count(*)`. If the extra row came back, drop
+    /// it and tell the caller `has_more = true`.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn get_conversation_messages_by_session_paged(
+        &self,
+        tenant: &str,
+        session_id: &str,
+        since: Option<&str>,
+        until: Option<&str>,
+        cursor: Option<(&str, i64, i64)>,
+        limit: usize,
+    ) -> Result<(Vec<ConversationMessage>, bool), StorageError> {
+        let conn = self.conn()?;
+        let mut sql = String::from(
+            "select message_block_id, session_id, tenant, caller_agent, transcript_path,
+                    line_number, block_index, message_uuid, role, block_type, content,
+                    tool_name, tool_use_id, embed_eligible, created_at
+             from conversation_messages
+             where tenant = ?1 and session_id = ?2",
+        );
+        let mut params: Vec<Box<dyn duckdb::ToSql>> = vec![
+            Box::new(tenant.to_string()),
+            Box::new(session_id.to_string()),
+        ];
+        if let Some(s) = since {
+            sql.push_str(&format!(" and created_at >= ?{}", params.len() + 1));
+            params.push(Box::new(s.to_string()));
+        }
+        if let Some(u) = until {
+            sql.push_str(&format!(" and created_at < ?{}", params.len() + 1));
+            params.push(Box::new(u.to_string()));
+        }
+        if let Some((cur_at, cur_line, cur_idx)) = cursor {
+            let p = params.len();
+            sql.push_str(&format!(
+                " and (created_at > ?{a} or (created_at = ?{a} and (line_number > ?{b} or (line_number = ?{b} and block_index > ?{c}))))",
+                a = p + 1, b = p + 2, c = p + 3,
+            ));
+            params.push(Box::new(cur_at.to_string()));
+            params.push(Box::new(cur_line));
+            params.push(Box::new(cur_idx));
+        }
+        sql.push_str(" order by created_at asc, line_number asc, block_index asc");
+        sql.push_str(&format!(" limit ?{}", params.len() + 1));
+        let fetch = (limit as i64).saturating_add(1);
+        params.push(Box::new(fetch));
+
+        let mut stmt = conn.prepare(&sql)?;
+        let param_refs: Vec<&dyn duckdb::ToSql> = params.iter().map(|b| b.as_ref()).collect();
+        let rows = stmt.query_map(param_refs.as_slice(), row_to_conversation_message)?;
+        let mut out = Vec::with_capacity(limit);
+        for r in rows {
+            out.push(r?);
+        }
+        let has_more = out.len() as i64 == fetch;
+        if has_more {
+            out.pop();
+        }
+        Ok((out, has_more))
+    }
+
     /// Returns the most recent `conversation_messages` rows for `tenant`,
     /// newest first, capped at `limit`. Used by the transcript search service
     /// as the empty-query fallback (when no embedding query is supplied) and

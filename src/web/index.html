@@ -168,6 +168,12 @@
         <button class="transcript-close" id="transcript-close" type="button" aria-label="close">×</button>
       </header>
       <div class="transcript-meta" id="transcript-meta" hidden></div>
+      <div class="transcript-filters" id="transcript-filters" hidden role="group" aria-label="time filter">
+        <button class="tx-filter-btn active" data-tx-range="all">全部</button>
+        <button class="tx-filter-btn" data-tx-range="24h">24h</button>
+        <button class="tx-filter-btn" data-tx-range="today">今天</button>
+        <button class="tx-filter-btn" data-tx-range="yesterday">昨天</button>
+      </div>
       <div class="transcript-body" id="transcript-body">
         <div class="placeholder loading">unbinding the volume</div>
       </div>

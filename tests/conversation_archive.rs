@@ -419,6 +419,150 @@ mod http_routes {
         assert_eq!(messages[1]["content"], "msg-1");
     }
 
+    /// Pagination contract: `limit` opt-in returns at most `limit` rows and a
+    /// `next_cursor` when more exist. Walking the cursor visits every block
+    /// exactly once, in chronological order, and the final page sets
+    /// `has_more=false` and omits `next_cursor`. Also exercises the
+    /// `since`/`until` window so a date-range filter narrows the set.
+    #[tokio::test]
+    async fn get_transcripts_paginates_with_cursor_and_range() {
+        let (app, _dir, _repo) = build_router().await;
+
+        // Seed 5 blocks with strictly-increasing 20-digit ms timestamps so
+        // the server's row-tuple cursor advances monotonically.
+        for i in 0..5u64 {
+            let ms = 1_700_000_000_000u64 + i * 1000;
+            let body = json!({
+                "session_id": "sess-P",
+                "tenant": "local",
+                "caller_agent": "claude-code",
+                "transcript_path": "/tmp/t.jsonl",
+                "line_number": i + 1,
+                "block_index": 0,
+                "role": "user",
+                "block_type": "text",
+                "content": format!("msg-{i}"),
+                "embed_eligible": false,
+                "created_at": format!("{ms:020}"),
+            });
+            let resp = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri("/transcripts/messages")
+                        .header("content-type", "application/json")
+                        .body(Body::from(body.to_string()))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), StatusCode::OK);
+        }
+
+        // Page 1 — limit=2, no cursor → first 2 chronologically.
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/transcripts?session_id=sess-P&tenant=local&limit=2")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let v: Value = serde_json::from_slice(&bytes).unwrap();
+        let msgs = v["messages"].as_array().unwrap();
+        assert_eq!(msgs.len(), 2);
+        assert_eq!(msgs[0]["content"], "msg-0");
+        assert_eq!(msgs[1]["content"], "msg-1");
+        assert_eq!(v["has_more"], json!(true));
+        let cursor1 = v["next_cursor"]
+            .as_str()
+            .expect("cursor on page 1")
+            .to_string();
+
+        // Page 2 — same limit + cursor from page 1.
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri(format!(
+                        "/transcripts?session_id=sess-P&tenant=local&limit=2&cursor={}",
+                        cursor1
+                    ))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let v: Value =
+            serde_json::from_slice(&to_bytes(resp.into_body(), usize::MAX).await.unwrap()).unwrap();
+        let msgs = v["messages"].as_array().unwrap();
+        assert_eq!(msgs.len(), 2);
+        assert_eq!(msgs[0]["content"], "msg-2");
+        assert_eq!(msgs[1]["content"], "msg-3");
+        assert_eq!(v["has_more"], json!(true));
+        let cursor2 = v["next_cursor"]
+            .as_str()
+            .expect("cursor on page 2")
+            .to_string();
+
+        // Page 3 — final 1 block, has_more=false, no cursor.
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri(format!(
+                        "/transcripts?session_id=sess-P&tenant=local&limit=2&cursor={}",
+                        cursor2
+                    ))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let v: Value =
+            serde_json::from_slice(&to_bytes(resp.into_body(), usize::MAX).await.unwrap()).unwrap();
+        let msgs = v["messages"].as_array().unwrap();
+        assert_eq!(msgs.len(), 1);
+        assert_eq!(msgs[0]["content"], "msg-4");
+        assert_eq!(v["has_more"], json!(false));
+        assert!(
+            v.get("next_cursor").map(|c| c.is_null()).unwrap_or(true),
+            "final page should not carry a cursor: {v:?}"
+        );
+
+        // Range filter — `since` slices off the first 2 blocks (ts < boundary)
+        // even at full limit; bounds are inclusive lower / exclusive upper.
+        let since = format!("{:020}", 1_700_000_000_000u64 + 2_000);
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri(format!(
+                        "/transcripts?session_id=sess-P&tenant=local&limit=10&since={since}"
+                    ))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let v: Value =
+            serde_json::from_slice(&to_bytes(resp.into_body(), usize::MAX).await.unwrap()).unwrap();
+        let msgs = v["messages"].as_array().unwrap();
+        assert_eq!(msgs.len(), 3);
+        assert_eq!(msgs[0]["content"], "msg-2");
+        assert_eq!(msgs[2]["content"], "msg-4");
+    }
+
     #[tokio::test]
     async fn post_transcripts_search_filters_by_role_and_block_type() {
         let (app, _dir, _repo) = build_router().await;

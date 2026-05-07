@@ -34,12 +34,24 @@ const txSearch       = document.getElementById('tx-search');
 const transcriptBg   = document.getElementById('transcript-bg');
 const transcriptBody = document.getElementById('transcript-body');
 const transcriptMeta = document.getElementById('transcript-meta');
+const transcriptFilters = document.getElementById('transcript-filters');
 const transcriptClose = document.getElementById('transcript-close');
+
+const TRANSCRIPT_PAGE_SIZE = 200;
 
 let currentView = 'archive';
 let allSessions = [];
 let txFilterText = '';
 let openTranscriptSession = null;
+// Pagination state for the open transcript drawer.
+let txPage = {
+  range: 'all',   // 'all' | '24h' | 'today' | 'yesterday'
+  cursor: null,   // server-issued opaque cursor for the next page
+  hasMore: false,
+  loading: false,
+  count: 0,       // blocks rendered so far
+  observer: null, // IntersectionObserver on the bottom sentinel
+};
 let allJobs       = [];
 let qFilterStatus = 'all';
 let qFilterText   = '';
@@ -773,40 +785,168 @@ function buildTranscriptMeta(blocks, sessionId) {
   }
 }
 
+// 20-digit zero-padded millisecond timestamp — same encoding the server
+// uses (`storage::time::current_timestamp`). The filter `since` cuts on
+// `created_at >= since` so we want the boundary as ms.
+function rangeSinceMs(range) {
+  const now = Date.now();
+  const day = 24 * 60 * 60 * 1000;
+  if (range === '24h') return now - day;
+  if (range === 'today') {
+    const d = new Date(); d.setHours(0, 0, 0, 0);
+    return d.getTime();
+  }
+  if (range === 'yesterday') {
+    const d = new Date(); d.setHours(0, 0, 0, 0);
+    return d.getTime() - day;
+  }
+  return null; // 'all'
+}
+function rangeUntilMs(range) {
+  if (range === 'yesterday') {
+    const d = new Date(); d.setHours(0, 0, 0, 0);
+    return d.getTime();
+  }
+  return null;
+}
+function pad20(ms) { return String(ms).padStart(20, '0'); }
+
+function teardownTxObserver() {
+  if (txPage.observer) {
+    txPage.observer.disconnect();
+    txPage.observer = null;
+  }
+}
+
+function appendLoadMoreSentinel() {
+  // Single sentinel at the bottom; IntersectionObserver auto-loads the
+  // next page when it scrolls into view. Removed once `has_more=false`.
+  const old = transcriptBody.querySelector('.transcript-loadmore');
+  if (old) old.remove();
+  if (!txPage.hasMore) { teardownTxObserver(); return; }
+  const sentinel = el('div', { class: 'transcript-loadmore', text: '· loading more ·' });
+  transcriptBody.appendChild(sentinel);
+  teardownTxObserver();
+  txPage.observer = new IntersectionObserver(entries => {
+    if (entries.some(e => e.isIntersecting) && !txPage.loading && txPage.hasMore) {
+      loadTranscriptPage(openTranscriptSession);
+    }
+  }, { root: transcriptBody, rootMargin: '200px' });
+  txPage.observer.observe(sentinel);
+}
+
+function buildTranscriptCounter(sessionId) {
+  // Shown as the "blocks" line in the meta block; lives in the meta
+  // refresh path so we update it after every page append.
+  const dt = transcriptMeta.querySelector('dt:nth-of-type(2)');
+  const dd = dt && dt.nextElementSibling;
+  if (dd) {
+    while (dd.firstChild) dd.removeChild(dd.firstChild);
+    const label = txPage.hasMore ? `${txPage.count}+` : String(txPage.count);
+    dd.appendChild(el('code', { text: label }));
+  }
+}
+
+async function loadTranscriptPage(sessionId) {
+  if (txPage.loading || !txPage.hasMore && txPage.count > 0) return;
+  txPage.loading = true;
+  const params = new URLSearchParams({
+    session_id: sessionId,
+    tenant: TENANT,
+    limit: String(TRANSCRIPT_PAGE_SIZE),
+  });
+  if (txPage.cursor) params.set('cursor', txPage.cursor);
+  const sinceMs = rangeSinceMs(txPage.range);
+  const untilMs = rangeUntilMs(txPage.range);
+  if (sinceMs !== null) params.set('since', pad20(sinceMs));
+  if (untilMs !== null) params.set('until', pad20(untilMs));
+  try {
+    const r = await fetch(`/transcripts?${params.toString()}`);
+    if (!r.ok) throw new Error(`HTTP ${r.status}: ${(await r.text()).slice(0, 160)}`);
+    const data = await r.json();
+    if (openTranscriptSession !== sessionId) return; // user moved on
+    const blocks = data.messages || [];
+    txPage.cursor = data.next_cursor || null;
+    txPage.hasMore = !!data.has_more;
+    if (txPage.count === 0) {
+      // First page: replace the placeholder, build meta from this page's
+      // blocks (so the date span is non-empty even before scrolling).
+      while (transcriptBody.firstChild) transcriptBody.removeChild(transcriptBody.firstChild);
+      buildTranscriptMeta(blocks, sessionId);
+      if (blocks.length === 0) {
+        transcriptBody.appendChild(buildPlaceholder('no blocks in this range', sessionId));
+        return;
+      }
+    } else {
+      // Subsequent page: drop the sentinel, append blocks, re-add sentinel.
+      const sentinel = transcriptBody.querySelector('.transcript-loadmore');
+      if (sentinel) sentinel.remove();
+    }
+    const frag = document.createDocumentFragment();
+    for (const b of blocks) frag.appendChild(buildBlock(b));
+    transcriptBody.appendChild(frag);
+    txPage.count += blocks.length;
+    buildTranscriptCounter(sessionId);
+    appendLoadMoreSentinel();
+  } catch (e) {
+    if (txPage.count === 0) {
+      while (transcriptBody.firstChild) transcriptBody.removeChild(transcriptBody.firstChild);
+      transcriptBody.appendChild(buildPlaceholder('could not retrieve the volume', e.message, 'error'));
+    }
+    // Mid-scroll error: leave already-rendered blocks in place; the
+    // sentinel stays so user can scroll past again to retry.
+  } finally {
+    txPage.loading = false;
+  }
+}
+
 async function openTranscript(sessionId) {
   if (!sessionId) return;
   openTranscriptSession = sessionId;
   transcriptBg.classList.add('open');
   transcriptBg.setAttribute('aria-hidden', 'false');
   transcriptMeta.hidden = true;
+  transcriptFilters.hidden = false;
+  // Reset filter buttons to current range (default 'all' on first open;
+  // on re-open we keep the user's previous choice).
+  for (const b of transcriptFilters.querySelectorAll('.tx-filter-btn')) {
+    b.classList.toggle('active', b.dataset.txRange === txPage.range);
+  }
+  txPage.cursor = null;
+  txPage.hasMore = true;
+  txPage.loading = false;
+  txPage.count = 0;
+  teardownTxObserver();
   while (transcriptBody.firstChild) transcriptBody.removeChild(transcriptBody.firstChild);
   transcriptBody.appendChild(buildPlaceholder('unbinding the volume', sessionId, 'loading'));
-  try {
-    const r = await fetch(`/transcripts?session_id=${encodeURIComponent(sessionId)}&tenant=${encodeURIComponent(TENANT)}`);
-    if (!r.ok) throw new Error(`HTTP ${r.status}: ${(await r.text()).slice(0, 160)}`);
-    const data = await r.json();
-    if (openTranscriptSession !== sessionId) return;
-    const blocks = data.messages || [];
-    while (transcriptBody.firstChild) transcriptBody.removeChild(transcriptBody.firstChild);
-    buildTranscriptMeta(blocks, sessionId);
-    if (blocks.length === 0) {
-      transcriptBody.appendChild(buildPlaceholder('the volume is empty', sessionId));
-      return;
-    }
-    const frag = document.createDocumentFragment();
-    for (const b of blocks) frag.appendChild(buildBlock(b));
-    transcriptBody.appendChild(frag);
-    transcriptBody.scrollTop = 0;
-  } catch (e) {
-    while (transcriptBody.firstChild) transcriptBody.removeChild(transcriptBody.firstChild);
-    transcriptBody.appendChild(buildPlaceholder('could not retrieve the volume', e.message, 'error'));
-  }
+  await loadTranscriptPage(sessionId);
+  transcriptBody.scrollTop = 0;
 }
+
+transcriptFilters.addEventListener('click', e => {
+  const btn = e.target.closest('.tx-filter-btn');
+  if (!btn || !openTranscriptSession) return;
+  const range = btn.dataset.txRange;
+  if (range === txPage.range) return;
+  txPage.range = range;
+  for (const b of transcriptFilters.querySelectorAll('.tx-filter-btn')) {
+    b.classList.toggle('active', b === btn);
+  }
+  // Reset and reload from scratch with the new range.
+  txPage.cursor = null;
+  txPage.hasMore = true;
+  txPage.count = 0;
+  teardownTxObserver();
+  while (transcriptBody.firstChild) transcriptBody.removeChild(transcriptBody.firstChild);
+  transcriptBody.appendChild(buildPlaceholder('refiltering the volume', null, 'loading'));
+  loadTranscriptPage(openTranscriptSession);
+});
 
 function closeTranscript() {
   transcriptBg.classList.remove('open');
   transcriptBg.setAttribute('aria-hidden', 'true');
   openTranscriptSession = null;
+  teardownTxObserver();
 }
 
 transcriptClose.addEventListener('click', closeTranscript);
