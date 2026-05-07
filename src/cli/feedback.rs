@@ -137,7 +137,19 @@ fn scan_transcript(args: &FeedbackFromTranscriptArgs) -> Result<HashSet<String>>
             Some(r @ ("user" | "assistant" | "system")) => r,
             _ => continue,
         };
-        let Some(content_array) = value["message"]["content"].as_array() else {
+        // Mirror `cli::mine`: accept both array-of-blocks and plain-string
+        // forms of `message.content`. Without this branch, ~80% of
+        // user-typed messages (string-content shape) are silently
+        // skipped — and our subsequent-text corpus, used for the
+        // "consumed" heuristic, loses most of its signal.
+        let raw_content = &value["message"]["content"];
+        let owned_array;
+        let content_array: &Vec<Value> = if let Some(arr) = raw_content.as_array() {
+            arr
+        } else if let Some(s) = raw_content.as_str() {
+            owned_array = vec![serde_json::json!({"type": "text", "text": s})];
+            &owned_array
+        } else {
             continue;
         };
 

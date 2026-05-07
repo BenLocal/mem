@@ -105,7 +105,20 @@ pub fn parse_transcript_full(path: &Path) -> Result<(Vec<ExtractedMemory>, Vec<A
         let timestamp = value["timestamp"].as_str().unwrap_or("").to_string();
         let message_uuid = value["uuid"].as_str().map(|s| s.to_string());
 
-        let Some(content_array) = value["message"]["content"].as_array() else {
+        // Claude Code emits user messages in two shapes: an array of
+        // structured blocks (when the message has tool-uses or
+        // attachments) and a plain string (the common case for raw
+        // user-typed text). Treating only the array form drops the
+        // bulk of user input — synthesize a single text block when the
+        // payload is a string so both shapes archive identically.
+        let raw_content = &value["message"]["content"];
+        let owned_array;
+        let content_array: &Vec<Value> = if let Some(arr) = raw_content.as_array() {
+            arr
+        } else if let Some(s) = raw_content.as_str() {
+            owned_array = vec![serde_json::json!({"type": "text", "text": s})];
+            &owned_array
+        } else {
             continue;
         };
 
