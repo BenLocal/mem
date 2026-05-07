@@ -11,6 +11,7 @@ set -uo pipefail
 
 INPUT=$(cat 2>/dev/null || echo '{}')
 TRANSCRIPT=$(echo "$INPUT" | jq -r '.transcriptPath // empty' 2>/dev/null || echo "")
+SESSION_ID=$(echo "$INPUT" | jq -r '.session_id // empty' 2>/dev/null || echo "")
 
 if [ -z "$TRANSCRIPT" ] || [ ! -f "$TRANSCRIPT" ]; then
     echo '{}'
@@ -18,7 +19,11 @@ if [ -z "$TRANSCRIPT" ] || [ ! -f "$TRANSCRIPT" ]; then
 fi
 
 EXCHANGE_COUNT=$(grep -c '"type":"user"' "$TRANSCRIPT" 2>/dev/null || echo 0)
-LAST_SAVE_FILE="$HOME/.mem/last_save"
+# Throttle file is per-session — multiple Claude Code sessions share one
+# `~/.mem/` dir, so a global throttle would have one session's count
+# starve another from ever crossing the 15-msg threshold. Falls back to
+# `last_save` (no suffix) when session_id is missing.
+LAST_SAVE_FILE="$HOME/.mem/last_save${SESSION_ID:+_$SESSION_ID}"
 mkdir -p "$(dirname "$LAST_SAVE_FILE")"
 LAST_SAVE=$(cat "$LAST_SAVE_FILE" 2>/dev/null || echo 0)
 

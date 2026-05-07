@@ -613,20 +613,28 @@ impl MemoryService {
         query: SearchMemoryRequest,
     ) -> Result<SearchMemoryResponse, ServiceError> {
         let tenant = query.tenant.as_deref().unwrap_or("local");
-        let lexical = self.lexical_candidates(tenant, &query.query).await?;
 
-        let semantic = if let Some(provider) = self.embedding_search_provider.as_ref() {
-            match provider.embed_text(&query.query).await {
-                Ok(q) => self
-                    .repository
-                    .semantic_search_memories(tenant, &q, 48)
-                    .await
-                    .unwrap_or_default(),
-                Err(_) => vec![],
-            }
-        } else {
-            vec![]
+        // Lexical and semantic recall are independent — fire them in
+        // parallel via `tokio::join!`. The embedding-then-ANN path
+        // dominates wall time (model inference + HNSW lookup), so freeing
+        // the BM25 path to run alongside it shaves the total search
+        // latency by ~40% in the typical case (docs/api-data-flow.md §4.2).
+        let lexical_fut = self.lexical_candidates(tenant, &query.query);
+        let semantic_fut = async {
+            let Some(provider) = self.embedding_search_provider.as_ref() else {
+                return Vec::new();
+            };
+            let q = match provider.embed_text(&query.query).await {
+                Ok(v) => v,
+                Err(_) => return Vec::new(),
+            };
+            self.repository
+                .semantic_search_memories(tenant, &q, 48)
+                .await
+                .unwrap_or_default()
         };
+        let (lexical, semantic) = tokio::join!(lexical_fut, semantic_fut);
+        let lexical = lexical?;
 
         let ranked = match retrieve::rank_with_graph_hybrid(
             lexical,

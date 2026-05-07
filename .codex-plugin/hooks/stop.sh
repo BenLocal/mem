@@ -9,6 +9,7 @@ set -uo pipefail
 
 INPUT=$(cat 2>/dev/null || echo '{}')
 TRANSCRIPT=$(echo "$INPUT" | jq -r '.transcriptPath // .transcript_path // empty' 2>/dev/null || echo "")
+SESSION_ID=$(echo "$INPUT" | jq -r '.session_id // empty' 2>/dev/null || echo "")
 
 if [ -z "$TRANSCRIPT" ] && [ -d "$HOME/.codex/sessions" ]; then
     # shellcheck disable=SC2012
@@ -21,7 +22,8 @@ if [ -z "$TRANSCRIPT" ] || [ ! -f "$TRANSCRIPT" ]; then
 fi
 
 EXCHANGE_COUNT=$(grep -c '"type":"user"' "$TRANSCRIPT" 2>/dev/null || echo 0)
-LAST_SAVE_FILE="$HOME/.mem/codex_last_save"
+# Per-session throttle (multi-session safety) — see Claude Code stop.sh.
+LAST_SAVE_FILE="$HOME/.mem/codex_last_save${SESSION_ID:+_$SESSION_ID}"
 mkdir -p "$(dirname "$LAST_SAVE_FILE")"
 LAST_SAVE=$(cat "$LAST_SAVE_FILE" 2>/dev/null || echo 0)
 

@@ -224,17 +224,45 @@ fn extract_tool_result_content(value: &Value) -> String {
 }
 
 fn extract_memory(text: &str) -> Option<String> {
-    if let Some(cap) = TAG_RE.captures(text) {
-        return Some(cap[1].trim().to_string());
-    }
-
-    for re in PATTERN_RES.iter() {
-        if let Some(cap) = re.captures(text) {
-            return Some(cap[1].trim().to_string());
+    let candidate = if let Some(cap) = TAG_RE.captures(text) {
+        cap[1].trim().to_string()
+    } else {
+        let mut found: Option<String> = None;
+        for re in PATTERN_RES.iter() {
+            if let Some(cap) = re.captures(text) {
+                found = Some(cap[1].trim().to_string());
+                break;
+            }
         }
-    }
+        found?
+    };
 
-    None
+    if looks_like_real_memory(&candidate) {
+        Some(candidate)
+    } else {
+        None
+    }
+}
+
+/// Reject obvious garbage extractions (e.g. `<mem-save>...</mem-save>`
+/// that the lazy `(.*?)` group ate when assistant text *described* the
+/// `<mem-save>` tag rather than using it). Two real-world misfires this
+/// guard catches:
+///   - mem_019e0054-6c48 = `"这种显式片段）`  (7-char partial sentence)
+///   - mem_019e0054-6c99 = `...`              (3-char placeholder)
+///
+/// Heuristic: minimum 12 chars AND at least 4 alphanumeric / CJK chars
+/// (Unicode `is_alphanumeric` covers Chinese, Japanese, Korean, etc.).
+/// Calibrated against observed garbage; legitimate one-liners like
+/// `use bun.lockb` (13 chars) still pass.
+fn looks_like_real_memory(s: &str) -> bool {
+    const MIN_LEN: usize = 12;
+    const MIN_SUBSTANTIVE: usize = 4;
+    if s.chars().count() < MIN_LEN {
+        return false;
+    }
+    let substantive = s.chars().filter(|c| c.is_alphanumeric()).count();
+    substantive >= MIN_SUBSTANTIVE
 }
 
 pub async fn run(args: MineArgs) -> i32 {
@@ -350,5 +378,55 @@ pub async fn run(args: MineArgs) -> i32 {
         1
     } else {
         0
+    }
+}
+
+// `mod extract_tests` lives at file end so clippy::items_after_test_module
+// doesn't fire — the lint requires no real items appear after a test
+// module.
+#[cfg(test)]
+mod extract_tests {
+    use super::*;
+
+    #[test]
+    fn rejects_three_dots() {
+        assert!(extract_memory("<mem-save>...</mem-save>").is_none());
+    }
+
+    #[test]
+    fn rejects_short_partial_fragment() {
+        // observed in production: assistant explained the tag and got a
+        // trailing fragment captured.
+        assert!(extract_memory("<mem-save>\"这种显式片段）</mem-save>").is_none());
+    }
+
+    #[test]
+    fn keeps_legit_short_memory() {
+        let s = "<mem-save>use rustls for TLS not native-tls</mem-save>";
+        assert_eq!(
+            extract_memory(s).as_deref(),
+            Some("use rustls for TLS not native-tls"),
+        );
+    }
+
+    #[test]
+    fn keeps_chinese_memory() {
+        let s = "<mem-save>记住：用 tokio 而不是 std::thread</mem-save>";
+        assert!(extract_memory(s).is_some());
+    }
+
+    #[test]
+    fn keeps_pattern_match() {
+        let s = "I'll remember: use bun for fast installs";
+        assert_eq!(
+            extract_memory(s).as_deref(),
+            Some("use bun for fast installs")
+        );
+    }
+
+    #[test]
+    fn rejects_pattern_match_too_short() {
+        let s = "I'll remember: ok";
+        assert!(extract_memory(s).is_none());
     }
 }
