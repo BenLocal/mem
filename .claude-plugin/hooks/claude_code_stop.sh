@@ -1,19 +1,16 @@
 #!/usr/bin/env bash
-# Codex Stop hook: every ~15 user exchanges, run `mem mine` and emit a
-# status line ("✦ mem · N memories + K blocks woven into the archive")
-# via `systemMessage`. Mirrors the Claude Code variant; only differences
-# are the per-runtime --agent label, the throttle file, and the transcript
-# path probe (Codex hook payload field shape varies; fall back to the
-# latest .jsonl under ~/.codex/sessions/).
+# Claude Code Stop hook: every ~15 user exchanges, run `mem mine` and emit
+# a status notification ("✦ mem · N memories + K blocks woven into the
+# archive") via `systemMessage`. Mining is synchronous so the count is
+# accurate at the time the line shows; on a typical 15-exchange increment
+# the post-loopback HTTP POSTs finish in well under a second.
+#
+# `set -uo pipefail` (no -e): we want to keep going past mine failures so a
+# transient mem-serve outage never breaks the Stop event itself.
 set -uo pipefail
 
 INPUT=$(cat 2>/dev/null || echo '{}')
-TRANSCRIPT=$(echo "$INPUT" | jq -r '.transcriptPath // .transcript_path // empty' 2>/dev/null || echo "")
-
-if [ -z "$TRANSCRIPT" ] && [ -d "$HOME/.codex/sessions" ]; then
-    # shellcheck disable=SC2012
-    TRANSCRIPT=$(ls -t "$HOME/.codex/sessions"/*.jsonl 2>/dev/null | head -1 || true)
-fi
+TRANSCRIPT=$(echo "$INPUT" | jq -r '.transcriptPath // empty' 2>/dev/null || echo "")
 
 if [ -z "$TRANSCRIPT" ] || [ ! -f "$TRANSCRIPT" ]; then
     echo '{}'
@@ -21,7 +18,7 @@ if [ -z "$TRANSCRIPT" ] || [ ! -f "$TRANSCRIPT" ]; then
 fi
 
 EXCHANGE_COUNT=$(grep -c '"type":"user"' "$TRANSCRIPT" 2>/dev/null || echo 0)
-LAST_SAVE_FILE="$HOME/.mem/codex_last_save"
+LAST_SAVE_FILE="$HOME/.mem/last_save"
 mkdir -p "$(dirname "$LAST_SAVE_FILE")"
 LAST_SAVE=$(cat "$LAST_SAVE_FILE" 2>/dev/null || echo 0)
 
@@ -30,7 +27,9 @@ if [ $((EXCHANGE_COUNT - LAST_SAVE)) -lt 15 ]; then
     exit 0
 fi
 
-MINE_OUT=$(timeout 60 mem mine "$TRANSCRIPT" --agent codex 2>&1 || true)
+# Sync mine, capped at 60 s. Output looks like:
+#   "Mined: memories sent=3/3 blocks sent=3244/3244 (server-side dedup applied)"
+MINE_OUT=$(timeout 60 mem mine "$TRANSCRIPT" --agent claude-code 2>&1 || true)
 
 echo "$EXCHANGE_COUNT" > "$LAST_SAVE_FILE"
 
