@@ -2213,11 +2213,18 @@ fn fts_rebuild_with_reload_fallback(
     conn.execute_batch(create_sql).map_err(StorageError::DuckDb)
 }
 
-fn is_fts_dependency_error(msg: &str) -> bool {
-    // Match on the stable identifying substring: `subject "stopwords"`. The
-    // surrounding text varies ("Failed to commit:", "Could not commit
-    // creation of dependency, subject 'stopwords' has been deleted"), but
-    // the subject-of-the-broken-dep is invariant across DuckDB 1.x.
+/// Detects the DuckDB FTS 1.x dependency-tracker bug:
+///   "Failed to commit: Could not commit creation of dependency,
+///    subject \"stopwords\" has been deleted"
+/// Match on the stable identifying substring `stopwords` (single- and
+/// double-quoted variants). Surrounding text varies across DuckDB
+/// minor versions but the broken-dep subject is invariant.
+///
+/// `pub(crate)` so the FTS worker can downgrade this error class to
+/// debug-level logging — the read path already keeps the prior index
+/// alive when this error fires (`bm25_candidates` swallows), so the
+/// worker spamming WARN every tick is just noise.
+pub(crate) fn is_fts_dependency_error(msg: &str) -> bool {
     msg.contains("\"stopwords\"") || msg.contains("'stopwords'")
 }
 

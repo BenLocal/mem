@@ -23,9 +23,9 @@
 
 use std::time::Duration;
 
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
-use crate::storage::DuckDbRepository;
+use crate::storage::{is_fts_dependency_error, DuckDbRepository};
 
 /// Run the FTS rebuild loop until the parent runtime drops it.
 ///
@@ -35,17 +35,31 @@ use crate::storage::DuckDbRepository;
 /// fallback) — typical rebuilds are short enough that running them on
 /// the runtime's worker thread is fine; if profiling shows otherwise
 /// we'd wrap each call in `spawn_blocking`.
+///
+/// Error logging policy: the DuckDB FTS 1.x dependency-tracker bug
+/// (`subject "stopwords" has been deleted`) is logged at debug rather
+/// than warn — the read path's `bm25_candidates` already swallows it
+/// and serves search from the prior index, so warn-level here was just
+/// noise spamming every tick. Other rebuild errors (real DuckDB
+/// failures) keep their warn level so they stay visible.
 pub async fn run(repo: DuckDbRepository, interval_ms: u64) {
     let interval_ms = interval_ms.max(100);
     info!(interval_ms, "fts rebuild worker started");
     let mut interval = tokio::time::interval(Duration::from_millis(interval_ms));
     loop {
         interval.tick().await;
-        if let Err(e) = repo.ensure_fts_index_fresh() {
-            warn!(error = %e, "fts worker memories rebuild failed");
-        }
-        if let Err(e) = repo.ensure_transcript_fts_index_fresh() {
-            warn!(error = %e, "fts worker transcripts rebuild failed");
+        log_rebuild_result("memories", repo.ensure_fts_index_fresh());
+        log_rebuild_result("transcripts", repo.ensure_transcript_fts_index_fresh());
+    }
+}
+
+fn log_rebuild_result(which: &'static str, result: Result<(), crate::storage::StorageError>) {
+    if let Err(e) = result {
+        let msg = e.to_string();
+        if is_fts_dependency_error(&msg) {
+            debug!(table = which, error = %msg, "fts rebuild hit dep-tracker bug; prior index kept");
+        } else {
+            warn!(table = which, error = %msg, "fts rebuild failed");
         }
     }
 }
