@@ -1371,7 +1371,16 @@ impl DuckDbRepository {
         if query.trim().is_empty() || k == 0 {
             return Ok(vec![]);
         }
-        self.ensure_fts_index_fresh()?;
+        // Rebuild best-effort: if it fails (DuckDB FTS 1.x dep tracker
+        // bug — see `is_fts_dependency_error`) keep using whatever index
+        // last existed on disk. Stale BM25 ranking is far better than
+        // returning 500 to the search caller; the `fts_worker` will keep
+        // attempting to rebuild on its own cadence and the dirty flag is
+        // restored inside `ensure_fts_index_fresh` so a future retry can
+        // succeed once the catalog state settles. Logged at debug only.
+        if let Err(e) = self.ensure_fts_index_fresh() {
+            tracing::debug!(error = %e, "bm25_candidates ignoring fts rebuild error; using prior index");
+        }
 
         let scored: Vec<(String, f64)> = {
             let conn = self.conn()?;

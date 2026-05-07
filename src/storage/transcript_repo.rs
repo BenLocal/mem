@@ -179,7 +179,10 @@ impl DuckDbRepository {
         if query.trim().is_empty() || k == 0 {
             return Ok(vec![]);
         }
-        self.ensure_transcript_fts_index_fresh()?;
+        // Best-effort rebuild — see `bm25_candidates` for the rationale.
+        if let Err(e) = self.ensure_transcript_fts_index_fresh() {
+            tracing::debug!(error = %e, "bm25_transcript_candidates ignoring fts rebuild error; using prior index");
+        }
 
         let scored: Vec<(String, f64)> = {
             let conn = self.conn()?;
