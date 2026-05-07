@@ -1384,6 +1384,38 @@ impl DuckDbRepository {
         Ok(candidates)
     }
 
+    /// Bounded recent-active fetch for the wake-up fast path.
+    ///
+    /// Pushes the status filter and `LIMIT` to SQL so a tenant with thousands
+    /// of memories can answer wake-up in O(`limit`) rather than scanning the
+    /// full live set into Rust the way `search_candidates` does. Same row
+    /// shape and ordering as `search_candidates`, so callers can swap between
+    /// them without re-parsing.
+    pub async fn recent_active_memories(
+        &self,
+        tenant: &str,
+        limit: usize,
+    ) -> Result<Vec<MemoryRecord>, StorageError> {
+        let conn = self.conn()?;
+        let lim = i64::try_from(limit).unwrap_or(64).clamp(1, 1024);
+        let rejected = encode_text(&MemoryStatus::Rejected)?;
+        let archived = encode_text(&MemoryStatus::Archived)?;
+        let mut stmt = conn.prepare(
+            "select
+                memory_id, tenant, memory_type, status, scope, visibility, version, summary,
+                content, evidence_json, code_refs_json, project, repo, module, task_type,
+                tags_json, confidence, decay_score, content_hash, idempotency_key,
+                session_id, supersedes_memory_id, source_agent, created_at, updated_at,
+                last_validated_at, topics
+             from memories
+             where tenant = ?1 and status not in (?2, ?3)
+             order by updated_at desc, version desc, memory_id asc
+             limit ?4",
+        )?;
+        let rows = stmt.query_map(params![tenant, rejected, archived, lim], map_memory_row)?;
+        Ok(rows.collect::<Result<Vec<_>, _>>()?)
+    }
+
     /// BM25 lexical retrieval. Returns up to `k` records ranked by BM25 score
     /// for the tenant's live memories, omitting rejected/archived rows. An
     /// empty `query` yields an empty result.

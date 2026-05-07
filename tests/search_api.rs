@@ -522,6 +522,104 @@ async fn negative_feedback_penalizes_future_recall() {
 // (docs/api-data-flow.md §5.1, observed 2026-05-06). The bundled DuckDB FTS
 // 1.x dependency tracker keeps a stale edge to the just-dropped `stopwords`
 // macro, so the second-and-onward rebuild on a long-lived connection used to
+// SessionStart-hook wake-up call (`intent="wake_up"`, empty `query`) takes
+// the fast path in `MemoryService::search`: it fetches a bounded slice of
+// recent active memories from DuckDB, skips embedding / HNSW / BM25 / graph
+// ranking, and hands the slice straight to `compress`. The full pipeline
+// took 11–200 s in production on a moderately-loaded DB; this test pins the
+// fast-path contract — recent active memories surface, archived rows are
+// filtered out at the SQL layer, and the response shape matches a normal
+// search response.
+#[tokio::test]
+async fn wake_up_fast_path_returns_recent_active_memories() {
+    let archived_memory = {
+        let mut m = memory(MemorySpec {
+            tenant: "local",
+            memory_id: "mem_archived",
+            memory_type: MemoryType::Implementation,
+            scope: Scope::Repo,
+            repo: Some("mem"),
+            project: Some("mem"),
+            module: Some("storage"),
+            content: "Archived note that the wake-up fast path must filter out.",
+            summary: "archived note",
+            updated_at: "2026-05-07T00:00:03Z",
+            decay_score: 0.0,
+        });
+        m.status = MemoryStatus::Archived;
+        m
+    };
+    let app = seeded_search_app(vec![
+        memory(MemorySpec {
+            tenant: "local",
+            memory_id: "mem_pref",
+            memory_type: MemoryType::Preference,
+            scope: Scope::Global,
+            repo: None,
+            project: None,
+            module: None,
+            content: "Prefer concise answers and mention rollback risk.",
+            summary: "prefer concise answers",
+            updated_at: "2026-05-07T00:00:02Z",
+            decay_score: 0.0,
+        }),
+        memory(MemorySpec {
+            tenant: "local",
+            memory_id: "mem_recent_fact",
+            memory_type: MemoryType::Implementation,
+            scope: Scope::Repo,
+            repo: Some("mem"),
+            project: Some("mem"),
+            module: Some("storage"),
+            content: "DuckDB stores canonical memory records and keeps indexes local.",
+            summary: "duckdb storage layout",
+            updated_at: "2026-05-07T00:00:01Z",
+            decay_score: 0.0,
+        }),
+        archived_memory,
+    ])
+    .await;
+
+    let response = app
+        .post_json(
+            "/memories/search",
+            json!({
+                "query": "",
+                "intent": "wake_up",
+                "scope_filters": [],
+                "token_budget": 800,
+                "caller_agent": "claude-code",
+                "expand_graph": false,
+                "tenant": "local",
+            }),
+        )
+        .await;
+    assert_eq!(response.status(), 200);
+
+    let body = response.json();
+    let surfaced: std::collections::HashSet<String> = body["directives"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .chain(body["relevant_facts"].as_array().unwrap().iter())
+        .chain(body["reusable_patterns"].as_array().unwrap().iter())
+        .filter_map(|item| item["memory_id"].as_str().map(str::to_string))
+        .collect();
+
+    assert!(
+        surfaced.contains("mem_pref"),
+        "preference must surface as directive on wake-up"
+    );
+    assert!(
+        surfaced.contains("mem_recent_fact"),
+        "recent active fact must surface on wake-up (no relevance floor on this path)"
+    );
+    assert!(
+        !surfaced.contains("mem_archived"),
+        "archived rows must be filtered at the SQL layer"
+    );
+}
+
 // 500 with the dependency-commit error. Fix: detect that error class and
 // retry once after `INSTALL fts; LOAD fts;` to reset extension state. This
 // test exercises the repeat-rebuild scenario via the public HTTP surface —

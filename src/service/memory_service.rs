@@ -614,6 +614,31 @@ impl MemoryService {
     ) -> Result<SearchMemoryResponse, ServiceError> {
         let tenant = query.tenant.as_deref().unwrap_or("local");
 
+        // Wake-up fast path: SessionStart hooks call us with `intent="wake_up"`
+        // and an empty `query` to seed "Recent Context" at session boot.
+        // The full pipeline (embedding the empty string, HNSW lookup, scanning
+        // every active memory for BM25, graph-aware ranking, tiktoken-based
+        // compression of the entire live set) was observed to take 11–200 s
+        // on a moderately-loaded local DB and made claude-code start sluggish.
+        //
+        // We instead fetch the most recently-updated active slice and hand it
+        // straight to `compress`. Ranking is skipped on purpose: with no query
+        // text the relevance floor in `retrieve::finalize` (default 25) gates
+        // out almost everything except Preference / Workflow because the
+        // text-match and scope signals are zero, and freshness alone caps at
+        // +6. The DB-side `ORDER BY updated_at DESC` already gives the
+        // ordering wake-up wants ("freshest first per section") and `compress`
+        // does the per-section truncation by token budget.
+        if query.intent == "wake_up" && query.query.trim().is_empty() {
+            const WAKE_UP_LIMIT: usize = 64;
+            let candidates = self
+                .repository
+                .recent_active_memories(tenant, WAKE_UP_LIMIT)
+                .await
+                .map_err(ServiceError::Storage)?;
+            return Ok(compress::compress(&candidates, query.token_budget));
+        }
+
         // Lexical and semantic recall are independent — fire them in
         // parallel via `tokio::join!`. The embedding-then-ANN path
         // dominates wall time (model inference + HNSW lookup), so freeing
