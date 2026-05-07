@@ -640,6 +640,71 @@ impl DuckDbRepository {
         Ok(())
     }
 
+    /// Hard-delete a memory and every row that references it. Children are
+    /// dropped first to satisfy DuckDB FK RESTRICT, then the parent.
+    ///
+    /// Auto-commit (no enclosing transaction). DuckDB 1.x's FK enforcer
+    /// checks at commit time and within a single transaction sometimes still
+    /// sees just-deleted child rows — wrapping these in a `BEGIN;…COMMIT;`
+    /// reproducibly fails the parent DELETE with
+    ///   `"is still referenced by a foreign key in a different table"`
+    /// even though every child was deleted earlier in the same tx. Going
+    /// through the connection's auto-commit path makes each DELETE a
+    /// standalone tx, so the parent DELETE sees a clean child table.
+    ///
+    /// Cascades:
+    ///   - `embedding_jobs`        (FK child)
+    ///   - `memory_embeddings`     (FK child)
+    ///   - `feedback_events`       (no FK, but logically owned)
+    ///   - `graph_edges` rows whose `from_node_id = "memory:<id>"`
+    ///   - `memories` row itself
+    ///
+    /// Failure mode: if any child DELETE succeeds but a later step fails,
+    /// the row is left in a partially-deleted state. Re-running
+    /// `delete_memory_hard` on the same id is safe — it picks up wherever
+    /// the previous attempt stopped (every step is `WHERE memory_id = ?`,
+    /// no-op on a missing row).
+    ///
+    /// Note: the HNSW sidecar entry is **not** touched here — the caller
+    /// must remove it via `VectorIndex::remove`. Service-layer
+    /// `MemoryService::delete_memory_hard` does that on best effort.
+    pub async fn delete_memory_hard(
+        &self,
+        tenant: &str,
+        memory_id: &str,
+    ) -> Result<(), StorageError> {
+        let conn = self.conn()?;
+        let from_node = format!("memory:{memory_id}");
+
+        conn.execute(
+            "delete from embedding_jobs where memory_id = ?1",
+            params![memory_id],
+        )?;
+        conn.execute(
+            "delete from memory_embeddings where memory_id = ?1",
+            params![memory_id],
+        )?;
+        conn.execute(
+            "delete from feedback_events where memory_id = ?1",
+            params![memory_id],
+        )?;
+        conn.execute(
+            "delete from graph_edges where from_node_id = ?1",
+            params![&from_node],
+        )?;
+
+        let n = conn.execute(
+            "delete from memories where tenant = ?1 and memory_id = ?2",
+            params![tenant, memory_id],
+        )?;
+        if n == 0 {
+            return Err(StorageError::InvalidData("memory not found"));
+        }
+
+        self.fts_dirty.store(true, Ordering::Release);
+        Ok(())
+    }
+
     pub async fn delete_memory_embedding(&self, memory_id: &str) -> Result<(), StorageError> {
         {
             let conn = self.conn()?;
@@ -1519,9 +1584,10 @@ impl DuckDbRepository {
             updated.last_validated_at = Some(updated_at.clone());
         }
 
-        let mut conn = self.conn()?;
-        let tx = conn.transaction()?;
-        tx.execute(
+        let conn = self.conn()?;
+        // Always log the feedback event — independent of the parent UPDATE,
+        // so the audit trail is preserved even if the dance below errors.
+        conn.execute(
             "insert into feedback_events (feedback_id, memory_id, feedback_kind, created_at)
              values (?1, ?2, ?3, ?4)",
             params![
@@ -1532,7 +1598,16 @@ impl DuckDbRepository {
             ],
         )?;
 
-        let rows_updated = tx.execute(
+        // DuckDB implements parent UPDATE as DELETE+INSERT internally; the
+        // DELETE half raises FK RESTRICT whenever any embedding_jobs /
+        // memory_embeddings row references this memory_id. Lift the children
+        // out, run the UPDATE, then restore — same dance as
+        // `replace_pending_with_successor` / `update_status` /
+        // `migrate_content_hash_to_sha256`.
+        let (jobs, embedding) = load_embedding_references(&conn, &updated.memory_id)?;
+        delete_embedding_references(&conn, &updated.memory_id)?;
+
+        let update_result = conn.execute(
             "update memories
              set status = ?1,
                  confidence = ?2,
@@ -1549,13 +1624,17 @@ impl DuckDbRepository {
                 updated.tenant.clone(),
                 updated.memory_id.clone(),
             ],
-        )?;
+        );
 
+        // Always restore children, even on UPDATE failure — they belong to
+        // the (still-existing) parent regardless of what happened here.
+        restore_embedding_references(&conn, &jobs, embedding.as_ref())?;
+
+        let rows_updated = update_result?;
         if rows_updated == 0 {
             return Err(StorageError::InvalidData("memory not found"));
         }
 
-        tx.commit()?;
         Ok(updated)
     }
 

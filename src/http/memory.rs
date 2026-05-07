@@ -21,7 +21,19 @@ pub fn router() -> Router<AppState> {
         .route("/episodes", post(ingest_episode))
         .route("/memories/search", post(search_memory))
         .route("/memories/feedback", post(submit_feedback))
-        .route("/memories/{id}", get(get_memory))
+        .route("/memories/{id}", get(get_memory).delete(delete_memory))
+}
+
+async fn delete_memory(
+    State(app): State<AppState>,
+    Path(memory_id): Path<String>,
+    Query(query): Query<MemoryDetailQuery>,
+) -> Result<StatusCode, AppError> {
+    let tenant = query.tenant.as_deref().unwrap_or("local");
+    app.memory_service
+        .delete_memory_hard(tenant, &memory_id)
+        .await?;
+    Ok(StatusCode::NO_CONTENT)
 }
 
 #[derive(Debug, Deserialize)]

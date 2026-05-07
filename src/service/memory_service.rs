@@ -278,6 +278,37 @@ impl MemoryService {
         Ok(self.repository.list_memories_for_tenant(tenant).await?)
     }
 
+    /// Hard-delete a memory and all its references. **Irreversible.**
+    /// Backs `DELETE /memories/{id}` from the admin web page.
+    ///
+    /// Order:
+    ///   1. Verify the row exists for this tenant (clean 404 if not).
+    ///   2. Transactional DuckDB cascade
+    ///      (`repository::delete_memory_hard`).
+    ///   3. Best-effort HNSW sidecar removal — if the sidecar is missing or
+    ///      the remove fails, the DB delete still wins; an orphan vector
+    ///      gets cleaned by the next `mem repair --rebuild`.
+    pub async fn delete_memory_hard(
+        &self,
+        tenant: &str,
+        memory_id: &str,
+    ) -> Result<(), ServiceError> {
+        self.repository
+            .get_memory_for_tenant(tenant, memory_id)
+            .await?
+            .ok_or(ServiceError::NotFound)?;
+
+        self.repository
+            .delete_memory_hard(tenant, memory_id)
+            .await?;
+
+        if let Some(idx) = self.repository.vector_index() {
+            let _ = idx.remove(memory_id).await;
+        }
+
+        Ok(())
+    }
+
     pub async fn get_memory(
         &self,
         tenant: Option<&str>,
