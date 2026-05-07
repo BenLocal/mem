@@ -240,6 +240,119 @@ body::before {
   margin: 0 0.3rem; font-size: 0.95rem;
 }
 
+/* queue view ------------------------------------------------ */
+
+.queue-summary {
+  position: relative; z-index: 2;
+  padding: 1.5rem 3rem 0;
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(140px, 1fr));
+  gap: 0.85rem;
+  max-width: 1100px;
+}
+.queue-cell {
+  background: var(--card);
+  border: 1px solid var(--card-edge);
+  padding: 0.85rem 1rem;
+  display: flex; flex-direction: column; gap: 0.25rem;
+  transition: transform 0.15s, border-color 0.15s;
+}
+.queue-cell:hover {
+  transform: translateY(-2px);
+  border-color: var(--ink-fade);
+}
+.queue-cell .num {
+  font-family: 'Cormorant Garamond', serif; font-style: italic;
+  font-size: 2rem; line-height: 1; color: var(--ink);
+}
+.queue-cell .label {
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 0.62rem; letter-spacing: 0.1em; text-transform: uppercase;
+  color: var(--ink-mute);
+}
+.queue-cell.pending     .num { color: var(--gold); }
+.queue-cell.processing  .num { color: var(--indigo); }
+.queue-cell.completed   .num { color: var(--forest); }
+.queue-cell.failed      .num { color: var(--oxblood); }
+.queue-cell.stale       .num { color: var(--ink-mute); }
+
+.jobs-list {
+  position: relative; z-index: 2;
+  padding: 1.5rem 3rem 6rem;
+  display: flex; flex-direction: column; gap: 0.4rem;
+  max-width: 1100px;
+}
+
+.job-row {
+  position: relative;
+  display: grid;
+  grid-template-columns: max-content 1fr max-content max-content max-content;
+  gap: 1rem;
+  align-items: baseline;
+  padding: 0.7rem 1.25rem;
+  background: var(--card);
+  border: 1px solid var(--card-edge);
+  border-left: 3px solid var(--ink-mute);
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 0.72rem;
+  transition: background 0.15s, border-left-color 0.15s;
+}
+.job-row:hover { background: rgba(80, 50, 20, 0.025); }
+.job-row.pending     { border-left-color: var(--gold); }
+.job-row.processing  { border-left-color: var(--indigo); }
+.job-row.completed   { border-left-color: var(--forest); }
+.job-row.failed      { border-left-color: var(--oxblood); }
+.job-row.stale       { border-left-color: var(--ink-mute); }
+
+.job-status {
+  font-family: 'Cormorant Garamond', serif; font-style: italic;
+  font-size: 0.95rem;
+  text-transform: lowercase;
+  min-width: 6rem;
+}
+.job-status.pending     { color: var(--gold); }
+.job-status.processing  { color: var(--indigo); }
+.job-status.completed   { color: var(--forest); }
+.job-status.failed      { color: var(--oxblood); }
+.job-status.stale       { color: var(--ink-mute); }
+
+.job-mid {
+  display: flex; flex-direction: column; gap: 0.15rem;
+  min-width: 0;
+}
+.job-mem {
+  color: var(--ink-fade); word-break: break-all; line-height: 1.3;
+}
+.job-mem .lead {
+  color: var(--ink-mute); margin-right: 0.4rem;
+}
+.job-err {
+  color: var(--oxblood); font-style: italic;
+  font-family: 'Cormorant Garamond', serif; font-size: 0.85rem;
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+  max-width: 60ch;
+}
+
+.job-attempt {
+  color: var(--ink-mute);
+  letter-spacing: 0.06em;
+}
+.job-attempt .n {
+  color: var(--ink); font-weight: 600;
+  font-family: 'Cormorant Garamond', serif; font-size: 0.95rem;
+  font-style: italic;
+}
+.job-provider {
+  color: var(--ink-fade);
+  text-transform: uppercase; letter-spacing: 0.06em;
+  padding: 0.05rem 0.4rem; border: 1px solid var(--card-edge);
+  font-size: 0.6rem;
+}
+.job-when {
+  color: var(--ink-mute); letter-spacing: 0.04em;
+  text-align: right; font-size: 0.66rem; min-width: 12rem;
+}
+
 /* transcript drawer (left-side, distinct from memory drawer) -- */
 
 .transcript-bg {
@@ -891,4 +1004,7 @@ body::before {
   .detail-actions { flex-direction: column; align-items: stretch; gap: 0.6rem; }
   .detail-actions-buttons { justify-content: flex-end; }
   .feedback-grid { grid-template-columns: repeat(2, 1fr); }
+  .queue-summary, .jobs-list { padding-left: 1.25rem; padding-right: 1.25rem; }
+  .job-row { grid-template-columns: max-content 1fr; gap: 0.5rem; }
+  .job-attempt, .job-provider, .job-when { display: none; }
 }

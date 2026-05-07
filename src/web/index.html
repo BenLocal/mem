@@ -1,142 +1,182 @@
 <!DOCTYPE html>
 <html lang="en">
+
 <head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<title>mem · archive</title>
-<link rel="icon" type="image/svg+xml" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'%3E%3Crect width='100' height='100' fill='%23efe3c8'/%3E%3Ctext x='50' y='72' text-anchor='middle' font-family='Cormorant Garamond,serif' font-weight='700' font-size='80' fill='%237d2a1e' font-style='italic'%3E·%3C/text%3E%3C/svg%3E">
-<link rel="preconnect" href="https://fonts.googleapis.com">
-<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-<link href="https://fonts.googleapis.com/css2?family=Cormorant+Garamond:ital,wght@0,500;0,600;0,700;1,500;1,700&family=Source+Serif+4:opsz,wght@8..60,400;8..60,500;8..60,600&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet">
-<link rel="stylesheet" href="/web/style.css">
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>mem</title>
+  <link rel="icon" type="image/svg+xml"
+    href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'%3E%3Crect width='100' height='100' fill='%23efe3c8'/%3E%3Ctext x='50' y='72' text-anchor='middle' font-family='Cormorant Garamond,serif' font-weight='700' font-size='80' fill='%237d2a1e' font-style='italic'%3E·%3C/text%3E%3C/svg%3E">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link
+    href="https://fonts.googleapis.com/css2?family=Cormorant+Garamond:ital,wght@0,500;0,600;0,700;1,500;1,700&family=Source+Serif+4:opsz,wght@8..60,400;8..60,500;8..60,600&family=JetBrains+Mono:wght@400;500;600&display=swap"
+    rel="stylesheet">
+  <link rel="stylesheet" href="/web/style.css">
 </head>
+
 <body>
 
-<header class="header">
-  <h1 class="title">
-    mem<span class="dot"> · </span><span id="title-mode">archive</span>
-    <span class="sub" id="title-sub">a register of remembered things, kept by hand</span>
-  </h1>
-  <div class="colophon">
-    <span class="num" id="count">— —</span>
-    <span id="count-label">records on file</span>
-  </div>
-</header>
-
-<nav class="tabs" id="tabs" role="tablist">
-  <button class="tab active" role="tab" data-view="archive" aria-selected="true">
-    <span class="tab-glyph">⌗</span> archive
-  </button>
-  <button class="tab" role="tab" data-view="transcripts" aria-selected="false">
-    <span class="tab-glyph">≣</span> transcripts
-  </button>
-</nav>
-
-<!-- ─── view: archive (memories) ────────────────────────────────────── -->
-<section class="view view-archive" id="view-archive" role="tabpanel">
-  <section class="controls">
-    <div class="search-wrap">
-      <input id="search" class="search" type="search" placeholder="search the stacks…" autocomplete="off">
+  <header class="header">
+    <h1 class="title">
+      mem<span class="dot"> · </span><span id="title-mode">archive</span>
+      <span class="sub" id="title-sub">a register of remembered things, kept by hand</span>
+    </h1>
+    <div class="colophon">
+      <span class="num" id="count">— —</span>
+      <span id="count-label">records on file</span>
     </div>
-    <div class="filter-group" id="filters">
-      <button class="filter-btn active" data-status="live">live</button>
-      <button class="filter-btn" data-status="active">active</button>
-      <button class="filter-btn" data-status="provisional">provisional</button>
-      <button class="filter-btn" data-status="archived">archived</button>
-      <button class="filter-btn" data-status="all">all</button>
-    </div>
-    <div class="tenant-badge">
-      tenant <span class="v" id="tenant">local</span>
-    </div>
-  </section>
+  </header>
 
-  <main class="archive" id="grid">
-    <div class="placeholder loading">retrieving from the stacks</div>
-  </main>
-</section>
+  <nav class="tabs" id="tabs" role="tablist">
+    <button class="tab active" role="tab" data-view="archive" aria-selected="true">
+      <span class="tab-glyph">⌗</span> archive
+    </button>
+    <button class="tab" role="tab" data-view="transcripts" aria-selected="false">
+      <span class="tab-glyph">≣</span> transcripts
+    </button>
+    <button class="tab" role="tab" data-view="queue" aria-selected="false">
+      <span class="tab-glyph">▤</span> queue
+    </button>
+  </nav>
 
-<!-- ─── view: transcripts (read-only conversation logs) ─────────────── -->
-<section class="view view-transcripts" id="view-transcripts" role="tabpanel" hidden>
-  <section class="controls controls-tx">
-    <div class="search-wrap">
-      <input id="tx-search" class="search" type="search" placeholder="filter by session id, agent, or content…" autocomplete="off">
-    </div>
-    <div class="tenant-badge">
-      tenant <span class="v">local</span>
-      <span class="ro-badge" title="conversation logs are verbatim, never edited or deleted">read only</span>
-    </div>
-  </section>
-
-  <main class="sessions-list" id="sessions-list">
-    <div class="placeholder loading">retrieving the conversation logs</div>
-  </main>
-</section>
-
-<!-- detail panel: slides in from the right, populated by GET /memories/{id} -->
-<aside class="detail-bg" id="detail-bg" aria-hidden="true" tabindex="-1">
-  <section class="detail" id="detail-panel" role="dialog" aria-modal="true" aria-labelledby="detail-title">
-    <header class="detail-head">
-      <span class="detail-eyebrow">record</span>
-      <button class="detail-close" id="detail-close" type="button" aria-label="close">×</button>
-    </header>
-    <div class="detail-body" id="detail-body">
-      <div class="placeholder loading">retrieving record</div>
-    </div>
-    <footer class="detail-actions" id="detail-actions" hidden>
-      <span class="detail-archive-note" id="detail-actions-note"></span>
-      <div class="detail-actions-buttons">
-        <button class="detail-archive-btn" id="detail-archive-btn" type="button">archive this record</button>
-        <button class="detail-delete-btn" id="detail-delete-btn" type="button" title="permanently delete — cannot be undone">delete forever</button>
+  <!-- ─── view: archive (memories) ────────────────────────────────────── -->
+  <section class="view view-archive" id="view-archive" role="tabpanel">
+    <section class="controls">
+      <div class="search-wrap">
+        <input id="search" class="search" type="search" placeholder="search the stacks…" autocomplete="off">
       </div>
-    </footer>
+      <div class="filter-group" id="filters">
+        <button class="filter-btn active" data-status="live">live</button>
+        <button class="filter-btn" data-status="active">active</button>
+        <button class="filter-btn" data-status="provisional">provisional</button>
+        <button class="filter-btn" data-status="archived">archived</button>
+        <button class="filter-btn" data-status="all">all</button>
+      </div>
+      <div class="tenant-badge">
+        tenant <span class="v" id="tenant">local</span>
+      </div>
+    </section>
+
+    <main class="archive" id="grid">
+      <div class="placeholder loading">retrieving from the stacks</div>
+    </main>
   </section>
-</aside>
 
-<!-- hard-delete confirmation modal -->
-<div class="modal-bg" id="delete-modal" aria-hidden="true">
-  <div class="modal" role="dialog" aria-modal="true" aria-labelledby="delete-modal-title">
-    <h2 id="delete-modal-title"><em>delete</em> this memory forever?</h2>
-    <p>This <strong>permanently removes</strong> the memory row, its embedding, all its embedding jobs, all feedback events, and all of its outgoing graph edges. <strong>Cannot be undone.</strong></p>
-    <p>If in doubt, prefer <code>archive</code> — same effect on search, but the row is preserved verbatim.</p>
-    <div class="id-quote" id="delete-modal-id">—</div>
-    <div class="modal-actions">
-      <button class="btn-cancel" id="delete-btn-cancel">never mind</button>
-      <button class="btn-confirm btn-confirm-danger" id="delete-btn-confirm">delete forever</button>
+  <!-- ─── view: transcripts (read-only conversation logs) ─────────────── -->
+  <section class="view view-transcripts" id="view-transcripts" role="tabpanel" hidden>
+    <section class="controls controls-tx">
+      <div class="search-wrap">
+        <input id="tx-search" class="search" type="search" placeholder="filter by session id, agent, or content…"
+          autocomplete="off">
+      </div>
+      <div class="tenant-badge">
+        tenant <span class="v">local</span>
+        <span class="ro-badge" title="conversation logs are verbatim, never edited or deleted">read only</span>
+      </div>
+    </section>
+
+    <main class="sessions-list" id="sessions-list">
+      <div class="placeholder loading">retrieving the conversation logs</div>
+    </main>
+  </section>
+
+  <!-- ─── view: queue (embedding jobs observability, read-only) ──────── -->
+  <section class="view view-queue" id="view-queue" role="tabpanel" hidden>
+    <section class="controls">
+      <div class="search-wrap">
+        <input id="q-search" class="search" type="search" placeholder="filter by memory id or error…" autocomplete="off">
+      </div>
+      <div class="filter-group" id="q-filters">
+        <button class="filter-btn active" data-q-status="all">all</button>
+        <button class="filter-btn" data-q-status="pending">pending</button>
+        <button class="filter-btn" data-q-status="processing">processing</button>
+        <button class="filter-btn" data-q-status="failed">failed</button>
+        <button class="filter-btn" data-q-status="stale">stale</button>
+        <button class="filter-btn" data-q-status="completed">completed</button>
+      </div>
+      <div class="tenant-badge">
+        tenant <span class="v">local</span>
+        <span class="ro-badge" title="job queue is read-only here; the embedding worker drains it">read only</span>
+      </div>
+    </section>
+
+    <section class="queue-summary" id="queue-summary"></section>
+
+    <main class="jobs-list" id="jobs-list">
+      <div class="placeholder loading">retrieving the queue</div>
+    </main>
+  </section>
+
+  <!-- detail panel: slides in from the right, populated by GET /memories/{id} -->
+  <aside class="detail-bg" id="detail-bg" aria-hidden="true" tabindex="-1">
+    <section class="detail" id="detail-panel" role="dialog" aria-modal="true" aria-labelledby="detail-title">
+      <header class="detail-head">
+        <span class="detail-eyebrow">record</span>
+        <button class="detail-close" id="detail-close" type="button" aria-label="close">×</button>
+      </header>
+      <div class="detail-body" id="detail-body">
+        <div class="placeholder loading">retrieving record</div>
+      </div>
+      <footer class="detail-actions" id="detail-actions" hidden>
+        <span class="detail-archive-note" id="detail-actions-note"></span>
+        <div class="detail-actions-buttons">
+          <button class="detail-archive-btn" id="detail-archive-btn" type="button">archive this record</button>
+          <button class="detail-delete-btn" id="detail-delete-btn" type="button"
+            title="permanently delete — cannot be undone">delete forever</button>
+        </div>
+      </footer>
+    </section>
+  </aside>
+
+  <!-- hard-delete confirmation modal -->
+  <div class="modal-bg" id="delete-modal" aria-hidden="true">
+    <div class="modal" role="dialog" aria-modal="true" aria-labelledby="delete-modal-title">
+      <h2 id="delete-modal-title"><em>delete</em> this memory forever?</h2>
+      <p>This <strong>permanently removes</strong> the memory row, its embedding, all its embedding jobs, all feedback
+        events, and all of its outgoing graph edges. <strong>Cannot be undone.</strong></p>
+      <p>If in doubt, prefer <code>archive</code> — same effect on search, but the row is preserved verbatim.</p>
+      <div class="id-quote" id="delete-modal-id">—</div>
+      <div class="modal-actions">
+        <button class="btn-cancel" id="delete-btn-cancel">never mind</button>
+        <button class="btn-confirm btn-confirm-danger" id="delete-btn-confirm">delete forever</button>
+      </div>
     </div>
   </div>
-</div>
 
-<!-- delete-confirmation modal -->
-<div class="modal-bg" id="modal" aria-hidden="true">
-  <div class="modal" role="dialog" aria-modal="true" aria-labelledby="modal-title">
-    <h2 id="modal-title">archive this <em>memory</em>?</h2>
-    <p>This will mark the entry as <strong>archived</strong> via a feedback signal of <code>incorrect</code>. The row is preserved verbatim — mem keeps history — but it will no longer surface in search results.</p>
-    <div class="id-quote" id="modal-id">—</div>
-    <div class="modal-actions">
-      <button class="btn-cancel" id="btn-cancel">never mind</button>
-      <button class="btn-confirm" id="btn-confirm">archive it</button>
+  <!-- delete-confirmation modal -->
+  <div class="modal-bg" id="modal" aria-hidden="true">
+    <div class="modal" role="dialog" aria-modal="true" aria-labelledby="modal-title">
+      <h2 id="modal-title">archive this <em>memory</em>?</h2>
+      <p>This will mark the entry as <strong>archived</strong> via a feedback signal of <code>incorrect</code>. The row
+        is preserved verbatim — mem keeps history — but it will no longer surface in search results.</p>
+      <div class="id-quote" id="modal-id">—</div>
+      <div class="modal-actions">
+        <button class="btn-cancel" id="btn-cancel">never mind</button>
+        <button class="btn-confirm" id="btn-confirm">archive it</button>
+      </div>
     </div>
   </div>
-</div>
 
-<!-- transcript drawer: slides in from the LEFT (visually distinct from
+  <!-- transcript drawer: slides in from the LEFT (visually distinct from
      the right-side memory detail drawer). Read-only, populated by
      GET /transcripts?session_id=…&tenant=… -->
-<aside class="transcript-bg" id="transcript-bg" aria-hidden="true">
-  <section class="transcript-panel" role="dialog" aria-modal="true" aria-labelledby="transcript-title">
-    <header class="transcript-head">
-      <span class="transcript-eyebrow">conversation log</span>
-      <button class="transcript-close" id="transcript-close" type="button" aria-label="close">×</button>
-    </header>
-    <div class="transcript-meta" id="transcript-meta" hidden></div>
-    <div class="transcript-body" id="transcript-body">
-      <div class="placeholder loading">unbinding the volume</div>
-    </div>
-  </section>
-</aside>
+  <aside class="transcript-bg" id="transcript-bg" aria-hidden="true">
+    <section class="transcript-panel" role="dialog" aria-modal="true" aria-labelledby="transcript-title">
+      <header class="transcript-head">
+        <span class="transcript-eyebrow">conversation log</span>
+        <button class="transcript-close" id="transcript-close" type="button" aria-label="close">×</button>
+      </header>
+      <div class="transcript-meta" id="transcript-meta" hidden></div>
+      <div class="transcript-body" id="transcript-body">
+        <div class="placeholder loading">unbinding the volume</div>
+      </div>
+    </section>
+  </aside>
 
-<div class="toast" id="toast" role="status" aria-live="polite"></div>
+  <div class="toast" id="toast" role="status" aria-live="polite"></div>
 
-<script src="/web/app.js" defer></script>
+  <script src="/web/app.js" defer></script>
 </body>
+
 </html>

@@ -17,10 +17,15 @@ const modalId    = document.getElementById('modal-id');
 const btnYes     = document.getElementById('btn-confirm');
 const btnNo      = document.getElementById('btn-cancel');
 const toast      = document.getElementById('toast');
-// ─── transcripts view ────────────────────────────────────────
+// ─── transcripts + queue views ───────────────────────────────
 const tabs           = document.getElementById('tabs');
 const viewArchive    = document.getElementById('view-archive');
 const viewTranscripts = document.getElementById('view-transcripts');
+const viewQueue      = document.getElementById('view-queue');
+const queueSummary   = document.getElementById('queue-summary');
+const jobsList       = document.getElementById('jobs-list');
+const qSearch        = document.getElementById('q-search');
+const qFilters       = document.getElementById('q-filters');
 const titleMode      = document.getElementById('title-mode');
 const titleSub       = document.getElementById('title-sub');
 const countLabel     = document.getElementById('count-label');
@@ -35,6 +40,9 @@ let currentView = 'archive';
 let allSessions = [];
 let txFilterText = '';
 let openTranscriptSession = null;
+let allJobs       = [];
+let qFilterStatus = 'all';
+let qFilterText   = '';
 
 const detailBg       = document.getElementById('detail-bg');
 const detailBody     = document.getElementById('detail-body');
@@ -578,6 +586,7 @@ async function load() {
 const VIEW_LABELS = {
   archive:     { mode: 'archive',     sub: 'a register of remembered things, kept by hand', count: 'records on file' },
   transcripts: { mode: 'transcripts', sub: 'verbatim conversation logs, bound and shelved', count: 'sessions on file' },
+  queue:       { mode: 'queue',       sub: 'embedding worker pulls from here every tick',   count: 'jobs in flight' },
 };
 
 function setView(name) {
@@ -590,16 +599,18 @@ function setView(name) {
   }
   viewArchive.hidden     = name !== 'archive';
   viewTranscripts.hidden = name !== 'transcripts';
+  viewQueue.hidden       = name !== 'queue';
   const lbl = VIEW_LABELS[name];
   titleMode.textContent  = lbl.mode;
   titleSub.textContent   = lbl.sub;
   countLabel.textContent = lbl.count;
   if (name === 'archive') {
     countEl.textContent = String(allMemories.filter(matchesFilter).length).padStart(3, '0');
-  } else if (allSessions.length === 0) {
-    loadSessions();
-  } else {
-    renderSessions();
+  } else if (name === 'transcripts') {
+    if (allSessions.length === 0) loadSessions();
+    else renderSessions();
+  } else if (name === 'queue') {
+    loadJobs();
   }
 }
 
@@ -811,6 +822,118 @@ document.addEventListener('keydown', e => {
   if (modal.classList.contains('open')) return;
   if (detailBg.classList.contains('open')) return;
   if (transcriptBg.classList.contains('open')) closeTranscript();
+});
+
+// ============================================================
+// queue view (embedding job observability, read-only)
+// ============================================================
+
+const JOB_STATUSES = ['pending', 'processing', 'failed', 'stale', 'completed'];
+
+function matchesJobFilter(j) {
+  const st = j.status || '';
+  if (qFilterStatus !== 'all' && st !== qFilterStatus) return false;
+  if (qFilterText) {
+    const hay = `${j.memory_id || ''} ${j.job_id || ''} ${j.last_error || ''}`.toLowerCase();
+    if (!hay.includes(qFilterText)) return false;
+  }
+  return true;
+}
+
+function buildJobRow(j) {
+  const st = (j.status || 'pending').toLowerCase();
+  const row = el('div', { class: `job-row ${st}` });
+  row.appendChild(el('span', { class: `job-status ${st}`, text: st }));
+
+  const mid = el('div', { class: 'job-mid' });
+  const memLine = el('div', { class: 'job-mem' });
+  memLine.appendChild(el('span', { class: 'lead', text: '⟶' }));
+  memLine.appendChild(document.createTextNode(' '));
+  memLine.appendChild(document.createTextNode(j.memory_id || '—'));
+  mid.appendChild(memLine);
+  if (j.last_error) {
+    mid.appendChild(el('div', { class: 'job-err', text: j.last_error, title: j.last_error }));
+  }
+  row.appendChild(mid);
+
+  const att = el('span', { class: 'job-attempt' });
+  att.appendChild(el('span', { class: 'n', text: String(j.attempt_count ?? 0) }));
+  att.appendChild(document.createTextNode(' attempts'));
+  row.appendChild(att);
+
+  row.appendChild(el('span', { class: 'job-provider', text: j.provider || '—' }));
+  row.appendChild(el('span', { class: 'job-when', text: fmtDateShort(j.updated_at) }));
+
+  return row;
+}
+
+function renderQueueSummary() {
+  while (queueSummary.firstChild) queueSummary.removeChild(queueSummary.firstChild);
+  const counts = Object.fromEntries(JOB_STATUSES.map(s => [s, 0]));
+  for (const j of allJobs) {
+    const k = j.status || '';
+    if (k in counts) counts[k]++;
+  }
+  for (const s of JOB_STATUSES) {
+    const cell = el('div', { class: `queue-cell ${s}` });
+    cell.appendChild(el('span', { class: 'num', text: String(counts[s]).padStart(3, '0') }));
+    cell.appendChild(el('span', { class: 'label', text: s }));
+    queueSummary.appendChild(cell);
+  }
+}
+
+function renderJobs() {
+  renderQueueSummary();
+  const rows = allJobs.filter(matchesJobFilter);
+  countEl.textContent = String(rows.length).padStart(3, '0');
+  while (jobsList.firstChild) jobsList.removeChild(jobsList.firstChild);
+  if (rows.length === 0) {
+    const empty = allJobs.length === 0
+      ? 'the queue is empty'
+      : 'nothing in the queue matches that';
+    const sub = `filter: ${qFilterStatus}${qFilterText ? ' · "' + qFilterText + '"' : ''}`;
+    jobsList.appendChild(buildPlaceholder(empty, sub));
+    return;
+  }
+  for (const j of rows) jobsList.appendChild(buildJobRow(j));
+}
+
+async function loadJobs() {
+  while (jobsList.firstChild) jobsList.removeChild(jobsList.firstChild);
+  jobsList.appendChild(buildPlaceholder('retrieving the queue', null, 'loading'));
+  while (queueSummary.firstChild) queueSummary.removeChild(queueSummary.firstChild);
+  try {
+    // Fetch a generous slice; the worker shouldn't have more than a few
+    // hundred jobs in any non-pathological state.
+    const r = await fetch(`/embeddings/jobs?tenant=${encodeURIComponent(TENANT)}&limit=500`);
+    if (!r.ok) throw new Error(`HTTP ${r.status}: ${(await r.text()).slice(0, 160)}`);
+    allJobs = await r.json();
+    // Newest first by updated_at (or available_at fallback).
+    allJobs.sort((a, b) =>
+      String(b.updated_at || b.available_at || '').localeCompare(String(a.updated_at || a.available_at || ''))
+    );
+    renderJobs();
+  } catch (e) {
+    while (jobsList.firstChild) jobsList.removeChild(jobsList.firstChild);
+    jobsList.appendChild(buildPlaceholder('could not reach the queue', e.message, 'error'));
+  }
+}
+
+qFilters.addEventListener('click', e => {
+  const btn = e.target.closest('.filter-btn');
+  if (!btn) return;
+  qFilterStatus = btn.dataset.qStatus;
+  qFilters.querySelectorAll('.filter-btn').forEach(b => b.classList.toggle('active', b === btn));
+  renderJobs();
+});
+
+let qSearchTimer = null;
+qSearch.addEventListener('input', () => {
+  clearTimeout(qSearchTimer);
+  qSearchTimer = setTimeout(() => {
+    qFilterText = qSearch.value.trim().toLowerCase();
+    renderJobs();
+  }, 120);
 });
 
 load();
