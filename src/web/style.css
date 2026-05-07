@@ -538,17 +538,17 @@ body::before {
 
 .detail-actions {
   position: sticky; bottom: 0;
-  margin: 2rem -2rem -2.5rem;
-  padding: 1.1rem 2rem;
-  background: linear-gradient(to top, var(--card) 65%, rgba(251, 243, 220, 0));
+  margin: 1rem -2rem -2.5rem;
+  padding: 0.6rem 2rem;
+  background: var(--card);                  /* opaque, no gradient */
   border-top: 1px solid var(--card-edge);
-  display: flex; justify-content: space-between; align-items: baseline; gap: 1rem;
+  display: flex; justify-content: space-between; align-items: center; gap: 1rem;
 }
 .detail-archive-btn {
   background: var(--oxblood); color: var(--paper); border: none;
-  font-family: 'JetBrains Mono', monospace; font-size: 0.78rem;
-  letter-spacing: 0.12em; text-transform: uppercase;
-  padding: 0.7rem 1.3rem; cursor: pointer; font-weight: 600;
+  font-family: 'JetBrains Mono', monospace; font-size: 0.72rem;
+  letter-spacing: 0.1em; text-transform: uppercase;
+  padding: 0.45rem 1rem; cursor: pointer; font-weight: 600;
   transition: background 0.15s, transform 0.1s;
 }
 .detail-archive-btn:hover { background: #5e1f17; }
@@ -559,7 +559,7 @@ body::before {
 }
 .detail-archive-note {
   font-family: 'Cormorant Garamond', serif; font-style: italic;
-  color: var(--ink-fade); font-size: 0.95rem;
+  color: var(--ink-fade); font-size: 0.85rem; line-height: 1.2;
 }
 
 /* responsive ------------------------------------------------- */
