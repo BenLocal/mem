@@ -82,7 +82,27 @@ struct MemoryEmbeddingRow {
 
 #[derive(Debug, Clone)]
 pub struct DuckDbRepository {
+    /// HTTP-side write connection. All HTTP-driven writes (memory ingest,
+    /// supersede, transcript ingest, graph edges, schema migrations,
+    /// entity registry) lock this. SELECT methods that have not been
+    /// individually audited for read-own-write also serialize here.
+    /// Accessed via [`Self::conn`].
     conn: Arc<Mutex<Connection>>,
+    /// Worker-side write connection. The embedding worker and the
+    /// transcript embedding worker hold this exclusively for status
+    /// updates on `embedding_jobs` / `transcript_embedding_jobs` and
+    /// vector upserts on `memory_embeddings` / `conversation_messages`.
+    /// Worker ticks are single-threaded so a bare Mutex is sufficient
+    /// (no pool). Accessed via [`Self::worker_conn`].
+    ///
+    /// Conflict surface vs `conn`: HTTP supersede paths
+    /// (`update_status`, `supersede_memory`) call
+    /// `delete_embedding_references` which DELETEs from `embedding_jobs`
+    /// while a worker tick may UPDATE the same row's status. DuckDB MVCC
+    /// will surface this as a transaction conflict; the worker's
+    /// existing tick error path logs and retries on the next interval,
+    /// which is acceptable for the rare-supersede workload.
+    worker_write_conn: Arc<Mutex<Connection>>,
     vector_index: Arc<RwLock<Option<Arc<VectorIndex>>>>,
     /// Embedding provider id stored on `transcript_embedding_jobs.provider`
     /// rows enqueued by [`Self::create_conversation_message`]. Set once during
@@ -265,8 +285,21 @@ impl DuckDbRepository {
             }
         }
 
+        // Second connection for worker-side writes. We use
+        // `Connection::try_clone()` rather than `Connection::open(path)`
+        // so the worker conn shares the same in-process Database handle
+        // as the HTTP write conn. Two separate `open()` calls would
+        // create two independent Database instances and writes
+        // committed on one wouldn't be visible to the other (each has
+        // its own snapshot / catalog cache). `SET threads = 1` so the
+        // worker tick doesn't compete with HTTP handlers for CPU on
+        // every batch upsert.
+        let worker_conn = conn.try_clone()?;
+        worker_conn.execute_batch("SET threads = 1")?;
+
         Ok(Self {
             conn: Arc::new(Mutex::new(conn)),
+            worker_write_conn: Arc::new(Mutex::new(worker_conn)),
             vector_index: Arc::new(RwLock::new(None)),
             transcript_job_provider: Arc::new(RwLock::new(None)),
             memory_fts,
@@ -579,7 +612,7 @@ impl DuckDbRepository {
         now: &str,
         max_retries: u32,
     ) -> Result<Option<ClaimedEmbeddingJob>, StorageError> {
-        let mut conn = self.conn()?;
+        let mut conn = self.worker_conn()?;
         let tx = conn.transaction()?;
         let max_r = i64::from(max_retries);
 
@@ -669,7 +702,7 @@ impl DuckDbRepository {
         source_updated_at: &str,
         now: &str,
     ) -> Result<(), StorageError> {
-        let conn = self.conn()?;
+        let conn = self.worker_conn()?;
         conn.execute(
             "delete from memory_embeddings where memory_id = ?1",
             params![memory_id],
@@ -1144,7 +1177,7 @@ impl DuckDbRepository {
         job_id: &str,
         now: &str,
     ) -> Result<(), StorageError> {
-        let conn = self.conn()?;
+        let conn = self.worker_conn()?;
         conn.execute(
             "update embedding_jobs
              set status = 'completed', last_error = null, updated_at = ?1
@@ -1159,7 +1192,7 @@ impl DuckDbRepository {
         job_id: &str,
         now: &str,
     ) -> Result<(), StorageError> {
-        let conn = self.conn()?;
+        let conn = self.worker_conn()?;
         conn.execute(
             "update embedding_jobs set status = 'stale', updated_at = ?1 where job_id = ?2",
             params![now, job_id],
@@ -1175,7 +1208,7 @@ impl DuckDbRepository {
         available_at: &str,
         now: &str,
     ) -> Result<(), StorageError> {
-        let conn = self.conn()?;
+        let conn = self.worker_conn()?;
         conn.execute(
             "update embedding_jobs
              set status = 'failed',
@@ -1196,7 +1229,7 @@ impl DuckDbRepository {
         last_error: &str,
         now: &str,
     ) -> Result<(), StorageError> {
-        let conn = self.conn()?;
+        let conn = self.worker_conn()?;
         conn.execute(
             "update embedding_jobs
              set status = 'failed',
@@ -1220,7 +1253,7 @@ impl DuckDbRepository {
         &self,
         memory_id: &str,
     ) -> Result<usize, StorageError> {
-        let conn = self.conn()?;
+        let conn = self.worker_conn()?;
         let n = conn.execute(
             "delete from embedding_jobs where memory_id = ?1",
             params![memory_id],
@@ -1915,6 +1948,18 @@ impl DuckDbRepository {
         self.conn
             .lock()
             .map_err(|_| StorageError::InvalidData("duckdb connection mutex poisoned"))
+    }
+
+    /// Lock the worker-side write connection. Used by embedding worker
+    /// and transcript embedding worker for status updates and vector
+    /// upserts; does not block (and is not blocked by) HTTP write
+    /// traffic on `self.conn`. See struct field doc on
+    /// `worker_write_conn` for the conflict-surface caveat with
+    /// supersede paths.
+    pub(crate) fn worker_conn(&self) -> Result<MutexGuard<'_, Connection>, StorageError> {
+        self.worker_write_conn
+            .lock()
+            .map_err(|_| StorageError::InvalidData("duckdb worker connection mutex poisoned"))
     }
 
     async fn update_status(
