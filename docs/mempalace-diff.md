@@ -208,6 +208,22 @@ mem 这块**比 MemPalace 强**，不需要借鉴。但需要修两个 bug：
 
 > 工作量：4–6 小时（含 indradb 的属性字段适配）；如果 indradb 属性 API 别扭，可考虑把图也换成 DuckDB 表（`graph_edges (from, to, relation, valid_from, valid_to)`），这样和主表统一备份/迁移更简单。
 
+### 5.1 实测 KG 不够稠密（2026-05-07 抽样）
+
+#4 + #8 上线之后，时序图 + entity registry 的骨架完整了，但**实际 KG 稀薄到几乎走不了图遍历**。当前样本（10 条 memory / 8 个 entity / 平均每条 memory 3 条边）：
+
+| 信号源 | 当前是否入图 | 后果 |
+|---|---|---|
+| `project` / `repo` / `module` / `task_type` | ✅ 入图（kind=project/repo/module/workflow） | 能查"同 project 的 memory" |
+| `topics: Vec<String>` | ✅ 入图（路由 EntityRegistry 创建 kind=topic） | 但 caller agent **基本不填**，整列空 |
+| `tags: Vec<String>` | ❌ 仅 `tags_json` 文本字段 | "找所有 `foreign-key` 标签的 memory" 只能 SQL 全表扫；同类 bug 互不连接 |
+| `code_refs: Vec<String>` | ❌ 仅文本字段 | "查所有提到 `src/storage/duckdb.rs` 的 memory" 走不了图 |
+| `supersedes_memory_id` | ❌ 仅 `memories` 表上的列，**没**写到 `graph_edges` | 版本链能 SQL 拿，但图遍历看不到（5.0 启示里说"`supersedes` 路径触发"指的是关闭旧边，不是新建一条 supersedes 边） |
+| transcript session ↔ memory | ❌ `mem mine` 抽出 memory 时没建会话归属边 | 反查"这次会话产出了哪些 memory"无图路径 |
+| 内容自动抽取（commit hash / 文件路径 / 函数名 / 错误码） | ❌ 无管线 | KG 完全依赖 caller 显式提供字段，长期天花板低 |
+
+**核心矛盾**：图骨架（schema、entity registry、时序、检索打分里有 `graph_signal`）齐全，但**入图字段集太窄**（只走 4 个结构化字段），其余信息源仍是文本数组，等于不进图。要让 graph 真发挥作用，得把入图入口拉宽。具体路线见 ROADMAP.MD #16–#20。
+
 ---
 
 ## 6. 状态机 / 生命周期 / 反馈
