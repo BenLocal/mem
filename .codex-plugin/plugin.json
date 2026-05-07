@@ -1,6 +1,6 @@
 {
   "name": "mem",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Local-first Rust memory service for multi-agent workflows. Provides MCP tools (memory_ingest/search/...) and Codex hooks that mine transcripts and inject wake-up context.",
   "author": { "name": "BenLocal", "url": "https://github.com/BenLocal" },
   "homepage": "https://github.com/BenLocal/mem",
@@ -14,6 +14,17 @@
     "agent-memory",
     "codex"
   ],
+  "hooks": "./hooks.json",
+  "mcpServers": {
+    "mem": {
+      "command": "mem",
+      "args": ["mcp"],
+      "env": {
+        "MEM_BASE_URL": "http://127.0.0.1:3000",
+        "MEM_TENANT": "local"
+      }
+    }
+  },
   "interface": {
     "displayName": "mem",
     "developerName": "BenLocal",

@@ -5,5 +5,16 @@
   "author": { "name": "BenLocal" },
   "homepage": "https://github.com/BenLocal/mem",
   "repository": "https://github.com/BenLocal/mem",
-  "license": "MIT"
+  "license": "MIT",
+  "mcpServers": {
+    "mem": {
+      "command": "mem",
+      "args": ["mcp"],
+      "env": {
+        "MEM_BASE_URL": "http://127.0.0.1:3000",
+        "MEM_TENANT": "local"
+      }
+    }
+  },
+  "keywords": ["memory", "rust", "duckdb", "tantivy", "rag", "mcp"]
 }

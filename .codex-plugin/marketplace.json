@@ -9,7 +9,7 @@
       "name": "mem",
       "source": "./.codex-plugin",
       "description": "Local-first Rust memory service for multi-agent workflows. Provides MCP tools (memory_ingest/search/...) and Codex hooks that mine transcripts and inject wake-up context.",
-      "version": "0.1.0",
+      "version": "0.1.1",
       "author": { "name": "BenLocal" },
       "homepage": "https://github.com/BenLocal/mem",
       "license": "MIT"
