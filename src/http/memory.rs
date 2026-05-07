@@ -17,11 +17,25 @@ use crate::{
 
 pub fn router() -> Router<AppState> {
     Router::new()
-        .route("/memories", post(ingest_memory))
+        .route("/memories", post(ingest_memory).get(list_memories))
         .route("/episodes", post(ingest_episode))
         .route("/memories/search", post(search_memory))
         .route("/memories/feedback", post(submit_feedback))
         .route("/memories/{id}", get(get_memory))
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "snake_case")]
+struct MemoryListQuery {
+    #[serde(default = "default_tenant")]
+    tenant: String,
+}
+
+async fn list_memories(
+    State(app): State<AppState>,
+    Query(query): Query<MemoryListQuery>,
+) -> Result<Json<Vec<crate::domain::memory::MemoryRecord>>, AppError> {
+    Ok(Json(app.memory_service.list_memories(&query.tenant).await?))
 }
 
 #[derive(Debug, Deserialize)]

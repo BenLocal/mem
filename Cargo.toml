@@ -31,6 +31,7 @@ uuid = { version = "1", features = ["v5", "v7"] }
 usearch = { version = "2", default-features = false }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+rust-embed = { version = "8", features = ["debug-embed"] }
 
 [dev-dependencies]
 rand = "0.8"

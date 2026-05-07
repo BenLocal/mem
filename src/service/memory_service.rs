@@ -272,6 +272,12 @@ impl MemoryService {
         Ok(self.repository.list_pending_review(tenant).await?)
     }
 
+    /// All memories for a tenant, regardless of status, ordered by created_at
+    /// ascending. Backs the admin web page (`GET /memories?tenant=…`).
+    pub async fn list_memories(&self, tenant: &str) -> Result<Vec<MemoryRecord>, ServiceError> {
+        Ok(self.repository.list_memories_for_tenant(tenant).await?)
+    }
+
     pub async fn get_memory(
         &self,
         tenant: Option<&str>,

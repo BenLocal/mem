@@ -11,3 +11,5 @@ target/
 # Recall bench fixtures (gitignored — real transcripts may be sensitive)
 bench-fixtures/
 target/bench-out/
+.playwright-mcp/
+admin-page-*.png

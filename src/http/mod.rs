@@ -1,3 +1,4 @@
+pub mod admin;
 pub mod embeddings;
 pub mod entities;
 pub mod graph;
@@ -20,5 +21,6 @@ pub fn router() -> Router<AppState> {
         .merge(graph::router())
         .merge(transcripts::router())
         .merge(entities::router())
+        .merge(admin::router())
         .layer(middleware::from_fn(logging::log_request_response))
 }

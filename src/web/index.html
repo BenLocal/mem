@@ -1,0 +1,62 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>mem · archive</title>
+<link rel="icon" type="image/svg+xml" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'%3E%3Crect width='100' height='100' fill='%23efe3c8'/%3E%3Ctext x='50' y='72' text-anchor='middle' font-family='Cormorant Garamond,serif' font-weight='700' font-size='80' fill='%237d2a1e' font-style='italic'%3E·%3C/text%3E%3C/svg%3E">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Cormorant+Garamond:ital,wght@0,500;0,600;0,700;1,500;1,700&family=Source+Serif+4:opsz,wght@8..60,400;8..60,500;8..60,600&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="/web/style.css">
+</head>
+<body>
+
+<header class="header">
+  <h1 class="title">
+    mem<span class="dot"> · </span>archive
+    <span class="sub">a register of remembered things, kept by hand</span>
+  </h1>
+  <div class="colophon">
+    <span class="num" id="count">— —</span>
+    records on file
+  </div>
+</header>
+
+<section class="controls">
+  <div class="search-wrap">
+    <input id="search" class="search" type="search" placeholder="search the stacks…" autocomplete="off">
+  </div>
+  <div class="filter-group" id="filters">
+    <button class="filter-btn active" data-status="live">live</button>
+    <button class="filter-btn" data-status="active">active</button>
+    <button class="filter-btn" data-status="provisional">provisional</button>
+    <button class="filter-btn" data-status="archived">archived</button>
+    <button class="filter-btn" data-status="all">all</button>
+  </div>
+  <div class="tenant-badge">
+    tenant <span class="v" id="tenant">local</span>
+  </div>
+</section>
+
+<main class="archive" id="grid">
+  <div class="placeholder loading">retrieving from the stacks</div>
+</main>
+
+<div class="modal-bg" id="modal" aria-hidden="true">
+  <div class="modal" role="dialog" aria-modal="true" aria-labelledby="modal-title">
+    <h2 id="modal-title">archive this <em>memory</em>?</h2>
+    <p>This will mark the entry as <strong>archived</strong> via a feedback signal of <code>incorrect</code>. The row is preserved verbatim — mem keeps history — but it will no longer surface in search results.</p>
+    <div class="id-quote" id="modal-id">—</div>
+    <div class="modal-actions">
+      <button class="btn-cancel" id="btn-cancel">never mind</button>
+      <button class="btn-confirm" id="btn-confirm">archive it</button>
+    </div>
+  </div>
+</div>
+
+<div class="toast" id="toast" role="status" aria-live="polite"></div>
+
+<script src="/web/app.js" defer></script>
+</body>
+</html>
