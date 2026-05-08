@@ -13,14 +13,21 @@ default = []
 # pulls in the lance/arrow stack, which is heavy and orthogonal to the DuckDB
 # happy path. Enable with `cargo build --features lancedb` to use the alternate
 # backend.
-lancedb = ["dep:lancedb", "dep:arrow-array", "dep:arrow-schema"]
+lancedb = ["dep:lancedb", "dep:arrow-array", "dep:futures"]
 
 [dependencies]
 lancedb = { version = "0.27", optional = true }
-# arrow-* versions must match lancedb 0.27's pinned 57.x to avoid the
-# "two different `arrow_schema::Schema` types in the dep graph" build error.
+# arrow-array must be pinned to lancedb 0.27's transitive 57.x — otherwise
+# cargo can resolve to 58.x for our direct dep, leaving two distinct
+# `RecordBatch` types in the dep graph that fail to typecheck across the
+# Table::add boundary. (lancedb re-exports `arrow_schema` via
+# `lancedb::arrow::arrow_schema`, so we don't need a direct dep on that.)
 arrow-array = { version = "57", optional = true }
-arrow-schema = { version = "57", optional = true }
+# `futures::TryStreamExt::try_collect` collapses LanceDB's
+# `SendableRecordBatchStream` into a `Vec<RecordBatch>`. lancedb already
+# pulls futures transitively, but cargo doesn't expose transitive deps as
+# importable, so we need a direct dep here too.
+futures = { version = "0.3", optional = true }
 anyhow = "1"
 async-trait = "0.1"
 axum = "0.8"

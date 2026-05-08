@@ -5,12 +5,23 @@
 //! `TranscriptRepository`, `EntityRegistry`, `GraphStore` — so all upper
 //! layers (services, HTTP handlers) work against it interchangeably.
 //!
-//! **Status:** every method body is `unimplemented!()` today. The struct +
-//! trait impl blocks are a scaffold proving the abstraction surface
-//! actually allows pluggable backends. To turn this into a working
-//! backend, implement the methods incrementally; tests in
-//! `tests/lancedb_*.rs` (to be added) will validate parity with the
-//! DuckDB happy path.
+//! **Status:** real implementations exist for `open()` (creates `memories`
+//! table), `MemoryRepository::insert_memory`, and
+//! `MemoryRepository::get_memory_for_tenant`. Round-trip is end-to-end
+//! verified by `lancedb_insert_and_get_memory_round_trip` in this
+//! module's `#[cfg(test)] mod tests`. All other methods are still
+//! `unimplemented!()` with TODO hints — each future implementation:
+//!
+//!   1. add `ensure_<table>_table` to `open()` for the table the method touches
+//!   2. extend the `*_to_record_batch` / `record_batch_to_*` helpers
+//!      (or write new ones for new tables)
+//!   3. write the method body using `Connection::open_table` + `Table::add` /
+//!      `Table::query().only_if(...)` / `Table::vector_search(...)`
+//!   4. add a parity test against DuckDB
+//!
+//! Helpers `memories_to_record_batch` / `record_batch_to_memories` /
+//! `enum_to_str` / `enum_from_str` / `sql_quote` are reusable across
+//! upcoming methods.
 //!
 //! **Schema mapping** (planned, not yet enforced):
 //!
@@ -38,9 +49,16 @@
 use std::path::Path;
 use std::sync::Arc;
 
-use arrow_schema::{DataType, Field, Schema};
+use arrow_array::{
+    builder::{Float32Builder, ListBuilder, StringBuilder, UInt64Builder},
+    Array, Float32Array, ListArray, RecordBatch, StringArray, UInt64Array,
+};
 use async_trait::async_trait;
+use futures::TryStreamExt;
+use lancedb::arrow::arrow_schema::{DataType, Field, Schema};
+use lancedb::query::{ExecutableQuery, QueryBase};
 use lancedb::Connection;
+use serde::{de::DeserializeOwned, Serialize};
 
 use crate::domain::embeddings::EmbeddingJobInfo;
 use crate::domain::episode::EpisodeRecord;
@@ -158,12 +176,271 @@ async fn ensure_memories_table(conn: &Connection) -> Result<(), StorageError> {
     Ok(())
 }
 
+/// Mirror of the DuckDB `encode_text` helper: serialize a snake_case-encoded
+/// enum (e.g. `MemoryType`, `MemoryStatus`) to its plain JSON string token.
+fn enum_to_str<T: Serialize>(v: &T) -> Result<String, StorageError> {
+    serde_json::to_value(v)
+        .map_err(StorageError::Serde)?
+        .as_str()
+        .map(|s| s.to_string())
+        .ok_or(StorageError::InvalidData(
+            "expected string serialization for enum",
+        ))
+}
+
+/// Inverse of `enum_to_str`. Used when materializing a `MemoryRecord` from
+/// a `RecordBatch` row.
+fn enum_from_str<T: DeserializeOwned>(s: &str) -> Result<T, StorageError> {
+    serde_json::from_value(serde_json::Value::String(s.to_string())).map_err(StorageError::Serde)
+}
+
+/// Serialize one or more `MemoryRecord`s to an Arrow `RecordBatch` matching
+/// the [`memories_schema`] layout. Used by `insert_memory` to feed
+/// `Table::add(...)`.
+fn memories_to_record_batch(memories: &[MemoryRecord]) -> Result<RecordBatch, StorageError> {
+    let mut memory_id = StringBuilder::new();
+    let mut tenant = StringBuilder::new();
+    let mut memory_type = StringBuilder::new();
+    let mut status = StringBuilder::new();
+    let mut scope = StringBuilder::new();
+    let mut visibility = StringBuilder::new();
+    let mut version = UInt64Builder::new();
+    let mut summary = StringBuilder::new();
+    let mut content = StringBuilder::new();
+    let mut evidence = ListBuilder::new(StringBuilder::new());
+    let mut code_refs = ListBuilder::new(StringBuilder::new());
+    let mut project = StringBuilder::new();
+    let mut repo = StringBuilder::new();
+    let mut module = StringBuilder::new();
+    let mut task_type = StringBuilder::new();
+    let mut tags = ListBuilder::new(StringBuilder::new());
+    let mut topics = ListBuilder::new(StringBuilder::new());
+    let mut confidence = Float32Builder::new();
+    let mut decay_score = Float32Builder::new();
+    let mut content_hash = StringBuilder::new();
+    let mut idempotency_key = StringBuilder::new();
+    let mut session_id = StringBuilder::new();
+    let mut supersedes_memory_id = StringBuilder::new();
+    let mut source_agent = StringBuilder::new();
+    let mut created_at = StringBuilder::new();
+    let mut updated_at = StringBuilder::new();
+    let mut last_validated_at = StringBuilder::new();
+
+    for m in memories {
+        memory_id.append_value(&m.memory_id);
+        tenant.append_value(&m.tenant);
+        memory_type.append_value(enum_to_str(&m.memory_type)?);
+        status.append_value(enum_to_str(&m.status)?);
+        scope.append_value(enum_to_str(&m.scope)?);
+        visibility.append_value(enum_to_str(&m.visibility)?);
+        version.append_value(m.version);
+        summary.append_value(&m.summary);
+        content.append_value(&m.content);
+        for s in &m.evidence {
+            evidence.values().append_value(s);
+        }
+        evidence.append(true);
+        for s in &m.code_refs {
+            code_refs.values().append_value(s);
+        }
+        code_refs.append(true);
+        match &m.project {
+            Some(s) => project.append_value(s),
+            None => project.append_null(),
+        }
+        match &m.repo {
+            Some(s) => repo.append_value(s),
+            None => repo.append_null(),
+        }
+        match &m.module {
+            Some(s) => module.append_value(s),
+            None => module.append_null(),
+        }
+        match &m.task_type {
+            Some(s) => task_type.append_value(s),
+            None => task_type.append_null(),
+        }
+        for s in &m.tags {
+            tags.values().append_value(s);
+        }
+        tags.append(true);
+        for s in &m.topics {
+            topics.values().append_value(s);
+        }
+        topics.append(true);
+        confidence.append_value(m.confidence);
+        decay_score.append_value(m.decay_score);
+        content_hash.append_value(&m.content_hash);
+        match &m.idempotency_key {
+            Some(s) => idempotency_key.append_value(s),
+            None => idempotency_key.append_null(),
+        }
+        match &m.session_id {
+            Some(s) => session_id.append_value(s),
+            None => session_id.append_null(),
+        }
+        match &m.supersedes_memory_id {
+            Some(s) => supersedes_memory_id.append_value(s),
+            None => supersedes_memory_id.append_null(),
+        }
+        source_agent.append_value(&m.source_agent);
+        created_at.append_value(&m.created_at);
+        updated_at.append_value(&m.updated_at);
+        match &m.last_validated_at {
+            Some(s) => last_validated_at.append_value(s),
+            None => last_validated_at.append_null(),
+        }
+    }
+
+    let schema = Arc::new(memories_schema());
+    let columns: Vec<Arc<dyn Array>> = vec![
+        Arc::new(memory_id.finish()),
+        Arc::new(tenant.finish()),
+        Arc::new(memory_type.finish()),
+        Arc::new(status.finish()),
+        Arc::new(scope.finish()),
+        Arc::new(visibility.finish()),
+        Arc::new(version.finish()),
+        Arc::new(summary.finish()),
+        Arc::new(content.finish()),
+        Arc::new(evidence.finish()),
+        Arc::new(code_refs.finish()),
+        Arc::new(project.finish()),
+        Arc::new(repo.finish()),
+        Arc::new(module.finish()),
+        Arc::new(task_type.finish()),
+        Arc::new(tags.finish()),
+        Arc::new(topics.finish()),
+        Arc::new(confidence.finish()),
+        Arc::new(decay_score.finish()),
+        Arc::new(content_hash.finish()),
+        Arc::new(idempotency_key.finish()),
+        Arc::new(session_id.finish()),
+        Arc::new(supersedes_memory_id.finish()),
+        Arc::new(source_agent.finish()),
+        Arc::new(created_at.finish()),
+        Arc::new(updated_at.finish()),
+        Arc::new(last_validated_at.finish()),
+    ];
+    RecordBatch::try_new(schema, columns)
+        .map_err(|e| StorageError::InvalidInput(format!("memories record batch: {e}")))
+}
+
+/// Inverse of `memories_to_record_batch`: parse a Lance query result into
+/// `MemoryRecord`s.
+fn record_batch_to_memories(batch: &RecordBatch) -> Result<Vec<MemoryRecord>, StorageError> {
+    fn col<'a, T: 'static>(
+        batch: &'a RecordBatch,
+        name: &'static str,
+    ) -> Result<&'a T, StorageError> {
+        batch
+            .column_by_name(name)
+            .ok_or(StorageError::InvalidData("missing column"))?
+            .as_any()
+            .downcast_ref::<T>()
+            .ok_or(StorageError::InvalidData("column type mismatch"))
+    }
+    let memory_id = col::<StringArray>(batch, "memory_id")?;
+    let tenant = col::<StringArray>(batch, "tenant")?;
+    let memory_type = col::<StringArray>(batch, "memory_type")?;
+    let status = col::<StringArray>(batch, "status")?;
+    let scope = col::<StringArray>(batch, "scope")?;
+    let visibility = col::<StringArray>(batch, "visibility")?;
+    let version = col::<UInt64Array>(batch, "version")?;
+    let summary = col::<StringArray>(batch, "summary")?;
+    let content = col::<StringArray>(batch, "content")?;
+    let evidence = col::<ListArray>(batch, "evidence")?;
+    let code_refs = col::<ListArray>(batch, "code_refs")?;
+    let project = col::<StringArray>(batch, "project")?;
+    let repo = col::<StringArray>(batch, "repo")?;
+    let module = col::<StringArray>(batch, "module")?;
+    let task_type = col::<StringArray>(batch, "task_type")?;
+    let tags = col::<ListArray>(batch, "tags")?;
+    let topics = col::<ListArray>(batch, "topics")?;
+    let confidence = col::<Float32Array>(batch, "confidence")?;
+    let decay_score = col::<Float32Array>(batch, "decay_score")?;
+    let content_hash = col::<StringArray>(batch, "content_hash")?;
+    let idempotency_key = col::<StringArray>(batch, "idempotency_key")?;
+    let session_id = col::<StringArray>(batch, "session_id")?;
+    let supersedes_memory_id = col::<StringArray>(batch, "supersedes_memory_id")?;
+    let source_agent = col::<StringArray>(batch, "source_agent")?;
+    let created_at = col::<StringArray>(batch, "created_at")?;
+    let updated_at = col::<StringArray>(batch, "updated_at")?;
+    let last_validated_at = col::<StringArray>(batch, "last_validated_at")?;
+
+    fn list_at(arr: &ListArray, i: usize) -> Result<Vec<String>, StorageError> {
+        let inner = arr.value(i);
+        let strs = inner
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .ok_or(StorageError::InvalidData("list inner type"))?;
+        Ok((0..strs.len()).map(|j| strs.value(j).to_string()).collect())
+    }
+    let opt = |arr: &StringArray, i: usize| -> Option<String> {
+        if arr.is_null(i) {
+            None
+        } else {
+            Some(arr.value(i).to_string())
+        }
+    };
+
+    let mut out = Vec::with_capacity(batch.num_rows());
+    for i in 0..batch.num_rows() {
+        out.push(MemoryRecord {
+            memory_id: memory_id.value(i).to_string(),
+            tenant: tenant.value(i).to_string(),
+            memory_type: enum_from_str(memory_type.value(i))?,
+            status: enum_from_str(status.value(i))?,
+            scope: enum_from_str(scope.value(i))?,
+            visibility: enum_from_str(visibility.value(i))?,
+            version: version.value(i),
+            summary: summary.value(i).to_string(),
+            content: content.value(i).to_string(),
+            evidence: list_at(evidence, i)?,
+            code_refs: list_at(code_refs, i)?,
+            project: opt(project, i),
+            repo: opt(repo, i),
+            module: opt(module, i),
+            task_type: opt(task_type, i),
+            tags: list_at(tags, i)?,
+            topics: list_at(topics, i)?,
+            confidence: confidence.value(i),
+            decay_score: decay_score.value(i),
+            content_hash: content_hash.value(i).to_string(),
+            idempotency_key: opt(idempotency_key, i),
+            session_id: opt(session_id, i),
+            supersedes_memory_id: opt(supersedes_memory_id, i),
+            source_agent: source_agent.value(i).to_string(),
+            created_at: created_at.value(i).to_string(),
+            updated_at: updated_at.value(i).to_string(),
+            last_validated_at: opt(last_validated_at, i),
+        });
+    }
+    Ok(out)
+}
+
+/// Escape a string literal for a LanceDB filter expression. LanceDB uses
+/// DuckDB's predicate flavor — single quotes for string literals, doubled
+/// to escape an embedded quote.
+fn sql_quote(s: &str) -> String {
+    format!("'{}'", s.replace('\'', "''"))
+}
+
 #[async_trait]
 #[allow(clippy::too_many_arguments)]
 impl MemoryRepository for LanceDbRepository {
     async fn insert_memory(&self, memory: MemoryRecord) -> Result<MemoryRecord, StorageError> {
-        let _ = memory;
-        unimplemented!("LanceDb::insert_memory — see docs/repository.rs trait def")
+        let table = self
+            .conn
+            .open_table("memories")
+            .execute()
+            .await
+            .map_err(lancedb_err)?;
+        let batch = memories_to_record_batch(std::slice::from_ref(&memory))?;
+        // `RecordBatch` impls `Scannable` directly — no need to wrap in an
+        // iterator. (Re-checking lancedb-0.27.2/src/data/scannable.rs L70.)
+        table.add(batch).execute().await.map_err(lancedb_err)?;
+        Ok(memory)
     }
 
     async fn try_enqueue_embedding_job(
@@ -293,8 +570,35 @@ impl MemoryRepository for LanceDbRepository {
         tenant: &str,
         memory_id: &str,
     ) -> Result<Option<MemoryRecord>, StorageError> {
-        let _ = (tenant, memory_id);
-        unimplemented!("LanceDb::get_memory_for_tenant — see docs/repository.rs trait def")
+        let table = self
+            .conn
+            .open_table("memories")
+            .execute()
+            .await
+            .map_err(lancedb_err)?;
+        let filter = format!(
+            "tenant = {} AND memory_id = {}",
+            sql_quote(tenant),
+            sql_quote(memory_id),
+        );
+        let stream = table
+            .query()
+            .only_if(filter)
+            .limit(1)
+            .execute()
+            .await
+            .map_err(lancedb_err)?;
+        let batches: Vec<RecordBatch> = stream
+            .try_collect()
+            .await
+            .map_err(|e| StorageError::InvalidInput(format!("lancedb stream: {e}")))?;
+        for batch in &batches {
+            let mems = record_batch_to_memories(batch)?;
+            if let Some(m) = mems.into_iter().next() {
+                return Ok(Some(m));
+            }
+        }
+        Ok(None)
     }
 
     async fn get_pending(
@@ -702,5 +1006,96 @@ impl EntityRegistry for LanceDbRepository {
     ) -> Result<Vec<Entity>, StorageError> {
         let _ = (tenant, kind_filter, query, limit);
         unimplemented!("LanceDb::list_entities — see docs/repository.rs trait def")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::domain::memory::{MemoryStatus, MemoryType, Scope, Visibility};
+    use tempfile::tempdir;
+
+    fn fixture(memory_id: &str, tenant: &str) -> MemoryRecord {
+        MemoryRecord {
+            memory_id: memory_id.into(),
+            tenant: tenant.into(),
+            memory_type: MemoryType::Implementation,
+            status: MemoryStatus::Active,
+            scope: Scope::Project,
+            visibility: Visibility::Shared,
+            version: 1,
+            summary: "round-trip test".into(),
+            content: "use bun for fast installs".into(),
+            evidence: vec!["src/main.rs:42".into(), "Cargo.toml:11".into()],
+            code_refs: vec!["foo::bar()".into()],
+            project: Some("mem".into()),
+            repo: Some("mem".into()),
+            module: None,
+            task_type: None,
+            tags: vec!["tooling".into()],
+            topics: vec![],
+            confidence: 0.7,
+            decay_score: 0.0,
+            content_hash: "h".repeat(64),
+            idempotency_key: Some("idemp-1".into()),
+            session_id: None,
+            supersedes_memory_id: None,
+            source_agent: "test".into(),
+            created_at: "00000001778000000000".into(),
+            updated_at: "00000001778000000000".into(),
+            last_validated_at: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn lancedb_insert_and_get_memory_round_trip() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("lance.store");
+        let repo = LanceDbRepository::open(&path)
+            .await
+            .expect("open lancedb store");
+
+        let memory = fixture("mem_lance_001", "tenant-a");
+        repo.insert_memory(memory.clone())
+            .await
+            .expect("insert_memory");
+
+        let got = repo
+            .get_memory_for_tenant("tenant-a", "mem_lance_001")
+            .await
+            .expect("get_memory_for_tenant")
+            .expect("memory should exist");
+
+        assert_eq!(got.memory_id, memory.memory_id);
+        assert_eq!(got.tenant, memory.tenant);
+        assert_eq!(got.memory_type, memory.memory_type);
+        assert_eq!(got.status, memory.status);
+        assert_eq!(got.summary, memory.summary);
+        assert_eq!(got.content, memory.content);
+        assert_eq!(got.evidence, memory.evidence);
+        assert_eq!(got.code_refs, memory.code_refs);
+        assert_eq!(got.project, memory.project);
+        assert_eq!(got.module, memory.module);
+        assert_eq!(got.tags, memory.tags);
+        assert_eq!(got.topics, memory.topics);
+        assert_eq!(got.confidence, memory.confidence);
+        assert_eq!(got.content_hash, memory.content_hash);
+        assert_eq!(got.idempotency_key, memory.idempotency_key);
+        assert_eq!(got.created_at, memory.created_at);
+        assert_eq!(got.updated_at, memory.updated_at);
+        assert_eq!(got.last_validated_at, memory.last_validated_at);
+
+        let missing = repo
+            .get_memory_for_tenant("tenant-a", "does-not-exist")
+            .await
+            .expect("missing query");
+        assert!(missing.is_none());
+
+        // Cross-tenant filter must not leak.
+        let wrong_tenant = repo
+            .get_memory_for_tenant("tenant-b", "mem_lance_001")
+            .await
+            .expect("cross-tenant query");
+        assert!(wrong_tenant.is_none());
     }
 }
