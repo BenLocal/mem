@@ -10,9 +10,9 @@ use std::collections::HashMap;
 use duckdb::{params, OptionalExt};
 use serde::Serialize;
 
-use super::duckdb::{DuckDbRepository, EmbeddingJobTransition, StorageError};
-use super::time::current_timestamp;
-use super::vector_index::TranscriptEmbeddingRowSource;
+use super::super::time::current_timestamp;
+use super::super::vector_index::TranscriptEmbeddingRowSource;
+use super::{DuckDbRepository, EmbeddingJobTransition, StorageError};
 use crate::domain::ConversationMessage;
 
 /// Aggregate row used by the admin web page's transcripts list view.

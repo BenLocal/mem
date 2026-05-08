@@ -1,22 +1,22 @@
 use duckdb::Connection;
 use tracing::info;
 
-use super::duckdb::{migrate_content_hash_to_sha256, StorageError};
+use super::{migrate_content_hash_to_sha256, StorageError};
 
-const INIT_SCHEMA_SQL: &str = include_str!("../../db/schema/001_init.sql");
-const EMBEDDINGS_SCHEMA_SQL: &str = include_str!("../../db/schema/002_embeddings.sql");
-const GRAPH_SCHEMA_SQL: &str = include_str!("../../db/schema/003_graph.sql");
+const INIT_SCHEMA_SQL: &str = include_str!("../../../db/schema/001_init.sql");
+const EMBEDDINGS_SCHEMA_SQL: &str = include_str!("../../../db/schema/002_embeddings.sql");
+const GRAPH_SCHEMA_SQL: &str = include_str!("../../../db/schema/003_graph.sql");
 // 004_sessions.sql contains `alter table memories add column session_id`, which
 // DuckDB does not support with `if not exists`. On a re-run the statement fails
 // with "Column with name ... already exists!". We apply this file
 // statement-by-statement and swallow that specific error so the migration is
 // idempotent. See docs/superpowers/specs/2026-04-29-sessions-design.md §DuckDB
 // caveats.
-const SESSIONS_SCHEMA_SQL: &str = include_str!("../../db/schema/004_sessions.sql");
-const FTS_SCHEMA_SQL: &str = include_str!("../../db/schema/005_fts.sql");
+const SESSIONS_SCHEMA_SQL: &str = include_str!("../../../db/schema/004_sessions.sql");
+const FTS_SCHEMA_SQL: &str = include_str!("../../../db/schema/005_fts.sql");
 const CONVERSATION_MESSAGES_SCHEMA_SQL: &str =
-    include_str!("../../db/schema/006_conversation_messages.sql");
-const ENTITY_REGISTRY_SCHEMA_SQL: &str = include_str!("../../db/schema/008_entity_registry.sql");
+    include_str!("../../../db/schema/006_conversation_messages.sql");
+const ENTITY_REGISTRY_SCHEMA_SQL: &str = include_str!("../../../db/schema/008_entity_registry.sql");
 
 pub fn bootstrap(conn: &Connection) -> Result<(), StorageError> {
     conn.execute_batch(INIT_SCHEMA_SQL)?;

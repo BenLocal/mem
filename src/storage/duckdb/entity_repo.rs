@@ -14,7 +14,7 @@
 use async_trait::async_trait;
 use duckdb::OptionalExt;
 
-use super::duckdb::{DuckDbRepository, EntityRegistry, StorageError};
+use super::{DuckDbRepository, EntityRegistry, StorageError};
 use crate::domain::{AddAliasOutcome, Entity, EntityKind, EntityWithAliases};
 use crate::pipeline::entity_normalize::normalize_alias;
 

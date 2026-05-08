@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use thiserror::Error;
 
-use super::time::current_timestamp;
+use super::super::time::current_timestamp;
 use super::{DuckDbRepository, StorageError};
 use crate::domain::memory::{GraphEdge, MemoryRecord};
 // `extract_graph_edges` is the deprecated legacy extractor. The production

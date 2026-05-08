@@ -193,16 +193,10 @@ pub trait MemoryRepository: Send + Sync {
 
     async fn insert_episode(&self, episode: EpisodeRecord) -> Result<EpisodeRecord, StorageError>;
 
-    async fn list_memory_ids_for_tenant(
-        &self,
-        tenant: &str,
-    ) -> Result<Vec<String>, StorageError>;
+    async fn list_memory_ids_for_tenant(&self, tenant: &str) -> Result<Vec<String>, StorageError>;
 
-    async fn touch_session(
-        &self,
-        session_id: &str,
-        last_seen_at: &str,
-    ) -> Result<(), StorageError>;
+    async fn touch_session(&self, session_id: &str, last_seen_at: &str)
+        -> Result<(), StorageError>;
 
     async fn latest_active_session(
         &self,
@@ -534,10 +528,7 @@ impl MemoryRepository for DuckDbRepository {
         DuckDbRepository::insert_episode(self, episode).await
     }
 
-    async fn list_memory_ids_for_tenant(
-        &self,
-        tenant: &str,
-    ) -> Result<Vec<String>, StorageError> {
+    async fn list_memory_ids_for_tenant(&self, tenant: &str) -> Result<Vec<String>, StorageError> {
         DuckDbRepository::list_memory_ids_for_tenant(self, tenant).await
     }
 

@@ -16,7 +16,15 @@ use crate::domain::{
 };
 use crate::pipeline::ingest::{compute_content_hash_from_record, CONTENT_HASH_LEN};
 
-use super::schema;
+pub mod conn_pool;
+pub mod entity_repo;
+pub mod graph_store;
+pub mod schema;
+pub mod transcript_repo;
+
+pub use graph_store::{DuckDbGraphStore, GraphError};
+pub use transcript_repo::{ClaimedTranscriptEmbeddingJob, ContextWindow, TranscriptSessionSummary};
+
 use super::time::current_timestamp;
 use super::vector_index::{EmbeddingRowSource, VectorIndex};
 
@@ -128,7 +136,7 @@ pub struct DuckDbRepository {
     /// Pool size is hardcoded at 8. Pool checkout uses
     /// `get_timeout(5s)` so an exhausted pool fails fast rather than
     /// queueing indefinitely.
-    read_pool: Option<r2d2::Pool<crate::storage::conn_pool::DuckDbReadManager>>,
+    read_pool: Option<r2d2::Pool<self::conn_pool::DuckDbReadManager>>,
     vector_index: Arc<RwLock<Option<Arc<VectorIndex>>>>,
     /// Embedding provider id stored on `transcript_embedding_jobs.provider`
     /// rows enqueued by [`Self::create_conversation_message`]. Set once during
@@ -327,7 +335,7 @@ impl DuckDbRepository {
             tracing::info!("MEM_RW_POOL_DISABLED=1; falling back to single-conn for SELECTs");
             None
         } else {
-            let manager = crate::storage::conn_pool::DuckDbReadManager::new(conn_arc.clone());
+            let manager = self::conn_pool::DuckDbReadManager::new(conn_arc.clone());
             match r2d2::Pool::builder().max_size(8).build(manager) {
                 Ok(pool) => Some(pool),
                 Err(e) => {
@@ -2058,16 +2066,16 @@ impl DuckDbRepository {
     /// a `StorageError::InvalidData` rather than queueing indefinitely.
     pub(crate) fn with_read<F, R>(&self, f: F) -> Result<R, StorageError>
     where
-        F: FnOnce(crate::storage::conn_pool::ReadOnlyConn<'_>) -> Result<R, StorageError>,
+        F: FnOnce(self::conn_pool::ReadOnlyConn<'_>) -> Result<R, StorageError>,
     {
         if let Some(pool) = &self.read_pool {
             let conn = pool
                 .get_timeout(std::time::Duration::from_secs(5))
                 .map_err(|_| StorageError::InvalidData("read pool checkout timeout"))?;
-            f(crate::storage::conn_pool::ReadOnlyConn::wrap(&conn))
+            f(self::conn_pool::ReadOnlyConn::wrap(&conn))
         } else {
             let conn = self.conn()?;
-            f(crate::storage::conn_pool::ReadOnlyConn::wrap(&conn))
+            f(self::conn_pool::ReadOnlyConn::wrap(&conn))
         }
     }
 
