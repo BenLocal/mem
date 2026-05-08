@@ -7,7 +7,18 @@ default-run = "mem"
 [lib]
 doctest = false
 
+[features]
+default = []
+# Compile in the LanceDB backend (`mem::storage::lancedb`). Off by default —
+# pulls in the lance/arrow stack, which is heavy and orthogonal to the DuckDB
+# happy path. Enable with `cargo build --features lancedb` to use the alternate
+# backend.
+lancedb = ["dep:lancedb", "dep:arrow-array", "dep:arrow-schema"]
+
 [dependencies]
+lancedb = { version = "0.27", optional = true }
+arrow-array = { version = "58", optional = true }
+arrow-schema = { version = "58", optional = true }
 anyhow = "1"
 async-trait = "0.1"
 axum = "0.8"
