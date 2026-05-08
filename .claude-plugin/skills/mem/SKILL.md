@@ -1,12 +1,50 @@
 ---
 name: mem
-description: Local-first Rust memory service for multi-agent workflows. Use when the user mentions mem / mem serve / mem mine / memory ingest / memory search / wake-up context / DuckDB-backed memory, or when they want to interact with the local mem HTTP/MCP service.
+description: |
+  Local-first Rust memory service backed by DuckDB + HNSW + Tantivy. Use this skill
+  proactively in any of these scenarios — don't wait for the user to invoke it
+  by name:
+
+  (a) **Explicit mention** — user says mem / mem serve / mem mine / memory ingest /
+      memory search / memory feedback / wake-up context / DuckDB-backed memory.
+
+  (b) **Start of a non-trivial task in a familiar repo** — debugging, design,
+      refactoring, "how should I do X here?". Call `memory_search` *first* to
+      surface prior decisions, incidents, conventions, or commit-message lessons
+      before formulating a plan. Skipping this step means re-deriving context the
+      user already taught you.
+
+  (c) **Recall intent signals** — "remember when...", "how did we handle...",
+      "上次怎么做的", "之前那个 bug", "what was the URL / port / config for X".
+      These are explicit recall asks; respond by querying memory before answering
+      from training-time priors.
+
+  (d) **Error / bug resembling something we've seen** — DuckDB / FK / index /
+      embedding / hook errors are often documented incidents (e.g.
+      `mem_019dfba4` FK retry-loop, `mem_019e05b0` DB invalidation race).
+      Search before guessing at the cause.
+
+  (e) **About to ingest a hard-won learning** — finished a debugging session,
+      landed a non-obvious fix, or hit a concurrency / SQL / framework gotcha.
+      Use `memory_ingest` (memory_type: experience) so the next session doesn't
+      retread the same ground. The verbatim-rule still applies: write the full
+      explanation, not a refined summary.
 allowed-tools: Bash, Read, Grep
----
 
 # mem — local memory service
 
 `mem` is a single-binary Rust service (DuckDB + HNSW + Tantivy + r2d2 read pool) exposing both an HTTP API and an MCP server. Default base URL: `http://127.0.0.1:3000`. Default tenant: `local`. Both can be overridden via `MEM_BASE_URL` / `MEM_TENANT`.
+
+## Proactive use policy
+
+**Default to searching before answering**, not after. When you load this skill via one of the (b)–(d) triggers above:
+
+1. Issue a single `mcp__mem__memory_search` against the user's apparent intent (the question, the error message, the file path, the function name — whichever is most specific). Token budget 1500–2500 is plenty.
+2. Read the returned `directives` + top 2–3 `relevant_facts` before formulating a response.
+3. If a returned memory directly resolved the question, send `feedback_kind: useful` for that `memory_id` (one signal per memory per session, max).
+4. If nothing relevant came back, proceed normally — silence is fine, don't over-invoke.
+
+**When to ingest, not just search**: after a non-trivial debugging session, landing a non-obvious fix, or hitting a concurrency/SQL/framework gotcha, use `mcp__mem__memory_ingest` with `memory_type: experience` and write the full explanation (cause + symptom + fix), not just a one-liner. Verbatim rule applies — `content` is the fact source, never a refined summary.
 
 ## Verifying the service is running
 
