@@ -6,12 +6,12 @@
 //! Design notes:
 //!
 //! - Connections in the pool share the same in-process DuckDB Database
-//!   handle as the HTTP write conn (via `Connection::try_clone()`), so
-//!   committed writes are visible across connections immediately. Two
-//!   independent `Connection::open(path)` calls would create two
-//!   separate Database instances whose snapshots don't see each other —
-//!   verified the failure mode the hard way during phase-1 worker
-//!   isolation; do not regress on it.
+//!   handle as the writer (via `Connection::try_clone()`), so committed
+//!   writes are visible across connections immediately. Two independent
+//!   `Connection::open(path)` calls would create two separate Database
+//!   instances whose snapshots don't see each other — verified the
+//!   failure mode the hard way during the worker-isolation experiment;
+//!   do not regress on it.
 //! - Read-only enforcement is **type-level** via [`ReadOnlyConn`], not
 //!   via DuckDB's `SET access_mode='READ_ONLY'`. That setting is
 //!   database-wide in DuckDB and would break the writer in the same
@@ -27,8 +27,8 @@ use duckdb::{Connection, Statement};
 /// r2d2 manager that produces read-only-by-convention DuckDB
 /// connections sharing a single in-process Database with `template`.
 ///
-/// `template` is the same `Arc<Mutex<Connection>>` as the HTTP write
-/// conn — the Manager only ever calls `try_clone()` on it inside
+/// `template` is the same `Arc<Mutex<Connection>>` as the writer
+/// connection — the Manager only ever calls `try_clone()` on it inside
 /// `connect()`, never executes against it.
 #[derive(Clone, Debug)]
 pub(crate) struct DuckDbReadManager {
@@ -47,7 +47,7 @@ impl r2d2::ManageConnection for DuckDbReadManager {
 
     fn connect(&self) -> Result<Connection, duckdb::Error> {
         // try_clone shares the underlying Database — committed writes
-        // from the http_write_conn / worker_write_conn are visible to
+        // from the writer connection are visible to
         // this clone's MVCC snapshot on every new transaction.
         let template = self
             .template

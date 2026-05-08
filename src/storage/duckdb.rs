@@ -82,29 +82,23 @@ struct MemoryEmbeddingRow {
 
 #[derive(Debug, Clone)]
 pub struct DuckDbRepository {
-    /// HTTP-side write connection. All HTTP-driven writes (memory ingest,
-    /// supersede, transcript ingest, graph edges, schema migrations,
-    /// entity registry) lock this. SELECT methods that have not been
-    /// individually audited for read-own-write also serialize here.
-    /// Accessed via [`Self::conn`].
-    conn: Arc<Mutex<Connection>>,
-    /// Worker-side write connection. **Narrowed scope after the
-    /// 2026-05-08 incident**: only used by
-    /// `upsert_conversation_message_embedding`, the single write path
-    /// against the genuinely worker-exclusive table
-    /// `conversation_message_embeddings` (no FK, never written by HTTP).
+    /// Single write connection. All write paths (HTTP ingest / supersede,
+    /// embedding worker tick status updates and vector upserts, graph
+    /// edges, schema migrations, entity registry) serialize through this
+    /// Mutex. Read paths that have been audited for read-own-write
+    /// safety route through [`Self::with_read`] (r2d2 pool); everything
+    /// else also locks here.
     ///
-    /// Earlier (commit `48a10cf`) every worker-side write was routed
-    /// here, including `embedding_jobs` / `transcript_embedding_jobs`
-    /// status updates and `memory_embeddings` upserts. That broke when
-    /// HTTP `accept_pending` issued `delete_embedding_references` (a
-    /// DELETE on the same `embedding_jobs` row a worker tick had just
-    /// UPDATEd via DuckDB's internal DELETE+INSERT). DuckDB's index
-    /// invariant check fired ("Failed to delete all rows from index. Only
-    /// deleted 0 out of 1 rows.") and marked the entire Database
-    /// INVALIDATED, requiring a `mem serve` restart. All shared-table
-    /// worker writes are back on `conn` to avoid the race.
-    worker_write_conn: Arc<Mutex<Connection>>,
+    /// History: a brief experiment (commits `48a10cf` / `a38ccd2`) split
+    /// worker writes onto a `try_clone()`'d second Connection. It bricked
+    /// the DB on the first concurrent UPDATE+DELETE on `embedding_jobs`:
+    /// DuckDB executes UPDATE as DELETE+INSERT, so two physical
+    /// Connections racing on the same row diverge on index entry counts
+    /// and DuckDB's invariant check marks the whole Database INVALIDATED.
+    /// `conversation_message_embeddings` was the only worker-exclusive
+    /// table that survived the audit, and the per-tick latency win was
+    /// sub-ms — not worth the architectural cost. Single-conn restored.
+    conn: Arc<Mutex<Connection>>,
     /// r2d2 read pool. `Some` by default (post-bench measurement showed
     /// ~9.2× speedup vs single-conn for `fetch_memories_by_ids`); set
     /// `MEM_RW_POOL_DISABLED=1` at startup to fall back to locking
@@ -298,25 +292,14 @@ impl DuckDbRepository {
             }
         }
 
-        // Second connection for worker-side writes. We use
-        // `Connection::try_clone()` rather than `Connection::open(path)`
-        // so the worker conn shares the same in-process Database handle
-        // as the HTTP write conn. Two separate `open()` calls would
-        // create two independent Database instances and writes
-        // committed on one wouldn't be visible to the other (each has
-        // its own snapshot / catalog cache). `SET threads = 1` so the
-        // worker tick doesn't compete with HTTP handlers for CPU on
-        // every batch upsert.
-        let worker_conn = conn.try_clone()?;
-        worker_conn.execute_batch("SET threads = 1")?;
-
         let conn_arc = Arc::new(Mutex::new(conn));
 
         // Read pool. On by default since post-impl bench measured
         // ~9.2× speedup on the search hot path; opt out with
-        // `MEM_RW_POOL_DISABLED=1`. Same try_clone-from-template story
-        // as the worker conn: every checkout shares the same Database
-        // handle so committed writes are visible. Hardcoded size 8.
+        // `MEM_RW_POOL_DISABLED=1`. Manager `try_clone`s from this
+        // Connection so every pool checkout shares the same in-process
+        // DuckDB Database handle as the writer — committed writes are
+        // visible across connections. Hardcoded size 8.
         let pool_disabled = std::env::var("MEM_RW_POOL_DISABLED")
             .ok()
             .map(|v| matches!(v.as_str(), "1" | "true" | "yes"))
@@ -340,7 +323,6 @@ impl DuckDbRepository {
 
         Ok(Self {
             conn: conn_arc,
-            worker_write_conn: Arc::new(Mutex::new(worker_conn)),
             read_pool,
             vector_index: Arc::new(RwLock::new(None)),
             transcript_job_provider: Arc::new(RwLock::new(None)),
@@ -1995,20 +1977,6 @@ impl DuckDbRepository {
         self.conn
             .lock()
             .map_err(|_| StorageError::InvalidData("duckdb connection mutex poisoned"))
-    }
-
-    /// Lock the worker-side write connection. Narrow scope: used **only**
-    /// by `upsert_conversation_message_embedding`, the single write path
-    /// against the worker-exclusive `conversation_message_embeddings`
-    /// table. All other worker-side writes that touch tables also written
-    /// by HTTP go through `self.conn` to avoid the index-invariant race
-    /// that bricked the DB in the 2026-05-08 incident. See the
-    /// `worker_write_conn` field doc for full context before adding new
-    /// callers.
-    pub(crate) fn worker_conn(&self) -> Result<MutexGuard<'_, Connection>, StorageError> {
-        self.worker_write_conn
-            .lock()
-            .map_err(|_| StorageError::InvalidData("duckdb worker connection mutex poisoned"))
     }
 
     /// Run a pure-SELECT closure against either a checked-out read-pool

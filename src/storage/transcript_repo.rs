@@ -791,7 +791,7 @@ impl DuckDbRepository {
         source_updated_at: &str,
         now: &str,
     ) -> Result<(), StorageError> {
-        let conn = self.worker_conn()?;
+        let conn = self.conn()?;
         conn.execute(
             "delete from conversation_message_embeddings where message_block_id = ?1",
             params![message_block_id],
