@@ -111,9 +111,10 @@ impl LanceDbRepository {
         let conn = lancedb::connect(uri).execute().await.map_err(lancedb_err)?;
 
         ensure_memories_table(&conn).await?;
+        ensure_feedback_events_table(&conn).await?;
         // TODO: ensure_embedding_jobs_table, ensure_memory_embeddings_table,
         // ensure_conversation_messages_table, ensure_*…
-        // (10 more tables — add as the corresponding trait methods leave
+        // (9 more tables — add as the corresponding trait methods leave
         //  unimplemented!() state).
 
         Ok(Self {
@@ -168,16 +169,114 @@ fn memories_schema() -> Schema {
 }
 
 async fn ensure_memories_table(conn: &Connection) -> Result<(), StorageError> {
+    ensure_table(conn, "memories", memories_schema()).await
+}
+
+async fn ensure_feedback_events_table(conn: &Connection) -> Result<(), StorageError> {
+    ensure_table(conn, "feedback_events", feedback_events_schema()).await
+}
+
+/// Idempotent `create_empty_table` — checks `Connection::table_names()`
+/// first and skips the create call if the table already exists.
+async fn ensure_table(conn: &Connection, name: &str, schema: Schema) -> Result<(), StorageError> {
     let names = conn.table_names().execute().await.map_err(lancedb_err)?;
-    if names.iter().any(|n| n == "memories") {
+    if names.iter().any(|n| n == name) {
         return Ok(());
     }
-    let schema = Arc::new(memories_schema());
-    conn.create_empty_table("memories", schema)
+    let schema = Arc::new(schema);
+    conn.create_empty_table(name, schema)
         .execute()
         .await
         .map_err(lancedb_err)?;
     Ok(())
+}
+
+/// Arrow schema for the `feedback_events` LanceDB table. Mirrors the
+/// `feedback_events` DuckDB schema (4 columns: feedback_id PK,
+/// memory_id, feedback_kind, created_at).
+fn feedback_events_schema() -> Schema {
+    Schema::new(vec![
+        Field::new("feedback_id", DataType::Utf8, false),
+        Field::new("memory_id", DataType::Utf8, false),
+        Field::new("feedback_kind", DataType::Utf8, false),
+        Field::new("created_at", DataType::Utf8, false),
+    ])
+}
+
+fn feedback_events_to_record_batch(events: &[FeedbackEvent]) -> Result<RecordBatch, StorageError> {
+    let mut feedback_id = StringBuilder::new();
+    let mut memory_id = StringBuilder::new();
+    let mut feedback_kind = StringBuilder::new();
+    let mut created_at = StringBuilder::new();
+    for e in events {
+        feedback_id.append_value(&e.feedback_id);
+        memory_id.append_value(&e.memory_id);
+        feedback_kind.append_value(&e.feedback_kind);
+        created_at.append_value(&e.created_at);
+    }
+    let schema = Arc::new(feedback_events_schema());
+    let columns: Vec<Arc<dyn Array>> = vec![
+        Arc::new(feedback_id.finish()),
+        Arc::new(memory_id.finish()),
+        Arc::new(feedback_kind.finish()),
+        Arc::new(created_at.finish()),
+    ];
+    RecordBatch::try_new(schema, columns)
+        .map_err(|e| StorageError::InvalidInput(format!("feedback record batch: {e}")))
+}
+
+fn record_batch_to_feedback_events(
+    batch: &RecordBatch,
+) -> Result<Vec<FeedbackEvent>, StorageError> {
+    fn col<'a, T: 'static>(
+        batch: &'a RecordBatch,
+        name: &'static str,
+    ) -> Result<&'a T, StorageError> {
+        batch
+            .column_by_name(name)
+            .ok_or(StorageError::InvalidData("missing column"))?
+            .as_any()
+            .downcast_ref::<T>()
+            .ok_or(StorageError::InvalidData("column type mismatch"))
+    }
+    let feedback_id = col::<StringArray>(batch, "feedback_id")?;
+    let memory_id = col::<StringArray>(batch, "memory_id")?;
+    let feedback_kind = col::<StringArray>(batch, "feedback_kind")?;
+    let created_at = col::<StringArray>(batch, "created_at")?;
+    let mut out = Vec::with_capacity(batch.num_rows());
+    for i in 0..batch.num_rows() {
+        out.push(FeedbackEvent {
+            feedback_id: feedback_id.value(i).to_string(),
+            memory_id: memory_id.value(i).to_string(),
+            feedback_kind: feedback_kind.value(i).to_string(),
+            created_at: created_at.value(i).to_string(),
+        });
+    }
+    Ok(out)
+}
+
+/// Mirror of DuckDB's private `feedback_adjustments` helper. Resolves a
+/// raw `feedback_kind` string to the deltas that `apply_feedback` must
+/// apply to the parent memory's confidence / decay / status fields.
+fn feedback_adjustments(
+    feedback_kind: &str,
+) -> Option<(f32, f32, Option<crate::domain::memory::MemoryStatus>, bool)> {
+    use crate::domain::memory::FeedbackKind;
+    let kind = match feedback_kind {
+        "useful" => FeedbackKind::Useful,
+        "outdated" => FeedbackKind::Outdated,
+        "incorrect" => FeedbackKind::Incorrect,
+        "applies_here" => FeedbackKind::AppliesHere,
+        "does_not_apply_here" => FeedbackKind::DoesNotApplyHere,
+        _ => return None,
+    };
+    let archive = kind.archived_status();
+    Some((
+        kind.confidence_delta(),
+        kind.decay_delta(),
+        archive.then_some(crate::domain::memory::MemoryStatus::Archived),
+        kind.marks_validated(),
+    ))
 }
 
 /// Mirror of the DuckDB `encode_text` helper: serialize a snake_case-encoded
@@ -849,16 +948,86 @@ impl MemoryRepository for LanceDbRepository {
         memory: &MemoryRecord,
         feedback: FeedbackEvent,
     ) -> Result<MemoryRecord, StorageError> {
-        let _ = (memory, feedback);
-        unimplemented!("LanceDb::apply_feedback — see docs/repository.rs trait def")
+        let (conf_delta, decay_delta, status_after, mark_validated) =
+            feedback_adjustments(&feedback.feedback_kind)
+                .ok_or(StorageError::InvalidData("invalid feedback kind"))?;
+        let updated_at = feedback.created_at.clone();
+        let mut updated = memory.clone();
+        updated.updated_at = updated_at.clone();
+        updated.confidence = (updated.confidence + conf_delta).clamp(0.0, 1.0);
+        updated.decay_score = (updated.decay_score + decay_delta).clamp(0.0, 1.0);
+        if let Some(ref s) = status_after {
+            updated.status = s.clone();
+        }
+        if mark_validated {
+            updated.last_validated_at = Some(updated_at.clone());
+        }
+
+        // Always log the event first — independent of the parent UPDATE
+        // succeeding, the audit trail is preserved. (Mirrors the DuckDB
+        // backend's ordering.)
+        let fb_table = self
+            .conn
+            .open_table("feedback_events")
+            .execute()
+            .await
+            .map_err(lancedb_err)?;
+        let batch = feedback_events_to_record_batch(std::slice::from_ref(&feedback))?;
+        fb_table.add(batch).execute().await.map_err(lancedb_err)?;
+
+        // Update the parent memory row. Status / last_validated_at are
+        // optionally set; confidence + decay + updated_at always.
+        let mem_table = self
+            .conn
+            .open_table("memories")
+            .execute()
+            .await
+            .map_err(lancedb_err)?;
+        let mut update = mem_table
+            .update()
+            .only_if(format!("memory_id = {}", sql_quote(&updated.memory_id)))
+            .column("confidence", format!("{}", updated.confidence))
+            .column("decay_score", format!("{}", updated.decay_score))
+            .column("updated_at", sql_quote(&updated.updated_at));
+        if let Some(s) = status_after {
+            update = update.column("status", sql_quote(&enum_to_str(&s)?));
+        }
+        if mark_validated {
+            update = update.column("last_validated_at", sql_quote(&updated_at));
+        }
+        update.execute().await.map_err(lancedb_err)?;
+        Ok(updated)
     }
 
     async fn list_feedback_for_memory(
         &self,
         memory_id: &str,
     ) -> Result<Vec<FeedbackEvent>, StorageError> {
-        let _ = memory_id;
-        unimplemented!("LanceDb::list_feedback_for_memory — see docs/repository.rs trait def")
+        let table = self
+            .conn
+            .open_table("feedback_events")
+            .execute()
+            .await
+            .map_err(lancedb_err)?;
+        let stream = table
+            .query()
+            .only_if(format!("memory_id = {}", sql_quote(memory_id)))
+            .execute()
+            .await
+            .map_err(lancedb_err)?;
+        let batches: Vec<RecordBatch> = stream
+            .try_collect()
+            .await
+            .map_err(|e| StorageError::InvalidInput(format!("lancedb stream: {e}")))?;
+        let mut out = Vec::new();
+        for b in &batches {
+            out.extend(record_batch_to_feedback_events(b)?);
+        }
+        // DuckDB returns `created_at ASC` order. LanceDB doesn't sort
+        // automatically — sort client-side since the row count per
+        // memory is small (single-digits typically).
+        out.sort_by(|a, b| a.created_at.cmp(&b.created_at));
+        Ok(out)
     }
 
     async fn list_memory_versions_for_tenant(
@@ -873,8 +1042,24 @@ impl MemoryRepository for LanceDbRepository {
     }
 
     async fn feedback_summary(&self, memory_id: &str) -> Result<FeedbackSummary, StorageError> {
-        let _ = memory_id;
-        unimplemented!("LanceDb::feedback_summary — see docs/repository.rs trait def")
+        // Fetch all events for this memory and aggregate client-side.
+        // Counts are tiny (events per memory typically < 10), so the
+        // network/parse cost is negligible compared to running a
+        // GROUP BY query through LanceDB's filter API.
+        let events = self.list_feedback_for_memory(memory_id).await?;
+        let mut summary = FeedbackSummary::default();
+        for e in events {
+            summary.total += 1;
+            match e.feedback_kind.as_str() {
+                "useful" => summary.useful += 1,
+                "outdated" => summary.outdated += 1,
+                "incorrect" => summary.incorrect += 1,
+                "applies_here" => summary.applies_here += 1,
+                "does_not_apply_here" => summary.does_not_apply_here += 1,
+                _ => {} // unknown kind — counted in `total` only
+            }
+        }
+        Ok(summary)
     }
 
     async fn delete_memory_hard(&self, tenant: &str, memory_id: &str) -> Result<(), StorageError> {
@@ -1440,5 +1625,89 @@ mod tests {
             matches!(err, StorageError::InvalidData("memory not found")),
             "expected NotFound-equivalent, got {err:?}",
         );
+    }
+
+    #[tokio::test]
+    async fn lancedb_feedback_round_trip() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("lance.store");
+        let repo = LanceDbRepository::open(&path).await.unwrap();
+
+        let memory = fixture("mem_fb", "tenant");
+        repo.insert_memory(memory.clone()).await.unwrap();
+
+        // Apply 3 feedbacks of different kinds
+        let make = |kind: &str, ts: &str, suffix: &str| FeedbackEvent {
+            feedback_id: format!("fb_{suffix}"),
+            memory_id: memory.memory_id.clone(),
+            feedback_kind: kind.into(),
+            created_at: ts.into(),
+        };
+        let _ = repo
+            .apply_feedback(&memory, make("useful", "2026-05-08T01:00:00Z", "1"))
+            .await
+            .unwrap();
+        let after_useful = repo
+            .get_memory_for_tenant("tenant", "mem_fb")
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            after_useful.confidence > memory.confidence,
+            "useful must increase confidence: {} vs {}",
+            after_useful.confidence,
+            memory.confidence,
+        );
+        assert!(after_useful.last_validated_at.is_some());
+
+        let _ = repo
+            .apply_feedback(&after_useful, make("outdated", "2026-05-08T02:00:00Z", "2"))
+            .await
+            .unwrap();
+        let after_outdated = repo
+            .get_memory_for_tenant("tenant", "mem_fb")
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            after_outdated.decay_score > after_useful.decay_score,
+            "outdated must increase decay",
+        );
+
+        let _ = repo
+            .apply_feedback(
+                &after_outdated,
+                make("incorrect", "2026-05-08T03:00:00Z", "3"),
+            )
+            .await
+            .unwrap();
+        let after_incorrect = repo
+            .get_memory_for_tenant("tenant", "mem_fb")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            after_incorrect.status,
+            MemoryStatus::Archived,
+            "incorrect must archive",
+        );
+
+        // list_feedback_for_memory — sorted ASC by created_at
+        let events = repo.list_feedback_for_memory("mem_fb").await.unwrap();
+        let kinds: Vec<_> = events.iter().map(|e| e.feedback_kind.as_str()).collect();
+        assert_eq!(kinds, vec!["useful", "outdated", "incorrect"]);
+
+        // feedback_summary — counts per kind
+        let summary = repo.feedback_summary("mem_fb").await.unwrap();
+        assert_eq!(summary.total, 3);
+        assert_eq!(summary.useful, 1);
+        assert_eq!(summary.outdated, 1);
+        assert_eq!(summary.incorrect, 1);
+        assert_eq!(summary.applies_here, 0);
+        assert_eq!(summary.does_not_apply_here, 0);
+
+        // Empty feedback for a memory with none
+        let summary_none = repo.feedback_summary("never-feedback'd").await.unwrap();
+        assert_eq!(summary_none.total, 0);
     }
 }
