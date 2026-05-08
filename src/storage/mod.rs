@@ -1,6 +1,6 @@
 pub mod duckdb;
 #[cfg(feature = "lancedb")]
-pub mod lancedb;
+pub mod lance_store;
 pub mod repository;
 pub mod time;
 pub mod vector_index;

@@ -78,10 +78,7 @@ async fn main() -> anyhow::Result<()> {
         ],
     )?;
 
-    let table = lance_conn
-        .create_table("animals", batch)
-        .execute()
-        .await?;
+    let table = lance_conn.create_table("animals", batch).execute().await?;
     println!("created Lance table 'animals' with 3 rows");
 
     // ── Step 2: install + load + attach Lance extension in DuckDB ─────
@@ -102,8 +99,7 @@ async fn main() -> anyhow::Result<()> {
 
     // ── Step 3: SELECT round-trip ─────────────────────────────────────
     println!("\n=== 3. SELECT through DuckDB SQL ===");
-    let mut stmt =
-        dconn.prepare("SELECT animal, noise FROM ns.main.animals ORDER BY animal")?;
+    let mut stmt = dconn.prepare("SELECT animal, noise FROM ns.main.animals ORDER BY animal")?;
     let rows: Vec<(String, String)> = stmt
         .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
         .collect::<Result<_, _>>()?;
@@ -119,9 +115,7 @@ async fn main() -> anyhow::Result<()> {
     }
 
     println!("\n=== 4b. UPDATE ns.main.animals SET ... ===");
-    match dconn.execute_batch(
-        "UPDATE ns.main.animals SET noise = 'cluck' WHERE animal = 'duck';",
-    ) {
+    match dconn.execute_batch("UPDATE ns.main.animals SET noise = 'cluck' WHERE animal = 'duck';") {
         Ok(()) => println!("UPDATE: OK ✓"),
         Err(e) => println!("UPDATE: FAILED — {e}"),
     }
@@ -190,32 +184,31 @@ async fn main() -> anyhow::Result<()> {
              'ns.main.animals', 'vector', [0.9, 0.7, 0.1]::FLOAT[], k => 2 \
            );";
     match dconn.prepare(q) {
-        Ok(mut stmt) => match stmt.query_map([], |r| {
-            Ok((r.get::<_, String>(0)?, r.get::<_, f32>(1)?))
-        }) {
-            Ok(it) => {
-                let rows: Result<Vec<(String, f32)>, _> = it.collect();
-                println!("vector_search rows: {rows:?}");
+        Ok(mut stmt) => {
+            match stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, f32>(1)?))) {
+                Ok(it) => {
+                    let rows: Result<Vec<(String, f32)>, _> = it.collect();
+                    println!("vector_search rows: {rows:?}");
+                }
+                Err(e) => println!("vector_search query_map FAILED: {e}"),
             }
-            Err(e) => println!("vector_search query_map FAILED: {e}"),
-        },
+        }
         Err(e) => println!("vector_search prepare FAILED: {e}"),
     }
 
     println!("\n=== 6b. lance_fts (will only succeed if FTS index exists) ===");
     // Try without a pre-built FTS index first — most likely fails.
-    let fts =
-        "SELECT animal, _score FROM lance_fts('ns.main.animals', 'noise', 'quack', k => 2);";
+    let fts = "SELECT animal, _score FROM lance_fts('ns.main.animals', 'noise', 'quack', k => 2);";
     match dconn.prepare(fts) {
-        Ok(mut stmt) => match stmt.query_map([], |r| {
-            Ok((r.get::<_, String>(0)?, r.get::<_, f32>(1)?))
-        }) {
-            Ok(it) => {
-                let rows: Result<Vec<(String, f32)>, _> = it.collect();
-                println!("fts rows: {rows:?}");
+        Ok(mut stmt) => {
+            match stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, f32>(1)?))) {
+                Ok(it) => {
+                    let rows: Result<Vec<(String, f32)>, _> = it.collect();
+                    println!("fts rows: {rows:?}");
+                }
+                Err(e) => println!("fts query_map FAILED: {e}"),
             }
-            Err(e) => println!("fts query_map FAILED: {e}"),
-        },
+        }
         Err(e) => println!("fts prepare FAILED (expected — no FTS index built): {e}"),
     }
 

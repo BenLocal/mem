@@ -1,5 +1,8 @@
 target/
 
+# Claude Code session-local state (task scheduling locks etc.)
+.claude/
+
 # Beads / Dolt files (added by bd init)
 .dolt/
 *.db

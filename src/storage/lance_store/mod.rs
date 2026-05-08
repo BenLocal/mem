@@ -1,6 +1,6 @@
 //! LanceDB backend (skeleton).
 //!
-//! `LanceDbRepository` is the alternate backend to [`crate::storage::DuckDbRepository`].
+//! `LanceStore` is the alternate backend to [`crate::storage::DuckDbRepository`].
 //! It implements the same four traits — `MemoryRepository`,
 //! `TranscriptRepository`, `EntityRegistry`, `GraphStore` — so all upper
 //! layers (services, HTTP handlers) work against it interchangeably.
@@ -89,7 +89,7 @@ use crate::storage::{
 /// connection because LanceDB is itself async-native and handles
 /// concurrency internally.
 #[derive(Clone)]
-pub struct LanceDbRepository {
+pub struct LanceStore {
     /// LanceDB connection. Currently unused — every trait method is
     /// `unimplemented!()` placeholder. The first real method to write is
     /// `open()` (creates / opens the schema tables); afterwards method
@@ -98,7 +98,7 @@ pub struct LanceDbRepository {
     conn: Arc<Connection>,
 }
 
-impl LanceDbRepository {
+impl LanceStore {
     /// Open (or create) a LanceDB store at the given path.
     ///
     /// Connects, then idempotently creates all backend tables. Currently
@@ -224,7 +224,7 @@ async fn ensure_feedback_events_table(conn: &Connection) -> Result<(), StorageEr
 
 /// Idempotently create the `memory_embeddings` table with `dim`-sized
 /// vectors. Lazy-created on first `upsert_memory_embedding` because dim
-/// is provider-dependent and not known at `LanceDbRepository::open()`
+/// is provider-dependent and not known at `LanceStore::open()`
 /// time. If the table already exists with a different dim, subsequent
 /// `Table::add` calls fail with a schema mismatch error — that's
 /// surfaced as the original `lancedb::Error` and is the right behavior
@@ -1173,7 +1173,7 @@ fn sql_quote(s: &str) -> String {
     format!("'{}'", s.replace('\'', "''"))
 }
 
-impl LanceDbRepository {
+impl LanceStore {
     /// Apply a status transition to `(tenant, memory_id)` and return the
     /// updated row. Shared by `accept_pending` / `reject_pending` (and a
     /// future `archive_pending` if needed). Mirrors the DuckDB backend's
@@ -1282,7 +1282,7 @@ impl LanceDbRepository {
 
 #[async_trait]
 #[allow(clippy::too_many_arguments)]
-impl MemoryRepository for LanceDbRepository {
+impl MemoryRepository for LanceStore {
     async fn insert_memory(&self, memory: MemoryRecord) -> Result<MemoryRecord, StorageError> {
         let table = self
             .conn
@@ -2359,7 +2359,7 @@ impl MemoryRepository for LanceDbRepository {
 
 /// Read all `conversation_messages` rows matching `filter`, parsed into
 /// [`ConversationMessage`]s. Shared by every transcript read path.
-impl LanceDbRepository {
+impl LanceStore {
     async fn query_conversation_messages(
         &self,
         filter: String,
@@ -2389,7 +2389,7 @@ impl LanceDbRepository {
 }
 
 #[async_trait]
-impl TranscriptRepository for LanceDbRepository {
+impl TranscriptRepository for LanceStore {
     async fn create_conversation_message(
         &self,
         msg: &ConversationMessage,
@@ -2795,7 +2795,7 @@ fn sort_messages_chronological_asc(msgs: &mut [ConversationMessage]) {
 /// Read all `graph_edges` rows matching `filter`, parsed into
 /// [`GraphEdge`]s. Helper shared by `neighbors`, `related_memory_ids`,
 /// and the existence check in `sync_memory_edges`.
-impl LanceDbRepository {
+impl LanceStore {
     async fn query_graph_edges(&self, filter: String) -> Result<Vec<GraphEdge>, GraphError> {
         let table = self
             .conn
@@ -2824,7 +2824,7 @@ impl LanceDbRepository {
 }
 
 #[async_trait]
-impl GraphStore for LanceDbRepository {
+impl GraphStore for LanceStore {
     async fn neighbors(&self, node_id: &str) -> Result<Vec<GraphEdge>, GraphError> {
         // Active edges only (valid_to is null) where the node sits on
         // either side. Order by (relation, from, to) to match DuckDB's
@@ -2964,7 +2964,7 @@ impl GraphStore for LanceDbRepository {
 }
 
 #[async_trait]
-impl EntityRegistry for LanceDbRepository {
+impl EntityRegistry for LanceStore {
     async fn resolve_or_create(
         &self,
         tenant: &str,
@@ -3271,9 +3271,7 @@ mod tests {
     async fn lancedb_insert_and_get_memory_round_trip() {
         let dir = tempdir().unwrap();
         let path = dir.path().join("lance.store");
-        let repo = LanceDbRepository::open(&path)
-            .await
-            .expect("open lancedb store");
+        let repo = LanceStore::open(&path).await.expect("open lancedb store");
 
         let memory = fixture("mem_lance_001", "tenant-a");
         repo.insert_memory(memory.clone())
@@ -3328,7 +3326,7 @@ mod tests {
     async fn lancedb_filter_methods_round_trip() {
         let dir = tempdir().unwrap();
         let path = dir.path().join("lance.store");
-        let repo = LanceDbRepository::open(&path).await.unwrap();
+        let repo = LanceStore::open(&path).await.unwrap();
 
         let mut a1 = fixture("mem_a_001", "tenant-a");
         a1.idempotency_key = Some("idem-a-1".into());
@@ -3414,7 +3412,7 @@ mod tests {
     async fn lancedb_mutating_methods_round_trip() {
         let dir = tempdir().unwrap();
         let path = dir.path().join("lance.store");
-        let repo = LanceDbRepository::open(&path).await.unwrap();
+        let repo = LanceStore::open(&path).await.unwrap();
 
         let mut p = fixture("mem_p", "tenant");
         p.status = MemoryStatus::PendingConfirmation;
@@ -3482,7 +3480,7 @@ mod tests {
     async fn lancedb_feedback_round_trip() {
         let dir = tempdir().unwrap();
         let path = dir.path().join("lance.store");
-        let repo = LanceDbRepository::open(&path).await.unwrap();
+        let repo = LanceStore::open(&path).await.unwrap();
 
         let memory = fixture("mem_fb", "tenant");
         repo.insert_memory(memory.clone()).await.unwrap();
@@ -3571,7 +3569,7 @@ mod tests {
     async fn lancedb_embedding_round_trip() {
         let dir = tempdir().unwrap();
         let path = dir.path().join("lance.store");
-        let repo = LanceDbRepository::open(&path).await.unwrap();
+        let repo = LanceStore::open(&path).await.unwrap();
 
         // Two memories under "tenant-a", one under "tenant-b" (cross-tenant
         // leak test).
@@ -3685,7 +3683,7 @@ mod tests {
         // table) returns empty without error.
         let dir2 = tempdir().unwrap();
         let path2 = dir2.path().join("empty.store");
-        let empty_repo = LanceDbRepository::open(&path2).await.unwrap();
+        let empty_repo = LanceStore::open(&path2).await.unwrap();
         let empty_hits = empty_repo
             .semantic_search_memories("tenant-a", &q, 10)
             .await
@@ -3706,7 +3704,7 @@ mod tests {
     async fn lancedb_embedding_jobs_queue_round_trip() {
         let dir = tempdir().unwrap();
         let path = dir.path().join("lance.store");
-        let repo = LanceDbRepository::open(&path).await.unwrap();
+        let repo = LanceStore::open(&path).await.unwrap();
 
         let m1 = fixture("mem_q1", "tenant-a");
         let m2 = fixture("mem_q2", "tenant-a");
@@ -3907,7 +3905,7 @@ mod tests {
     async fn lancedb_bm25_candidates_round_trip() {
         let dir = tempdir().unwrap();
         let path = dir.path().join("lance.store");
-        let repo = LanceDbRepository::open(&path).await.unwrap();
+        let repo = LanceStore::open(&path).await.unwrap();
 
         let mut a = fixture("mem_b1", "tenant-a");
         a.content = "DuckDB single mutex serializes all writes".into();
@@ -3967,7 +3965,7 @@ mod tests {
     async fn lancedb_graph_store_round_trip() {
         let dir = tempdir().unwrap();
         let path = dir.path().join("lance.store");
-        let repo = LanceDbRepository::open(&path).await.unwrap();
+        let repo = LanceStore::open(&path).await.unwrap();
 
         let edges = vec![
             GraphEdge {
@@ -4058,7 +4056,7 @@ mod tests {
     async fn lancedb_entity_registry_round_trip() {
         let dir = tempdir().unwrap();
         let path = dir.path().join("lance.store");
-        let repo = LanceDbRepository::open(&path).await.unwrap();
+        let repo = LanceStore::open(&path).await.unwrap();
 
         let id1 = repo
             .resolve_or_create(
@@ -4219,7 +4217,7 @@ mod tests {
     async fn lancedb_transcript_repository_round_trip() {
         let dir = tempdir().unwrap();
         let path = dir.path().join("lance.store");
-        let repo = LanceDbRepository::open(&path).await.unwrap();
+        let repo = LanceStore::open(&path).await.unwrap();
 
         // 4 blocks, 2 sessions × 2 tenants.
         let m1 = msg(
