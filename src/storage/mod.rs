@@ -1,3 +1,4 @@
+pub mod conn_pool;
 pub mod duckdb;
 pub mod entity_repo;
 pub mod fts;

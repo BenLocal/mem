@@ -22,7 +22,7 @@ cargo clippy --all-targets -- -D warnings      # required by CI
 cross build --release                          # cross-compile (reads ./Cross.toml)
 ```
 
-**Key env vars:** `MEM_DB_PATH` (DuckDB file), `BIND_ADDR` (HTTP bind), `MEM_BASE_URL` / `MEM_TENANT` (MCP forwarder), `MEM_MCP_EXPOSE_EMBEDDINGS=1` (admin tools), `MEM_VECTOR_INDEX_FLUSH_EVERY` / `_OVERSAMPLE` / `_USE_LEGACY` (HNSW sidecar tuning), `MEM_TRANSCRIPT_EMBED_DISABLED=1` / `MEM_TRANSCRIPT_VECTOR_INDEX_FLUSH_EVERY` (transcript-archive worker + sidecar tuning).
+**Key env vars:** `MEM_DB_PATH` (DuckDB file), `BIND_ADDR` (HTTP bind), `MEM_BASE_URL` / `MEM_TENANT` (MCP forwarder), `MEM_MCP_EXPOSE_EMBEDDINGS=1` (admin tools), `MEM_VECTOR_INDEX_FLUSH_EVERY` / `_OVERSAMPLE` / `_USE_LEGACY` (HNSW sidecar tuning), `MEM_TRANSCRIPT_EMBED_DISABLED=1` / `MEM_TRANSCRIPT_VECTOR_INDEX_FLUSH_EVERY` (transcript-archive worker + sidecar tuning), `MEM_RW_POOL_DISABLED=1` (opt out of the r2d2 read pool that backs `fetch_memories_by_ids`; default is on).
 
 ---
 

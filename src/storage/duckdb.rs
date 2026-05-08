@@ -82,7 +82,38 @@ struct MemoryEmbeddingRow {
 
 #[derive(Debug, Clone)]
 pub struct DuckDbRepository {
+    /// HTTP-side write connection. All HTTP-driven writes (memory ingest,
+    /// supersede, transcript ingest, graph edges, schema migrations,
+    /// entity registry) lock this. SELECT methods that have not been
+    /// individually audited for read-own-write also serialize here.
+    /// Accessed via [`Self::conn`].
     conn: Arc<Mutex<Connection>>,
+    /// Worker-side write connection. The embedding worker and the
+    /// transcript embedding worker hold this exclusively for status
+    /// updates on `embedding_jobs` / `transcript_embedding_jobs` and
+    /// vector upserts on `memory_embeddings` / `conversation_messages`.
+    /// Worker ticks are single-threaded so a bare Mutex is sufficient
+    /// (no pool). Accessed via [`Self::worker_conn`].
+    ///
+    /// Conflict surface vs `conn`: HTTP supersede paths
+    /// (`update_status`, `supersede_memory`) call
+    /// `delete_embedding_references` which DELETEs from `embedding_jobs`
+    /// while a worker tick may UPDATE the same row's status. DuckDB MVCC
+    /// will surface this as a transaction conflict; the worker's
+    /// existing tick error path logs and retries on the next interval,
+    /// which is acceptable for the rare-supersede workload.
+    worker_write_conn: Arc<Mutex<Connection>>,
+    /// r2d2 read pool. `Some` by default (post-bench measurement showed
+    /// ~9.2× speedup vs single-conn for `fetch_memories_by_ids`); set
+    /// `MEM_RW_POOL_DISABLED=1` at startup to fall back to locking
+    /// `conn` for SELECT methods that opted in to
+    /// [`Self::with_read`]. v1 opt-ins: `fetch_memories_by_ids` (the
+    /// hot path under both semantic and BM25 search).
+    ///
+    /// Pool size is hardcoded at 8. Pool checkout uses
+    /// `get_timeout(5s)` so an exhausted pool fails fast rather than
+    /// queueing indefinitely.
+    read_pool: Option<r2d2::Pool<crate::storage::conn_pool::DuckDbReadManager>>,
     vector_index: Arc<RwLock<Option<Arc<VectorIndex>>>>,
     /// Embedding provider id stored on `transcript_embedding_jobs.provider`
     /// rows enqueued by [`Self::create_conversation_message`]. Set once during
@@ -265,8 +296,50 @@ impl DuckDbRepository {
             }
         }
 
+        // Second connection for worker-side writes. We use
+        // `Connection::try_clone()` rather than `Connection::open(path)`
+        // so the worker conn shares the same in-process Database handle
+        // as the HTTP write conn. Two separate `open()` calls would
+        // create two independent Database instances and writes
+        // committed on one wouldn't be visible to the other (each has
+        // its own snapshot / catalog cache). `SET threads = 1` so the
+        // worker tick doesn't compete with HTTP handlers for CPU on
+        // every batch upsert.
+        let worker_conn = conn.try_clone()?;
+        worker_conn.execute_batch("SET threads = 1")?;
+
+        let conn_arc = Arc::new(Mutex::new(conn));
+
+        // Read pool. On by default since post-impl bench measured
+        // ~9.2× speedup on the search hot path; opt out with
+        // `MEM_RW_POOL_DISABLED=1`. Same try_clone-from-template story
+        // as the worker conn: every checkout shares the same Database
+        // handle so committed writes are visible. Hardcoded size 8.
+        let pool_disabled = std::env::var("MEM_RW_POOL_DISABLED")
+            .ok()
+            .map(|v| matches!(v.as_str(), "1" | "true" | "yes"))
+            .unwrap_or(false);
+        let read_pool = if pool_disabled {
+            tracing::info!("MEM_RW_POOL_DISABLED=1; falling back to single-conn for SELECTs");
+            None
+        } else {
+            let manager = crate::storage::conn_pool::DuckDbReadManager::new(conn_arc.clone());
+            match r2d2::Pool::builder().max_size(8).build(manager) {
+                Ok(pool) => Some(pool),
+                Err(e) => {
+                    tracing::warn!(
+                        error = %e,
+                        "read pool init failed; falling back to single-conn"
+                    );
+                    None
+                }
+            }
+        };
+
         Ok(Self {
-            conn: Arc::new(Mutex::new(conn)),
+            conn: conn_arc,
+            worker_write_conn: Arc::new(Mutex::new(worker_conn)),
+            read_pool,
             vector_index: Arc::new(RwLock::new(None)),
             transcript_job_provider: Arc::new(RwLock::new(None)),
             memory_fts,
@@ -579,7 +652,7 @@ impl DuckDbRepository {
         now: &str,
         max_retries: u32,
     ) -> Result<Option<ClaimedEmbeddingJob>, StorageError> {
-        let mut conn = self.conn()?;
+        let mut conn = self.worker_conn()?;
         let tx = conn.transaction()?;
         let max_r = i64::from(max_retries);
 
@@ -669,7 +742,7 @@ impl DuckDbRepository {
         source_updated_at: &str,
         now: &str,
     ) -> Result<(), StorageError> {
-        let conn = self.conn()?;
+        let conn = self.worker_conn()?;
         conn.execute(
             "delete from memory_embeddings where memory_id = ?1",
             params![memory_id],
@@ -1144,7 +1217,7 @@ impl DuckDbRepository {
         job_id: &str,
         now: &str,
     ) -> Result<(), StorageError> {
-        let conn = self.conn()?;
+        let conn = self.worker_conn()?;
         conn.execute(
             "update embedding_jobs
              set status = 'completed', last_error = null, updated_at = ?1
@@ -1159,7 +1232,7 @@ impl DuckDbRepository {
         job_id: &str,
         now: &str,
     ) -> Result<(), StorageError> {
-        let conn = self.conn()?;
+        let conn = self.worker_conn()?;
         conn.execute(
             "update embedding_jobs set status = 'stale', updated_at = ?1 where job_id = ?2",
             params![now, job_id],
@@ -1175,7 +1248,7 @@ impl DuckDbRepository {
         available_at: &str,
         now: &str,
     ) -> Result<(), StorageError> {
-        let conn = self.conn()?;
+        let conn = self.worker_conn()?;
         conn.execute(
             "update embedding_jobs
              set status = 'failed',
@@ -1196,7 +1269,7 @@ impl DuckDbRepository {
         last_error: &str,
         now: &str,
     ) -> Result<(), StorageError> {
-        let conn = self.conn()?;
+        let conn = self.worker_conn()?;
         conn.execute(
             "update embedding_jobs
              set status = 'failed',
@@ -1220,7 +1293,7 @@ impl DuckDbRepository {
         &self,
         memory_id: &str,
     ) -> Result<usize, StorageError> {
-        let conn = self.conn()?;
+        let conn = self.worker_conn()?;
         let n = conn.execute(
             "delete from embedding_jobs where memory_id = ?1",
             params![memory_id],
@@ -1476,7 +1549,6 @@ impl DuckDbRepository {
         if ids.is_empty() {
             return Ok(vec![]);
         }
-        let conn = self.conn()?;
 
         let placeholders = std::iter::repeat_n("?", ids.len())
             .collect::<Vec<_>>()
@@ -1494,19 +1566,25 @@ impl DuckDbRepository {
                and memory_id in ({placeholders})"
         );
 
-        let mut stmt = conn.prepare(&sql)?;
-        let mut params_vec: Vec<Box<dyn duckdb::ToSql>> = vec![Box::new(tenant.to_string())];
-        for id in ids {
-            params_vec.push(Box::new(id.to_string()));
-        }
-        let params_refs: Vec<&dyn duckdb::ToSql> = params_vec.iter().map(|b| b.as_ref()).collect();
-
-        let rows = stmt.query_map(&params_refs[..], map_memory_row)?;
-        let mut out = Vec::with_capacity(ids.len());
-        for row in rows {
-            out.push(row?);
-        }
-        Ok(out)
+        // read-pool ok: no read-own-write dependency. Callers
+        // (semantic_search_memories post-ANN, bm25_candidates post-FTS)
+        // hydrate already-committed memory_ids; never observe their own
+        // pending writes.
+        self.with_read(|read| {
+            let mut stmt = read.prepare(&sql)?;
+            let mut params_vec: Vec<Box<dyn duckdb::ToSql>> = vec![Box::new(tenant.to_string())];
+            for id in ids {
+                params_vec.push(Box::new(id.to_string()));
+            }
+            let params_refs: Vec<&dyn duckdb::ToSql> =
+                params_vec.iter().map(|b| b.as_ref()).collect();
+            let rows = stmt.query_map(&params_refs[..], map_memory_row)?;
+            let mut out = Vec::with_capacity(ids.len());
+            for row in rows {
+                out.push(row?);
+            }
+            Ok(out)
+        })
     }
 
     pub async fn accept_pending(
@@ -1915,6 +1993,40 @@ impl DuckDbRepository {
         self.conn
             .lock()
             .map_err(|_| StorageError::InvalidData("duckdb connection mutex poisoned"))
+    }
+
+    /// Lock the worker-side write connection. Used by embedding worker
+    /// and transcript embedding worker for status updates and vector
+    /// upserts; does not block (and is not blocked by) HTTP write
+    /// traffic on `self.conn`. See struct field doc on
+    /// `worker_write_conn` for the conflict-surface caveat with
+    /// supersede paths.
+    pub(crate) fn worker_conn(&self) -> Result<MutexGuard<'_, Connection>, StorageError> {
+        self.worker_write_conn
+            .lock()
+            .map_err(|_| StorageError::InvalidData("duckdb worker connection mutex poisoned"))
+    }
+
+    /// Run a pure-SELECT closure against either a checked-out read-pool
+    /// connection (when `MEM_RW_POOL_ENABLED=1`) or the HTTP write
+    /// connection (fallback / default). Reserved for methods that have
+    /// been individually audited for read-own-write safety.
+    ///
+    /// Pool checkout has a 5 s timeout; on exhaustion the call returns
+    /// a `StorageError::InvalidData` rather than queueing indefinitely.
+    pub(crate) fn with_read<F, R>(&self, f: F) -> Result<R, StorageError>
+    where
+        F: FnOnce(crate::storage::conn_pool::ReadOnlyConn<'_>) -> Result<R, StorageError>,
+    {
+        if let Some(pool) = &self.read_pool {
+            let conn = pool
+                .get_timeout(std::time::Duration::from_secs(5))
+                .map_err(|_| StorageError::InvalidData("read pool checkout timeout"))?;
+            f(crate::storage::conn_pool::ReadOnlyConn::wrap(&conn))
+        } else {
+            let conn = self.conn()?;
+            f(crate::storage::conn_pool::ReadOnlyConn::wrap(&conn))
+        }
     }
 
     async fn update_status(
