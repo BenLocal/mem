@@ -1,5 +1,4 @@
 pub mod duckdb;
-pub mod fts;
 #[cfg(feature = "lancedb")]
 pub mod lancedb;
 pub mod repository;

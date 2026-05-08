@@ -82,7 +82,7 @@ impl AppState {
         });
 
         // The previous DuckDB-FTS-rebuild worker is gone — BM25 is now
-        // incremental via tantivy (see `storage::fts`) so writes upsert
+        // incremental via tantivy (see `storage::duckdb::fts`) so writes upsert
         // directly and no rebuild task is needed.
 
         if !config.embedding.transcript_disabled {

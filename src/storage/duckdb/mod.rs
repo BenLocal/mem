@@ -18,6 +18,7 @@ use crate::pipeline::ingest::{compute_content_hash_from_record, CONTENT_HASH_LEN
 
 pub mod conn_pool;
 pub mod entity_repo;
+pub mod fts;
 pub mod graph_store;
 pub mod schema;
 pub mod transcript_repo;
@@ -153,10 +154,10 @@ pub struct DuckDbRepository {
     /// incremental at the `add_document` level — each ingest writes a
     /// segment, segments merge in the background, search reads all live
     /// segments without rebuild ceremony.
-    memory_fts: Arc<crate::storage::fts::MemoryFts>,
+    memory_fts: Arc<crate::storage::duckdb::fts::MemoryFts>,
     /// Tantivy-backed BM25 index for `conversation_messages`. Same
     /// rationale as `memory_fts` but for the transcript archive.
-    pub(crate) transcript_fts: Arc<crate::storage::fts::TranscriptFts>,
+    pub(crate) transcript_fts: Arc<crate::storage::duckdb::fts::TranscriptFts>,
 }
 
 #[derive(Debug, Error)]
@@ -288,7 +289,9 @@ impl DuckDbRepository {
         // bootstrap so BM25 isn't silently zero on the first query —
         // typical first run after the FTS replacement, or recovery after
         // a manually-deleted sidecar.
-        use crate::storage::fts::{memory_fts_path, transcript_fts_path, MemoryFts, TranscriptFts};
+        use crate::storage::duckdb::fts::{
+            memory_fts_path, transcript_fts_path, MemoryFts, TranscriptFts,
+        };
         let memory_fts = Arc::new(
             MemoryFts::open(&memory_fts_path(path))
                 .map_err(|e| StorageError::InvalidInput(format!("memory fts open: {e}")))?,
@@ -2655,7 +2658,7 @@ fn decode_feedback_kind(value: &str) -> Option<FeedbackKind> {
 /// after the FTS replacement landed and on sidecar recovery.
 fn bootstrap_memory_fts(
     conn: &Connection,
-    fts: &crate::storage::fts::MemoryFts,
+    fts: &crate::storage::duckdb::fts::MemoryFts,
 ) -> Result<usize, StorageError> {
     let mut stmt = conn.prepare("select memory_id, tenant, summary, content from memories")?;
     let rows: Vec<(String, String, String, String)> = stmt
@@ -2678,7 +2681,7 @@ fn bootstrap_memory_fts(
 /// Same as `bootstrap_memory_fts` for the transcripts index.
 fn bootstrap_transcript_fts(
     conn: &Connection,
-    fts: &crate::storage::fts::TranscriptFts,
+    fts: &crate::storage::duckdb::fts::TranscriptFts,
 ) -> Result<usize, StorageError> {
     let mut stmt =
         conn.prepare("select message_block_id, tenant, content from conversation_messages")?;

@@ -10,7 +10,7 @@
 //! - `transcript_embedding_worker` — same but for `transcript_embedding_jobs`
 //!
 //! There is no `fts_worker` — the BM25 index is now incremental
-//! (tantivy, see `storage::fts`); writes upsert directly, no rebuild
+//! (tantivy, see `storage::duckdb::fts`); writes upsert directly, no rebuild
 //! cycle, no background task needed.
 
 pub mod decay_worker;
