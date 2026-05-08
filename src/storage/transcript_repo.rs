@@ -633,7 +633,7 @@ impl DuckDbRepository {
         now: &str,
         max_retries: u32,
     ) -> Result<Option<ClaimedTranscriptEmbeddingJob>, StorageError> {
-        let mut conn = self.worker_conn()?;
+        let mut conn = self.conn()?;
         let tx = conn.transaction()?;
         let max_r = i64::from(max_retries);
 
@@ -697,7 +697,7 @@ impl DuckDbRepository {
         job_id: &str,
         now: &str,
     ) -> Result<(), StorageError> {
-        let conn = self.worker_conn()?;
+        let conn = self.conn()?;
         conn.execute(
             "update transcript_embedding_jobs
              set status = 'completed', last_error = null, updated_at = ?1
@@ -712,7 +712,7 @@ impl DuckDbRepository {
         job_id: &str,
         now: &str,
     ) -> Result<(), StorageError> {
-        let conn = self.worker_conn()?;
+        let conn = self.conn()?;
         conn.execute(
             "update transcript_embedding_jobs set status = 'stale', updated_at = ?1 where job_id = ?2",
             params![now, job_id],
@@ -728,7 +728,7 @@ impl DuckDbRepository {
         available_at: &str,
         now: &str,
     ) -> Result<(), StorageError> {
-        let conn = self.worker_conn()?;
+        let conn = self.conn()?;
         conn.execute(
             "update transcript_embedding_jobs
              set status = 'failed',
@@ -749,7 +749,7 @@ impl DuckDbRepository {
         last_error: &str,
         now: &str,
     ) -> Result<(), StorageError> {
-        let conn = self.worker_conn()?;
+        let conn = self.conn()?;
         conn.execute(
             "update transcript_embedding_jobs
              set status = 'failed',

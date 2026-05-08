@@ -88,20 +88,22 @@ pub struct DuckDbRepository {
     /// individually audited for read-own-write also serialize here.
     /// Accessed via [`Self::conn`].
     conn: Arc<Mutex<Connection>>,
-    /// Worker-side write connection. The embedding worker and the
-    /// transcript embedding worker hold this exclusively for status
-    /// updates on `embedding_jobs` / `transcript_embedding_jobs` and
-    /// vector upserts on `memory_embeddings` / `conversation_messages`.
-    /// Worker ticks are single-threaded so a bare Mutex is sufficient
-    /// (no pool). Accessed via [`Self::worker_conn`].
+    /// Worker-side write connection. **Narrowed scope after the
+    /// 2026-05-08 incident**: only used by
+    /// `upsert_conversation_message_embedding`, the single write path
+    /// against the genuinely worker-exclusive table
+    /// `conversation_message_embeddings` (no FK, never written by HTTP).
     ///
-    /// Conflict surface vs `conn`: HTTP supersede paths
-    /// (`update_status`, `supersede_memory`) call
-    /// `delete_embedding_references` which DELETEs from `embedding_jobs`
-    /// while a worker tick may UPDATE the same row's status. DuckDB MVCC
-    /// will surface this as a transaction conflict; the worker's
-    /// existing tick error path logs and retries on the next interval,
-    /// which is acceptable for the rare-supersede workload.
+    /// Earlier (commit `48a10cf`) every worker-side write was routed
+    /// here, including `embedding_jobs` / `transcript_embedding_jobs`
+    /// status updates and `memory_embeddings` upserts. That broke when
+    /// HTTP `accept_pending` issued `delete_embedding_references` (a
+    /// DELETE on the same `embedding_jobs` row a worker tick had just
+    /// UPDATEd via DuckDB's internal DELETE+INSERT). DuckDB's index
+    /// invariant check fired ("Failed to delete all rows from index. Only
+    /// deleted 0 out of 1 rows.") and marked the entire Database
+    /// INVALIDATED, requiring a `mem serve` restart. All shared-table
+    /// worker writes are back on `conn` to avoid the race.
     worker_write_conn: Arc<Mutex<Connection>>,
     /// r2d2 read pool. `Some` by default (post-bench measurement showed
     /// ~9.2× speedup vs single-conn for `fetch_memories_by_ids`); set
@@ -652,7 +654,7 @@ impl DuckDbRepository {
         now: &str,
         max_retries: u32,
     ) -> Result<Option<ClaimedEmbeddingJob>, StorageError> {
-        let mut conn = self.worker_conn()?;
+        let mut conn = self.conn()?;
         let tx = conn.transaction()?;
         let max_r = i64::from(max_retries);
 
@@ -742,7 +744,7 @@ impl DuckDbRepository {
         source_updated_at: &str,
         now: &str,
     ) -> Result<(), StorageError> {
-        let conn = self.worker_conn()?;
+        let conn = self.conn()?;
         conn.execute(
             "delete from memory_embeddings where memory_id = ?1",
             params![memory_id],
@@ -1217,7 +1219,7 @@ impl DuckDbRepository {
         job_id: &str,
         now: &str,
     ) -> Result<(), StorageError> {
-        let conn = self.worker_conn()?;
+        let conn = self.conn()?;
         conn.execute(
             "update embedding_jobs
              set status = 'completed', last_error = null, updated_at = ?1
@@ -1232,7 +1234,7 @@ impl DuckDbRepository {
         job_id: &str,
         now: &str,
     ) -> Result<(), StorageError> {
-        let conn = self.worker_conn()?;
+        let conn = self.conn()?;
         conn.execute(
             "update embedding_jobs set status = 'stale', updated_at = ?1 where job_id = ?2",
             params![now, job_id],
@@ -1248,7 +1250,7 @@ impl DuckDbRepository {
         available_at: &str,
         now: &str,
     ) -> Result<(), StorageError> {
-        let conn = self.worker_conn()?;
+        let conn = self.conn()?;
         conn.execute(
             "update embedding_jobs
              set status = 'failed',
@@ -1269,7 +1271,7 @@ impl DuckDbRepository {
         last_error: &str,
         now: &str,
     ) -> Result<(), StorageError> {
-        let conn = self.worker_conn()?;
+        let conn = self.conn()?;
         conn.execute(
             "update embedding_jobs
              set status = 'failed',
@@ -1293,7 +1295,7 @@ impl DuckDbRepository {
         &self,
         memory_id: &str,
     ) -> Result<usize, StorageError> {
-        let conn = self.worker_conn()?;
+        let conn = self.conn()?;
         let n = conn.execute(
             "delete from embedding_jobs where memory_id = ?1",
             params![memory_id],
@@ -1995,12 +1997,14 @@ impl DuckDbRepository {
             .map_err(|_| StorageError::InvalidData("duckdb connection mutex poisoned"))
     }
 
-    /// Lock the worker-side write connection. Used by embedding worker
-    /// and transcript embedding worker for status updates and vector
-    /// upserts; does not block (and is not blocked by) HTTP write
-    /// traffic on `self.conn`. See struct field doc on
-    /// `worker_write_conn` for the conflict-surface caveat with
-    /// supersede paths.
+    /// Lock the worker-side write connection. Narrow scope: used **only**
+    /// by `upsert_conversation_message_embedding`, the single write path
+    /// against the worker-exclusive `conversation_message_embeddings`
+    /// table. All other worker-side writes that touch tables also written
+    /// by HTTP go through `self.conn` to avoid the index-invariant race
+    /// that bricked the DB in the 2026-05-08 incident. See the
+    /// `worker_write_conn` field doc for full context before adding new
+    /// callers.
     pub(crate) fn worker_conn(&self) -> Result<MutexGuard<'_, Connection>, StorageError> {
         self.worker_write_conn
             .lock()
