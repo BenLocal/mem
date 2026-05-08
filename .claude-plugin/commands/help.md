@@ -8,7 +8,7 @@ Invoke the `mem` skill (using the Skill tool) and present its overview to the us
 1. Where `mem serve` is running (`MEM_BASE_URL`, default `http://127.0.0.1:3000`) and how to start it if it's down.
 2. The most-used MCP tools under `plugin:mem:mem` (`memory_search`, `memory_ingest`, `memory_feedback`, etc.).
 3. The CLI subcommands (`mem serve`, `mem mine`, `mem wake-up`, `mem repair`).
-4. The other slash commands this plugin provides (`/mem:health`, `/mem:search`, `/mem:mine`, `/mem:wake-up`).
+4. The other slash commands this plugin provides (`/mem:health`, `/mem:search`, `/mem:mine`, `/mem:wake-up`, `/mem:summary`).
 5. The verbatim rule and feedback discipline (one signal per used memory, at most).
 
 Keep the output concise — bullet lists, no walls of prose.

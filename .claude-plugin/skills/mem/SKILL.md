@@ -58,6 +58,7 @@ This plugin ships matching commands under `/mem:`:
 - `/mem:search <query>` — invoke `memory_search` and show results
 - `/mem:mine [<transcript_path>]` — mine the current Claude Code transcript (or an explicit path) into memories + archive
 - `/mem:wake-up` — print the wake-up context block
+- `/mem:summary` — one-screen state of the local mem instance (health + pending review + recent + wake-up)
 
 ## Verbatim rule (read before writing memories)
 
