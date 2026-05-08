@@ -27,11 +27,14 @@ use crate::domain::episode::EpisodeRecord;
 use crate::domain::memory::{FeedbackSummary, MemoryRecord, MemoryVersionLink};
 use crate::domain::session::Session;
 use crate::domain::ConversationMessage;
-use crate::storage::{ContextWindow, FeedbackEvent, TranscriptSessionSummary};
+use crate::storage::{
+    ContextWindow, DuckDbGraphStore, FeedbackEvent, GraphError, TranscriptSessionSummary,
+};
 
 use super::duckdb::{
     ClaimedEmbeddingJob, DuckDbRepository, EmbeddingJobInsert, EntityRegistry, StorageError,
 };
+use crate::domain::memory::GraphEdge;
 
 /// Core memory + embedding-job repository surface. See module-level docs.
 #[async_trait]
@@ -315,6 +318,40 @@ pub trait TranscriptRepository: Send + Sync {
         query: &str,
         k: usize,
     ) -> Result<Vec<ConversationMessage>, StorageError>;
+}
+
+/// Graph-edge storage surface — used by `MemoryService` to materialize entity
+/// + topic edges out of memory ingest and to sweep them on supersede /
+/// archive. Backends that don't have a notion of versioned edges can return
+/// empty results from `neighbors`; the service degrades gracefully.
+#[async_trait]
+pub trait GraphStore: Send + Sync {
+    async fn neighbors(&self, node_id: &str) -> Result<Vec<GraphEdge>, GraphError>;
+
+    async fn sync_memory_edges(&self, edges: &[GraphEdge], now: &str) -> Result<(), GraphError>;
+
+    async fn close_edges_for_memory(&self, memory_id: &str) -> Result<usize, GraphError>;
+
+    async fn related_memory_ids(&self, node_ids: &[String]) -> Result<Vec<String>, GraphError>;
+}
+
+#[async_trait]
+impl GraphStore for DuckDbGraphStore {
+    async fn neighbors(&self, node_id: &str) -> Result<Vec<GraphEdge>, GraphError> {
+        DuckDbGraphStore::neighbors(self, node_id).await
+    }
+
+    async fn sync_memory_edges(&self, edges: &[GraphEdge], now: &str) -> Result<(), GraphError> {
+        DuckDbGraphStore::sync_memory_edges(self, edges, now).await
+    }
+
+    async fn close_edges_for_memory(&self, memory_id: &str) -> Result<usize, GraphError> {
+        DuckDbGraphStore::close_edges_for_memory(self, memory_id).await
+    }
+
+    async fn related_memory_ids(&self, node_ids: &[String]) -> Result<Vec<String>, GraphError> {
+        DuckDbGraphStore::related_memory_ids(self, node_ids).await
+    }
 }
 
 /// Combined storage surface: `MemoryRepository` for the core memories +

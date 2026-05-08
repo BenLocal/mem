@@ -26,7 +26,7 @@ use crate::{
     pipeline::{compress, retrieve},
     storage::{
         current_timestamp, DuckDbGraphStore, DuckDbRepository, EmbeddingJobInsert, EntityRegistry,
-        GraphError, Repository, StorageError,
+        GraphError, GraphStore, Repository, StorageError,
     },
 };
 
@@ -64,7 +64,7 @@ pub struct MemoryService {
     /// because `DuckDbGraphStore::new` (constructed alongside) requires
     /// the concrete type — abstracting graph storage is a follow-up.
     repository: Arc<dyn Repository>,
-    graph: Arc<DuckDbGraphStore>,
+    graph: Arc<dyn GraphStore>,
     /// Value stored on `embedding_jobs.provider` (e.g. `fake`, `openai`).
     embedding_job_provider: String,
     /// When set, search runs hybrid lexical + semantic retrieval.
