@@ -5,12 +5,16 @@
 //! `TranscriptRepository`, `EntityRegistry`, `GraphStore` — so all upper
 //! layers (services, HTTP handlers) work against it interchangeably.
 //!
-//! **Status:** real implementations exist for `open()` (creates `memories`
-//! table), `MemoryRepository::insert_memory`, and
-//! `MemoryRepository::get_memory_for_tenant`. Round-trip is end-to-end
-//! verified by `lancedb_insert_and_get_memory_round_trip` in this
-//! module's `#[cfg(test)] mod tests`. All other methods are still
-//! `unimplemented!()` with TODO hints — each future implementation:
+//! **Status:** the read path on the `memories` table is fully working —
+//! `open` creates the table, `insert_memory` writes a row, and 11
+//! filter/lookup methods read back (`get_memory`, `get_memory_for_tenant`,
+//! `get_pending`, `find_by_idempotency_or_hash`, `list_memories_for_tenant`,
+//! `list_memory_ids_for_tenant`, `list_pending_review`, `search_candidates`,
+//! `recent_active_memories`, `fetch_memories_by_ids`). Round-trip is
+//! end-to-end verified by two tests in this module's `#[cfg(test)] mod
+//! tests`. Mutating methods (accept/reject/supersede/apply_feedback) and
+//! all non-`memories`-table methods are still `unimplemented!()` —
+//! each future implementation:
 //!
 //!   1. add `ensure_<table>_table` to `open()` for the table the method touches
 //!   2. extend the `*_to_record_batch` / `record_batch_to_*` helpers
@@ -426,6 +430,38 @@ fn sql_quote(s: &str) -> String {
     format!("'{}'", s.replace('\'', "''"))
 }
 
+impl LanceDbRepository {
+    /// Run a filter query against the `memories` table and parse all
+    /// returned batches into [`MemoryRecord`]s. Shared by every read
+    /// method that just needs a `WHERE`-clause + optional `LIMIT`.
+    async fn query_memories(
+        &self,
+        filter: String,
+        limit: Option<usize>,
+    ) -> Result<Vec<MemoryRecord>, StorageError> {
+        let table = self
+            .conn
+            .open_table("memories")
+            .execute()
+            .await
+            .map_err(lancedb_err)?;
+        let mut q = table.query().only_if(filter);
+        if let Some(l) = limit {
+            q = q.limit(l);
+        }
+        let stream = q.execute().await.map_err(lancedb_err)?;
+        let batches: Vec<RecordBatch> = stream
+            .try_collect()
+            .await
+            .map_err(|e| StorageError::InvalidInput(format!("lancedb stream: {e}")))?;
+        let mut out = Vec::new();
+        for b in &batches {
+            out.extend(record_batch_to_memories(b)?);
+        }
+        Ok(out)
+    }
+}
+
 #[async_trait]
 #[allow(clippy::too_many_arguments)]
 impl MemoryRepository for LanceDbRepository {
@@ -504,8 +540,8 @@ impl MemoryRepository for LanceDbRepository {
         &self,
         tenant: &str,
     ) -> Result<Vec<MemoryRecord>, StorageError> {
-        let _ = tenant;
-        unimplemented!("LanceDb::list_memories_for_tenant — see docs/repository.rs trait def")
+        self.query_memories(format!("tenant = {}", sql_quote(tenant)), None)
+            .await
     }
 
     async fn semantic_search_memories(
@@ -606,8 +642,16 @@ impl MemoryRepository for LanceDbRepository {
         tenant: &str,
         memory_id: &str,
     ) -> Result<Option<MemoryRecord>, StorageError> {
-        let _ = (tenant, memory_id);
-        unimplemented!("LanceDb::get_pending — see docs/repository.rs trait def")
+        let filter = format!(
+            "tenant = {} AND memory_id = {} AND status = 'pending_confirmation'",
+            sql_quote(tenant),
+            sql_quote(memory_id),
+        );
+        Ok(self
+            .query_memories(filter, Some(1))
+            .await?
+            .into_iter()
+            .next())
     }
 
     async fn find_by_idempotency_or_hash(
@@ -616,18 +660,44 @@ impl MemoryRepository for LanceDbRepository {
         idempotency_key: &Option<String>,
         content_hash: &str,
     ) -> Result<Option<MemoryRecord>, StorageError> {
-        let _ = (tenant, idempotency_key, content_hash);
-        unimplemented!("LanceDb::find_by_idempotency_or_hash — see docs/repository.rs trait def")
+        // Match either `idempotency_key` (when caller provided one) OR
+        // `content_hash` — same precedence as DuckDB's variant.
+        let filter = match idempotency_key.as_deref() {
+            Some(k) => format!(
+                "tenant = {} AND (idempotency_key = {} OR content_hash = {})",
+                sql_quote(tenant),
+                sql_quote(k),
+                sql_quote(content_hash),
+            ),
+            None => format!(
+                "tenant = {} AND content_hash = {}",
+                sql_quote(tenant),
+                sql_quote(content_hash),
+            ),
+        };
+        Ok(self
+            .query_memories(filter, Some(1))
+            .await?
+            .into_iter()
+            .next())
     }
 
     async fn list_pending_review(&self, tenant: &str) -> Result<Vec<MemoryRecord>, StorageError> {
-        let _ = tenant;
-        unimplemented!("LanceDb::list_pending_review — see docs/repository.rs trait def")
+        let filter = format!(
+            "tenant = {} AND status = 'pending_confirmation'",
+            sql_quote(tenant),
+        );
+        self.query_memories(filter, None).await
     }
 
     async fn search_candidates(&self, tenant: &str) -> Result<Vec<MemoryRecord>, StorageError> {
-        let _ = tenant;
-        unimplemented!("LanceDb::search_candidates — see docs/repository.rs trait def")
+        // Same live-status filter the DuckDB backend uses
+        // (`pipeline::retrieve` post-filters this set anyway).
+        let filter = format!(
+            "tenant = {} AND status NOT IN ('rejected', 'archived')",
+            sql_quote(tenant),
+        );
+        self.query_memories(filter, None).await
     }
 
     async fn recent_active_memories(
@@ -635,8 +705,16 @@ impl MemoryRepository for LanceDbRepository {
         tenant: &str,
         limit: usize,
     ) -> Result<Vec<MemoryRecord>, StorageError> {
-        let _ = (tenant, limit);
-        unimplemented!("LanceDb::recent_active_memories — see docs/repository.rs trait def")
+        // NOTE: LanceDB's `Query::limit` doesn't guarantee any ordering
+        // without a `Table::create_index` on `updated_at`. For now this
+        // returns _some_ N rows; switching to ordered results requires
+        // an index + `Query::nearest_to` or a sort step. The DuckDB
+        // backend uses `ORDER BY updated_at DESC`.
+        let filter = format!(
+            "tenant = {} AND status NOT IN ('rejected', 'archived')",
+            sql_quote(tenant),
+        );
+        self.query_memories(filter, Some(limit)).await
     }
 
     async fn bm25_candidates(
@@ -658,8 +736,16 @@ impl MemoryRepository for LanceDbRepository {
         tenant: &str,
         ids: &[&str],
     ) -> Result<Vec<MemoryRecord>, StorageError> {
-        let _ = (tenant, ids);
-        unimplemented!("LanceDb::fetch_memories_by_ids — see docs/repository.rs trait def")
+        if ids.is_empty() {
+            return Ok(vec![]);
+        }
+        let id_list: Vec<String> = ids.iter().map(|i| sql_quote(i)).collect();
+        let filter = format!(
+            "tenant = {} AND status NOT IN ('rejected', 'archived') AND memory_id IN ({})",
+            sql_quote(tenant),
+            id_list.join(", "),
+        );
+        self.query_memories(filter, None).await
     }
 
     async fn accept_pending(
@@ -729,8 +815,14 @@ impl MemoryRepository for LanceDbRepository {
     }
 
     async fn get_memory(&self, memory_id: String) -> Result<Option<MemoryRecord>, StorageError> {
-        let _ = memory_id;
-        unimplemented!("LanceDb::get_memory — see docs/repository.rs trait def")
+        // Cross-tenant lookup (admin / version-chain path). DuckDB does the
+        // same — filters only on memory_id.
+        let filter = format!("memory_id = {}", sql_quote(&memory_id));
+        Ok(self
+            .query_memories(filter, Some(1))
+            .await?
+            .into_iter()
+            .next())
     }
 
     async fn insert_episode(&self, episode: EpisodeRecord) -> Result<EpisodeRecord, StorageError> {
@@ -739,8 +831,12 @@ impl MemoryRepository for LanceDbRepository {
     }
 
     async fn list_memory_ids_for_tenant(&self, tenant: &str) -> Result<Vec<String>, StorageError> {
-        let _ = tenant;
-        unimplemented!("LanceDb::list_memory_ids_for_tenant — see docs/repository.rs trait def")
+        Ok(self
+            .query_memories(format!("tenant = {}", sql_quote(tenant)), None)
+            .await?
+            .into_iter()
+            .map(|m| m.memory_id)
+            .collect())
     }
 
     async fn touch_session(
@@ -1097,5 +1193,94 @@ mod tests {
             .await
             .expect("cross-tenant query");
         assert!(wrong_tenant.is_none());
+    }
+
+    /// Exercises the batch-impl filter methods (`list_memories_for_tenant`,
+    /// `list_memory_ids_for_tenant`, `find_by_idempotency_or_hash`,
+    /// `search_candidates`, `recent_active_memories`,
+    /// `fetch_memories_by_ids`, `list_pending_review`, `get_pending`,
+    /// `get_memory`).
+    #[tokio::test]
+    async fn lancedb_filter_methods_round_trip() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("lance.store");
+        let repo = LanceDbRepository::open(&path).await.unwrap();
+
+        let mut a1 = fixture("mem_a_001", "tenant-a");
+        a1.idempotency_key = Some("idem-a-1".into());
+        let mut a2 = fixture("mem_a_002", "tenant-a");
+        a2.status = MemoryStatus::PendingConfirmation;
+        a2.content_hash = "h2".repeat(32);
+        let mut a3 = fixture("mem_a_003", "tenant-a");
+        a3.status = MemoryStatus::Archived;
+        let b1 = fixture("mem_b_001", "tenant-b");
+
+        for m in [&a1, &a2, &a3, &b1] {
+            repo.insert_memory(m.clone()).await.unwrap();
+        }
+
+        // list_memories_for_tenant
+        let a_all = repo.list_memories_for_tenant("tenant-a").await.unwrap();
+        assert_eq!(a_all.len(), 3);
+        let b_all = repo.list_memories_for_tenant("tenant-b").await.unwrap();
+        assert_eq!(b_all.len(), 1);
+
+        // list_memory_ids_for_tenant
+        let mut ids_a = repo.list_memory_ids_for_tenant("tenant-a").await.unwrap();
+        ids_a.sort();
+        assert_eq!(ids_a, vec!["mem_a_001", "mem_a_002", "mem_a_003"]);
+
+        // find_by_idempotency_or_hash — match via idempotency_key
+        let by_idem = repo
+            .find_by_idempotency_or_hash("tenant-a", &Some("idem-a-1".into()), "no-such-hash")
+            .await
+            .unwrap();
+        assert_eq!(by_idem.unwrap().memory_id, "mem_a_001");
+
+        // ... match via content_hash when no idempotency_key supplied
+        let by_hash = repo
+            .find_by_idempotency_or_hash("tenant-a", &None, &a2.content_hash)
+            .await
+            .unwrap();
+        assert_eq!(by_hash.unwrap().memory_id, "mem_a_002");
+
+        // search_candidates — drops `archived`
+        let cands = repo.search_candidates("tenant-a").await.unwrap();
+        let mut cand_ids: Vec<_> = cands.iter().map(|m| m.memory_id.clone()).collect();
+        cand_ids.sort();
+        assert_eq!(cand_ids, vec!["mem_a_001", "mem_a_002"]);
+
+        // recent_active_memories — same filter, with limit
+        let recent = repo.recent_active_memories("tenant-a", 1).await.unwrap();
+        assert_eq!(recent.len(), 1);
+
+        // fetch_memories_by_ids — IN clause
+        let by_ids = repo
+            .fetch_memories_by_ids("tenant-a", &["mem_a_001", "mem_a_002"])
+            .await
+            .unwrap();
+        assert_eq!(by_ids.len(), 2);
+        // Empty input — short-circuit, no query.
+        assert!(repo
+            .fetch_memories_by_ids("tenant-a", &[])
+            .await
+            .unwrap()
+            .is_empty());
+
+        // list_pending_review
+        let pending = repo.list_pending_review("tenant-a").await.unwrap();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].memory_id, "mem_a_002");
+
+        // get_pending — exact one
+        let p = repo.get_pending("tenant-a", "mem_a_002").await.unwrap();
+        assert_eq!(p.unwrap().memory_id, "mem_a_002");
+        // get_pending — wrong status returns None
+        let np = repo.get_pending("tenant-a", "mem_a_001").await.unwrap();
+        assert!(np.is_none());
+
+        // get_memory — cross-tenant (no tenant filter)
+        let cross = repo.get_memory("mem_b_001".into()).await.unwrap();
+        assert_eq!(cross.unwrap().tenant, "tenant-b");
     }
 }
