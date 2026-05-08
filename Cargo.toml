@@ -58,3 +58,11 @@ r2d2 = "0.8"
 
 [dev-dependencies]
 rand = "0.8"
+
+# PoC: probe the Lance DuckDB extension's row-level DML capabilities and
+# Rust-write→DuckDB-read visibility model. Run with:
+#   cargo run --example lance_duckdb_poc --features lancedb
+# Requires network at first run (community extension download).
+[[example]]
+name = "lance_duckdb_poc"
+required-features = ["lancedb"]
