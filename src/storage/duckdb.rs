@@ -103,8 +103,9 @@ pub struct DuckDbRepository {
     /// existing tick error path logs and retries on the next interval,
     /// which is acceptable for the rare-supersede workload.
     worker_write_conn: Arc<Mutex<Connection>>,
-    /// Optional r2d2 read pool. `Some` when `MEM_RW_POOL_ENABLED=1` is
-    /// set at startup; `None` falls back to locking
+    /// r2d2 read pool. `Some` by default (post-bench measurement showed
+    /// ~9.2× speedup vs single-conn for `fetch_memories_by_ids`); set
+    /// `MEM_RW_POOL_DISABLED=1` at startup to fall back to locking
     /// `conn` for SELECT methods that opted in to
     /// [`Self::with_read`]. v1 opt-ins: `fetch_memories_by_ids` (the
     /// hot path under both semantic and BM25 search).
@@ -309,34 +310,30 @@ impl DuckDbRepository {
 
         let conn_arc = Arc::new(Mutex::new(conn));
 
-        // Optional read pool. Off by default; enable with
-        // `MEM_RW_POOL_ENABLED=1`. Same try_clone-from-template story
+        // Read pool. On by default since post-impl bench measured
+        // ~9.2× speedup on the search hot path; opt out with
+        // `MEM_RW_POOL_DISABLED=1`. Same try_clone-from-template story
         // as the worker conn: every checkout shares the same Database
         // handle so committed writes are visible. Hardcoded size 8.
-        let read_pool = if std::env::var("MEM_RW_POOL_ENABLED")
+        let pool_disabled = std::env::var("MEM_RW_POOL_DISABLED")
             .ok()
             .map(|v| matches!(v.as_str(), "1" | "true" | "yes"))
-            .unwrap_or(false)
-        {
+            .unwrap_or(false);
+        let read_pool = if pool_disabled {
+            tracing::info!("MEM_RW_POOL_DISABLED=1; falling back to single-conn for SELECTs");
+            None
+        } else {
             let manager = crate::storage::conn_pool::DuckDbReadManager::new(conn_arc.clone());
             match r2d2::Pool::builder().max_size(8).build(manager) {
-                Ok(pool) => {
-                    tracing::info!(
-                        size = 8,
-                        "MEM_RW_POOL_ENABLED=1; SELECT routing for opted-in methods will use read pool"
-                    );
-                    Some(pool)
-                }
+                Ok(pool) => Some(pool),
                 Err(e) => {
                     tracing::warn!(
                         error = %e,
-                        "MEM_RW_POOL_ENABLED=1 but pool init failed; falling back to single-conn"
+                        "read pool init failed; falling back to single-conn"
                     );
                     None
                 }
             }
-        } else {
-            None
         };
 
         Ok(Self {

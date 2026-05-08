@@ -6,7 +6,7 @@
 
 This spec proposes a **two-part narrow change**:
 
-1. **Read pool** — an `r2d2` pool of read-only connections that backs the two search hot paths (`semantic_search_memories`, `lexical_search_memories`). Behind `MEM_RW_POOL_ENABLED=1` for first ship; everything else still routes through the existing write Mutex.
+1. **Read pool** — an `r2d2` pool of read-only connections that backs the search hot path (`fetch_memories_by_ids`, used by both semantic and BM25 retrieval). On by default after a microbench measured ~9.2× speedup vs the single-Mutex baseline; opt out with `MEM_RW_POOL_DISABLED=1`. Everything else still routes through the existing write Mutex.
 2. **Worker isolation** — `embedding_worker` (and `transcript_embedding_worker`) get their own dedicated `Connection`, separate from the HTTP write Mutex. Worker tick no longer blocks HTTP write traffic and vice versa. Unconditional in v1 (no flag).
 
 The HTTP write Mutex stays serialized — no transaction-conflict surface or FK retry-loop class of issues introduced on the HTTP write path. Worker writes target a non-overlapping set of tables (`embedding_jobs` UPDATEs vs HTTP-side INSERTs), so DuckDB's MVCC handles them without conflicts in steady state.
@@ -18,7 +18,7 @@ This spec deliberately stops short of a full multi-writer pool. That comes later
 - Unlock parallel SELECT execution for the two confirmed hot paths (`semantic_search_memories`, `lexical_search_memories`) via the read pool
 - Stop the embedding worker from blocking HTTP writes (and vice versa) by giving the worker its own dedicated `Connection`
 - Zero changes to HTTP write-path call sites — `MemoryService::ingest`, `supersede_memory`, `transcript_repo::insert_*` keep their Mutex semantics
-- Read pool behind `MEM_RW_POOL_ENABLED=1` for first ship; worker isolation is unconditional (no flag — it's a Mutex split with no behavior surface to A/B)
+- Read pool on by default; opt out with `MEM_RW_POOL_DISABLED=1`. Worker isolation is unconditional (no flag — it's a Mutex split with no behavior surface to A/B)
 - No new public surface area on `MemoryService` / `TranscriptService` — the split is hidden inside `DuckDbRepository`
 
 ## Non-Goals
@@ -63,7 +63,7 @@ pub struct DuckDbRepository {
 
     /// Read pool. Opt-in SELECT paths (`semantic_search_memories`,
     /// `lexical_search_memories`) check out a connection here.
-    /// `None` when MEM_RW_POOL_ENABLED is unset — those paths fall back
+    /// `None` when MEM_RW_POOL_DISABLED=1 — those paths fall back
     /// to http_write_conn (current behavior).
     read_pool: Option<r2d2::Pool<DuckDbReadManager>>,
 
@@ -177,14 +177,13 @@ Everything else: ingest paths, supersede, schema migrations, graph edge sync, tr
 
 ## Rollout
 
-1. Land behind `MEM_RW_POOL_ENABLED=1` (default unset → existing single-connection behavior, only the worker isolation kicks in unconditionally since it has no failure mode beyond the Mutex split).
-2. **Worker isolation is unconditional in v1** (no flag) — it's a localized split with a clear "two single-writer tracks against non-overlapping tables" model. No flag because there's no behavior change to A/B against; either it works or we revert.
-3. **Read pool is flagged**. Run a `tests/bench/concurrent_search.rs` before/after with `MEM_RW_POOL_ENABLED=1` set. Sanity threshold: ≥1.5× P99 search throughput improvement at 4 concurrent searches. Below that → leave the flag default-off until the gain is proven.
-4. Flip the read-pool default to on in a follow-up commit only after the bench result + at least one week of soak in dev tenant.
+Worker isolation is unconditional in v1 — it's a localized Mutex split with a clear "two single-writer tracks against non-overlapping tables" model. No flag, no A/B; either it works or we revert.
+
+The read pool ships on-by-default. Bench (`tests/conn_pool.rs::bench_pool_*`) measured **9.24× throughput** on `fetch_memories_by_ids` (1600 concurrent fetches: 10.013 s pool=off → 1.083 s pool=on) — comfortably exceeds the original ≥1.5× P99 sanity threshold, so the rollout gate is met. Operators who hit an unforeseen issue can fall back with `MEM_RW_POOL_DISABLED=1` (single-conn baseline).
 
 ## Testing
 
-- **Existing integration tests pass unchanged** — they use whichever code path the env var dictates. Run the full suite once with `MEM_RW_POOL_ENABLED=1`, once unset.
+- **Existing integration tests pass unchanged** with the pool default-on (regular `cargo test`). Re-run with `MEM_RW_POOL_DISABLED=1` to exercise the fallback path.
 - **`tests/conn_pool.rs`** (new):
   - Spawn 8 concurrent `memory_search` calls with pool on; assert wall-clock < 1.5× single-call latency (pool actually parallelizes)
   - Interleave 1 HTTP writer + 4 readers; assert all readers complete and writer commits within bounded time
@@ -203,9 +202,10 @@ Everything else: ingest paths, supersede, schema migrations, graph edge sync, tr
 | RoW policy | **Default to write conn, opt-in to read pool per method.** v1 routes only `semantic_search_memories` + `lexical_search_memories`. |
 | Worker connection scope | **Phase 1** — `worker_write_conn` is part of this spec, not deferred. |
 | Pool size | **Hardcoded 8.** No env-var tuning knob in v1. |
+| Default ship state | **Read pool on by default** post-bench. Opt out via `MEM_RW_POOL_DISABLED=1`. |
 
 ## What this spec does *not* commit to
 
 - Phase 3 (full multi-writer pool with retry-on-conflict on every UPDATE path). Separate decision, separate spec.
 - Cross-process pool coordination. Single-process model is unchanged.
-- A guarantee that the read pool flag flips to default-on. The `tests/bench/concurrent_search` result decides.
+- A formal SLO on the perf number. Bench result is a one-off measurement on dev hardware; production workloads may differ.

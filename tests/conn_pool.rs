@@ -1,12 +1,12 @@
-//! Integration tests for the `MEM_RW_POOL_ENABLED=1` r2d2 read pool
-//! routing on `fetch_memories_by_ids`.
+//! Integration tests for the r2d2 read pool routing on
+//! `fetch_memories_by_ids`. The pool is on by default; opt out with
+//! `MEM_RW_POOL_DISABLED=1`.
 //!
 //! These verify functional correctness under concurrent reads: the
 //! pool actually parallelizes (no deadlock), and every concurrent
 //! caller sees the same correct row set. The perf-improvement
-//! threshold from the spec (≥1.5× P99 throughput) is *not* asserted
-//! here — CI variance makes that flaky; the rollout gate that flips
-//! the pool default-on lives in a separate bench.
+//! threshold (≥1.5× P99 throughput) is *not* asserted here — CI
+//! variance makes that flaky; see `bench_pool_*` for measured numbers.
 
 use mem::{
     config::{EmbeddingProviderKind, EmbeddingSettings},
@@ -47,20 +47,14 @@ fn ingest_request(tenant: &str, content: &str) -> IngestMemoryRequest {
     }
 }
 
-/// 8 concurrent `fetch_memories_by_ids` calls against an
-/// `MEM_RW_POOL_ENABLED=1` repo all return the same correct row set
-/// without deadlocking.
-///
-/// We `set_var` *before* `DuckDbRepository::open` so the pool is built
-/// during construction. The whole test is one `#[tokio::test]` to
-/// keep env-var lifetime contained — there's no other test in this
-/// file that could observe the flag flip.
+/// 8 concurrent `fetch_memories_by_ids` calls against the
+/// default-on read pool all return the same correct row set without
+/// deadlocking.
 #[tokio::test]
-async fn pool_enabled_serves_concurrent_fetches() {
-    // SAFETY: integration test binary is single-process; no other test
-    // observes this env var since this file has only one test.
+async fn pool_default_on_serves_concurrent_fetches() {
+    // Defensive: clear any opt-out flag a sibling test may have set.
     unsafe {
-        std::env::set_var("MEM_RW_POOL_ENABLED", "1");
+        std::env::remove_var("MEM_RW_POOL_DISABLED");
     }
 
     let dir = tempdir().unwrap();
@@ -104,22 +98,15 @@ async fn pool_enabled_serves_concurrent_fetches() {
             "every concurrent fetch should hydrate all 24 seeded memories"
         );
     }
-
-    unsafe {
-        std::env::remove_var("MEM_RW_POOL_ENABLED");
-    }
 }
 
-/// Same fan-out without the flag set — exercises the fallback path
-/// where `with_read` locks `self.conn` instead of checking out a pool
+/// `MEM_RW_POOL_DISABLED=1` exercises the fallback path where
+/// `with_read` locks `self.conn` instead of checking out a pool
 /// connection. Same correctness expectation.
 #[tokio::test]
 async fn pool_disabled_falls_back_to_http_write_conn() {
-    // Defensive: clear the var even if a parallel test set it
-    // (Cargo runs each integration test file in its own process so
-    // this is belt-and-braces).
     unsafe {
-        std::env::remove_var("MEM_RW_POOL_ENABLED");
+        std::env::set_var("MEM_RW_POOL_DISABLED", "1");
     }
 
     let dir = tempdir().unwrap();
@@ -144,15 +131,19 @@ async fn pool_disabled_falls_back_to_http_write_conn() {
         .await
         .expect("fetch_memories_by_ids");
     assert_eq!(rows.len(), 8);
+
+    unsafe {
+        std::env::remove_var("MEM_RW_POOL_DISABLED");
+    }
 }
 
 /// Microbench: time N×K concurrent `fetch_memories_by_ids` calls.
 /// Marked `#[ignore]` so regular `cargo test` skips it; run explicitly:
 ///
 /// ```text
-///     cargo test --release --test conn_pool bench_pool_off -- --ignored --nocapture
-///     MEM_RW_POOL_ENABLED=1 \
-///         cargo test --release --test conn_pool bench_pool_on -- --ignored --nocapture
+///     MEM_RW_POOL_DISABLED=1 \
+///         cargo test --release --test conn_pool bench_pool_off -- --ignored --nocapture
+///     cargo test --release --test conn_pool bench_pool_on -- --ignored --nocapture
 /// ```
 ///
 /// Compare the printed `fetches/sec` numbers to see the actual perf
@@ -212,19 +203,19 @@ async fn bench_inner(label: &str) {
 #[ignore]
 async fn bench_pool_off() {
     unsafe {
-        std::env::remove_var("MEM_RW_POOL_ENABLED");
+        std::env::set_var("MEM_RW_POOL_DISABLED", "1");
     }
     bench_inner("pool=off").await;
+    unsafe {
+        std::env::remove_var("MEM_RW_POOL_DISABLED");
+    }
 }
 
 #[tokio::test(flavor = "multi_thread")]
 #[ignore]
 async fn bench_pool_on() {
     unsafe {
-        std::env::set_var("MEM_RW_POOL_ENABLED", "1");
+        std::env::remove_var("MEM_RW_POOL_DISABLED");
     }
     bench_inner("pool=on").await;
-    unsafe {
-        std::env::remove_var("MEM_RW_POOL_ENABLED");
-    }
 }
