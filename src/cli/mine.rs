@@ -7,13 +7,17 @@ use std::fs::File;
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 
+// Only the explicit `<mem-save>...</mem-save>` tag triggers extraction.
+//
+// Earlier (pre-2026-05-08) the extractor also matched prose cues like
+// `重要：` / `Important:` / `我会记住：` / `Key insight:` / `关键发现：` /
+// `I'll remember:`. Those produced too many false positives in agent
+// transcripts that *discussed* the cues — e.g. "提取器只认 `<mem-save>` /
+// `重要：` 等显式 cue" matched its own meta-mention and saved the trailing
+// text as a memory (`mem_019e061e-...`, archived). Agents that want to
+// persist a fact must use `<mem-save>...</mem-save>` (or call
+// `memory_ingest` directly via MCP).
 static TAG_RE: Lazy<Regex> = Lazy::new(|| Regex::new(r"<mem-save>(.*?)</mem-save>").unwrap());
-static PATTERN_RES: Lazy<Vec<Regex>> = Lazy::new(|| {
-    vec![
-        Regex::new(r"(?:我会记住：|关键发现：|重要：)(.+?)(?:\n|$)").unwrap(),
-        Regex::new(r"(?:I'll remember:|Key insight:|Important:)(.+?)(?:\n|$)").unwrap(),
-    ]
-});
 
 #[derive(Debug, Args)]
 pub struct MineArgs {
@@ -237,19 +241,8 @@ fn extract_tool_result_content(value: &Value) -> String {
 }
 
 fn extract_memory(text: &str) -> Option<String> {
-    let candidate = if let Some(cap) = TAG_RE.captures(text) {
-        cap[1].trim().to_string()
-    } else {
-        let mut found: Option<String> = None;
-        for re in PATTERN_RES.iter() {
-            if let Some(cap) = re.captures(text) {
-                found = Some(cap[1].trim().to_string());
-                break;
-            }
-        }
-        found?
-    };
-
+    let cap = TAG_RE.captures(text)?;
+    let candidate = cap[1].trim().to_string();
     if looks_like_real_memory(&candidate) {
         Some(candidate)
     } else {
@@ -429,17 +422,13 @@ mod extract_tests {
     }
 
     #[test]
-    fn keeps_pattern_match() {
-        let s = "I'll remember: use bun for fast installs";
-        assert_eq!(
-            extract_memory(s).as_deref(),
-            Some("use bun for fast installs")
-        );
-    }
-
-    #[test]
-    fn rejects_pattern_match_too_short() {
-        let s = "I'll remember: ok";
-        assert!(extract_memory(s).is_none());
+    fn rejects_prose_cue_outside_mem_save_tag() {
+        // Prose cues like "I'll remember:" / "重要：" used to also trigger
+        // extraction; that path was removed after a recursive false-
+        // positive bug (`mem_019e061e-...`). Ensure we don't regress.
+        assert!(extract_memory("I'll remember: use bun for fast installs").is_none());
+        assert!(extract_memory("重要：用 tokio 而不是 std::thread").is_none());
+        assert!(extract_memory("Key insight: this matters").is_none());
+        assert!(extract_memory("我会记住：保持简单").is_none());
     }
 }
