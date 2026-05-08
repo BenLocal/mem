@@ -17,8 +17,10 @@ lancedb = ["dep:lancedb", "dep:arrow-array", "dep:arrow-schema"]
 
 [dependencies]
 lancedb = { version = "0.27", optional = true }
-arrow-array = { version = "58", optional = true }
-arrow-schema = { version = "58", optional = true }
+# arrow-* versions must match lancedb 0.27's pinned 57.x to avoid the
+# "two different `arrow_schema::Schema` types in the dep graph" build error.
+arrow-array = { version = "57", optional = true }
+arrow-schema = { version = "57", optional = true }
 anyhow = "1"
 async-trait = "0.1"
 axum = "0.8"

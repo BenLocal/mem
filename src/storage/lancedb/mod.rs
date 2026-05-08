@@ -38,6 +38,7 @@
 use std::path::Path;
 use std::sync::Arc;
 
+use arrow_schema::{DataType, Field, Schema};
 use async_trait::async_trait;
 use lancedb::Connection;
 
@@ -72,16 +73,89 @@ pub struct LanceDbRepository {
 impl LanceDbRepository {
     /// Open (or create) a LanceDB store at the given path.
     ///
-    /// **Not implemented:** creating the per-table schemas (memories,
-    /// embedding_jobs, etc.) is the first real method that needs writing.
+    /// Connects, then idempotently creates all backend tables. Currently
+    /// only the `memories` table schema is defined; remaining tables get
+    /// added as their corresponding trait methods become non-stub.
     pub async fn open(path: impl AsRef<Path>) -> Result<Self, StorageError> {
-        let _ = path;
-        unimplemented!(
-            "LanceDb::open — connect via lancedb::connect(path).execute().await, then \
-             ensure all 12 schema tables exist (create_empty_table) per the schema \
-             mapping in this module's doc comment"
-        )
+        let path = path.as_ref();
+        let uri = path
+            .to_str()
+            .ok_or(StorageError::InvalidData("lancedb path must be UTF-8"))?;
+
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+
+        let conn = lancedb::connect(uri).execute().await.map_err(lancedb_err)?;
+
+        ensure_memories_table(&conn).await?;
+        // TODO: ensure_embedding_jobs_table, ensure_memory_embeddings_table,
+        // ensure_conversation_messages_table, ensure_*…
+        // (10 more tables — add as the corresponding trait methods leave
+        //  unimplemented!() state).
+
+        Ok(Self {
+            conn: Arc::new(conn),
+        })
     }
+}
+
+/// Map a `lancedb::Error` into our generic [`StorageError`]. We lose the
+/// rich variant info but the upper layers don't care — they only branch
+/// on `NotFound` vs everything-else.
+fn lancedb_err(e: lancedb::Error) -> StorageError {
+    StorageError::InvalidInput(format!("lancedb: {e}"))
+}
+
+/// Arrow schema for the `memories` LanceDB table. One column per
+/// [`MemoryRecord`] field; enums (`memory_type`, `status`, `scope`,
+/// `visibility`) are stored as their `serde` snake_case representation
+/// for symmetry with the JSON-string encoding the DuckDB backend uses
+/// in its `text` columns.
+fn memories_schema() -> Schema {
+    let str_list = DataType::List(Arc::new(Field::new("item", DataType::Utf8, true)));
+    Schema::new(vec![
+        Field::new("memory_id", DataType::Utf8, false),
+        Field::new("tenant", DataType::Utf8, false),
+        Field::new("memory_type", DataType::Utf8, false),
+        Field::new("status", DataType::Utf8, false),
+        Field::new("scope", DataType::Utf8, false),
+        Field::new("visibility", DataType::Utf8, false),
+        Field::new("version", DataType::UInt64, false),
+        Field::new("summary", DataType::Utf8, false),
+        Field::new("content", DataType::Utf8, false),
+        Field::new("evidence", str_list.clone(), false),
+        Field::new("code_refs", str_list.clone(), false),
+        Field::new("project", DataType::Utf8, true),
+        Field::new("repo", DataType::Utf8, true),
+        Field::new("module", DataType::Utf8, true),
+        Field::new("task_type", DataType::Utf8, true),
+        Field::new("tags", str_list.clone(), false),
+        Field::new("topics", str_list, false),
+        Field::new("confidence", DataType::Float32, false),
+        Field::new("decay_score", DataType::Float32, false),
+        Field::new("content_hash", DataType::Utf8, false),
+        Field::new("idempotency_key", DataType::Utf8, true),
+        Field::new("session_id", DataType::Utf8, true),
+        Field::new("supersedes_memory_id", DataType::Utf8, true),
+        Field::new("source_agent", DataType::Utf8, false),
+        Field::new("created_at", DataType::Utf8, false),
+        Field::new("updated_at", DataType::Utf8, false),
+        Field::new("last_validated_at", DataType::Utf8, true),
+    ])
+}
+
+async fn ensure_memories_table(conn: &Connection) -> Result<(), StorageError> {
+    let names = conn.table_names().execute().await.map_err(lancedb_err)?;
+    if names.iter().any(|n| n == "memories") {
+        return Ok(());
+    }
+    let schema = Arc::new(memories_schema());
+    conn.create_empty_table("memories", schema)
+        .execute()
+        .await
+        .map_err(lancedb_err)?;
+    Ok(())
 }
 
 #[async_trait]
@@ -269,8 +343,9 @@ impl MemoryRepository for LanceDbRepository {
     ) -> Result<Vec<MemoryRecord>, StorageError> {
         let _ = (tenant, query, k);
         unimplemented!(
-            "LanceDb::bm25_candidates — LanceDB has no native BM25; either run Tantivy \
-             alongside (same as DuckDB) or use vector_search() as a substitute"
+            "LanceDb::bm25_candidates — use LanceDB native FTS: \
+             create_index([\"content\"], Index::FTS(FtsIndexBuilder::default())) on the \
+             `memories` table at open(), then query via Table::query().full_text_search(query)"
         )
     }
 
@@ -544,7 +619,10 @@ impl TranscriptRepository for LanceDbRepository {
         k: usize,
     ) -> Result<Vec<ConversationMessage>, StorageError> {
         let _ = (tenant, query, k);
-        unimplemented!("LanceDb::bm25_transcript_candidates — see docs/repository.rs trait def")
+        unimplemented!(
+            "LanceDb::bm25_transcript_candidates — LanceDB native FTS over \
+             `conversation_messages.content`. Same pattern as bm25_candidates."
+        )
     }
 }
 
