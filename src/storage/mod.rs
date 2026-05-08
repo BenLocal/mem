@@ -11,7 +11,7 @@ pub use duckdb::{
     DuckDbRepository, EmbeddingJobInsert, EntityRegistry, FeedbackEvent, GraphError,
     TranscriptSessionSummary,
 };
-pub use repository::{MemoryRepository, Repository};
+pub use repository::{MemoryRepository, Repository, TranscriptRepository};
 pub use time::{current_timestamp, timestamp_add_ms};
 pub use vector_index::{
     sidecar_paths, transcript_sidecar_paths, EmbeddingRowSource, TranscriptEmbeddingRowSource,

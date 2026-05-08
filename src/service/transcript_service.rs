@@ -20,7 +20,9 @@ use crate::embedding::EmbeddingProvider;
 use crate::pipeline::transcript_recall::{
     merge_windows, score_candidates, MergedWindow, PrimaryWithContext, ScoringOpts,
 };
-use crate::storage::{ContextWindow, DuckDbRepository, StorageError, VectorIndex};
+use crate::storage::{
+    ContextWindow, DuckDbRepository, StorageError, TranscriptRepository, VectorIndex,
+};
 
 /// Optional filters layered on top of the candidate set returned by
 /// scoring. All fields are AND-ed.
@@ -56,7 +58,10 @@ pub struct TranscriptSearchResult {
 
 #[derive(Clone)]
 pub struct TranscriptService {
-    repo: DuckDbRepository,
+    /// Storage backend, accessed through the [`TranscriptRepository`] trait —
+    /// portable across DuckDB / future LanceDB / Milvus backends. Concrete
+    /// `DuckDbRepository` is wrapped at the constructor.
+    repo: Arc<dyn TranscriptRepository + Send + Sync>,
     index: Arc<VectorIndex>,
     provider: Option<Arc<dyn EmbeddingProvider>>,
 }
@@ -68,7 +73,7 @@ impl TranscriptService {
         provider: Option<Arc<dyn EmbeddingProvider>>,
     ) -> Self {
         Self {
-            repo,
+            repo: Arc::new(repo),
             index,
             provider,
         }

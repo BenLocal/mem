@@ -26,7 +26,8 @@ use crate::domain::embeddings::EmbeddingJobInfo;
 use crate::domain::episode::EpisodeRecord;
 use crate::domain::memory::{FeedbackSummary, MemoryRecord, MemoryVersionLink};
 use crate::domain::session::Session;
-use crate::storage::FeedbackEvent;
+use crate::domain::ConversationMessage;
+use crate::storage::{ContextWindow, FeedbackEvent, TranscriptSessionSummary};
 
 use super::duckdb::{
     ClaimedEmbeddingJob, DuckDbRepository, EmbeddingJobInsert, EntityRegistry, StorageError,
@@ -248,6 +249,74 @@ pub trait MemoryRepository: Send + Sync {
     ) -> Result<Option<String>, StorageError>;
 }
 
+/// Transcript-archive surface — the parallel pipeline alongside `memories`
+/// (one row per Claude Code transcript block). Used by `TranscriptService`
+/// and the `POST /transcripts/*` HTTP routes.
+#[async_trait]
+pub trait TranscriptRepository: Send + Sync {
+    async fn create_conversation_message(
+        &self,
+        msg: &ConversationMessage,
+    ) -> Result<(), StorageError>;
+
+    async fn get_conversation_messages_by_session(
+        &self,
+        tenant: &str,
+        session_id: &str,
+    ) -> Result<Vec<ConversationMessage>, StorageError>;
+
+    #[allow(clippy::too_many_arguments)]
+    async fn get_conversation_messages_by_session_paged(
+        &self,
+        tenant: &str,
+        session_id: &str,
+        since: Option<&str>,
+        until: Option<&str>,
+        cursor: Option<(&str, i64, i64)>,
+        limit: usize,
+    ) -> Result<(Vec<ConversationMessage>, bool), StorageError>;
+
+    async fn list_transcript_sessions(
+        &self,
+        tenant: &str,
+    ) -> Result<Vec<TranscriptSessionSummary>, StorageError>;
+
+    async fn fetch_conversation_messages_by_ids(
+        &self,
+        tenant: &str,
+        ids: &[String],
+    ) -> Result<Vec<ConversationMessage>, StorageError>;
+
+    async fn context_window_for_block(
+        &self,
+        tenant: &str,
+        primary_id: &str,
+        k_before: usize,
+        k_after: usize,
+        include_tool_blocks: bool,
+    ) -> Result<ContextWindow, StorageError>;
+
+    async fn anchor_session_candidates(
+        &self,
+        tenant: &str,
+        session_id: &str,
+        k: usize,
+    ) -> Result<Vec<String>, StorageError>;
+
+    async fn recent_conversation_messages(
+        &self,
+        tenant: &str,
+        limit: usize,
+    ) -> Result<Vec<ConversationMessage>, StorageError>;
+
+    async fn bm25_transcript_candidates(
+        &self,
+        tenant: &str,
+        query: &str,
+        k: usize,
+    ) -> Result<Vec<ConversationMessage>, StorageError>;
+}
+
 /// Combined storage surface: `MemoryRepository` for the core memories +
 /// embedding-jobs surface, plus `EntityRegistry` for the alias-canonicalization
 /// path used by `MemoryService::ingest`. Bundling them here lets services
@@ -261,15 +330,21 @@ pub trait MemoryRepository: Send + Sync {
 ///
 /// Backends that implement both traits get `Repository` for free via the
 /// blanket impl below.
-pub trait Repository: MemoryRepository + EntityRegistry + Send + Sync {
+pub trait Repository:
+    MemoryRepository + EntityRegistry + TranscriptRepository + Send + Sync
+{
     fn as_entity_registry(&self) -> &dyn EntityRegistry;
+    fn as_transcript_repository(&self) -> &dyn TranscriptRepository;
 }
 
 impl<T> Repository for T
 where
-    T: MemoryRepository + EntityRegistry + Send + Sync + 'static,
+    T: MemoryRepository + EntityRegistry + TranscriptRepository + Send + Sync + 'static,
 {
     fn as_entity_registry(&self) -> &dyn EntityRegistry {
+        self
+    }
+    fn as_transcript_repository(&self) -> &dyn TranscriptRepository {
         self
     }
 }
@@ -613,5 +688,98 @@ impl MemoryRepository for DuckDbRepository {
             target_content_hash,
         )
         .await
+    }
+}
+
+#[async_trait]
+impl TranscriptRepository for DuckDbRepository {
+    async fn create_conversation_message(
+        &self,
+        msg: &ConversationMessage,
+    ) -> Result<(), StorageError> {
+        DuckDbRepository::create_conversation_message(self, msg).await
+    }
+
+    async fn get_conversation_messages_by_session(
+        &self,
+        tenant: &str,
+        session_id: &str,
+    ) -> Result<Vec<ConversationMessage>, StorageError> {
+        DuckDbRepository::get_conversation_messages_by_session(self, tenant, session_id).await
+    }
+
+    async fn get_conversation_messages_by_session_paged(
+        &self,
+        tenant: &str,
+        session_id: &str,
+        since: Option<&str>,
+        until: Option<&str>,
+        cursor: Option<(&str, i64, i64)>,
+        limit: usize,
+    ) -> Result<(Vec<ConversationMessage>, bool), StorageError> {
+        DuckDbRepository::get_conversation_messages_by_session_paged(
+            self, tenant, session_id, since, until, cursor, limit,
+        )
+        .await
+    }
+
+    async fn list_transcript_sessions(
+        &self,
+        tenant: &str,
+    ) -> Result<Vec<TranscriptSessionSummary>, StorageError> {
+        DuckDbRepository::list_transcript_sessions(self, tenant).await
+    }
+
+    async fn fetch_conversation_messages_by_ids(
+        &self,
+        tenant: &str,
+        ids: &[String],
+    ) -> Result<Vec<ConversationMessage>, StorageError> {
+        DuckDbRepository::fetch_conversation_messages_by_ids(self, tenant, ids).await
+    }
+
+    async fn context_window_for_block(
+        &self,
+        tenant: &str,
+        primary_id: &str,
+        k_before: usize,
+        k_after: usize,
+        include_tool_blocks: bool,
+    ) -> Result<ContextWindow, StorageError> {
+        DuckDbRepository::context_window_for_block(
+            self,
+            tenant,
+            primary_id,
+            k_before,
+            k_after,
+            include_tool_blocks,
+        )
+        .await
+    }
+
+    async fn anchor_session_candidates(
+        &self,
+        tenant: &str,
+        session_id: &str,
+        k: usize,
+    ) -> Result<Vec<String>, StorageError> {
+        DuckDbRepository::anchor_session_candidates(self, tenant, session_id, k).await
+    }
+
+    async fn recent_conversation_messages(
+        &self,
+        tenant: &str,
+        limit: usize,
+    ) -> Result<Vec<ConversationMessage>, StorageError> {
+        DuckDbRepository::recent_conversation_messages(self, tenant, limit).await
+    }
+
+    async fn bm25_transcript_candidates(
+        &self,
+        tenant: &str,
+        query: &str,
+        k: usize,
+    ) -> Result<Vec<ConversationMessage>, StorageError> {
+        DuckDbRepository::bm25_transcript_candidates(self, tenant, query, k).await
     }
 }
