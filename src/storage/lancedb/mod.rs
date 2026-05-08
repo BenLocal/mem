@@ -4180,6 +4180,7 @@ mod tests {
         assert_eq!(all_b[0].entity_id, id3);
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn msg(
         id: &str,
         tenant: &str,
