@@ -54,7 +54,10 @@ use std::path::Path;
 use std::sync::Arc;
 
 use arrow_array::{
-    builder::{Float32Builder, ListBuilder, StringBuilder, UInt64Builder},
+    builder::{
+        FixedSizeListBuilder, Float32Builder, Int64Builder, ListBuilder, StringBuilder,
+        UInt64Builder,
+    },
     Array, Float32Array, ListArray, RecordBatch, StringArray, UInt64Array,
 };
 use async_trait::async_trait;
@@ -62,7 +65,7 @@ use futures::TryStreamExt;
 use lancedb::arrow::arrow_schema::{DataType, Field, Schema};
 use lancedb::embeddings::{EmbeddingFunction, EmbeddingRegistry, MemoryRegistry};
 use lancedb::query::{ExecutableQuery, QueryBase};
-use lancedb::Connection;
+use lancedb::{Connection, DistanceType};
 use serde::{de::DeserializeOwned, Serialize};
 
 mod embedding;
@@ -215,6 +218,17 @@ async fn ensure_feedback_events_table(conn: &Connection) -> Result<(), StorageEr
     ensure_table(conn, "feedback_events", feedback_events_schema()).await
 }
 
+/// Idempotently create the `memory_embeddings` table with `dim`-sized
+/// vectors. Lazy-created on first `upsert_memory_embedding` because dim
+/// is provider-dependent and not known at `LanceDbRepository::open()`
+/// time. If the table already exists with a different dim, subsequent
+/// `Table::add` calls fail with a schema mismatch error — that's
+/// surfaced as the original `lancedb::Error` and is the right behavior
+/// (mixing dims would break vector search regardless).
+async fn ensure_memory_embeddings_table(conn: &Connection, dim: i32) -> Result<(), StorageError> {
+    ensure_table(conn, "memory_embeddings", memory_embeddings_schema(dim)).await
+}
+
 /// Idempotent `create_empty_table` — checks `Connection::table_names()`
 /// first and skips the create call if the table already exists.
 async fn ensure_table(conn: &Connection, name: &str, schema: Schema) -> Result<(), StorageError> {
@@ -292,6 +306,102 @@ fn record_batch_to_feedback_events(
         });
     }
     Ok(out)
+}
+
+/// Arrow schema for the `memory_embeddings` LanceDB table. The vector
+/// column is `FixedSizeList<Float32, dim>` because LanceDB's ANN index
+/// requires a known fixed dimension; `dim` comes from the upserting
+/// caller (which knows the embedding model's output size).
+fn memory_embeddings_schema(dim: i32) -> Schema {
+    Schema::new(vec![
+        Field::new("memory_id", DataType::Utf8, false),
+        Field::new("tenant", DataType::Utf8, false),
+        Field::new("embedding_model", DataType::Utf8, false),
+        Field::new("embedding_dim", DataType::Int64, false),
+        Field::new(
+            "embedding",
+            DataType::FixedSizeList(Arc::new(Field::new("item", DataType::Float32, true)), dim),
+            false,
+        ),
+        Field::new("content_hash", DataType::Utf8, false),
+        Field::new("source_updated_at", DataType::Utf8, false),
+        Field::new("created_at", DataType::Utf8, false),
+        Field::new("updated_at", DataType::Utf8, false),
+    ])
+}
+
+/// Decode a native-endian `[f32]` blob into a `Vec<f32>` of length
+/// `expected_dim`. Mirrors the DuckDB backend's
+/// `f32::from_ne_bytes`-chunking — every embedding row in mem (DuckDB or
+/// LanceDB) ultimately came from the same `EmbeddingProvider`, which
+/// produces native-endian f32 bytes.
+fn decode_embedding_blob(blob: &[u8], expected_dim: usize) -> Result<Vec<f32>, StorageError> {
+    if blob.len() != expected_dim * 4 {
+        return Err(StorageError::InvalidData(
+            "embedding blob length mismatch (expected dim * 4 bytes)",
+        ));
+    }
+    let mut out = Vec::with_capacity(expected_dim);
+    for chunk in blob.chunks_exact(4) {
+        out.push(f32::from_ne_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]));
+    }
+    Ok(out)
+}
+
+/// Build a one-row `RecordBatch` for `memory_embeddings`. `embedding`
+/// must already be the decoded `Vec<f32>` of length `dim`.
+#[allow(clippy::too_many_arguments)]
+fn memory_embedding_to_record_batch(
+    memory_id: &str,
+    tenant: &str,
+    embedding_model: &str,
+    embedding_dim: i64,
+    embedding: &[f32],
+    content_hash: &str,
+    source_updated_at: &str,
+    now: &str,
+) -> Result<RecordBatch, StorageError> {
+    let dim = i32::try_from(embedding.len()).map_err(|_| {
+        StorageError::InvalidData("embedding dim does not fit in i32 for FixedSizeList")
+    })?;
+
+    let mut memory_id_b = StringBuilder::new();
+    let mut tenant_b = StringBuilder::new();
+    let mut model_b = StringBuilder::new();
+    let mut dim_b = Int64Builder::new();
+    let mut hash_b = StringBuilder::new();
+    let mut src_ts_b = StringBuilder::new();
+    let mut created_b = StringBuilder::new();
+    let mut updated_b = StringBuilder::new();
+    memory_id_b.append_value(memory_id);
+    tenant_b.append_value(tenant);
+    model_b.append_value(embedding_model);
+    dim_b.append_value(embedding_dim);
+    hash_b.append_value(content_hash);
+    src_ts_b.append_value(source_updated_at);
+    created_b.append_value(now);
+    updated_b.append_value(now);
+
+    let mut emb_b = FixedSizeListBuilder::with_capacity(Float32Builder::new(), dim, 1);
+    for v in embedding {
+        emb_b.values().append_value(*v);
+    }
+    emb_b.append(true);
+
+    let schema = Arc::new(memory_embeddings_schema(dim));
+    let columns: Vec<Arc<dyn Array>> = vec![
+        Arc::new(memory_id_b.finish()),
+        Arc::new(tenant_b.finish()),
+        Arc::new(model_b.finish()),
+        Arc::new(dim_b.finish()),
+        Arc::new(emb_b.finish()),
+        Arc::new(hash_b.finish()),
+        Arc::new(src_ts_b.finish()),
+        Arc::new(created_b.finish()),
+        Arc::new(updated_b.finish()),
+    ];
+    RecordBatch::try_new(schema, columns)
+        .map_err(|e| StorageError::InvalidInput(format!("memory_embedding record batch: {e}")))
 }
 
 /// Mirror of DuckDB's private `feedback_adjustments` helper. Resolves a
@@ -700,22 +810,61 @@ impl MemoryRepository for LanceDbRepository {
         source_updated_at: &str,
         now: &str,
     ) -> Result<(), StorageError> {
-        let _ = (
+        let dim_i32 = i32::try_from(embedding_dim)
+            .map_err(|_| StorageError::InvalidData("embedding_dim does not fit in i32"))?;
+        let vector = decode_embedding_blob(embedding_blob, embedding_dim as usize)?;
+
+        ensure_memory_embeddings_table(&self.conn, dim_i32).await?;
+
+        let table = self
+            .conn
+            .open_table("memory_embeddings")
+            .execute()
+            .await
+            .map_err(lancedb_err)?;
+        // upsert = delete-then-insert. LanceDB has no PK enforcement so
+        // we sweep any existing row for this memory_id first.
+        table
+            .delete(&format!("memory_id = {}", sql_quote(memory_id)))
+            .await
+            .map_err(lancedb_err)?;
+        let batch = memory_embedding_to_record_batch(
             memory_id,
             tenant,
             embedding_model,
             embedding_dim,
-            embedding_blob,
+            &vector,
             content_hash,
             source_updated_at,
             now,
-        );
-        unimplemented!("LanceDb::upsert_memory_embedding — see docs/repository.rs trait def")
+        )?;
+        table.add(batch).execute().await.map_err(lancedb_err)?;
+        Ok(())
     }
 
     async fn delete_memory_embedding(&self, memory_id: &str) -> Result<(), StorageError> {
-        let _ = memory_id;
-        unimplemented!("LanceDb::delete_memory_embedding — see docs/repository.rs trait def")
+        // No-op if the table doesn't exist yet (semantic search hasn't
+        // been used; nothing to delete).
+        let names = self
+            .conn
+            .table_names()
+            .execute()
+            .await
+            .map_err(lancedb_err)?;
+        if !names.iter().any(|n| n == "memory_embeddings") {
+            return Ok(());
+        }
+        let table = self
+            .conn
+            .open_table("memory_embeddings")
+            .execute()
+            .await
+            .map_err(lancedb_err)?;
+        table
+            .delete(&format!("memory_id = {}", sql_quote(memory_id)))
+            .await
+            .map_err(lancedb_err)?;
+        Ok(())
     }
 
     async fn list_memories_for_tenant(
@@ -732,10 +881,92 @@ impl MemoryRepository for LanceDbRepository {
         query_embedding: &[f32],
         limit: usize,
     ) -> Result<Vec<(MemoryRecord, f32)>, StorageError> {
-        let _ = (tenant, query_embedding, limit);
-        unimplemented!(
-            "LanceDb::semantic_search_memories — use Table::vector_search().column(\"embedding\").limit(limit).execute()"
-        )
+        if query_embedding.is_empty() || limit == 0 {
+            return Ok(vec![]);
+        }
+        // No embeddings written yet → empty result (matches DuckDB
+        // legacy linear-scan behavior on an empty memory_embeddings).
+        let names = self
+            .conn
+            .table_names()
+            .execute()
+            .await
+            .map_err(lancedb_err)?;
+        if !names.iter().any(|n| n == "memory_embeddings") {
+            return Ok(vec![]);
+        }
+        let table = self
+            .conn
+            .open_table("memory_embeddings")
+            .execute()
+            .await
+            .map_err(lancedb_err)?;
+
+        // Vector search with tenant prefilter (default mode). LanceDB
+        // filters before ANN, so tenant-scoping is correct even when an
+        // ANN index is later attached.
+        let stream = table
+            .vector_search(query_embedding)
+            .map_err(lancedb_err)?
+            .distance_type(DistanceType::Cosine)
+            .only_if(format!("tenant = {}", sql_quote(tenant)))
+            .limit(limit)
+            .execute()
+            .await
+            .map_err(lancedb_err)?;
+        let batches: Vec<RecordBatch> = stream
+            .try_collect()
+            .await
+            .map_err(|e| StorageError::InvalidInput(format!("lancedb stream: {e}")))?;
+
+        // Collect (memory_id, score) pairs in distance-ascending order.
+        // LanceDB returns rows already sorted by `_distance`; preserve
+        // that order across batches by extending sequentially.
+        let mut hits: Vec<(String, f32)> = Vec::new();
+        for b in &batches {
+            let memory_ids = b
+                .column_by_name("memory_id")
+                .ok_or(StorageError::InvalidData("missing memory_id column"))?
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .ok_or(StorageError::InvalidData("memory_id column type mismatch"))?;
+            let distances = b
+                .column_by_name("_distance")
+                .ok_or(StorageError::InvalidData(
+                    "missing _distance column from vector_search",
+                ))?
+                .as_any()
+                .downcast_ref::<Float32Array>()
+                .ok_or(StorageError::InvalidData("_distance column type mismatch"))?;
+            for i in 0..b.num_rows() {
+                // Cosine distance ∈ [0, 2]; similarity = 1 - distance
+                // matches DuckDB backend's cosine_similarity score
+                // shape (higher = better, normalized vectors → [0, 1]).
+                let score = 1.0 - distances.value(i);
+                hits.push((memory_ids.value(i).to_string(), score));
+            }
+        }
+
+        // Hydrate full MemoryRecord rows. fetch_memories_by_ids returns
+        // out of input order, so we rebuild the score-ordered list
+        // afterwards via a hashmap lookup.
+        let ids: Vec<String> = hits.iter().map(|(id, _)| id.clone()).collect();
+        let id_refs: Vec<&str> = ids.iter().map(|s| s.as_str()).collect();
+        let records = self.fetch_memories_by_ids(tenant, &id_refs).await?;
+        let by_id: std::collections::HashMap<String, MemoryRecord> = records
+            .into_iter()
+            .map(|m| (m.memory_id.clone(), m))
+            .collect();
+        let mut out = Vec::with_capacity(hits.len());
+        for (id, score) in hits {
+            if let Some(rec) = by_id.get(&id) {
+                out.push((rec.clone(), score));
+            }
+            // Else: embedding row exists but memory was archived/deleted
+            // after embedding write — skip silently, matches DuckDB's
+            // implicit-join semantics.
+        }
+        Ok(out)
     }
 
     async fn complete_embedding_job(&self, job_id: &str, now: &str) -> Result<(), StorageError> {
@@ -1748,5 +1979,141 @@ mod tests {
         // Empty feedback for a memory with none
         let summary_none = repo.feedback_summary("never-feedback'd").await.unwrap();
         assert_eq!(summary_none.total, 0);
+    }
+
+    /// `upsert_memory_embedding` + `semantic_search_memories` round-trip:
+    /// insert two memories, write their embeddings, search by a query
+    /// vector, expect both back in cosine-distance order with the closer
+    /// vector ranked first. Also exercises tenant prefilter and
+    /// `delete_memory_embedding`.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn lancedb_embedding_round_trip() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("lance.store");
+        let repo = LanceDbRepository::open(&path).await.unwrap();
+
+        // Two memories under "tenant-a", one under "tenant-b" (cross-tenant
+        // leak test).
+        let a1 = fixture("mem_emb_1", "tenant-a");
+        let a2 = fixture("mem_emb_2", "tenant-a");
+        let b1 = fixture("mem_emb_3", "tenant-b");
+        for m in [&a1, &a2, &b1] {
+            repo.insert_memory(m.clone()).await.unwrap();
+        }
+
+        // Hand-rolled 4-d unit vectors. q ≈ v1 (close), v2 different,
+        // v3 belongs to tenant-b and must not appear in tenant-a search.
+        fn to_blob(v: &[f32]) -> Vec<u8> {
+            let mut out = Vec::with_capacity(v.len() * 4);
+            for f in v {
+                out.extend_from_slice(&f.to_ne_bytes());
+            }
+            out
+        }
+        let v1 = vec![1.0_f32, 0.0, 0.0, 0.0];
+        let v2 = vec![0.0_f32, 1.0, 0.0, 0.0];
+        let v3 = vec![0.0_f32, 0.0, 1.0, 0.0];
+        repo.upsert_memory_embedding(
+            "mem_emb_1",
+            "tenant-a",
+            "fake-test",
+            4,
+            &to_blob(&v1),
+            "h1",
+            "00000001778000000000",
+            "00000001778000000000",
+        )
+        .await
+        .unwrap();
+        repo.upsert_memory_embedding(
+            "mem_emb_2",
+            "tenant-a",
+            "fake-test",
+            4,
+            &to_blob(&v2),
+            "h2",
+            "00000001778000000000",
+            "00000001778000000000",
+        )
+        .await
+        .unwrap();
+        repo.upsert_memory_embedding(
+            "mem_emb_3",
+            "tenant-b",
+            "fake-test",
+            4,
+            &to_blob(&v3),
+            "h3",
+            "00000001778000000000",
+            "00000001778000000000",
+        )
+        .await
+        .unwrap();
+
+        // Query close to v1 → mem_emb_1 should rank first; mem_emb_3
+        // (tenant-b) must be filtered out.
+        let q = vec![0.99_f32, 0.14, 0.0, 0.0]; // ≈ unit, close to v1
+        let hits = repo
+            .semantic_search_memories("tenant-a", &q, 10)
+            .await
+            .unwrap();
+        assert_eq!(hits.len(), 2, "tenant-a should have 2 hits, got {hits:?}");
+        assert_eq!(hits[0].0.memory_id, "mem_emb_1", "v1 should rank first");
+        assert_eq!(hits[1].0.memory_id, "mem_emb_2");
+        // similarity ∈ (0, 1] for close-but-not-identical normalized vecs;
+        // strictly greater than the v2 score.
+        assert!(hits[0].1 > hits[1].1);
+
+        // Upsert overwrite: re-write mem_emb_1 with v2 — now query close
+        // to v1 should rank mem_emb_2 first (because both rows now have
+        // v2-like vectors, but mem_emb_1 will be slightly off due to
+        // float roundtrip, so we just check the row count stays at 2).
+        repo.upsert_memory_embedding(
+            "mem_emb_1",
+            "tenant-a",
+            "fake-test",
+            4,
+            &to_blob(&v2),
+            "h1b",
+            "00000001778000000001",
+            "00000001778000000001",
+        )
+        .await
+        .unwrap();
+        let after_overwrite = repo
+            .semantic_search_memories("tenant-a", &q, 10)
+            .await
+            .unwrap();
+        assert_eq!(after_overwrite.len(), 2);
+
+        // delete_memory_embedding removes the row from the search corpus.
+        repo.delete_memory_embedding("mem_emb_2").await.unwrap();
+        let after_delete = repo
+            .semantic_search_memories("tenant-a", &q, 10)
+            .await
+            .unwrap();
+        assert_eq!(after_delete.len(), 1);
+        assert_eq!(after_delete[0].0.memory_id, "mem_emb_1");
+
+        // delete on no-row is a no-op (table exists but no matching row).
+        repo.delete_memory_embedding("does-not-exist")
+            .await
+            .unwrap();
+
+        // Search before any upsert (fresh repo, no memory_embeddings
+        // table) returns empty without error.
+        let dir2 = tempdir().unwrap();
+        let path2 = dir2.path().join("empty.store");
+        let empty_repo = LanceDbRepository::open(&path2).await.unwrap();
+        let empty_hits = empty_repo
+            .semantic_search_memories("tenant-a", &q, 10)
+            .await
+            .unwrap();
+        assert!(empty_hits.is_empty());
+        // And delete on a missing table is a no-op.
+        empty_repo
+            .delete_memory_embedding("anything")
+            .await
+            .unwrap();
     }
 }
