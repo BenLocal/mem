@@ -1502,12 +1502,55 @@ impl MemoryRepository for LanceDbRepository {
         query: &str,
         k: usize,
     ) -> Result<Vec<MemoryRecord>, StorageError> {
-        let _ = (tenant, query, k);
-        unimplemented!(
-            "LanceDb::bm25_candidates — use LanceDB native FTS: \
-             create_index([\"content\"], Index::FTS(FtsIndexBuilder::default())) on the \
-             `memories` table at open(), then query via Table::query().full_text_search(query)"
-        )
+        if query.trim().is_empty() || k == 0 {
+            return Ok(vec![]);
+        }
+        let table = self
+            .conn
+            .open_table("memories")
+            .execute()
+            .await
+            .map_err(lancedb_err)?;
+
+        // Lazy-create FTS index on `content` if not already there. We
+        // keep this lazy (rather than at open()) for the same reason
+        // memory_embeddings is lazy: indexing an empty table is wasted
+        // work, and any test/dev path that never calls bm25_candidates
+        // doesn't pay the build cost. Once present, `replace(false)` +
+        // the existence check makes subsequent calls cheap.
+        let indices = table.list_indices().await.map_err(lancedb_err)?;
+        let has_fts = indices
+            .iter()
+            .any(|c| c.columns.iter().any(|col| col == "content"));
+        if !has_fts {
+            table
+                .create_index(
+                    &["content"],
+                    lancedb::index::Index::FTS(lancedb::index::scalar::FtsIndexBuilder::default()),
+                )
+                .execute()
+                .await
+                .map_err(lancedb_err)?;
+        }
+
+        let fts_query = lancedb::index::scalar::FullTextSearchQuery::new(query.to_string());
+        let stream = table
+            .query()
+            .full_text_search(fts_query)
+            .only_if(format!("tenant = {}", sql_quote(tenant)))
+            .limit(k)
+            .execute()
+            .await
+            .map_err(lancedb_err)?;
+        let batches: Vec<RecordBatch> = stream
+            .try_collect()
+            .await
+            .map_err(|e| StorageError::InvalidInput(format!("lancedb stream: {e}")))?;
+        let mut out = Vec::new();
+        for b in &batches {
+            out.extend(record_batch_to_memories(b)?);
+        }
+        Ok(out)
     }
 
     async fn fetch_memories_by_ids(
@@ -2800,5 +2843,67 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(zero, 0);
+    }
+
+    /// `bm25_candidates` lazy-creates the FTS index on `memories.content`
+    /// the first time it's called, then BM25-ranks rows matching the
+    /// query — distinct from semantic_search_memories (vector ANN).
+    /// Tenant filter must be honored; empty query / k == 0 returns [].
+    #[tokio::test]
+    async fn lancedb_bm25_candidates_round_trip() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("lance.store");
+        let repo = LanceDbRepository::open(&path).await.unwrap();
+
+        let mut a = fixture("mem_b1", "tenant-a");
+        a.content = "DuckDB single mutex serializes all writes".into();
+        let mut b = fixture("mem_b2", "tenant-a");
+        b.content = "LanceDB native vector search uses ANN".into();
+        let mut c = fixture("mem_b3", "tenant-a");
+        c.content = "Tantivy provides BM25 in DuckDB build".into();
+        let mut d = fixture("mem_b4", "tenant-b");
+        d.content = "DuckDB connection pool tenant-b".into();
+        for m in [&a, &b, &c, &d] {
+            repo.insert_memory(m.clone()).await.unwrap();
+        }
+
+        // Empty query → []; k=0 → [].
+        let none1 = repo.bm25_candidates("tenant-a", "", 10).await.unwrap();
+        assert!(none1.is_empty());
+        let none2 = repo.bm25_candidates("tenant-a", "DuckDB", 0).await.unwrap();
+        assert!(none2.is_empty());
+
+        // Real query: 'DuckDB' should match mem_b1 + mem_b3 (tenant-a)
+        // but NOT mem_b4 (tenant-b filter).
+        let hits = repo
+            .bm25_candidates("tenant-a", "DuckDB", 10)
+            .await
+            .unwrap();
+        let ids: Vec<&str> = hits.iter().map(|m| m.memory_id.as_str()).collect();
+        assert!(ids.contains(&"mem_b1"), "got {ids:?}");
+        assert!(ids.contains(&"mem_b3"), "got {ids:?}");
+        assert!(!ids.contains(&"mem_b2"));
+        assert!(
+            !ids.contains(&"mem_b4"),
+            "tenant filter must exclude tenant-b"
+        );
+
+        // Index now exists — second call should reuse, not rebuild.
+        let table = repo.conn.open_table("memories").execute().await.unwrap();
+        let indices = table.list_indices().await.unwrap();
+        assert!(
+            indices
+                .iter()
+                .any(|c| c.columns.iter().any(|col| col == "content")),
+            "FTS index should exist on content column after first call",
+        );
+
+        // Different query, same tenant.
+        let lance_hits = repo
+            .bm25_candidates("tenant-a", "LanceDB", 10)
+            .await
+            .unwrap();
+        let lance_ids: Vec<&str> = lance_hits.iter().map(|m| m.memory_id.as_str()).collect();
+        assert!(lance_ids.contains(&"mem_b2"));
     }
 }
