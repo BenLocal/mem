@@ -431,6 +431,50 @@ fn sql_quote(s: &str) -> String {
 }
 
 impl LanceDbRepository {
+    /// Apply a status transition to `(tenant, memory_id)` and return the
+    /// updated row. Shared by `accept_pending` / `reject_pending` (and a
+    /// future `archive_pending` if needed). Mirrors the DuckDB backend's
+    /// `update_status` private helper.
+    ///
+    /// **Not yet implemented:** the embedding-references cleanup that the
+    /// DuckDB version does (delete `embedding_jobs` + `memory_embeddings`
+    /// rows for this memory) — those tables don't exist on the LanceDB
+    /// side yet. Add when those tables land.
+    async fn update_status(
+        &self,
+        tenant: &str,
+        memory_id: &str,
+        status_str: &str,
+    ) -> Result<MemoryRecord, StorageError> {
+        let table = self
+            .conn
+            .open_table("memories")
+            .execute()
+            .await
+            .map_err(lancedb_err)?;
+        let now = crate::storage::current_timestamp();
+        let result = table
+            .update()
+            .only_if(format!(
+                "tenant = {} AND memory_id = {}",
+                sql_quote(tenant),
+                sql_quote(memory_id),
+            ))
+            .column("status", sql_quote(status_str))
+            .column("updated_at", sql_quote(&now))
+            .execute()
+            .await
+            .map_err(lancedb_err)?;
+        if result.rows_updated == 0 {
+            return Err(StorageError::InvalidData("memory not found"));
+        }
+        self.get_memory_for_tenant(tenant, memory_id)
+            .await?
+            .ok_or(StorageError::InvalidData(
+                "memory missing after status update",
+            ))
+    }
+
     /// Run a filter query against the `memories` table and parse all
     /// returned batches into [`MemoryRecord`]s. Shared by every read
     /// method that just needs a `WHERE`-clause + optional `LIMIT`.
@@ -753,8 +797,7 @@ impl MemoryRepository for LanceDbRepository {
         tenant: &str,
         memory_id: &str,
     ) -> Result<MemoryRecord, StorageError> {
-        let _ = (tenant, memory_id);
-        unimplemented!("LanceDb::accept_pending — see docs/repository.rs trait def")
+        self.update_status(tenant, memory_id, "active").await
     }
 
     async fn reject_pending(
@@ -762,8 +805,7 @@ impl MemoryRepository for LanceDbRepository {
         tenant: &str,
         memory_id: &str,
     ) -> Result<MemoryRecord, StorageError> {
-        let _ = (tenant, memory_id);
-        unimplemented!("LanceDb::reject_pending — see docs/repository.rs trait def")
+        self.update_status(tenant, memory_id, "rejected").await
     }
 
     async fn replace_pending_with_successor(
@@ -772,8 +814,34 @@ impl MemoryRepository for LanceDbRepository {
         original_memory_id: &str,
         successor: MemoryRecord,
     ) -> Result<MemoryRecord, StorageError> {
-        let _ = (tenant, original_memory_id, successor);
-        unimplemented!("LanceDb::replace_pending_with_successor — see docs/repository.rs trait def")
+        // Two-step supersede: archive the old row, then insert the new
+        // one. LanceDB has no transaction semantics across these calls,
+        // so a crash between them leaves the old archived without a
+        // successor — same risk profile as the DuckDB backend's
+        // non-tx'd version (see `replace_pending_with_successor` in
+        // duckdb/mod.rs).
+        let table = self
+            .conn
+            .open_table("memories")
+            .execute()
+            .await
+            .map_err(lancedb_err)?;
+        let now = crate::storage::current_timestamp();
+        table
+            .update()
+            .only_if(format!(
+                "tenant = {} AND memory_id = {}",
+                sql_quote(tenant),
+                sql_quote(original_memory_id),
+            ))
+            .column("status", "'archived'")
+            .column("updated_at", sql_quote(&now))
+            .execute()
+            .await
+            .map_err(lancedb_err)?;
+        let batch = memories_to_record_batch(std::slice::from_ref(&successor))?;
+        table.add(batch).execute().await.map_err(lancedb_err)?;
+        Ok(successor)
     }
 
     async fn apply_feedback(
@@ -810,8 +878,28 @@ impl MemoryRepository for LanceDbRepository {
     }
 
     async fn delete_memory_hard(&self, tenant: &str, memory_id: &str) -> Result<(), StorageError> {
-        let _ = (tenant, memory_id);
-        unimplemented!("LanceDb::delete_memory_hard — see docs/repository.rs trait def")
+        let table = self
+            .conn
+            .open_table("memories")
+            .execute()
+            .await
+            .map_err(lancedb_err)?;
+        let result = table
+            .delete(&format!(
+                "tenant = {} AND memory_id = {}",
+                sql_quote(tenant),
+                sql_quote(memory_id),
+            ))
+            .await
+            .map_err(lancedb_err)?;
+        if result.num_deleted_rows == 0 {
+            return Err(StorageError::InvalidData("memory not found"));
+        }
+        // TODO: cascade-delete from embedding_jobs / memory_embeddings /
+        // feedback_events / graph_edges once those tables exist on the
+        // LanceDB side. The DuckDB backend handles this in
+        // `DuckDbRepository::delete_memory_hard` (see ./duckdb/mod.rs).
+        Ok(())
     }
 
     async fn get_memory(&self, memory_id: String) -> Result<Option<MemoryRecord>, StorageError> {
@@ -1282,5 +1370,75 @@ mod tests {
         // get_memory — cross-tenant (no tenant filter)
         let cross = repo.get_memory("mem_b_001".into()).await.unwrap();
         assert_eq!(cross.unwrap().tenant, "tenant-b");
+    }
+
+    /// Mutating-method round-trip: accept_pending, reject_pending,
+    /// replace_pending_with_successor, delete_memory_hard.
+    #[tokio::test]
+    async fn lancedb_mutating_methods_round_trip() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("lance.store");
+        let repo = LanceDbRepository::open(&path).await.unwrap();
+
+        let mut p = fixture("mem_p", "tenant");
+        p.status = MemoryStatus::PendingConfirmation;
+        let mut q = fixture("mem_q", "tenant");
+        q.status = MemoryStatus::PendingConfirmation;
+        let r = fixture("mem_r", "tenant");
+        let s = fixture("mem_s", "tenant");
+        for m in [&p, &q, &r, &s] {
+            repo.insert_memory(m.clone()).await.unwrap();
+        }
+
+        // accept_pending → status active
+        let accepted = repo.accept_pending("tenant", "mem_p").await.unwrap();
+        assert_eq!(accepted.status, MemoryStatus::Active);
+        assert_eq!(accepted.memory_id, "mem_p");
+
+        // reject_pending → status rejected
+        let rejected = repo.reject_pending("tenant", "mem_q").await.unwrap();
+        assert_eq!(rejected.status, MemoryStatus::Rejected);
+
+        // After accept/reject, list_pending_review is empty
+        let pending = repo.list_pending_review("tenant").await.unwrap();
+        assert!(pending.is_empty());
+
+        // replace_pending_with_successor: archive r, insert successor
+        let mut succ = fixture("mem_r_v2", "tenant");
+        succ.supersedes_memory_id = Some("mem_r".into());
+        succ.version = 2;
+        let returned = repo
+            .replace_pending_with_successor("tenant", "mem_r", succ.clone())
+            .await
+            .unwrap();
+        assert_eq!(returned.memory_id, "mem_r_v2");
+        let archived = repo
+            .get_memory_for_tenant("tenant", "mem_r")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(archived.status, MemoryStatus::Archived);
+        let successor_row = repo
+            .get_memory_for_tenant("tenant", "mem_r_v2")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(successor_row.supersedes_memory_id, Some("mem_r".into()));
+        assert_eq!(successor_row.version, 2);
+
+        // delete_memory_hard
+        repo.delete_memory_hard("tenant", "mem_s").await.unwrap();
+        let gone = repo.get_memory_for_tenant("tenant", "mem_s").await.unwrap();
+        assert!(gone.is_none());
+
+        // delete on non-existent → NotFound-equivalent error
+        let err = repo
+            .delete_memory_hard("tenant", "does-not-exist")
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, StorageError::InvalidData("memory not found")),
+            "expected NotFound-equivalent, got {err:?}",
+        );
     }
 }
