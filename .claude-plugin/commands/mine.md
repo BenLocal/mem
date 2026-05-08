@@ -24,6 +24,6 @@ Output of `mem mine` looks like:
 Mined: memories sent=X/Y blocks sent=A/B (server-side dedup applied)
 ```
 
-Report the numerator/denominator to the user. `memories sent=0/N` is normal — the extractor only picks up explicit cues like `<mem-save>...</mem-save>` / `我会记住：…` / `Important: …`. The verbatim block archive (`blocks sent`) is non-discriminating; everything goes in.
+Report the numerator/denominator to the user. `memories sent=0/N` is normal — the extractor only picks up the explicit `<mem-save>...</mem-save>` tag (the prose-cue heuristics like "我会记住：" / "Important:" were removed after a recursive false-positive bug; the verbatim block archive `blocks sent` is non-discriminating and everything goes in there).
 
-If the user wants a memory written from this conversation that doesn't have an explicit cue, they should use `mcp__mem__memory_ingest` directly with structured fields, not rely on `mem mine`.
+If the user wants a memory written from this conversation, they should either embed `<mem-save>...</mem-save>` in the assistant turn or use `mcp__mem__memory_ingest` directly with structured fields. Do not rely on `mem mine` to infer memory-worthiness from prose.

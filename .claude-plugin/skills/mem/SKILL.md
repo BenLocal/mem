@@ -43,7 +43,7 @@ Set `MEM_MCP_EXPOSE_EMBEDDINGS=1` to also get the admin `embeddings_*` tools (re
 
 - `mem serve` — HTTP server on `BIND_ADDR` (default `127.0.0.1:3000`)
 - `mem mcp` — stdio MCP forwarder; reads `MEM_BASE_URL` + `MEM_TENANT`
-- `mem mine <transcript_path> --agent claude-code` — dual-sink: extracts memories from `<mem-save>` / "我会记住：" / "Important:" cues AND archives every block (text / tool_use / tool_result / thinking) verbatim to `conversation_messages`
+- `mem mine <transcript_path> --agent claude-code` — dual-sink: extracts memories from `<mem-save>...</mem-save>` tags only (prose cues like "我会记住：" / "Important:" used to also trigger extraction but were removed after a recursive false-positive bug — agents wanting a fact persisted without writing the tag should call `memory_ingest` MCP directly), AND archives every block (text / tool_use / tool_result / thinking) verbatim to `conversation_messages`
 - `mem wake-up --tenant local --token-budget 800` — short recent-context dump (used by the SessionStart hook)
 - `mem repair --check` — diagnose vector index sidecar without modifying anything
 - `mem repair --rebuild` — force-rebuild the HNSW sidecar (offline; stop `mem serve` first)
