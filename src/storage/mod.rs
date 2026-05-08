@@ -3,6 +3,7 @@ pub mod duckdb;
 pub mod entity_repo;
 pub mod fts;
 pub mod graph_store;
+pub mod repository;
 pub mod schema;
 pub mod time;
 pub mod transcript_repo;
@@ -15,6 +16,7 @@ pub use duckdb::{
     StorageError,
 };
 pub use graph_store::{DuckDbGraphStore, GraphError};
+pub use repository::MemoryRepository;
 pub use time::{current_timestamp, timestamp_add_ms};
 pub use transcript_repo::{ClaimedTranscriptEmbeddingJob, ContextWindow, TranscriptSessionSummary};
 pub use vector_index::{
