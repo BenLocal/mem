@@ -145,3 +145,86 @@ async fn pool_disabled_falls_back_to_http_write_conn() {
         .expect("fetch_memories_by_ids");
     assert_eq!(rows.len(), 8);
 }
+
+/// Microbench: time N×K concurrent `fetch_memories_by_ids` calls.
+/// Marked `#[ignore]` so regular `cargo test` skips it; run explicitly:
+///
+/// ```text
+///     cargo test --release --test conn_pool bench_pool_off -- --ignored --nocapture
+///     MEM_RW_POOL_ENABLED=1 \
+///         cargo test --release --test conn_pool bench_pool_on -- --ignored --nocapture
+/// ```
+///
+/// Compare the printed `fetches/sec` numbers to see the actual perf
+/// delta on this hardware. Numbers are *not* CI-checked.
+async fn bench_inner(label: &str) {
+    let dir = tempdir().unwrap();
+    let db = dir.path().join("bench.duckdb");
+    let repo = DuckDbRepository::open(&db).await.unwrap();
+    let settings = fake_settings();
+    let service = Arc::new(MemoryService::new_with_settings(repo.clone(), &settings));
+
+    let tenant = "bench-tenant";
+    let mut ids: Vec<String> = Vec::with_capacity(100);
+    for i in 0..100 {
+        let resp = service
+            .ingest(ingest_request(tenant, &format!("bench fact {i}")))
+            .await
+            .expect("ingest");
+        ids.push(resp.memory_id);
+    }
+
+    // Warm-up: one sequential fetch to populate any caches.
+    let id_refs: Vec<&str> = ids.iter().map(|s| s.as_str()).collect();
+    let _ = repo.fetch_memories_by_ids(tenant, &id_refs).await.unwrap();
+
+    let iters = 200usize;
+    let parallel = 8usize;
+    let start = std::time::Instant::now();
+    for _ in 0..iters {
+        let mut handles = Vec::with_capacity(parallel);
+        for _ in 0..parallel {
+            let repo_c = repo.clone();
+            let ids_c: Vec<String> = ids.clone();
+            handles.push(tokio::spawn(async move {
+                let id_refs: Vec<&str> = ids_c.iter().map(|s| s.as_str()).collect();
+                repo_c
+                    .fetch_memories_by_ids(tenant, &id_refs)
+                    .await
+                    .unwrap()
+            }));
+        }
+        for h in handles {
+            h.await.unwrap();
+        }
+    }
+    let elapsed = start.elapsed();
+    let total_calls = iters * parallel;
+    println!(
+        "\nBENCH [{label}] {total_calls} concurrent fetches in {:.3?} ({:.0} fetches/sec, {:?}/fetch avg)",
+        elapsed,
+        total_calls as f64 / elapsed.as_secs_f64(),
+        elapsed / total_calls as u32,
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore]
+async fn bench_pool_off() {
+    unsafe {
+        std::env::remove_var("MEM_RW_POOL_ENABLED");
+    }
+    bench_inner("pool=off").await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore]
+async fn bench_pool_on() {
+    unsafe {
+        std::env::set_var("MEM_RW_POOL_ENABLED", "1");
+    }
+    bench_inner("pool=on").await;
+    unsafe {
+        std::env::remove_var("MEM_RW_POOL_ENABLED");
+    }
+}
