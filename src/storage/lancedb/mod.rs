@@ -154,10 +154,11 @@ impl LanceDbRepository {
 
         ensure_memories_table(&conn).await?;
         ensure_feedback_events_table(&conn).await?;
-        // TODO: ensure_embedding_jobs_table, ensure_memory_embeddings_table,
-        // ensure_conversation_messages_table, ensure_*…
-        // (9 more tables — add as the corresponding trait methods leave
-        //  unimplemented!() state).
+        ensure_embedding_jobs_table(&conn).await?;
+        // memory_embeddings is lazy-created on first upsert (dim is
+        // provider-dependent and unknown here without provider).
+        // TODO: ensure_conversation_messages_table, ensure_episodes_table,
+        // ensure_sessions_table, ensure_graph_edges_table, ensure_entities_table.
 
         Ok(Self {
             conn: Arc::new(conn),
@@ -227,6 +228,10 @@ async fn ensure_feedback_events_table(conn: &Connection) -> Result<(), StorageEr
 /// (mixing dims would break vector search regardless).
 async fn ensure_memory_embeddings_table(conn: &Connection, dim: i32) -> Result<(), StorageError> {
     ensure_table(conn, "memory_embeddings", memory_embeddings_schema(dim)).await
+}
+
+async fn ensure_embedding_jobs_table(conn: &Connection) -> Result<(), StorageError> {
+    ensure_table(conn, "embedding_jobs", embedding_jobs_schema()).await
 }
 
 /// Idempotent `create_empty_table` — checks `Connection::table_names()`
@@ -402,6 +407,137 @@ fn memory_embedding_to_record_batch(
     ];
     RecordBatch::try_new(schema, columns)
         .map_err(|e| StorageError::InvalidInput(format!("memory_embedding record batch: {e}")))
+}
+
+/// Internal row representation for `embedding_jobs`. Mirrors DuckDB's
+/// private `EmbeddingJobRow` (same field set, same types). Used as the
+/// intermediate when reading record batches off LanceDB so we can sort
+/// in memory before slicing — LanceDB's `QueryBase` doesn't expose
+/// ORDER BY, so the queue's "oldest pending first" ordering is enforced
+/// after the fact.
+#[derive(Debug, Clone)]
+struct EmbeddingJobRow {
+    job_id: String,
+    tenant: String,
+    memory_id: String,
+    target_content_hash: String,
+    provider: String,
+    status: String,
+    attempt_count: i64,
+    last_error: Option<String>,
+    available_at: String,
+    created_at: String,
+    updated_at: String,
+}
+
+/// Arrow schema for the `embedding_jobs` LanceDB table. 11 columns,
+/// scalar-only — mirrors the DuckDB embedding_jobs table 1:1.
+fn embedding_jobs_schema() -> Schema {
+    Schema::new(vec![
+        Field::new("job_id", DataType::Utf8, false),
+        Field::new("tenant", DataType::Utf8, false),
+        Field::new("memory_id", DataType::Utf8, false),
+        Field::new("target_content_hash", DataType::Utf8, false),
+        Field::new("provider", DataType::Utf8, false),
+        Field::new("status", DataType::Utf8, false),
+        Field::new("attempt_count", DataType::Int64, false),
+        Field::new("last_error", DataType::Utf8, true),
+        Field::new("available_at", DataType::Utf8, false),
+        Field::new("created_at", DataType::Utf8, false),
+        Field::new("updated_at", DataType::Utf8, false),
+    ])
+}
+
+fn embedding_job_row_to_record_batch(row: &EmbeddingJobRow) -> Result<RecordBatch, StorageError> {
+    let mut job_id = StringBuilder::new();
+    let mut tenant = StringBuilder::new();
+    let mut memory_id = StringBuilder::new();
+    let mut target_content_hash = StringBuilder::new();
+    let mut provider = StringBuilder::new();
+    let mut status = StringBuilder::new();
+    let mut attempt_count = Int64Builder::new();
+    let mut last_error = StringBuilder::new();
+    let mut available_at = StringBuilder::new();
+    let mut created_at = StringBuilder::new();
+    let mut updated_at = StringBuilder::new();
+    job_id.append_value(&row.job_id);
+    tenant.append_value(&row.tenant);
+    memory_id.append_value(&row.memory_id);
+    target_content_hash.append_value(&row.target_content_hash);
+    provider.append_value(&row.provider);
+    status.append_value(&row.status);
+    attempt_count.append_value(row.attempt_count);
+    match &row.last_error {
+        Some(s) => last_error.append_value(s),
+        None => last_error.append_null(),
+    }
+    available_at.append_value(&row.available_at);
+    created_at.append_value(&row.created_at);
+    updated_at.append_value(&row.updated_at);
+    let columns: Vec<Arc<dyn Array>> = vec![
+        Arc::new(job_id.finish()),
+        Arc::new(tenant.finish()),
+        Arc::new(memory_id.finish()),
+        Arc::new(target_content_hash.finish()),
+        Arc::new(provider.finish()),
+        Arc::new(status.finish()),
+        Arc::new(attempt_count.finish()),
+        Arc::new(last_error.finish()),
+        Arc::new(available_at.finish()),
+        Arc::new(created_at.finish()),
+        Arc::new(updated_at.finish()),
+    ];
+    RecordBatch::try_new(Arc::new(embedding_jobs_schema()), columns)
+        .map_err(|e| StorageError::InvalidInput(format!("embedding_job record batch: {e}")))
+}
+
+fn record_batch_to_embedding_job_rows(
+    batch: &RecordBatch,
+) -> Result<Vec<EmbeddingJobRow>, StorageError> {
+    fn col<'a, T: 'static>(
+        batch: &'a RecordBatch,
+        name: &'static str,
+    ) -> Result<&'a T, StorageError> {
+        batch
+            .column_by_name(name)
+            .ok_or(StorageError::InvalidData("missing column"))?
+            .as_any()
+            .downcast_ref::<T>()
+            .ok_or(StorageError::InvalidData("column type mismatch"))
+    }
+    use arrow_array::Int64Array;
+    let job_id = col::<StringArray>(batch, "job_id")?;
+    let tenant = col::<StringArray>(batch, "tenant")?;
+    let memory_id = col::<StringArray>(batch, "memory_id")?;
+    let target_content_hash = col::<StringArray>(batch, "target_content_hash")?;
+    let provider = col::<StringArray>(batch, "provider")?;
+    let status = col::<StringArray>(batch, "status")?;
+    let attempt_count = col::<Int64Array>(batch, "attempt_count")?;
+    let last_error = col::<StringArray>(batch, "last_error")?;
+    let available_at = col::<StringArray>(batch, "available_at")?;
+    let created_at = col::<StringArray>(batch, "created_at")?;
+    let updated_at = col::<StringArray>(batch, "updated_at")?;
+    let mut out = Vec::with_capacity(batch.num_rows());
+    for i in 0..batch.num_rows() {
+        out.push(EmbeddingJobRow {
+            job_id: job_id.value(i).to_string(),
+            tenant: tenant.value(i).to_string(),
+            memory_id: memory_id.value(i).to_string(),
+            target_content_hash: target_content_hash.value(i).to_string(),
+            provider: provider.value(i).to_string(),
+            status: status.value(i).to_string(),
+            attempt_count: attempt_count.value(i),
+            last_error: if last_error.is_null(i) {
+                None
+            } else {
+                Some(last_error.value(i).to_string())
+            },
+            available_at: available_at.value(i).to_string(),
+            created_at: created_at.value(i).to_string(),
+            updated_at: updated_at.value(i).to_string(),
+        });
+    }
+    Ok(out)
 }
 
 /// Mirror of DuckDB's private `feedback_adjustments` helper. Resolves a
@@ -752,6 +888,37 @@ impl LanceDbRepository {
         }
         Ok(out)
     }
+
+    /// Read all `embedding_jobs` rows matching `filter`, parsed into
+    /// [`EmbeddingJobRow`]s. Shared by every queue read path: the claim
+    /// flow, `first_embedding_job_id_for_memory`, `list_embedding_jobs`,
+    /// and the duplicate-detection in `try_enqueue_embedding_job`.
+    async fn query_embedding_jobs(
+        &self,
+        filter: String,
+    ) -> Result<Vec<EmbeddingJobRow>, StorageError> {
+        let table = self
+            .conn
+            .open_table("embedding_jobs")
+            .execute()
+            .await
+            .map_err(lancedb_err)?;
+        let stream = table
+            .query()
+            .only_if(filter)
+            .execute()
+            .await
+            .map_err(lancedb_err)?;
+        let batches: Vec<RecordBatch> = stream
+            .try_collect()
+            .await
+            .map_err(|e| StorageError::InvalidInput(format!("lancedb stream: {e}")))?;
+        let mut out = Vec::new();
+        for b in &batches {
+            out.extend(record_batch_to_embedding_job_rows(b)?);
+        }
+        Ok(out)
+    }
 }
 
 #[async_trait]
@@ -775,18 +942,60 @@ impl MemoryRepository for LanceDbRepository {
         &self,
         insert: EmbeddingJobInsert,
     ) -> Result<bool, StorageError> {
-        let _ = insert;
-        unimplemented!("LanceDb::try_enqueue_embedding_job — see docs/repository.rs trait def")
+        // Idempotency check: if any live (pending/processing) row already
+        // covers this (tenant, memory_id, target_content_hash, provider)
+        // tuple, decline the enqueue. LanceDB has no transactions so the
+        // count → insert window is racy under concurrent writers, but mem
+        // serve runs one writer per DB so the race is single-instance safe.
+        let table = self
+            .conn
+            .open_table("embedding_jobs")
+            .execute()
+            .await
+            .map_err(lancedb_err)?;
+        let live = table
+            .count_rows(Some(format!(
+                "tenant = {} AND memory_id = {} AND target_content_hash = {} \
+                 AND provider = {} AND (status = 'pending' OR status = 'processing')",
+                sql_quote(&insert.tenant),
+                sql_quote(&insert.memory_id),
+                sql_quote(&insert.target_content_hash),
+                sql_quote(&insert.provider),
+            )))
+            .await
+            .map_err(lancedb_err)?;
+        if live > 0 {
+            return Ok(false);
+        }
+        let row = EmbeddingJobRow {
+            job_id: insert.job_id,
+            tenant: insert.tenant,
+            memory_id: insert.memory_id,
+            target_content_hash: insert.target_content_hash,
+            provider: insert.provider,
+            status: "pending".to_string(),
+            attempt_count: 0,
+            last_error: None,
+            available_at: insert.available_at,
+            created_at: insert.created_at,
+            updated_at: insert.updated_at,
+        };
+        let batch = embedding_job_row_to_record_batch(&row)?;
+        table.add(batch).execute().await.map_err(lancedb_err)?;
+        Ok(true)
     }
 
     async fn first_embedding_job_id_for_memory(
         &self,
         memory_id: &str,
     ) -> Result<Option<String>, StorageError> {
-        let _ = memory_id;
-        unimplemented!(
-            "LanceDb::first_embedding_job_id_for_memory — see docs/repository.rs trait def"
-        )
+        let mut rows = self
+            .query_embedding_jobs(format!("memory_id = {}", sql_quote(memory_id)))
+            .await?;
+        // LanceDB has no ORDER BY — sort in memory by created_at ASC
+        // (same shape as the DuckDB SQL).
+        rows.sort_by(|a, b| a.created_at.cmp(&b.created_at));
+        Ok(rows.into_iter().next().map(|r| r.job_id))
     }
 
     async fn claim_next_n_embedding_jobs(
@@ -795,8 +1004,75 @@ impl MemoryRepository for LanceDbRepository {
         max_retries: u32,
         n: usize,
     ) -> Result<Vec<ClaimedEmbeddingJob>, StorageError> {
-        let _ = (now, max_retries, n);
-        unimplemented!("LanceDb::claim_next_n_embedding_jobs — see docs/repository.rs trait def")
+        if n == 0 {
+            return Ok(vec![]);
+        }
+        // Eligible = available_at <= now AND (pending OR (failed AND
+        // attempt_count < max_retries)). LanceDB has no ORDER BY, so we
+        // pull all eligible rows and sort by (available_at, created_at)
+        // ASC in memory before slicing — queue depth is expected to be
+        // small (worker drains continuously) so the in-memory cost is
+        // negligible vs. the simpler code.
+        //
+        // Note: unlike DuckDB we don't sweep orphan jobs here. LanceDB
+        // has no FK constraints, so the FK-loop pathology that motivated
+        // the orphan sweep on DuckDB cannot occur here. If a memory is
+        // deleted, its embedding_jobs rows simply stay until the worker
+        // touches them; the FK-error retry loop is a DuckDB-only bug.
+        let max_r = i64::from(max_retries);
+        let filter = format!(
+            "available_at <= {} AND (status = 'pending' OR (status = 'failed' AND attempt_count < {}))",
+            sql_quote(now),
+            max_r,
+        );
+        let mut rows = self.query_embedding_jobs(filter).await?;
+        rows.sort_by(|a, b| {
+            a.available_at
+                .cmp(&b.available_at)
+                .then_with(|| a.created_at.cmp(&b.created_at))
+        });
+        rows.truncate(n);
+        if rows.is_empty() {
+            return Ok(vec![]);
+        }
+
+        let table = self
+            .conn
+            .open_table("embedding_jobs")
+            .execute()
+            .await
+            .map_err(lancedb_err)?;
+        let mut claimed = Vec::with_capacity(rows.len());
+        for r in rows {
+            // Optimistic claim: only update if status is still eligible
+            // (pending, or failed-with-budget). A second-instance race
+            // would see rows_updated == 0 and we'd skip the row — same
+            // shape as DuckDB's "updated == 0 → return None" branch.
+            let result = table
+                .update()
+                .only_if(format!(
+                    "job_id = {} AND (status = 'pending' OR (status = 'failed' AND attempt_count < {}))",
+                    sql_quote(&r.job_id),
+                    max_r,
+                ))
+                .column("status", "'processing'")
+                .column("updated_at", sql_quote(now))
+                .execute()
+                .await
+                .map_err(lancedb_err)?;
+            if result.rows_updated == 0 {
+                continue;
+            }
+            claimed.push(ClaimedEmbeddingJob {
+                job_id: r.job_id,
+                tenant: r.tenant,
+                memory_id: r.memory_id,
+                target_content_hash: r.target_content_hash,
+                provider: r.provider,
+                attempt_count: r.attempt_count,
+            });
+        }
+        Ok(claimed)
     }
 
     async fn upsert_memory_embedding(
@@ -970,13 +1246,49 @@ impl MemoryRepository for LanceDbRepository {
     }
 
     async fn complete_embedding_job(&self, job_id: &str, now: &str) -> Result<(), StorageError> {
-        let _ = (job_id, now);
-        unimplemented!("LanceDb::complete_embedding_job — see docs/repository.rs trait def")
+        // Mirror DuckDB: only complete a row that's currently 'processing'
+        // (otherwise it's already completed/stale and we shouldn't bump it).
+        // LanceDB doesn't have a NULL literal for last_error inside the
+        // update column expression in a way the SQL parser tolerates as
+        // an arbitrary expression — we encode "clear last_error" as
+        // `CAST(NULL AS string)` so the column value is a SQL NULL.
+        let table = self
+            .conn
+            .open_table("embedding_jobs")
+            .execute()
+            .await
+            .map_err(lancedb_err)?;
+        table
+            .update()
+            .only_if(format!(
+                "job_id = {} AND status = 'processing'",
+                sql_quote(job_id),
+            ))
+            .column("status", "'completed'")
+            .column("last_error", "CAST(NULL AS string)")
+            .column("updated_at", sql_quote(now))
+            .execute()
+            .await
+            .map_err(lancedb_err)?;
+        Ok(())
     }
 
     async fn mark_embedding_job_stale(&self, job_id: &str, now: &str) -> Result<(), StorageError> {
-        let _ = (job_id, now);
-        unimplemented!("LanceDb::mark_embedding_job_stale — see docs/repository.rs trait def")
+        let table = self
+            .conn
+            .open_table("embedding_jobs")
+            .execute()
+            .await
+            .map_err(lancedb_err)?;
+        table
+            .update()
+            .only_if(format!("job_id = {}", sql_quote(job_id)))
+            .column("status", "'stale'")
+            .column("updated_at", sql_quote(now))
+            .execute()
+            .await
+            .map_err(lancedb_err)?;
+        Ok(())
     }
 
     async fn reschedule_embedding_job_failure(
@@ -987,10 +1299,24 @@ impl MemoryRepository for LanceDbRepository {
         available_at: &str,
         now: &str,
     ) -> Result<(), StorageError> {
-        let _ = (job_id, new_attempt_count, last_error, available_at, now);
-        unimplemented!(
-            "LanceDb::reschedule_embedding_job_failure — see docs/repository.rs trait def"
-        )
+        let table = self
+            .conn
+            .open_table("embedding_jobs")
+            .execute()
+            .await
+            .map_err(lancedb_err)?;
+        table
+            .update()
+            .only_if(format!("job_id = {}", sql_quote(job_id)))
+            .column("status", "'failed'")
+            .column("attempt_count", new_attempt_count.to_string())
+            .column("last_error", sql_quote(last_error))
+            .column("available_at", sql_quote(available_at))
+            .column("updated_at", sql_quote(now))
+            .execute()
+            .await
+            .map_err(lancedb_err)?;
+        Ok(())
     }
 
     async fn permanently_fail_embedding_job(
@@ -1000,18 +1326,58 @@ impl MemoryRepository for LanceDbRepository {
         last_error: &str,
         now: &str,
     ) -> Result<(), StorageError> {
-        let _ = (job_id, new_attempt_count, last_error, now);
-        unimplemented!("LanceDb::permanently_fail_embedding_job — see docs/repository.rs trait def")
+        let table = self
+            .conn
+            .open_table("embedding_jobs")
+            .execute()
+            .await
+            .map_err(lancedb_err)?;
+        table
+            .update()
+            .only_if(format!("job_id = {}", sql_quote(job_id)))
+            .column("status", "'failed'")
+            .column("attempt_count", new_attempt_count.to_string())
+            .column("last_error", sql_quote(last_error))
+            .column("updated_at", sql_quote(now))
+            .execute()
+            .await
+            .map_err(lancedb_err)?;
+        Ok(())
     }
 
     async fn delete_embedding_jobs_by_memory_id(
         &self,
         memory_id: &str,
     ) -> Result<usize, StorageError> {
-        let _ = memory_id;
-        unimplemented!(
-            "LanceDb::delete_embedding_jobs_by_memory_id — see docs/repository.rs trait def"
-        )
+        // Pre-count to return how many rows we delete (LanceDB's
+        // DeleteResult only carries num_deleted_rows, but we want this
+        // to match DuckDB's `Connection::execute(DELETE)` rowcount
+        // contract regardless).
+        let table = self
+            .conn
+            .open_table("embedding_jobs")
+            .execute()
+            .await
+            .map_err(lancedb_err)?;
+        let count = table
+            .count_rows(Some(format!("memory_id = {}", sql_quote(memory_id))))
+            .await
+            .map_err(lancedb_err)?;
+        if count == 0 {
+            return Ok(0);
+        }
+        let result = table
+            .delete(&format!("memory_id = {}", sql_quote(memory_id)))
+            .await
+            .map_err(lancedb_err)?;
+        // Lance servers older than this codebase may report 0 here even
+        // when rows were deleted (the count_rows pre-flight is the
+        // canonical source for the count we return).
+        if result.num_deleted_rows == 0 {
+            Ok(count)
+        } else {
+            Ok(usize::try_from(result.num_deleted_rows).unwrap_or(count))
+        }
     }
 
     async fn get_memory_for_tenant(
@@ -1433,8 +1799,35 @@ impl MemoryRepository for LanceDbRepository {
         memory_id_filter: Option<&str>,
         limit: usize,
     ) -> Result<Vec<EmbeddingJobInfo>, StorageError> {
-        let _ = (tenant, status_filter, memory_id_filter, limit);
-        unimplemented!("LanceDb::list_embedding_jobs — see docs/repository.rs trait def")
+        let mut filter = format!("tenant = {}", sql_quote(tenant));
+        if let Some(s) = status_filter {
+            filter.push_str(&format!(" AND status = {}", sql_quote(s)));
+        }
+        if let Some(m) = memory_id_filter {
+            filter.push_str(&format!(" AND memory_id = {}", sql_quote(m)));
+        }
+        let mut rows = self.query_embedding_jobs(filter).await?;
+        // ORDER BY updated_at DESC LIMIT n — sort then truncate.
+        rows.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
+        let lim = limit.min(10_000);
+        rows.truncate(lim);
+        let out = rows
+            .into_iter()
+            .map(|r| EmbeddingJobInfo {
+                job_id: r.job_id,
+                tenant: r.tenant,
+                memory_id: r.memory_id,
+                target_content_hash: r.target_content_hash,
+                provider: r.provider,
+                status: r.status,
+                attempt_count: u32::try_from(r.attempt_count).unwrap_or(u32::MAX),
+                last_error: r.last_error,
+                available_at: r.available_at,
+                created_at: r.created_at,
+                updated_at: r.updated_at,
+            })
+            .collect();
+        Ok(out)
     }
 
     async fn stale_live_embedding_jobs_for_memory(
@@ -1444,18 +1837,102 @@ impl MemoryRepository for LanceDbRepository {
         provider: &str,
         now: &str,
     ) -> Result<usize, StorageError> {
-        let _ = (tenant, memory_id, provider, now);
-        unimplemented!(
-            "LanceDb::stale_live_embedding_jobs_for_memory — see docs/repository.rs trait def"
-        )
+        // Pre-count, then UPDATE all matching live rows to status 'stale'.
+        // LanceDB's UpdateResult.rows_updated is the canonical rowcount,
+        // but we count first so we can return the same shape as DuckDB
+        // even if the LanceDB update reports 0 (legacy server quirk —
+        // matches the same defensive shape we use in delete_*).
+        let table = self
+            .conn
+            .open_table("embedding_jobs")
+            .execute()
+            .await
+            .map_err(lancedb_err)?;
+        let filter = format!(
+            "tenant = {} AND memory_id = {} AND provider = {} \
+             AND (status = 'pending' OR status = 'processing')",
+            sql_quote(tenant),
+            sql_quote(memory_id),
+            sql_quote(provider),
+        );
+        let count = table
+            .count_rows(Some(filter.clone()))
+            .await
+            .map_err(lancedb_err)?;
+        if count == 0 {
+            return Ok(0);
+        }
+        let result = table
+            .update()
+            .only_if(filter)
+            .column("status", "'stale'")
+            .column("updated_at", sql_quote(now))
+            .execute()
+            .await
+            .map_err(lancedb_err)?;
+        if result.rows_updated == 0 {
+            Ok(count)
+        } else {
+            Ok(usize::try_from(result.rows_updated).unwrap_or(count))
+        }
     }
 
     async fn get_memory_embedding_row(
         &self,
         memory_id: &str,
     ) -> Result<Option<(String, String, String)>, StorageError> {
-        let _ = memory_id;
-        unimplemented!("LanceDb::get_memory_embedding_row — see docs/repository.rs trait def")
+        // No memory_embeddings table yet → no row by definition.
+        let names = self
+            .conn
+            .table_names()
+            .execute()
+            .await
+            .map_err(lancedb_err)?;
+        if !names.iter().any(|n| n == "memory_embeddings") {
+            return Ok(None);
+        }
+        let table = self
+            .conn
+            .open_table("memory_embeddings")
+            .execute()
+            .await
+            .map_err(lancedb_err)?;
+        let stream = table
+            .query()
+            .only_if(format!("memory_id = {}", sql_quote(memory_id)))
+            .limit(1)
+            .execute()
+            .await
+            .map_err(lancedb_err)?;
+        let batches: Vec<RecordBatch> = stream
+            .try_collect()
+            .await
+            .map_err(|e| StorageError::InvalidInput(format!("lancedb stream: {e}")))?;
+        for b in &batches {
+            if b.num_rows() == 0 {
+                continue;
+            }
+            fn col<'a, T: 'static>(
+                batch: &'a RecordBatch,
+                name: &'static str,
+            ) -> Result<&'a T, StorageError> {
+                batch
+                    .column_by_name(name)
+                    .ok_or(StorageError::InvalidData("missing column"))?
+                    .as_any()
+                    .downcast_ref::<T>()
+                    .ok_or(StorageError::InvalidData("column type mismatch"))
+            }
+            let model = col::<StringArray>(b, "embedding_model")?;
+            let hash = col::<StringArray>(b, "content_hash")?;
+            let updated = col::<StringArray>(b, "updated_at")?;
+            return Ok(Some((
+                model.value(0).to_string(),
+                hash.value(0).to_string(),
+                updated.value(0).to_string(),
+            )));
+        }
+        Ok(None)
     }
 
     async fn latest_embedding_job_status_for_hash(
@@ -1464,10 +1941,17 @@ impl MemoryRepository for LanceDbRepository {
         memory_id: &str,
         target_content_hash: &str,
     ) -> Result<Option<String>, StorageError> {
-        let _ = (tenant, memory_id, target_content_hash);
-        unimplemented!(
-            "LanceDb::latest_embedding_job_status_for_hash — see docs/repository.rs trait def"
-        )
+        let mut rows = self
+            .query_embedding_jobs(format!(
+                "tenant = {} AND memory_id = {} AND target_content_hash = {}",
+                sql_quote(tenant),
+                sql_quote(memory_id),
+                sql_quote(target_content_hash),
+            ))
+            .await?;
+        // ORDER BY updated_at DESC LIMIT 1.
+        rows.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
+        Ok(rows.into_iter().next().map(|r| r.status))
     }
 }
 
@@ -2115,5 +2599,206 @@ mod tests {
             .delete_memory_embedding("anything")
             .await
             .unwrap();
+    }
+
+    /// embedding_jobs queue end-to-end:
+    /// enqueue (idempotent) → claim → complete; reschedule → re-claim;
+    /// permanently_fail; mark_stale; list/filter; stale_live;
+    /// delete_by_memory_id; latest_status_for_hash.
+    #[tokio::test]
+    async fn lancedb_embedding_jobs_queue_round_trip() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("lance.store");
+        let repo = LanceDbRepository::open(&path).await.unwrap();
+
+        let m1 = fixture("mem_q1", "tenant-a");
+        let m2 = fixture("mem_q2", "tenant-a");
+        for m in [&m1, &m2] {
+            repo.insert_memory(m.clone()).await.unwrap();
+        }
+
+        // Enqueue: first call creates, second is idempotent (dup detected).
+        let insert1 = EmbeddingJobInsert {
+            job_id: "job_1".into(),
+            tenant: "tenant-a".into(),
+            memory_id: "mem_q1".into(),
+            target_content_hash: "hash_q1".into(),
+            provider: "fake-test".into(),
+            available_at: "00000001778000000000".into(),
+            created_at: "00000001778000000000".into(),
+            updated_at: "00000001778000000000".into(),
+        };
+        let enq1 = repo
+            .try_enqueue_embedding_job(insert1.clone())
+            .await
+            .unwrap();
+        assert!(enq1, "first enqueue should create");
+        let enq1b = repo.try_enqueue_embedding_job(insert1).await.unwrap();
+        assert!(!enq1b, "duplicate enqueue must return false");
+
+        let first = repo
+            .first_embedding_job_id_for_memory("mem_q1")
+            .await
+            .unwrap();
+        assert_eq!(first, Some("job_1".into()));
+        let none = repo
+            .first_embedding_job_id_for_memory("does-not-exist")
+            .await
+            .unwrap();
+        assert!(none.is_none());
+
+        let status = repo
+            .latest_embedding_job_status_for_hash("tenant-a", "mem_q1", "hash_q1")
+            .await
+            .unwrap();
+        assert_eq!(status.as_deref(), Some("pending"));
+
+        // Add a second job (different memory) so claim ordering is testable.
+        let insert2 = EmbeddingJobInsert {
+            job_id: "job_2".into(),
+            tenant: "tenant-a".into(),
+            memory_id: "mem_q2".into(),
+            target_content_hash: "hash_q2".into(),
+            provider: "fake-test".into(),
+            available_at: "00000001778000000001".into(),
+            created_at: "00000001778000000001".into(),
+            updated_at: "00000001778000000001".into(),
+        };
+        repo.try_enqueue_embedding_job(insert2).await.unwrap();
+
+        // Claim 5: only 2 available; ordered by available_at ASC then
+        // created_at ASC (job_1 first because earlier available_at).
+        let now = "00000001778000010000";
+        let claimed = repo.claim_next_n_embedding_jobs(now, 5, 5).await.unwrap();
+        assert_eq!(claimed.len(), 2);
+        assert_eq!(claimed[0].job_id, "job_1");
+        assert_eq!(claimed[1].job_id, "job_2");
+        assert_eq!(claimed[0].attempt_count, 0);
+
+        // After claim, both rows are 'processing'.
+        let status_after = repo
+            .latest_embedding_job_status_for_hash("tenant-a", "mem_q1", "hash_q1")
+            .await
+            .unwrap();
+        assert_eq!(status_after.as_deref(), Some("processing"));
+
+        // Re-claim returns nothing.
+        let recl = repo.claim_next_n_embedding_jobs(now, 5, 5).await.unwrap();
+        assert!(recl.is_empty());
+
+        repo.complete_embedding_job("job_1", "00000001778000020000")
+            .await
+            .unwrap();
+        let s1 = repo
+            .latest_embedding_job_status_for_hash("tenant-a", "mem_q1", "hash_q1")
+            .await
+            .unwrap();
+        assert_eq!(s1.as_deref(), Some("completed"));
+
+        repo.reschedule_embedding_job_failure(
+            "job_2",
+            1,
+            "transient",
+            "00000001778000040000",
+            "00000001778000030000",
+        )
+        .await
+        .unwrap();
+        let s2 = repo
+            .latest_embedding_job_status_for_hash("tenant-a", "mem_q2", "hash_q2")
+            .await
+            .unwrap();
+        assert_eq!(s2.as_deref(), Some("failed"));
+
+        // Re-claim with budget=2 should pick job_2 again (failed,
+        // attempt_count < max_retries, available_at <= now).
+        let now2 = "00000001778000050000";
+        let recl2 = repo.claim_next_n_embedding_jobs(now2, 2, 5).await.unwrap();
+        assert_eq!(recl2.len(), 1);
+        assert_eq!(recl2[0].job_id, "job_2");
+        assert_eq!(recl2[0].attempt_count, 1);
+
+        // Permanently fail it (attempt_count beyond budget).
+        repo.permanently_fail_embedding_job("job_2", 5, "boom", "00000001778000060000")
+            .await
+            .unwrap();
+        let recl3 = repo.claim_next_n_embedding_jobs(now2, 2, 5).await.unwrap();
+        // Failed but attempt_count (5) >= max_retries (2) → not eligible.
+        assert!(recl3.is_empty());
+
+        repo.mark_embedding_job_stale("job_1", "00000001778000070000")
+            .await
+            .unwrap();
+        let s_stale = repo
+            .latest_embedding_job_status_for_hash("tenant-a", "mem_q1", "hash_q1")
+            .await
+            .unwrap();
+        assert_eq!(s_stale.as_deref(), Some("stale"));
+
+        // list_embedding_jobs: tenant filter.
+        let all = repo
+            .list_embedding_jobs("tenant-a", None, None, 50)
+            .await
+            .unwrap();
+        assert_eq!(all.len(), 2);
+
+        // status filter.
+        let only_failed = repo
+            .list_embedding_jobs("tenant-a", Some("failed"), None, 50)
+            .await
+            .unwrap();
+        assert_eq!(only_failed.len(), 1);
+        assert_eq!(only_failed[0].job_id, "job_2");
+        assert_eq!(only_failed[0].attempt_count, 5);
+
+        // memory_id filter.
+        let only_q1 = repo
+            .list_embedding_jobs("tenant-a", None, Some("mem_q1"), 50)
+            .await
+            .unwrap();
+        assert_eq!(only_q1.len(), 1);
+        assert_eq!(only_q1[0].memory_id, "mem_q1");
+
+        // stale_live: enqueue a fresh pending row, then sweep it stale.
+        let insert3 = EmbeddingJobInsert {
+            job_id: "job_3".into(),
+            tenant: "tenant-a".into(),
+            memory_id: "mem_q1".into(),
+            target_content_hash: "hash_q1_v2".into(),
+            provider: "fake-test".into(),
+            available_at: "00000001778000080000".into(),
+            created_at: "00000001778000080000".into(),
+            updated_at: "00000001778000080000".into(),
+        };
+        repo.try_enqueue_embedding_job(insert3).await.unwrap();
+        let staled = repo
+            .stale_live_embedding_jobs_for_memory(
+                "tenant-a",
+                "mem_q1",
+                "fake-test",
+                "00000001778000090000",
+            )
+            .await
+            .unwrap();
+        assert_eq!(staled, 1);
+
+        let deleted = repo
+            .delete_embedding_jobs_by_memory_id("mem_q1")
+            .await
+            .unwrap();
+        assert_eq!(deleted, 2);
+        let remaining = repo
+            .list_embedding_jobs("tenant-a", None, None, 50)
+            .await
+            .unwrap();
+        assert_eq!(remaining.len(), 1);
+        assert_eq!(remaining[0].memory_id, "mem_q2");
+
+        // delete on no-row → 0.
+        let zero = repo
+            .delete_embedding_jobs_by_memory_id("nope")
+            .await
+            .unwrap();
+        assert_eq!(zero, 0);
     }
 }
