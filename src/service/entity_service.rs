@@ -8,6 +8,8 @@
 //! resulting [`EntityWithAliases`] for the response body.
 
 use crate::domain::{AddAliasOutcome, Entity, EntityKind, EntityWithAliases};
+use std::sync::Arc;
+
 use crate::storage::{DuckDbRepository, EntityRegistry, StorageError};
 
 /// Error variants returned by [`EntityService::create_with_aliases`].
@@ -28,12 +30,17 @@ pub enum CreateWithAliasesError {
 
 #[derive(Clone)]
 pub struct EntityService {
-    repo: DuckDbRepository,
+    /// Storage backend, accessed through the [`EntityRegistry`] trait — portable
+    /// across DuckDB / future LanceDB / Milvus backends. Concrete
+    /// `DuckDbRepository` is wrapped at the constructor.
+    repo: Arc<dyn EntityRegistry + Send + Sync>,
 }
 
 impl EntityService {
     pub fn new(repo: DuckDbRepository) -> Self {
-        Self { repo }
+        Self {
+            repo: Arc::new(repo),
+        }
     }
 
     /// Create or resolve `canonical_name` (caller's verbatim input) under
