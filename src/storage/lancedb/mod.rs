@@ -155,10 +155,13 @@ impl LanceDbRepository {
         ensure_memories_table(&conn).await?;
         ensure_feedback_events_table(&conn).await?;
         ensure_embedding_jobs_table(&conn).await?;
+        ensure_graph_edges_table(&conn).await?;
+        ensure_entities_table(&conn).await?;
+        ensure_entity_aliases_table(&conn).await?;
         // memory_embeddings is lazy-created on first upsert (dim is
         // provider-dependent and unknown here without provider).
         // TODO: ensure_conversation_messages_table, ensure_episodes_table,
-        // ensure_sessions_table, ensure_graph_edges_table, ensure_entities_table.
+        // ensure_sessions_table.
 
         Ok(Self {
             conn: Arc::new(conn),
@@ -232,6 +235,18 @@ async fn ensure_memory_embeddings_table(conn: &Connection, dim: i32) -> Result<(
 
 async fn ensure_embedding_jobs_table(conn: &Connection) -> Result<(), StorageError> {
     ensure_table(conn, "embedding_jobs", embedding_jobs_schema()).await
+}
+
+async fn ensure_graph_edges_table(conn: &Connection) -> Result<(), StorageError> {
+    ensure_table(conn, "graph_edges", graph_edges_schema()).await
+}
+
+async fn ensure_entities_table(conn: &Connection) -> Result<(), StorageError> {
+    ensure_table(conn, "entities", entities_schema()).await
+}
+
+async fn ensure_entity_aliases_table(conn: &Connection) -> Result<(), StorageError> {
+    ensure_table(conn, "entity_aliases", entity_aliases_schema()).await
 }
 
 /// Idempotent `create_empty_table` — checks `Connection::table_names()`
@@ -538,6 +553,179 @@ fn record_batch_to_embedding_job_rows(
         });
     }
     Ok(out)
+}
+
+/// Arrow schema for `graph_edges`. Bitemporal edge model — `valid_to`
+/// is null for active edges, set to a timestamp when superseded.
+fn graph_edges_schema() -> Schema {
+    Schema::new(vec![
+        Field::new("from_node_id", DataType::Utf8, false),
+        Field::new("to_node_id", DataType::Utf8, false),
+        Field::new("relation", DataType::Utf8, false),
+        Field::new("valid_from", DataType::Utf8, false),
+        Field::new("valid_to", DataType::Utf8, true),
+    ])
+}
+
+fn graph_edge_to_record_batch(edge: &GraphEdge) -> Result<RecordBatch, StorageError> {
+    let mut from = StringBuilder::new();
+    let mut to = StringBuilder::new();
+    let mut relation = StringBuilder::new();
+    let mut valid_from = StringBuilder::new();
+    let mut valid_to = StringBuilder::new();
+    from.append_value(&edge.from_node_id);
+    to.append_value(&edge.to_node_id);
+    relation.append_value(&edge.relation);
+    valid_from.append_value(&edge.valid_from);
+    match &edge.valid_to {
+        Some(s) => valid_to.append_value(s),
+        None => valid_to.append_null(),
+    }
+    let columns: Vec<Arc<dyn Array>> = vec![
+        Arc::new(from.finish()),
+        Arc::new(to.finish()),
+        Arc::new(relation.finish()),
+        Arc::new(valid_from.finish()),
+        Arc::new(valid_to.finish()),
+    ];
+    RecordBatch::try_new(Arc::new(graph_edges_schema()), columns)
+        .map_err(|e| StorageError::InvalidInput(format!("graph_edge record batch: {e}")))
+}
+
+fn record_batch_to_graph_edges(batch: &RecordBatch) -> Result<Vec<GraphEdge>, StorageError> {
+    fn col<'a, T: 'static>(
+        batch: &'a RecordBatch,
+        name: &'static str,
+    ) -> Result<&'a T, StorageError> {
+        batch
+            .column_by_name(name)
+            .ok_or(StorageError::InvalidData("missing column"))?
+            .as_any()
+            .downcast_ref::<T>()
+            .ok_or(StorageError::InvalidData("column type mismatch"))
+    }
+    let from = col::<StringArray>(batch, "from_node_id")?;
+    let to = col::<StringArray>(batch, "to_node_id")?;
+    let relation = col::<StringArray>(batch, "relation")?;
+    let valid_from = col::<StringArray>(batch, "valid_from")?;
+    let valid_to = col::<StringArray>(batch, "valid_to")?;
+    let mut out = Vec::with_capacity(batch.num_rows());
+    for i in 0..batch.num_rows() {
+        out.push(GraphEdge {
+            from_node_id: from.value(i).to_string(),
+            to_node_id: to.value(i).to_string(),
+            relation: relation.value(i).to_string(),
+            valid_from: valid_from.value(i).to_string(),
+            valid_to: if valid_to.is_null(i) {
+                None
+            } else {
+                Some(valid_to.value(i).to_string())
+            },
+        });
+    }
+    Ok(out)
+}
+
+/// Arrow schema for `entities`. Mirrors DuckDB 1:1 (5 cols, scalar).
+fn entities_schema() -> Schema {
+    Schema::new(vec![
+        Field::new("entity_id", DataType::Utf8, false),
+        Field::new("tenant", DataType::Utf8, false),
+        Field::new("canonical_name", DataType::Utf8, false),
+        Field::new("kind", DataType::Utf8, false),
+        Field::new("created_at", DataType::Utf8, false),
+    ])
+}
+
+fn entity_to_record_batch(entity: &Entity) -> Result<RecordBatch, StorageError> {
+    let mut entity_id = StringBuilder::new();
+    let mut tenant = StringBuilder::new();
+    let mut canonical_name = StringBuilder::new();
+    let mut kind = StringBuilder::new();
+    let mut created_at = StringBuilder::new();
+    entity_id.append_value(&entity.entity_id);
+    tenant.append_value(&entity.tenant);
+    canonical_name.append_value(&entity.canonical_name);
+    kind.append_value(entity.kind.as_db_str());
+    created_at.append_value(&entity.created_at);
+    let columns: Vec<Arc<dyn Array>> = vec![
+        Arc::new(entity_id.finish()),
+        Arc::new(tenant.finish()),
+        Arc::new(canonical_name.finish()),
+        Arc::new(kind.finish()),
+        Arc::new(created_at.finish()),
+    ];
+    RecordBatch::try_new(Arc::new(entities_schema()), columns)
+        .map_err(|e| StorageError::InvalidInput(format!("entity record batch: {e}")))
+}
+
+fn record_batch_to_entities(batch: &RecordBatch) -> Result<Vec<Entity>, StorageError> {
+    fn col<'a, T: 'static>(
+        batch: &'a RecordBatch,
+        name: &'static str,
+    ) -> Result<&'a T, StorageError> {
+        batch
+            .column_by_name(name)
+            .ok_or(StorageError::InvalidData("missing column"))?
+            .as_any()
+            .downcast_ref::<T>()
+            .ok_or(StorageError::InvalidData("column type mismatch"))
+    }
+    let entity_id = col::<StringArray>(batch, "entity_id")?;
+    let tenant = col::<StringArray>(batch, "tenant")?;
+    let canonical_name = col::<StringArray>(batch, "canonical_name")?;
+    let kind = col::<StringArray>(batch, "kind")?;
+    let created_at = col::<StringArray>(batch, "created_at")?;
+    let mut out = Vec::with_capacity(batch.num_rows());
+    for i in 0..batch.num_rows() {
+        let kind_s = kind.value(i);
+        let kind = EntityKind::from_db_str(kind_s)
+            .ok_or(StorageError::InvalidData("invalid entity kind"))?;
+        out.push(Entity {
+            entity_id: entity_id.value(i).to_string(),
+            tenant: tenant.value(i).to_string(),
+            canonical_name: canonical_name.value(i).to_string(),
+            kind,
+            created_at: created_at.value(i).to_string(),
+        });
+    }
+    Ok(out)
+}
+
+/// Arrow schema for `entity_aliases`. Composite "PK" = (tenant,
+/// alias_text) but LanceDB doesn't enforce uniqueness — every write
+/// path that touches this table must do its own existence check first.
+fn entity_aliases_schema() -> Schema {
+    Schema::new(vec![
+        Field::new("tenant", DataType::Utf8, false),
+        Field::new("alias_text", DataType::Utf8, false),
+        Field::new("entity_id", DataType::Utf8, false),
+        Field::new("created_at", DataType::Utf8, false),
+    ])
+}
+
+fn entity_alias_to_record_batch(
+    tenant_v: &str,
+    alias_text_v: &str,
+    entity_id_v: &str,
+    created_at_v: &str,
+) -> Result<RecordBatch, StorageError> {
+    let mut tenant = StringBuilder::new();
+    let mut alias_text = StringBuilder::new();
+    let mut entity_id = StringBuilder::new();
+    let mut created_at = StringBuilder::new();
+    tenant.append_value(tenant_v);
+    alias_text.append_value(alias_text_v);
+    entity_id.append_value(entity_id_v);
+    created_at.append_value(created_at_v);
+    let columns: Vec<Arc<dyn Array>> = vec![
+        Arc::new(tenant.finish()),
+        Arc::new(alias_text.finish()),
+        Arc::new(entity_id.finish()),
+        Arc::new(created_at.finish()),
+    ];
+    RecordBatch::try_new(Arc::new(entity_aliases_schema()), columns)
+        .map_err(|e| StorageError::InvalidInput(format!("entity_alias record batch: {e}")))
 }
 
 /// Mirror of DuckDB's private `feedback_adjustments` helper. Resolves a
@@ -2096,28 +2284,174 @@ impl TranscriptRepository for LanceDbRepository {
     }
 }
 
+/// Read all `graph_edges` rows matching `filter`, parsed into
+/// [`GraphEdge`]s. Helper shared by `neighbors`, `related_memory_ids`,
+/// and the existence check in `sync_memory_edges`.
+impl LanceDbRepository {
+    async fn query_graph_edges(&self, filter: String) -> Result<Vec<GraphEdge>, GraphError> {
+        let table = self
+            .conn
+            .open_table("graph_edges")
+            .execute()
+            .await
+            .map_err(|e| GraphError::Backend(e.to_string()))?;
+        let stream = table
+            .query()
+            .only_if(filter)
+            .execute()
+            .await
+            .map_err(|e| GraphError::Backend(e.to_string()))?;
+        let batches: Vec<RecordBatch> = stream
+            .try_collect()
+            .await
+            .map_err(|e| GraphError::Backend(format!("lancedb stream: {e}")))?;
+        let mut out = Vec::new();
+        for b in &batches {
+            out.extend(
+                record_batch_to_graph_edges(b).map_err(|e| GraphError::Backend(e.to_string()))?,
+            );
+        }
+        Ok(out)
+    }
+}
+
 #[async_trait]
 impl GraphStore for LanceDbRepository {
     async fn neighbors(&self, node_id: &str) -> Result<Vec<GraphEdge>, GraphError> {
-        let _ = node_id;
-        unimplemented!("LanceDb::neighbors — query graph_edges table where from_node_id = ? OR to_node_id = ? AND valid_to is null")
+        // Active edges only (valid_to is null) where the node sits on
+        // either side. Order by (relation, from, to) to match DuckDB's
+        // SQL — done in-memory because LanceDB has no ORDER BY.
+        let mut edges = self
+            .query_graph_edges(format!(
+                "(from_node_id = {0} OR to_node_id = {0}) AND valid_to IS NULL",
+                sql_quote(node_id),
+            ))
+            .await?;
+        edges.sort_by(|a, b| {
+            a.relation
+                .cmp(&b.relation)
+                .then_with(|| a.from_node_id.cmp(&b.from_node_id))
+                .then_with(|| a.to_node_id.cmp(&b.to_node_id))
+        });
+        Ok(edges)
     }
 
     async fn sync_memory_edges(&self, edges: &[GraphEdge], now: &str) -> Result<(), GraphError> {
-        let _ = (edges, now);
-        unimplemented!("LanceDb::sync_memory_edges — idempotent insert into graph_edges table")
+        if edges.is_empty() {
+            return Ok(());
+        }
+        let table = self
+            .conn
+            .open_table("graph_edges")
+            .execute()
+            .await
+            .map_err(|e| GraphError::Backend(e.to_string()))?;
+        // Idempotent insert: skip rows where an active edge with the
+        // same (from, to, relation) already exists. LanceDB has no
+        // transactions; a concurrent writer could race the existence
+        // check, but mem serve is single-instance per DB so this is
+        // safe in practice (same posture as embedding_jobs enqueue).
+        for edge in edges {
+            let exists = table
+                .count_rows(Some(format!(
+                    "from_node_id = {} AND to_node_id = {} AND relation = {} AND valid_to IS NULL",
+                    sql_quote(&edge.from_node_id),
+                    sql_quote(&edge.to_node_id),
+                    sql_quote(&edge.relation),
+                )))
+                .await
+                .map_err(|e| GraphError::Backend(e.to_string()))?;
+            if exists > 0 {
+                continue;
+            }
+            // Server overrides valid_from with `now` (matching DuckDB
+            // behavior — callers don't need to think about clocks) and
+            // forces valid_to = NULL (active).
+            let to_write = GraphEdge {
+                from_node_id: edge.from_node_id.clone(),
+                to_node_id: edge.to_node_id.clone(),
+                relation: edge.relation.clone(),
+                valid_from: now.to_string(),
+                valid_to: None,
+            };
+            let batch = graph_edge_to_record_batch(&to_write)
+                .map_err(|e| GraphError::Backend(e.to_string()))?;
+            table
+                .add(batch)
+                .execute()
+                .await
+                .map_err(|e| GraphError::Backend(e.to_string()))?;
+        }
+        Ok(())
     }
 
     async fn close_edges_for_memory(&self, memory_id: &str) -> Result<usize, GraphError> {
-        let _ = memory_id;
-        unimplemented!(
-            "LanceDb::close_edges_for_memory — set valid_to = now where from_node_id = memory:<id>"
-        )
+        let from = format!("memory:{memory_id}");
+        let now = crate::storage::current_timestamp();
+        let table = self
+            .conn
+            .open_table("graph_edges")
+            .execute()
+            .await
+            .map_err(|e| GraphError::Backend(e.to_string()))?;
+        let filter = format!("from_node_id = {} AND valid_to IS NULL", sql_quote(&from));
+        let count = table
+            .count_rows(Some(filter.clone()))
+            .await
+            .map_err(|e| GraphError::Backend(e.to_string()))?;
+        if count == 0 {
+            return Ok(0);
+        }
+        let result = table
+            .update()
+            .only_if(filter)
+            .column("valid_to", sql_quote(&now))
+            .execute()
+            .await
+            .map_err(|e| GraphError::Backend(e.to_string()))?;
+        if result.rows_updated == 0 {
+            Ok(count)
+        } else {
+            Ok(usize::try_from(result.rows_updated).unwrap_or(count))
+        }
     }
 
     async fn related_memory_ids(&self, node_ids: &[String]) -> Result<Vec<String>, GraphError> {
-        let _ = node_ids;
-        unimplemented!("LanceDb::related_memory_ids — find memory: prefixed nodes connected to any of node_ids")
+        if node_ids.is_empty() {
+            return Ok(vec![]);
+        }
+        // Build "id IN ('a', 'b', ...)" — LanceDB supports SQL IN, so
+        // we match the DuckDB shape directly. No CASE expression
+        // though, so we project both endpoints in Rust below.
+        let in_list = node_ids
+            .iter()
+            .map(|n| sql_quote(n))
+            .collect::<Vec<_>>()
+            .join(",");
+        let filter = format!(
+            "(from_node_id IN ({0}) OR to_node_id IN ({0})) AND valid_to IS NULL",
+            in_list,
+        );
+        let edges = self.query_graph_edges(filter).await?;
+        let node_set: std::collections::HashSet<&str> =
+            node_ids.iter().map(|s| s.as_str()).collect();
+        let mut memory_ids = std::collections::HashSet::new();
+        for e in edges {
+            // Adjacency: pick the endpoint that's NOT in node_ids; if
+            // both sides are in node_ids, both are recorded (matches
+            // the DuckDB "case when from in (...) then to else from"
+            // semantics — the SELECT DISTINCT collapses the duplicate).
+            for endpoint in [&e.from_node_id, &e.to_node_id] {
+                if !node_set.contains(endpoint.as_str()) {
+                    if let Some(memory_id) = endpoint.strip_prefix("memory:") {
+                        memory_ids.insert(memory_id.to_string());
+                    }
+                }
+            }
+        }
+        let mut out: Vec<String> = memory_ids.into_iter().collect();
+        out.sort();
+        Ok(out)
     }
 }
 
@@ -2130,8 +2464,53 @@ impl EntityRegistry for LanceDbRepository {
         kind: EntityKind,
         now: &str,
     ) -> Result<String, StorageError> {
-        let _ = (tenant, alias, kind, now);
-        unimplemented!("LanceDb::resolve_or_create — see docs/repository.rs trait def")
+        use crate::pipeline::entity_normalize::normalize_alias;
+        let normalized = normalize_alias(alias);
+
+        // Lookup first.
+        if let Some(id) = self.lookup_alias(tenant, alias).await? {
+            return Ok(id);
+        }
+
+        // Auto-promote: insert entity + first alias. No transaction (LanceDB
+        // doesn't have them) — under concurrent enqueue the
+        // single-writer assumption holds (see embedding_jobs comment).
+        let entity_id = uuid::Uuid::now_v7().to_string();
+        let entity = Entity {
+            entity_id: entity_id.clone(),
+            tenant: tenant.to_string(),
+            canonical_name: alias.to_string(),
+            kind,
+            created_at: now.to_string(),
+        };
+        let entities = self
+            .conn
+            .open_table("entities")
+            .execute()
+            .await
+            .map_err(lancedb_err)?;
+        entities
+            .add(entity_to_record_batch(&entity)?)
+            .execute()
+            .await
+            .map_err(lancedb_err)?;
+        let aliases = self
+            .conn
+            .open_table("entity_aliases")
+            .execute()
+            .await
+            .map_err(lancedb_err)?;
+        aliases
+            .add(entity_alias_to_record_batch(
+                tenant,
+                &normalized,
+                &entity_id,
+                now,
+            )?)
+            .execute()
+            .await
+            .map_err(lancedb_err)?;
+        Ok(entity_id)
     }
 
     async fn get_entity(
@@ -2139,8 +2518,81 @@ impl EntityRegistry for LanceDbRepository {
         tenant: &str,
         entity_id: &str,
     ) -> Result<Option<EntityWithAliases>, StorageError> {
-        let _ = (tenant, entity_id);
-        unimplemented!("LanceDb::get_entity — see docs/repository.rs trait def")
+        let entities = self
+            .conn
+            .open_table("entities")
+            .execute()
+            .await
+            .map_err(lancedb_err)?;
+        let stream = entities
+            .query()
+            .only_if(format!(
+                "tenant = {} AND entity_id = {}",
+                sql_quote(tenant),
+                sql_quote(entity_id),
+            ))
+            .limit(1)
+            .execute()
+            .await
+            .map_err(lancedb_err)?;
+        let batches: Vec<RecordBatch> = stream
+            .try_collect()
+            .await
+            .map_err(|e| StorageError::InvalidInput(format!("lancedb stream: {e}")))?;
+        let mut entity_iter = batches
+            .iter()
+            .flat_map(|b| record_batch_to_entities(b).unwrap_or_default().into_iter());
+        let Some(entity) = entity_iter.next() else {
+            return Ok(None);
+        };
+
+        // Pull aliases for this entity, sorted by created_at ASC then
+        // alias_text ASC (mirror DuckDB SQL).
+        let aliases_table = self
+            .conn
+            .open_table("entity_aliases")
+            .execute()
+            .await
+            .map_err(lancedb_err)?;
+        let stream2 = aliases_table
+            .query()
+            .only_if(format!(
+                "tenant = {} AND entity_id = {}",
+                sql_quote(tenant),
+                sql_quote(entity_id),
+            ))
+            .execute()
+            .await
+            .map_err(lancedb_err)?;
+        let batches2: Vec<RecordBatch> = stream2
+            .try_collect()
+            .await
+            .map_err(|e| StorageError::InvalidInput(format!("lancedb stream: {e}")))?;
+        let mut alias_rows: Vec<(String, String)> = Vec::new(); // (created_at, alias_text)
+        for b in &batches2 {
+            fn col<'a, T: 'static>(
+                batch: &'a RecordBatch,
+                name: &'static str,
+            ) -> Result<&'a T, StorageError> {
+                batch
+                    .column_by_name(name)
+                    .ok_or(StorageError::InvalidData("missing column"))?
+                    .as_any()
+                    .downcast_ref::<T>()
+                    .ok_or(StorageError::InvalidData("column type mismatch"))
+            }
+            let alias_text = col::<StringArray>(b, "alias_text")?;
+            let created_at = col::<StringArray>(b, "created_at")?;
+            for i in 0..b.num_rows() {
+                alias_rows.push((
+                    created_at.value(i).to_string(),
+                    alias_text.value(i).to_string(),
+                ));
+            }
+        }
+        alias_rows.sort();
+        let aliases: Vec<String> = alias_rows.into_iter().map(|(_, a)| a).collect();
+        Ok(Some(EntityWithAliases { entity, aliases }))
     }
 
     async fn add_alias(
@@ -2150,8 +2602,34 @@ impl EntityRegistry for LanceDbRepository {
         alias: &str,
         now: &str,
     ) -> Result<AddAliasOutcome, StorageError> {
-        let _ = (tenant, entity_id, alias, now);
-        unimplemented!("LanceDb::add_alias — see docs/repository.rs trait def")
+        use crate::pipeline::entity_normalize::normalize_alias;
+        let normalized = normalize_alias(alias);
+
+        // Existing-owner check: who currently owns the normalized form?
+        let existing_owner = self.lookup_alias(tenant, alias).await?;
+        match existing_owner {
+            None => {
+                let aliases_table = self
+                    .conn
+                    .open_table("entity_aliases")
+                    .execute()
+                    .await
+                    .map_err(lancedb_err)?;
+                aliases_table
+                    .add(entity_alias_to_record_batch(
+                        tenant,
+                        &normalized,
+                        entity_id,
+                        now,
+                    )?)
+                    .execute()
+                    .await
+                    .map_err(lancedb_err)?;
+                Ok(AddAliasOutcome::Inserted)
+            }
+            Some(owner) if owner == entity_id => Ok(AddAliasOutcome::AlreadyOnSameEntity),
+            Some(other) => Ok(AddAliasOutcome::ConflictWithDifferentEntity(other)),
+        }
     }
 
     async fn lookup_alias(
@@ -2159,8 +2637,42 @@ impl EntityRegistry for LanceDbRepository {
         tenant: &str,
         alias: &str,
     ) -> Result<Option<String>, StorageError> {
-        let _ = (tenant, alias);
-        unimplemented!("LanceDb::lookup_alias — see docs/repository.rs trait def")
+        use crate::pipeline::entity_normalize::normalize_alias;
+        let normalized = normalize_alias(alias);
+        let table = self
+            .conn
+            .open_table("entity_aliases")
+            .execute()
+            .await
+            .map_err(lancedb_err)?;
+        let stream = table
+            .query()
+            .only_if(format!(
+                "tenant = {} AND alias_text = {}",
+                sql_quote(tenant),
+                sql_quote(&normalized),
+            ))
+            .limit(1)
+            .execute()
+            .await
+            .map_err(lancedb_err)?;
+        let batches: Vec<RecordBatch> = stream
+            .try_collect()
+            .await
+            .map_err(|e| StorageError::InvalidInput(format!("lancedb stream: {e}")))?;
+        for b in &batches {
+            if b.num_rows() == 0 {
+                continue;
+            }
+            let entity_id = b
+                .column_by_name("entity_id")
+                .ok_or(StorageError::InvalidData("missing entity_id column"))?
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .ok_or(StorageError::InvalidData("entity_id column type mismatch"))?;
+            return Ok(Some(entity_id.value(0).to_string()));
+        }
+        Ok(None)
     }
 
     async fn list_entities(
@@ -2170,8 +2682,42 @@ impl EntityRegistry for LanceDbRepository {
         query: Option<&str>,
         limit: usize,
     ) -> Result<Vec<Entity>, StorageError> {
-        let _ = (tenant, kind_filter, query, limit);
-        unimplemented!("LanceDb::list_entities — see docs/repository.rs trait def")
+        let mut filter = format!("tenant = {}", sql_quote(tenant));
+        if let Some(k) = kind_filter {
+            filter.push_str(&format!(" AND kind = {}", sql_quote(k.as_db_str())));
+        }
+        // canonical_name LIKE '%query%' — LanceDB's filter parser accepts
+        // SQL LIKE patterns with `%` wildcards.
+        if let Some(q) = query {
+            filter.push_str(&format!(
+                " AND canonical_name LIKE {}",
+                sql_quote(&format!("%{q}%")),
+            ));
+        }
+        let table = self
+            .conn
+            .open_table("entities")
+            .execute()
+            .await
+            .map_err(lancedb_err)?;
+        let stream = table
+            .query()
+            .only_if(filter)
+            .execute()
+            .await
+            .map_err(lancedb_err)?;
+        let batches: Vec<RecordBatch> = stream
+            .try_collect()
+            .await
+            .map_err(|e| StorageError::InvalidInput(format!("lancedb stream: {e}")))?;
+        let mut entities = Vec::new();
+        for b in &batches {
+            entities.extend(record_batch_to_entities(b)?);
+        }
+        // ORDER BY created_at DESC — sort in-memory.
+        entities.sort_by(|a, b| b.created_at.cmp(&a.created_at));
+        entities.truncate(limit);
+        Ok(entities)
     }
 }
 
@@ -2905,5 +3451,224 @@ mod tests {
             .unwrap();
         let lance_ids: Vec<&str> = lance_hits.iter().map(|m| m.memory_id.as_str()).collect();
         assert!(lance_ids.contains(&"mem_b2"));
+    }
+
+    /// `GraphStore` round-trip: sync_memory_edges (idempotent) →
+    /// neighbors → close_edges_for_memory → related_memory_ids.
+    #[tokio::test]
+    async fn lancedb_graph_store_round_trip() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("lance.store");
+        let repo = LanceDbRepository::open(&path).await.unwrap();
+
+        let edges = vec![
+            GraphEdge {
+                from_node_id: "memory:m1".into(),
+                to_node_id: "entity:e1".into(),
+                relation: "mentions".into(),
+                valid_from: "00000001778000000000".into(),
+                valid_to: None,
+            },
+            GraphEdge {
+                from_node_id: "memory:m2".into(),
+                to_node_id: "entity:e1".into(),
+                relation: "mentions".into(),
+                valid_from: "00000001778000000000".into(),
+                valid_to: None,
+            },
+            GraphEdge {
+                from_node_id: "memory:m1".into(),
+                to_node_id: "entity:e2".into(),
+                relation: "discusses".into(),
+                valid_from: "00000001778000000000".into(),
+                valid_to: None,
+            },
+        ];
+        repo.sync_memory_edges(&edges, "00000001778000010000")
+            .await
+            .unwrap();
+        // Idempotent: re-sync same edges → no duplicates.
+        repo.sync_memory_edges(&edges, "00000001778000020000")
+            .await
+            .unwrap();
+        let after_dup_sync = repo.neighbors("entity:e1").await.unwrap();
+        assert_eq!(
+            after_dup_sync.len(),
+            2,
+            "duplicate sync should not create new rows"
+        );
+
+        // neighbors at e1: 2 active edges (m1, m2 both 'mentions')
+        let n_e1 = repo.neighbors("entity:e1").await.unwrap();
+        assert_eq!(n_e1.len(), 2);
+        // ordered by relation,from,to — mentions/m1, mentions/m2
+        assert_eq!(n_e1[0].from_node_id, "memory:m1");
+        assert_eq!(n_e1[1].from_node_id, "memory:m2");
+
+        // related_memory_ids for [e1, e2]: should give {m1, m2}.
+        let related = repo
+            .related_memory_ids(&["entity:e1".into(), "entity:e2".into()])
+            .await
+            .unwrap();
+        assert_eq!(related, vec!["m1".to_string(), "m2".to_string()]);
+
+        // Close all edges from m1 (mentions e1 + discusses e2).
+        let closed = repo.close_edges_for_memory("m1").await.unwrap();
+        assert_eq!(closed, 2);
+
+        // After close, neighbors(e1) drops to just m2's edge.
+        let n_after = repo.neighbors("entity:e1").await.unwrap();
+        assert_eq!(n_after.len(), 1);
+        assert_eq!(n_after[0].from_node_id, "memory:m2");
+
+        // related_memory_ids reflects the close — m1 is gone.
+        let related2 = repo
+            .related_memory_ids(&["entity:e1".into(), "entity:e2".into()])
+            .await
+            .unwrap();
+        assert_eq!(related2, vec!["m2".to_string()]);
+
+        // close on a memory with no active edges → 0.
+        let zero = repo.close_edges_for_memory("nope").await.unwrap();
+        assert_eq!(zero, 0);
+
+        // Empty input edge list → no-op (no errors).
+        repo.sync_memory_edges(&[], "00000001778000030000")
+            .await
+            .unwrap();
+
+        // Empty input node_ids → empty Vec.
+        let empty = repo.related_memory_ids(&[]).await.unwrap();
+        assert!(empty.is_empty());
+    }
+
+    /// `EntityRegistry` round-trip: resolve_or_create idempotency, alias
+    /// normalization (case + whitespace), get_entity, add_alias
+    /// (Inserted / AlreadyOnSameEntity / ConflictWithDifferentEntity),
+    /// lookup_alias, list_entities (kind + LIKE filters).
+    #[tokio::test]
+    async fn lancedb_entity_registry_round_trip() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("lance.store");
+        let repo = LanceDbRepository::open(&path).await.unwrap();
+
+        let id1 = repo
+            .resolve_or_create(
+                "tenant-a",
+                "Rust Async",
+                EntityKind::Topic,
+                "00000001778000000000",
+            )
+            .await
+            .unwrap();
+        // Same alias under different casing/whitespace → same entity.
+        let id1b = repo
+            .resolve_or_create(
+                "tenant-a",
+                "  rust   ASYNC  ",
+                EntityKind::Topic,
+                "00000001778000000001",
+            )
+            .await
+            .unwrap();
+        assert_eq!(id1, id1b, "normalized alias must round-trip to same entity");
+
+        let id2 = repo
+            .resolve_or_create(
+                "tenant-a",
+                "DuckDB",
+                EntityKind::Project,
+                "00000001778000000002",
+            )
+            .await
+            .unwrap();
+        assert_ne!(id1, id2);
+
+        // Different tenant, same alias → distinct entity.
+        let id3 = repo
+            .resolve_or_create(
+                "tenant-b",
+                "Rust Async",
+                EntityKind::Topic,
+                "00000001778000000003",
+            )
+            .await
+            .unwrap();
+        assert_ne!(id1, id3);
+
+        let with_aliases = repo
+            .get_entity("tenant-a", &id1)
+            .await
+            .unwrap()
+            .expect("entity should exist");
+        assert_eq!(with_aliases.entity.canonical_name, "Rust Async");
+        assert_eq!(with_aliases.entity.kind, EntityKind::Topic);
+        assert_eq!(with_aliases.aliases, vec!["rust async".to_string()]);
+
+        let none = repo.get_entity("tenant-a", "does-not-exist").await.unwrap();
+        assert!(none.is_none());
+
+        // add_alias: new alias on same entity → Inserted.
+        let r1 = repo
+            .add_alias("tenant-a", &id1, "Tokio", "00000001778000000010")
+            .await
+            .unwrap();
+        assert_eq!(r1, AddAliasOutcome::Inserted);
+
+        // Same alias re-added → AlreadyOnSameEntity (idempotent).
+        let r2 = repo
+            .add_alias("tenant-a", &id1, "tokio", "00000001778000000011")
+            .await
+            .unwrap();
+        assert_eq!(r2, AddAliasOutcome::AlreadyOnSameEntity);
+
+        // Different entity claiming the same alias → Conflict.
+        let r3 = repo
+            .add_alias("tenant-a", &id2, "Tokio", "00000001778000000012")
+            .await
+            .unwrap();
+        assert_eq!(
+            r3,
+            AddAliasOutcome::ConflictWithDifferentEntity(id1.clone())
+        );
+
+        // lookup_alias short-circuit.
+        let look = repo.lookup_alias("tenant-a", "Rust Async").await.unwrap();
+        assert_eq!(look.as_deref(), Some(id1.as_str()));
+        let look_none = repo.lookup_alias("tenant-a", "unknown").await.unwrap();
+        assert!(look_none.is_none());
+
+        // list_entities: tenant-a has 2 entities, ORDER BY created_at DESC.
+        let all_a = repo
+            .list_entities("tenant-a", None, None, 10)
+            .await
+            .unwrap();
+        assert_eq!(all_a.len(), 2);
+        assert_eq!(all_a[0].entity_id, id2);
+        assert_eq!(all_a[1].entity_id, id1);
+
+        // kind filter.
+        let topics = repo
+            .list_entities("tenant-a", Some(EntityKind::Topic), None, 10)
+            .await
+            .unwrap();
+        assert_eq!(topics.len(), 1);
+        assert_eq!(topics[0].entity_id, id1);
+
+        // LIKE filter on canonical_name.
+        let like = repo
+            .list_entities("tenant-a", None, Some("Rust"), 10)
+            .await
+            .unwrap();
+        assert_eq!(like.len(), 1);
+        assert_eq!(like[0].canonical_name, "Rust Async");
+
+        // tenant-b has just the cross-tenant duplicate.
+        let all_b = repo
+            .list_entities("tenant-b", None, None, 10)
+            .await
+            .unwrap();
+        assert_eq!(all_b.len(), 1);
+        assert_eq!(all_b[0].entity_id, id3);
     }
 }
