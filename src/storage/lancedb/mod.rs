@@ -60,9 +60,12 @@ use arrow_array::{
 use async_trait::async_trait;
 use futures::TryStreamExt;
 use lancedb::arrow::arrow_schema::{DataType, Field, Schema};
+use lancedb::embeddings::{EmbeddingFunction, EmbeddingRegistry, MemoryRegistry};
 use lancedb::query::{ExecutableQuery, QueryBase};
 use lancedb::Connection;
 use serde::{de::DeserializeOwned, Serialize};
+
+mod embedding;
 
 use crate::domain::embeddings::EmbeddingJobInfo;
 use crate::domain::episode::EpisodeRecord;
@@ -99,6 +102,33 @@ impl LanceDbRepository {
     /// only the `memories` table schema is defined; remaining tables get
     /// added as their corresponding trait methods become non-stub.
     pub async fn open(path: impl AsRef<Path>) -> Result<Self, StorageError> {
+        Self::open_inner(path, None).await
+    }
+
+    /// Like [`Self::open`], but registers the given `EmbeddingProvider` as
+    /// a LanceDB `EmbeddingFunction` named `"<provider>-<model>"`. Vector
+    /// columns can then declare auto-embed against it via
+    /// `EmbeddingDefinition::new("content", "<provider>-<model>", None)` —
+    /// `Table::add(text_only_batch)` and
+    /// `Table::vector_search(text_query)` will internally call back into
+    /// the provider through this adapter.
+    ///
+    /// **Runtime requirement:** the adapter blocks an async embed call
+    /// from inside LanceDB's sync `EmbeddingFunction` trait method via
+    /// `tokio::task::block_in_place`. The caller must run on a
+    /// **multi-thread** tokio runtime; calling this from a current-thread
+    /// runtime will panic at first auto-embed.
+    pub async fn open_with_provider(
+        path: impl AsRef<Path>,
+        provider: Arc<dyn crate::embedding::EmbeddingProvider>,
+    ) -> Result<Self, StorageError> {
+        Self::open_inner(path, Some(provider)).await
+    }
+
+    async fn open_inner(
+        path: impl AsRef<Path>,
+        provider: Option<Arc<dyn crate::embedding::EmbeddingProvider>>,
+    ) -> Result<Self, StorageError> {
         let path = path.as_ref();
         let uri = path
             .to_str()
@@ -108,7 +138,16 @@ impl LanceDbRepository {
             std::fs::create_dir_all(parent)?;
         }
 
-        let conn = lancedb::connect(uri).execute().await.map_err(lancedb_err)?;
+        let mut builder = lancedb::connect(uri);
+        if let Some(provider) = provider {
+            let func = Arc::new(embedding::ProviderEmbeddingFunction::new(provider));
+            let registry = Arc::new(MemoryRegistry::new());
+            registry
+                .register(func.name(), func.clone())
+                .map_err(lancedb_err)?;
+            builder = builder.embedding_registry(registry);
+        }
+        let conn = builder.execute().await.map_err(lancedb_err)?;
 
         ensure_memories_table(&conn).await?;
         ensure_feedback_events_table(&conn).await?;
