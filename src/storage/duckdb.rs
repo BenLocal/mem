@@ -52,6 +52,25 @@ pub struct EmbeddingJobInsert {
     pub updated_at: String,
 }
 
+/// State transition for an embedding-job row (`embedding_jobs` /
+/// `transcript_embedding_jobs`). Single source of truth for the worker
+/// job state machine — used by both `DuckDbRepository::update_embedding_job`
+/// and `DuckDbRepository::update_transcript_embedding_job` so the SQL
+/// shape stays in lock-step across the two parallel queues.
+pub(crate) enum EmbeddingJobTransition<'a> {
+    Complete,
+    Stale,
+    Reschedule {
+        attempt_count: i64,
+        last_error: &'a str,
+        available_at: &'a str,
+    },
+    Fail {
+        attempt_count: i64,
+        last_error: &'a str,
+    },
+}
+
 #[derive(Debug, Clone)]
 struct EmbeddingJobRow {
     job_id: String,
@@ -1196,19 +1215,60 @@ impl DuckDbRepository {
         Ok(scored)
     }
 
+    /// Apply a state transition to an `embedding_jobs` row. Single source of
+    /// truth for the worker job state machine; the four `*_embedding_job`
+    /// methods below are thin wrappers preserving the public API.
+    async fn update_embedding_job(
+        &self,
+        job_id: &str,
+        transition: EmbeddingJobTransition<'_>,
+        now: &str,
+    ) -> Result<(), StorageError> {
+        let conn = self.conn()?;
+        match transition {
+            EmbeddingJobTransition::Complete => conn.execute(
+                "update embedding_jobs
+                 set status = 'completed', last_error = null, updated_at = ?1
+                 where job_id = ?2 and status = 'processing'",
+                params![now, job_id],
+            )?,
+            EmbeddingJobTransition::Stale => conn.execute(
+                "update embedding_jobs set status = 'stale', updated_at = ?1 where job_id = ?2",
+                params![now, job_id],
+            )?,
+            EmbeddingJobTransition::Reschedule {
+                attempt_count,
+                last_error,
+                available_at,
+            } => conn.execute(
+                "update embedding_jobs
+                 set status = 'failed',
+                     attempt_count = ?1, last_error = ?2,
+                     available_at = ?3, updated_at = ?4
+                 where job_id = ?5",
+                params![attempt_count, last_error, available_at, now, job_id],
+            )?,
+            EmbeddingJobTransition::Fail {
+                attempt_count,
+                last_error,
+            } => conn.execute(
+                "update embedding_jobs
+                 set status = 'failed',
+                     attempt_count = ?1, last_error = ?2, updated_at = ?3
+                 where job_id = ?4",
+                params![attempt_count, last_error, now, job_id],
+            )?,
+        };
+        Ok(())
+    }
+
     pub async fn complete_embedding_job(
         &self,
         job_id: &str,
         now: &str,
     ) -> Result<(), StorageError> {
-        let conn = self.conn()?;
-        conn.execute(
-            "update embedding_jobs
-             set status = 'completed', last_error = null, updated_at = ?1
-             where job_id = ?2 and status = 'processing'",
-            params![now, job_id],
-        )?;
-        Ok(())
+        self.update_embedding_job(job_id, EmbeddingJobTransition::Complete, now)
+            .await
     }
 
     pub async fn mark_embedding_job_stale(
@@ -1216,12 +1276,8 @@ impl DuckDbRepository {
         job_id: &str,
         now: &str,
     ) -> Result<(), StorageError> {
-        let conn = self.conn()?;
-        conn.execute(
-            "update embedding_jobs set status = 'stale', updated_at = ?1 where job_id = ?2",
-            params![now, job_id],
-        )?;
-        Ok(())
+        self.update_embedding_job(job_id, EmbeddingJobTransition::Stale, now)
+            .await
     }
 
     pub async fn reschedule_embedding_job_failure(
@@ -1232,18 +1288,16 @@ impl DuckDbRepository {
         available_at: &str,
         now: &str,
     ) -> Result<(), StorageError> {
-        let conn = self.conn()?;
-        conn.execute(
-            "update embedding_jobs
-             set status = 'failed',
-                 attempt_count = ?1,
-                 last_error = ?2,
-                 available_at = ?3,
-                 updated_at = ?4
-             where job_id = ?5",
-            params![new_attempt_count, last_error, available_at, now, job_id],
-        )?;
-        Ok(())
+        self.update_embedding_job(
+            job_id,
+            EmbeddingJobTransition::Reschedule {
+                attempt_count: new_attempt_count,
+                last_error,
+                available_at,
+            },
+            now,
+        )
+        .await
     }
 
     pub async fn permanently_fail_embedding_job(
@@ -1253,17 +1307,15 @@ impl DuckDbRepository {
         last_error: &str,
         now: &str,
     ) -> Result<(), StorageError> {
-        let conn = self.conn()?;
-        conn.execute(
-            "update embedding_jobs
-             set status = 'failed',
-                 attempt_count = ?1,
-                 last_error = ?2,
-                 updated_at = ?3
-             where job_id = ?4",
-            params![new_attempt_count, last_error, now, job_id],
-        )?;
-        Ok(())
+        self.update_embedding_job(
+            job_id,
+            EmbeddingJobTransition::Fail {
+                attempt_count: new_attempt_count,
+                last_error,
+            },
+            now,
+        )
+        .await
     }
 
     /// Last-resort orphan cleanup: DELETE every `embedding_jobs` row matching

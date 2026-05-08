@@ -10,7 +10,7 @@ use std::collections::HashMap;
 use duckdb::{params, OptionalExt};
 use serde::Serialize;
 
-use super::duckdb::{DuckDbRepository, StorageError};
+use super::duckdb::{DuckDbRepository, EmbeddingJobTransition, StorageError};
 use super::time::current_timestamp;
 use super::vector_index::TranscriptEmbeddingRowSource;
 use crate::domain::ConversationMessage;
@@ -692,19 +692,58 @@ impl DuckDbRepository {
         Ok(Some(job))
     }
 
+    /// Mirror of `update_embedding_job` for the transcript queue.
+    async fn update_transcript_embedding_job(
+        &self,
+        job_id: &str,
+        transition: EmbeddingJobTransition<'_>,
+        now: &str,
+    ) -> Result<(), StorageError> {
+        let conn = self.conn()?;
+        match transition {
+            EmbeddingJobTransition::Complete => conn.execute(
+                "update transcript_embedding_jobs
+                 set status = 'completed', last_error = null, updated_at = ?1
+                 where job_id = ?2 and status = 'processing'",
+                params![now, job_id],
+            )?,
+            EmbeddingJobTransition::Stale => conn.execute(
+                "update transcript_embedding_jobs set status = 'stale', updated_at = ?1 where job_id = ?2",
+                params![now, job_id],
+            )?,
+            EmbeddingJobTransition::Reschedule {
+                attempt_count,
+                last_error,
+                available_at,
+            } => conn.execute(
+                "update transcript_embedding_jobs
+                 set status = 'failed',
+                     attempt_count = ?1, last_error = ?2,
+                     available_at = ?3, updated_at = ?4
+                 where job_id = ?5",
+                params![attempt_count, last_error, available_at, now, job_id],
+            )?,
+            EmbeddingJobTransition::Fail {
+                attempt_count,
+                last_error,
+            } => conn.execute(
+                "update transcript_embedding_jobs
+                 set status = 'failed',
+                     attempt_count = ?1, last_error = ?2, updated_at = ?3
+                 where job_id = ?4",
+                params![attempt_count, last_error, now, job_id],
+            )?,
+        };
+        Ok(())
+    }
+
     pub async fn complete_transcript_embedding_job(
         &self,
         job_id: &str,
         now: &str,
     ) -> Result<(), StorageError> {
-        let conn = self.conn()?;
-        conn.execute(
-            "update transcript_embedding_jobs
-             set status = 'completed', last_error = null, updated_at = ?1
-             where job_id = ?2 and status = 'processing'",
-            params![now, job_id],
-        )?;
-        Ok(())
+        self.update_transcript_embedding_job(job_id, EmbeddingJobTransition::Complete, now)
+            .await
     }
 
     pub async fn mark_transcript_embedding_job_stale(
@@ -712,12 +751,8 @@ impl DuckDbRepository {
         job_id: &str,
         now: &str,
     ) -> Result<(), StorageError> {
-        let conn = self.conn()?;
-        conn.execute(
-            "update transcript_embedding_jobs set status = 'stale', updated_at = ?1 where job_id = ?2",
-            params![now, job_id],
-        )?;
-        Ok(())
+        self.update_transcript_embedding_job(job_id, EmbeddingJobTransition::Stale, now)
+            .await
     }
 
     pub async fn reschedule_transcript_embedding_job_failure(
@@ -728,18 +763,16 @@ impl DuckDbRepository {
         available_at: &str,
         now: &str,
     ) -> Result<(), StorageError> {
-        let conn = self.conn()?;
-        conn.execute(
-            "update transcript_embedding_jobs
-             set status = 'failed',
-                 attempt_count = ?1,
-                 last_error = ?2,
-                 available_at = ?3,
-                 updated_at = ?4
-             where job_id = ?5",
-            params![new_attempt_count, last_error, available_at, now, job_id],
-        )?;
-        Ok(())
+        self.update_transcript_embedding_job(
+            job_id,
+            EmbeddingJobTransition::Reschedule {
+                attempt_count: new_attempt_count,
+                last_error,
+                available_at,
+            },
+            now,
+        )
+        .await
     }
 
     pub async fn permanently_fail_transcript_embedding_job(
@@ -749,17 +782,15 @@ impl DuckDbRepository {
         last_error: &str,
         now: &str,
     ) -> Result<(), StorageError> {
-        let conn = self.conn()?;
-        conn.execute(
-            "update transcript_embedding_jobs
-             set status = 'failed',
-                 attempt_count = ?1,
-                 last_error = ?2,
-                 updated_at = ?3
-             where job_id = ?4",
-            params![new_attempt_count, last_error, now, job_id],
-        )?;
-        Ok(())
+        self.update_transcript_embedding_job(
+            job_id,
+            EmbeddingJobTransition::Fail {
+                attempt_count: new_attempt_count,
+                last_error,
+            },
+            now,
+        )
+        .await
     }
 
     pub async fn get_transcript_embedding_job_status(
