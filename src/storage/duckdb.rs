@@ -803,36 +803,54 @@ impl DuckDbRepository {
         tenant: &str,
         memory_id: &str,
     ) -> Result<(), StorageError> {
-        let conn = self.conn()?;
-        let from_node = format!("memory:{memory_id}");
+        // Block-scope the MutexGuard so it's strictly dropped before the
+        // async vector_index.remove call below — otherwise the resulting
+        // future is `!Send` and can't be used through `Arc<dyn MemoryRepository>`.
+        {
+            let conn = self.conn()?;
+            let from_node = format!("memory:{memory_id}");
 
-        conn.execute(
-            "delete from embedding_jobs where memory_id = ?1",
-            params![memory_id],
-        )?;
-        conn.execute(
-            "delete from memory_embeddings where memory_id = ?1",
-            params![memory_id],
-        )?;
-        conn.execute(
-            "delete from feedback_events where memory_id = ?1",
-            params![memory_id],
-        )?;
-        conn.execute(
-            "delete from graph_edges where from_node_id = ?1",
-            params![&from_node],
-        )?;
+            conn.execute(
+                "delete from embedding_jobs where memory_id = ?1",
+                params![memory_id],
+            )?;
+            conn.execute(
+                "delete from memory_embeddings where memory_id = ?1",
+                params![memory_id],
+            )?;
+            conn.execute(
+                "delete from feedback_events where memory_id = ?1",
+                params![memory_id],
+            )?;
+            conn.execute(
+                "delete from graph_edges where from_node_id = ?1",
+                params![&from_node],
+            )?;
 
-        let n = conn.execute(
-            "delete from memories where tenant = ?1 and memory_id = ?2",
-            params![tenant, memory_id],
-        )?;
-        if n == 0 {
-            return Err(StorageError::InvalidData("memory not found"));
+            let n = conn.execute(
+                "delete from memories where tenant = ?1 and memory_id = ?2",
+                params![tenant, memory_id],
+            )?;
+            if n == 0 {
+                return Err(StorageError::InvalidData("memory not found"));
+            }
         }
 
         if let Err(e) = self.memory_fts.delete(memory_id) {
             tracing::warn!(error = %e, memory_id = %memory_id, "memory fts delete failed");
+        }
+
+        // Remove from the HNSW sidecar too. Best-effort: failures here are
+        // logged and ignored — the row is already gone from DuckDB so the
+        // worst case is a stale ANN entry that re-fetch will skip.
+        if let Some(idx) = self.vector_index() {
+            if let Err(err) = idx.remove(memory_id).await {
+                tracing::warn!(
+                    error = %err,
+                    memory_id = %memory_id,
+                    "vector index remove failed during delete_memory_hard",
+                );
+            }
         }
         Ok(())
     }

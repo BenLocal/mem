@@ -26,7 +26,7 @@ use crate::{
     pipeline::{compress, retrieve},
     storage::{
         current_timestamp, DuckDbGraphStore, DuckDbRepository, EmbeddingJobInsert, EntityRegistry,
-        GraphError, StorageError,
+        GraphError, Repository, StorageError,
     },
 };
 
@@ -58,7 +58,12 @@ impl From<MemoryRecord> for IngestMemoryResponse {
 
 #[derive(Clone)]
 pub struct MemoryService {
-    repository: DuckDbRepository,
+    /// Storage backend, accessed through the [`MemoryRepository`] trait so
+    /// `MemoryService` is portable across DuckDB / future LanceDB / Milvus
+    /// backends. Constructors still accept `DuckDbRepository` for now
+    /// because `DuckDbGraphStore::new` (constructed alongside) requires
+    /// the concrete type — abstracting graph storage is a follow-up.
+    repository: Arc<dyn Repository>,
     graph: Arc<DuckDbGraphStore>,
     /// Value stored on `embedding_jobs.provider` (e.g. `fake`, `openai`).
     embedding_job_provider: String,
@@ -119,7 +124,9 @@ impl MemoryService {
         Self::with_graph_and_embedding_providers(repository, graph, embedding_job_provider, None)
     }
 
-    /// Full constructor used by `app.rs`.
+    /// Full constructor used by `app.rs`. Accepts the concrete
+    /// `DuckDbRepository` (it's the only backend today) and stores it as
+    /// an `Arc<dyn MemoryRepository>` trait object internally.
     pub fn with_graph_and_embedding_providers(
         repository: DuckDbRepository,
         graph: Arc<DuckDbGraphStore>,
@@ -127,7 +134,7 @@ impl MemoryService {
         embedding_search_provider: Option<Arc<dyn EmbeddingProvider>>,
     ) -> Self {
         Self {
-            repository,
+            repository: Arc::new(repository),
             graph,
             embedding_job_provider,
             embedding_search_provider,
@@ -162,7 +169,7 @@ impl MemoryService {
             .unwrap_or_else(|| summarize(&request.content));
 
         let session_id = crate::pipeline::session::resolve_session(
-            &self.repository,
+            &*self.repository,
             &request.tenant,
             &request.source_agent,
             &now,
@@ -203,7 +210,13 @@ impl MemoryService {
 
         let stored = self.repository.insert_memory(memory).await?;
         let drafts = crate::pipeline::ingest::extract_graph_edge_drafts(&stored);
-        let edges = resolve_drafts_to_edges(drafts, &self.repository, &stored.tenant, &now).await?;
+        let edges = resolve_drafts_to_edges(
+            drafts,
+            self.repository.as_entity_registry(),
+            &stored.tenant,
+            &now,
+        )
+        .await?;
         self.graph.sync_memory_edges(&edges, &now).await?;
         self.enqueue_embedding_job_for_memory(&stored).await?;
         self.repository
@@ -301,11 +314,9 @@ impl MemoryService {
         self.repository
             .delete_memory_hard(tenant, memory_id)
             .await?;
-
-        if let Some(idx) = self.repository.vector_index() {
-            let _ = idx.remove(memory_id).await;
-        }
-
+        // Vector-index sidecar removal happens inside
+        // `DuckDbRepository::delete_memory_hard` itself; service code no
+        // longer needs to know the backend uses HNSW.
         Ok(())
     }
 
@@ -513,8 +524,13 @@ impl MemoryService {
             .await?;
         let now = current_timestamp();
         let drafts = crate::pipeline::ingest::extract_graph_edge_drafts(&superseding);
-        let edges =
-            resolve_drafts_to_edges(drafts, &self.repository, &superseding.tenant, &now).await?;
+        let edges = resolve_drafts_to_edges(
+            drafts,
+            self.repository.as_entity_registry(),
+            &superseding.tenant,
+            &now,
+        )
+        .await?;
         self.graph.sync_memory_edges(&edges, &now).await?;
 
         self.enqueue_embedding_job_for_memory(&superseding).await?;
@@ -769,7 +785,7 @@ impl MemoryService {
 /// of the entity-registry roadmap.
 pub(crate) async fn resolve_drafts_to_edges(
     drafts: Vec<GraphEdgeDraft>,
-    registry: &impl EntityRegistry,
+    registry: &(impl EntityRegistry + ?Sized),
     tenant: &str,
     now: &str,
 ) -> Result<Vec<GraphEdge>, StorageError> {

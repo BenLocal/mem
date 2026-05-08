@@ -22,10 +22,15 @@
 
 use async_trait::async_trait;
 
+use crate::domain::embeddings::EmbeddingJobInfo;
+use crate::domain::episode::EpisodeRecord;
 use crate::domain::memory::{FeedbackSummary, MemoryRecord, MemoryVersionLink};
+use crate::domain::session::Session;
 use crate::storage::FeedbackEvent;
 
-use super::duckdb::{ClaimedEmbeddingJob, DuckDbRepository, EmbeddingJobInsert, StorageError};
+use super::duckdb::{
+    ClaimedEmbeddingJob, DuckDbRepository, EmbeddingJobInsert, EntityRegistry, StorageError,
+};
 
 /// Core memory + embedding-job repository surface. See module-level docs.
 #[async_trait]
@@ -181,6 +186,98 @@ pub trait MemoryRepository: Send + Sync {
     ) -> Result<Vec<MemoryVersionLink>, StorageError>;
 
     async fn feedback_summary(&self, memory_id: &str) -> Result<FeedbackSummary, StorageError>;
+
+    async fn delete_memory_hard(&self, tenant: &str, memory_id: &str) -> Result<(), StorageError>;
+
+    async fn get_memory(&self, memory_id: String) -> Result<Option<MemoryRecord>, StorageError>;
+
+    async fn insert_episode(&self, episode: EpisodeRecord) -> Result<EpisodeRecord, StorageError>;
+
+    async fn list_memory_ids_for_tenant(
+        &self,
+        tenant: &str,
+    ) -> Result<Vec<String>, StorageError>;
+
+    async fn touch_session(
+        &self,
+        session_id: &str,
+        last_seen_at: &str,
+    ) -> Result<(), StorageError>;
+
+    async fn latest_active_session(
+        &self,
+        tenant: &str,
+        caller_agent: &str,
+    ) -> Result<Option<Session>, StorageError>;
+
+    async fn open_session(
+        &self,
+        session_id: &str,
+        tenant: &str,
+        caller_agent: &str,
+        now: &str,
+    ) -> Result<Session, StorageError>;
+
+    async fn close_session(&self, session_id: &str, ended_at: &str) -> Result<(), StorageError>;
+
+    async fn list_successful_episodes_for_tenant(
+        &self,
+        tenant: &str,
+    ) -> Result<Vec<EpisodeRecord>, StorageError>;
+
+    async fn list_embedding_jobs(
+        &self,
+        tenant: &str,
+        status_filter: Option<&str>,
+        memory_id_filter: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<EmbeddingJobInfo>, StorageError>;
+
+    async fn stale_live_embedding_jobs_for_memory(
+        &self,
+        tenant: &str,
+        memory_id: &str,
+        provider: &str,
+        now: &str,
+    ) -> Result<usize, StorageError>;
+
+    async fn get_memory_embedding_row(
+        &self,
+        memory_id: &str,
+    ) -> Result<Option<(String, String, String)>, StorageError>;
+
+    async fn latest_embedding_job_status_for_hash(
+        &self,
+        tenant: &str,
+        memory_id: &str,
+        target_content_hash: &str,
+    ) -> Result<Option<String>, StorageError>;
+}
+
+/// Combined storage surface: `MemoryRepository` for the core memories +
+/// embedding-jobs surface, plus `EntityRegistry` for the alias-canonicalization
+/// path used by `MemoryService::ingest`. Bundling them here lets services
+/// hold a single `Arc<dyn Repository + Send + Sync>` instead of two
+/// separate trait objects.
+///
+/// `as_entity_registry` is the manual upcasting helper — without it (or
+/// nightly trait-upcasting), callers can't pass `&dyn Repository` to a
+/// function that wants `&dyn EntityRegistry`. With it, the call site is
+/// `repo.as_entity_registry()`.
+///
+/// Backends that implement both traits get `Repository` for free via the
+/// blanket impl below.
+pub trait Repository: MemoryRepository + EntityRegistry + Send + Sync {
+    fn as_entity_registry(&self) -> &dyn EntityRegistry;
+}
+
+impl<T> Repository for T
+where
+    T: MemoryRepository + EntityRegistry + Send + Sync + 'static,
+{
+    fn as_entity_registry(&self) -> &dyn EntityRegistry {
+        self
+    }
 }
 
 #[async_trait]
@@ -423,5 +520,107 @@ impl MemoryRepository for DuckDbRepository {
 
     async fn feedback_summary(&self, memory_id: &str) -> Result<FeedbackSummary, StorageError> {
         DuckDbRepository::feedback_summary(self, memory_id).await
+    }
+
+    async fn delete_memory_hard(&self, tenant: &str, memory_id: &str) -> Result<(), StorageError> {
+        DuckDbRepository::delete_memory_hard(self, tenant, memory_id).await
+    }
+
+    async fn get_memory(&self, memory_id: String) -> Result<Option<MemoryRecord>, StorageError> {
+        DuckDbRepository::get_memory(self, memory_id).await
+    }
+
+    async fn insert_episode(&self, episode: EpisodeRecord) -> Result<EpisodeRecord, StorageError> {
+        DuckDbRepository::insert_episode(self, episode).await
+    }
+
+    async fn list_memory_ids_for_tenant(
+        &self,
+        tenant: &str,
+    ) -> Result<Vec<String>, StorageError> {
+        DuckDbRepository::list_memory_ids_for_tenant(self, tenant).await
+    }
+
+    async fn touch_session(
+        &self,
+        session_id: &str,
+        last_seen_at: &str,
+    ) -> Result<(), StorageError> {
+        DuckDbRepository::touch_session(self, session_id, last_seen_at).await
+    }
+
+    async fn latest_active_session(
+        &self,
+        tenant: &str,
+        caller_agent: &str,
+    ) -> Result<Option<Session>, StorageError> {
+        DuckDbRepository::latest_active_session(self, tenant, caller_agent).await
+    }
+
+    async fn open_session(
+        &self,
+        session_id: &str,
+        tenant: &str,
+        caller_agent: &str,
+        now: &str,
+    ) -> Result<Session, StorageError> {
+        DuckDbRepository::open_session(self, session_id, tenant, caller_agent, now).await
+    }
+
+    async fn close_session(&self, session_id: &str, ended_at: &str) -> Result<(), StorageError> {
+        DuckDbRepository::close_session(self, session_id, ended_at).await
+    }
+
+    async fn list_successful_episodes_for_tenant(
+        &self,
+        tenant: &str,
+    ) -> Result<Vec<EpisodeRecord>, StorageError> {
+        DuckDbRepository::list_successful_episodes_for_tenant(self, tenant).await
+    }
+
+    async fn list_embedding_jobs(
+        &self,
+        tenant: &str,
+        status_filter: Option<&str>,
+        memory_id_filter: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<EmbeddingJobInfo>, StorageError> {
+        DuckDbRepository::list_embedding_jobs(self, tenant, status_filter, memory_id_filter, limit)
+            .await
+    }
+
+    async fn stale_live_embedding_jobs_for_memory(
+        &self,
+        tenant: &str,
+        memory_id: &str,
+        provider: &str,
+        now: &str,
+    ) -> Result<usize, StorageError> {
+        DuckDbRepository::stale_live_embedding_jobs_for_memory(
+            self, tenant, memory_id, provider, now,
+        )
+        .await
+    }
+
+    async fn get_memory_embedding_row(
+        &self,
+        memory_id: &str,
+    ) -> Result<Option<(String, String, String)>, StorageError> {
+        DuckDbRepository::get_memory_embedding_row(self, memory_id).await
+    }
+
+    async fn latest_embedding_job_status_for_hash(
+        &self,
+        tenant: &str,
+        memory_id: &str,
+        target_content_hash: &str,
+    ) -> Result<Option<String>, StorageError> {
+        DuckDbRepository::latest_embedding_job_status_for_hash(
+            self,
+            tenant,
+            memory_id,
+            target_content_hash,
+        )
+        .await
     }
 }
