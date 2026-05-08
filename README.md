@@ -30,10 +30,6 @@ The MCP server forwards 20 tools to the HTTP service over `MEM_BASE_URL` (defaul
 | `MEM_TENANT` | `local` | Default tenant when a tool omits it |
 | `MEM_MCP_EXPOSE_EMBEDDINGS` | unset | Set to `1` to enable admin `embeddings_*` tools |
 
-- **Agent skill (workflow):** [docs/superpowers/skills/mem-mcp-codex/SKILL.md](docs/superpowers/skills/mem-mcp-codex/SKILL.md)
-- **CI without MCP:** [docs/superpowers/examples/ci-mem-http-snippet.md](docs/superpowers/examples/ci-mem-http-snippet.md)
-- **Historical context** (now superseded by the Rust implementation): [spec](docs/superpowers/specs/2026-03-21-codex-mem-mcp-integration-design.md), [plan](docs/superpowers/plans/2026-03-21-codex-mem-mcp-integration.md)
-
 ## Cross-compile server (Linux binary)
 
 配置文件为仓库根目录的 **`Cross.toml`**（`cross` CLI 固定读取该文件名；若要用别的路径可设环境变量 `CROSS_CONFIG`）。
@@ -72,8 +68,6 @@ Default in the image: `BIND_ADDR=0.0.0.0:3000`, `MEM_DB_PATH=/data/mem.duckdb`. 
 
 1. Push a semver tag: `git tag v0.1.0 && git push origin v0.1.0`（同时触发 **CI** 与 **Release**；Docker 镜像构建使用 GitHub Actions 缓存加速重复构建）。
 2. Workflow [`.github/workflows/release.yml`](.github/workflows/release.yml) 推送 **`ghcr.io/<lowercase-owner>/mem:<tag>`** 与 **`:latest`**，并在 GitHub Release 上附带 **`mem-<tag>-x86_64-unknown-linux-gnu`**、**`mem-<tag>-x86_64-unknown-linux-musl`** 以及 **`mem-<tag>-SHA256SUMS`**（`sha256sum` 校验文件）。MCP server 已合入二进制，无需单独发布。
-
-Plan (历史): [docs/superpowers/plans/2026-03-22-mem-publish-docker-actions.md](docs/superpowers/plans/2026-03-22-mem-publish-docker-actions.md).
 
 Point every client at the same `MEM_BASE_URL` and `tenant` so multiple Codex or Cursor processes share one store.
 
@@ -195,7 +189,7 @@ mem wake-up --token-budget 800
 
 ## Transcript Archive (conversation_messages)
 
-A second pipeline, fully isolated from `memories`, archives every Claude Code transcript block verbatim and exposes semantic search + ordered replay over those blocks. It exists alongside `memories` so the existing ranking / lifecycle / verbatim-guard surface is **untouched**: separate table (`conversation_messages`), separate embedding queue (`transcript_embedding_jobs`), and a separate HNSW sidecar at `<MEM_DB_PATH>.transcripts.usearch`. `mem mine` is now **dual-sink** — one transcript scan writes both extracted memories (existing path) and every block (text / tool_use / tool_result / thinking) to the archive. Design: [`docs/superpowers/specs/2026-04-30-conversation-archive-design.md`](docs/superpowers/specs/2026-04-30-conversation-archive-design.md).
+A second pipeline, fully isolated from `memories`, archives every Claude Code transcript block verbatim and exposes semantic search + ordered replay over those blocks. It exists alongside `memories` so the existing ranking / lifecycle / verbatim-guard surface is **untouched**: separate table (`conversation_messages`), separate embedding queue (`transcript_embedding_jobs`), and a separate HNSW sidecar at `<MEM_DB_PATH>.transcripts.usearch`. `mem mine` is now **dual-sink** — one transcript scan writes both extracted memories (existing path) and every block (text / tool_use / tool_result / thinking) to the archive.
 
 ```bash
 # Ingest a single block (internal — `mem mine` POSTs these for you).
@@ -285,7 +279,7 @@ Prints the 10-rung table to stdout; writes `target/bench-out/recall-synthetic.js
 ### Real (local decision pull)
 
 Set `MEM_BENCH_FIXTURE_PATH` to a JSON dump of your own transcripts
-(see `docs/superpowers/specs/2026-05-03-transcript-recall-bench-design.md` §Real Fixture for schema):
+(see `tests/bench/longmemeval_dataset.rs` for the expected schema):
 
 ```bash
 MEM_BENCH_FIXTURE_PATH=/path/to/recall-real.json \
@@ -386,4 +380,3 @@ After ingest, `graph_edges.to_node_id` is `"entity:<uuid>"` for every entity-typ
 
 **MCP**: the registry is HTTP-only; no MCP surface (matches the conversation-archive / transcript-recall convention).
 
-Spec: [`docs/superpowers/specs/2026-05-02-entity-registry-design.md`](docs/superpowers/specs/2026-05-02-entity-registry-design.md).

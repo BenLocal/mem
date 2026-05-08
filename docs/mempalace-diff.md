@@ -309,7 +309,7 @@ mem 的本性是 **"结构化记忆生命周期"**（status / supersedes / feedb
 
 ## 11. Sessions（对齐 MemPalace 的 Room，但和 episodes 正交）
 
-> **2026-04-29 落地**：✅ schema (`db/schema/004_sessions.sql`) + auto-bucket (`pipeline/session.rs::resolve_session`) + `memories.session_id` 落地。`MEM_SESSION_IDLE_MINUTES` 环境变量化（默认 30）。HTTP 端点（`GET /sessions` 等）、`episodes.session_id` 列、`DELETE /sessions/{id}` 软删均延后到后续 PR。详见 `docs/superpowers/specs/2026-04-29-sessions-design.md`。
+> **2026-04-29 落地**：✅ schema (`db/schema/004_sessions.sql`) + auto-bucket (`pipeline/session.rs::resolve_session`) + `memories.session_id` 落地。`MEM_SESSION_IDLE_MINUTES` 环境变量化（默认 30）。HTTP 端点（`GET /sessions` 等）、`episodes.session_id` 列、`DELETE /sessions/{id}` 软删均延后到后续 PR。
 >
 > **本次落地的两点偏离原设计**：
 > 1. `last_seen_at` 单独成列（原 §11 用 `ended_at.unwrap_or(started_at)`，对长 session 不 work）。
@@ -416,7 +416,7 @@ M（半天）= schema 迁移 + `resolve_session` + ingest 路径接线 + 一个 
 
 ## 12. 检索流水线三段式重构（取 mem 之结构化、借 MemPalace 之分层）
 
-> **2026-04-29 落地**：✅ 按 line 513 的 "可降级为只做 Stage 2 拆分（半天）" 路径执行。`pipeline/retrieve.rs::apply_lifecycle_score` 抽出共享 helper（9 个普适信号），三个 scorer 都调它复用 lifecycle 加性层；evidence bonus 在两个 hybrid scorer 内联（`score_candidates` 非 hybrid 路径历史上没这个 bonus，保持原样）。3 个新单测 + 全套现有测试零 assertion 改动通过 —— 行为完全等价。**Stage 3 仍未做**：响应形状变更（暴露 `score_breakdown`）、`compress.rs` 解构、A/B `MEM_RANKER=three_stage` 切换均延后。详见 `docs/superpowers/specs/2026-04-29-lifecycle-score-extraction-design.md`。
+> **2026-04-29 落地**：✅ 按 line 513 的 "可降级为只做 Stage 2 拆分（半天）" 路径执行。`pipeline/retrieve.rs::apply_lifecycle_score` 抽出共享 helper（9 个普适信号），三个 scorer 都调它复用 lifecycle 加性层；evidence bonus 在两个 hybrid scorer 内联（`score_candidates` 非 hybrid 路径历史上没这个 bonus，保持原样）。3 个新单测 + 全套现有测试零 assertion 改动通过 —— 行为完全等价。**Stage 3 仍未做**：响应形状变更（暴露 `score_breakdown`）、`compress.rs` 解构、A/B `MEM_RANKER=three_stage` 切换均延后。
 >
 > **触发完整 §12 重构的条件**：当 `tests/search_api.rs` 出现 P95 延迟报警 OR caller 反馈 token 截断失真 OR caller-side LLM rerank 真的接进来。
 
@@ -665,7 +665,7 @@ M（1.5 天，前提是 #11 完成）：
 
 ## 14. Conversation Archive（verbatim transcript 全量归档，与 memories 管道完全隔离）
 
-> **2026-04-30 落地**：✅ 在 §13 的 `mem mine` 之上加一条**全量原始对话归档**管道。新表 `conversation_messages`（每个 transcript block 一行，verbatim）+ 独立队列 `transcript_embedding_jobs` + 独立 HNSW sidecar `<MEM_DB_PATH>.transcripts.usearch`；与 `memories` 表 / 嵌入队列 / sidecar **完全不共享**任何状态或向量空间。`mem mine` 改为 dual-sink，单次扫描既写既有 memories 路径也写新 archive；`mem repair --check|--rebuild` 同时覆盖两个 sidecar。HTTP 路由 `POST /transcripts/messages` / `POST /transcripts/search` / `GET /transcripts?session_id=…&tenant=…`。**MCP 表面零变化**——transcript 搜索仅 HTTP，agent 走 `memory_search` → 命中后用 `session_id` 拉对应 transcript。详见 spec [`docs/superpowers/specs/2026-04-30-conversation-archive-design.md`](./superpowers/specs/2026-04-30-conversation-archive-design.md) 与 plan [`docs/superpowers/plans/2026-04-30-conversation-archive.md`](./superpowers/plans/2026-04-30-conversation-archive.md)。
+> **2026-04-30 落地**：✅ 在 §13 的 `mem mine` 之上加一条**全量原始对话归档**管道。新表 `conversation_messages`（每个 transcript block 一行，verbatim）+ 独立队列 `transcript_embedding_jobs` + 独立 HNSW sidecar `<MEM_DB_PATH>.transcripts.usearch`；与 `memories` 表 / 嵌入队列 / sidecar **完全不共享**任何状态或向量空间。`mem mine` 改为 dual-sink，单次扫描既写既有 memories 路径也写新 archive；`mem repair --check|--rebuild` 同时覆盖两个 sidecar。HTTP 路由 `POST /transcripts/messages` / `POST /transcripts/search` / `GET /transcripts?session_id=…&tenant=…`。**MCP 表面零变化**——transcript 搜索仅 HTTP，agent 走 `memory_search` → 命中后用 `session_id` 拉对应 transcript。
 
 ### 与既有路线的关系
 
