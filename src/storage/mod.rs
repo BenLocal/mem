@@ -1,4 +1,5 @@
 pub mod duckdb;
+pub mod duckdb_query;
 #[cfg(feature = "lancedb")]
 pub mod lance_store;
 pub mod repository;
