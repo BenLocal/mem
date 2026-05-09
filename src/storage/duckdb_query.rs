@@ -1756,7 +1756,6 @@ mod tests {
     use super::*;
     use crate::domain::memory::{MemoryStatus, MemoryType, Scope, Visibility};
     use crate::storage::lance_store::LanceStore;
-    use crate::storage::{MemoryRepository, TranscriptRepository};
     use tempfile::tempdir;
 
     fn fixture(memory_id: &str, tenant: &str) -> MemoryRecord {
@@ -2543,7 +2542,6 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn duckdb_query_graph_and_entity_reads() {
         use crate::domain::memory::GraphEdge;
-        use crate::storage::{EntityRegistry, GraphStore};
 
         let dir = tempdir().unwrap();
         let path = dir.path().join("store");

@@ -6,7 +6,7 @@ use crate::{
         query::SearchMemoryRequest,
     },
     pipeline::ranking::{freshness_score, timestamp_score, RRF_K, RRF_SCALE},
-    storage::GraphStore,
+    storage::Store,
 };
 
 #[derive(Debug, Clone)]
@@ -142,7 +142,7 @@ pub async fn rank_with_graph_hybrid(
     lexical: Vec<MemoryRecord>,
     semantic: Vec<(MemoryRecord, f32)>,
     query: &SearchMemoryRequest,
-    graph: &dyn GraphStore,
+    graph: &Store,
 ) -> Result<Vec<MemoryRecord>, crate::storage::GraphError> {
     if semantic.is_empty() {
         return rank_with_graph(lexical, query, graph).await;
@@ -182,7 +182,7 @@ pub async fn rank_with_graph_hybrid(
 pub async fn rank_with_graph(
     candidates: Vec<MemoryRecord>,
     query: &SearchMemoryRequest,
-    graph: &dyn GraphStore,
+    graph: &Store,
 ) -> Result<Vec<MemoryRecord>, crate::storage::GraphError> {
     if !query.expand_graph {
         return Ok(rank_candidates(candidates, query));
@@ -206,7 +206,7 @@ pub async fn rank_with_graph(
 }
 
 pub async fn candidate_memory_ids(
-    graph: &dyn GraphStore,
+    graph: &Store,
     candidates: &[MemoryRecord],
 ) -> Result<Vec<String>, crate::storage::GraphError> {
     let mut nodes = graph_anchor_nodes(

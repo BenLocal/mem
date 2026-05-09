@@ -453,7 +453,7 @@ pub async fn compute_rebuild_graph_outcome(
 ) -> Result<RebuildGraphOutcome, anyhow::Error> {
     use crate::domain::memory::GraphEdge;
     use crate::pipeline::ingest::{extract_graph_edge_drafts, ToNodeKind};
-    use crate::storage::{current_timestamp, EntityRegistry};
+    use crate::storage::current_timestamp;
 
     let started = std::time::Instant::now();
     let repo = DuckDbRepository::open(&config.db_path).await?;

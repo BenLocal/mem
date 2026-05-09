@@ -60,7 +60,6 @@ use arrow_array::{
     },
     Array, Float32Array, ListArray, RecordBatch, StringArray, UInt64Array,
 };
-use async_trait::async_trait;
 use futures::TryStreamExt;
 use lancedb::arrow::arrow_schema::{DataType, Field, Schema};
 use lancedb::embeddings::{EmbeddingFunction, EmbeddingRegistry, MemoryRegistry};
@@ -76,10 +75,9 @@ use crate::domain::memory::{FeedbackSummary, GraphEdge, MemoryRecord, MemoryVers
 use crate::domain::session::Session;
 use crate::domain::{AddAliasOutcome, Entity, EntityKind, EntityWithAliases};
 use crate::domain::{BlockType, ConversationMessage, MessageRole};
-use crate::storage::duckdb::{ClaimedEmbeddingJob, EmbeddingJobInsert, EntityRegistry};
 use crate::storage::{
-    ClaimedTranscriptEmbeddingJob, ContextWindow, FeedbackEvent, GraphError, GraphStore,
-    MemoryRepository, StorageError, TranscriptRepository, TranscriptSessionSummary,
+    ClaimedEmbeddingJob, ClaimedTranscriptEmbeddingJob, ContextWindow, EmbeddingJobInsert,
+    FeedbackEvent, GraphError, StorageError, TranscriptSessionSummary,
 };
 
 /// LanceDB-backed implementation of the storage trait surface.
@@ -133,7 +131,7 @@ impl LanceStore {
         Self::open_inner(path, Some(provider)).await
     }
 
-    async fn open_inner(
+    pub async fn open_inner(
         path: impl AsRef<Path>,
         provider: Option<Arc<dyn crate::embedding::EmbeddingProvider>>,
     ) -> Result<Self, StorageError> {
@@ -617,7 +615,7 @@ fn conversation_message_embedding_to_record_batch(
 /// ORDER BY, so the queue's "oldest pending first" ordering is enforced
 /// after the fact.
 #[derive(Debug, Clone)]
-struct EmbeddingJobRow {
+pub(crate) struct EmbeddingJobRow {
     job_id: String,
     tenant: String,
     memory_id: String,
@@ -746,7 +744,7 @@ fn record_batch_to_embedding_job_rows(
 /// `message_block_id` and `target_content_hash` dropped (transcript
 /// blocks are immutable, so the row id IS the hash).
 #[derive(Debug, Clone)]
-struct TranscriptEmbeddingJobRow {
+pub(crate) struct TranscriptEmbeddingJobRow {
     job_id: String,
     tenant: String,
     message_block_id: String,
@@ -1486,7 +1484,7 @@ impl LanceStore {
     /// DuckDB version does (delete `embedding_jobs` + `memory_embeddings`
     /// rows for this memory) — those tables don't exist on the LanceDB
     /// side yet. Add when those tables land.
-    async fn update_status(
+    pub async fn update_status(
         &self,
         tenant: &str,
         memory_id: &str,
@@ -1524,7 +1522,7 @@ impl LanceStore {
     /// Run a filter query against the `memories` table and parse all
     /// returned batches into [`MemoryRecord`]s. Shared by every read
     /// method that just needs a `WHERE`-clause + optional `LIMIT`.
-    async fn query_memories(
+    pub async fn query_memories(
         &self,
         filter: String,
         limit: Option<usize>,
@@ -1555,7 +1553,7 @@ impl LanceStore {
     /// [`EmbeddingJobRow`]s. Shared by every queue read path: the claim
     /// flow, `first_embedding_job_id_for_memory`, `list_embedding_jobs`,
     /// and the duplicate-detection in `try_enqueue_embedding_job`.
-    async fn query_embedding_jobs(
+    pub(crate) async fn query_embedding_jobs(
         &self,
         filter: String,
     ) -> Result<Vec<EmbeddingJobRow>, StorageError> {
@@ -1583,7 +1581,7 @@ impl LanceStore {
     }
 
     /// Counterpart of `query_embedding_jobs` for the transcript queue.
-    async fn query_transcript_embedding_jobs(
+    pub(crate) async fn query_transcript_embedding_jobs(
         &self,
         filter: String,
     ) -> Result<Vec<TranscriptEmbeddingJobRow>, StorageError> {
@@ -1906,10 +1904,12 @@ impl LanceStore {
     }
 }
 
-#[async_trait]
+/// Memory CRUD + filter + embedding-job + feedback methods —
+/// previously bound by the `MemoryRepository` trait, now plain
+/// inherent. Methods kept as `pub async fn`; signatures unchanged.
 #[allow(clippy::too_many_arguments)]
-impl MemoryRepository for LanceStore {
-    async fn insert_memory(&self, memory: MemoryRecord) -> Result<MemoryRecord, StorageError> {
+impl LanceStore {
+    pub async fn insert_memory(&self, memory: MemoryRecord) -> Result<MemoryRecord, StorageError> {
         let table = self
             .conn
             .open_table("memories")
@@ -1923,7 +1923,7 @@ impl MemoryRepository for LanceStore {
         Ok(memory)
     }
 
-    async fn try_enqueue_embedding_job(
+    pub async fn try_enqueue_embedding_job(
         &self,
         insert: EmbeddingJobInsert,
     ) -> Result<bool, StorageError> {
@@ -1970,7 +1970,7 @@ impl MemoryRepository for LanceStore {
         Ok(true)
     }
 
-    async fn first_embedding_job_id_for_memory(
+    pub async fn first_embedding_job_id_for_memory(
         &self,
         memory_id: &str,
     ) -> Result<Option<String>, StorageError> {
@@ -1983,7 +1983,7 @@ impl MemoryRepository for LanceStore {
         Ok(rows.into_iter().next().map(|r| r.job_id))
     }
 
-    async fn claim_next_n_embedding_jobs(
+    pub async fn claim_next_n_embedding_jobs(
         &self,
         now: &str,
         max_retries: u32,
@@ -2060,7 +2060,7 @@ impl MemoryRepository for LanceStore {
         Ok(claimed)
     }
 
-    async fn upsert_memory_embedding(
+    pub async fn upsert_memory_embedding(
         &self,
         memory_id: &str,
         tenant: &str,
@@ -2103,7 +2103,7 @@ impl MemoryRepository for LanceStore {
         Ok(())
     }
 
-    async fn delete_memory_embedding(&self, memory_id: &str) -> Result<(), StorageError> {
+    pub async fn delete_memory_embedding(&self, memory_id: &str) -> Result<(), StorageError> {
         // No-op if the table doesn't exist yet (semantic search hasn't
         // been used; nothing to delete).
         let names = self
@@ -2128,7 +2128,7 @@ impl MemoryRepository for LanceStore {
         Ok(())
     }
 
-    async fn list_memories_for_tenant(
+    pub async fn list_memories_for_tenant(
         &self,
         tenant: &str,
     ) -> Result<Vec<MemoryRecord>, StorageError> {
@@ -2136,7 +2136,7 @@ impl MemoryRepository for LanceStore {
             .await
     }
 
-    async fn semantic_search_memories(
+    pub async fn semantic_search_memories(
         &self,
         tenant: &str,
         query_embedding: &[f32],
@@ -2230,7 +2230,11 @@ impl MemoryRepository for LanceStore {
         Ok(out)
     }
 
-    async fn complete_embedding_job(&self, job_id: &str, now: &str) -> Result<(), StorageError> {
+    pub async fn complete_embedding_job(
+        &self,
+        job_id: &str,
+        now: &str,
+    ) -> Result<(), StorageError> {
         // Mirror DuckDB: only complete a row that's currently 'processing'
         // (otherwise it's already completed/stale and we shouldn't bump it).
         // LanceDB doesn't have a NULL literal for last_error inside the
@@ -2258,7 +2262,11 @@ impl MemoryRepository for LanceStore {
         Ok(())
     }
 
-    async fn mark_embedding_job_stale(&self, job_id: &str, now: &str) -> Result<(), StorageError> {
+    pub async fn mark_embedding_job_stale(
+        &self,
+        job_id: &str,
+        now: &str,
+    ) -> Result<(), StorageError> {
         let table = self
             .conn
             .open_table("embedding_jobs")
@@ -2276,7 +2284,7 @@ impl MemoryRepository for LanceStore {
         Ok(())
     }
 
-    async fn reschedule_embedding_job_failure(
+    pub async fn reschedule_embedding_job_failure(
         &self,
         job_id: &str,
         new_attempt_count: i64,
@@ -2304,7 +2312,7 @@ impl MemoryRepository for LanceStore {
         Ok(())
     }
 
-    async fn permanently_fail_embedding_job(
+    pub async fn permanently_fail_embedding_job(
         &self,
         job_id: &str,
         new_attempt_count: i64,
@@ -2330,7 +2338,7 @@ impl MemoryRepository for LanceStore {
         Ok(())
     }
 
-    async fn delete_embedding_jobs_by_memory_id(
+    pub async fn delete_embedding_jobs_by_memory_id(
         &self,
         memory_id: &str,
     ) -> Result<usize, StorageError> {
@@ -2365,7 +2373,7 @@ impl MemoryRepository for LanceStore {
         }
     }
 
-    async fn get_memory_for_tenant(
+    pub async fn get_memory_for_tenant(
         &self,
         tenant: &str,
         memory_id: &str,
@@ -2401,7 +2409,7 @@ impl MemoryRepository for LanceStore {
         Ok(None)
     }
 
-    async fn get_pending(
+    pub async fn get_pending(
         &self,
         tenant: &str,
         memory_id: &str,
@@ -2418,7 +2426,7 @@ impl MemoryRepository for LanceStore {
             .next())
     }
 
-    async fn find_by_idempotency_or_hash(
+    pub async fn find_by_idempotency_or_hash(
         &self,
         tenant: &str,
         idempotency_key: &Option<String>,
@@ -2446,7 +2454,10 @@ impl MemoryRepository for LanceStore {
             .next())
     }
 
-    async fn list_pending_review(&self, tenant: &str) -> Result<Vec<MemoryRecord>, StorageError> {
+    pub async fn list_pending_review(
+        &self,
+        tenant: &str,
+    ) -> Result<Vec<MemoryRecord>, StorageError> {
         let filter = format!(
             "tenant = {} AND status = 'pending_confirmation'",
             sql_quote(tenant),
@@ -2454,7 +2465,7 @@ impl MemoryRepository for LanceStore {
         self.query_memories(filter, None).await
     }
 
-    async fn search_candidates(&self, tenant: &str) -> Result<Vec<MemoryRecord>, StorageError> {
+    pub async fn search_candidates(&self, tenant: &str) -> Result<Vec<MemoryRecord>, StorageError> {
         // Same live-status filter the DuckDB backend uses
         // (`pipeline::retrieve` post-filters this set anyway).
         let filter = format!(
@@ -2464,7 +2475,7 @@ impl MemoryRepository for LanceStore {
         self.query_memories(filter, None).await
     }
 
-    async fn recent_active_memories(
+    pub async fn recent_active_memories(
         &self,
         tenant: &str,
         limit: usize,
@@ -2481,7 +2492,7 @@ impl MemoryRepository for LanceStore {
         self.query_memories(filter, Some(limit)).await
     }
 
-    async fn bm25_candidates(
+    pub async fn bm25_candidates(
         &self,
         tenant: &str,
         query: &str,
@@ -2519,7 +2530,7 @@ impl MemoryRepository for LanceStore {
         Ok(out)
     }
 
-    async fn fetch_memories_by_ids(
+    pub async fn fetch_memories_by_ids(
         &self,
         tenant: &str,
         ids: &[&str],
@@ -2536,7 +2547,7 @@ impl MemoryRepository for LanceStore {
         self.query_memories(filter, None).await
     }
 
-    async fn accept_pending(
+    pub async fn accept_pending(
         &self,
         tenant: &str,
         memory_id: &str,
@@ -2544,7 +2555,7 @@ impl MemoryRepository for LanceStore {
         self.update_status(tenant, memory_id, "active").await
     }
 
-    async fn reject_pending(
+    pub async fn reject_pending(
         &self,
         tenant: &str,
         memory_id: &str,
@@ -2552,7 +2563,7 @@ impl MemoryRepository for LanceStore {
         self.update_status(tenant, memory_id, "rejected").await
     }
 
-    async fn replace_pending_with_successor(
+    pub async fn replace_pending_with_successor(
         &self,
         tenant: &str,
         original_memory_id: &str,
@@ -2588,7 +2599,7 @@ impl MemoryRepository for LanceStore {
         Ok(successor)
     }
 
-    async fn apply_feedback(
+    pub async fn apply_feedback(
         &self,
         memory: &MemoryRecord,
         feedback: FeedbackEvent,
@@ -2644,7 +2655,7 @@ impl MemoryRepository for LanceStore {
         Ok(updated)
     }
 
-    async fn list_feedback_for_memory(
+    pub async fn list_feedback_for_memory(
         &self,
         memory_id: &str,
     ) -> Result<Vec<FeedbackEvent>, StorageError> {
@@ -2675,7 +2686,7 @@ impl MemoryRepository for LanceStore {
         Ok(out)
     }
 
-    async fn list_memory_versions_for_tenant(
+    pub async fn list_memory_versions_for_tenant(
         &self,
         tenant: &str,
         memory_id: &str,
@@ -2686,7 +2697,7 @@ impl MemoryRepository for LanceStore {
         )
     }
 
-    async fn feedback_summary(&self, memory_id: &str) -> Result<FeedbackSummary, StorageError> {
+    pub async fn feedback_summary(&self, memory_id: &str) -> Result<FeedbackSummary, StorageError> {
         // Fetch all events for this memory and aggregate client-side.
         // Counts are tiny (events per memory typically < 10), so the
         // network/parse cost is negligible compared to running a
@@ -2707,7 +2718,11 @@ impl MemoryRepository for LanceStore {
         Ok(summary)
     }
 
-    async fn delete_memory_hard(&self, tenant: &str, memory_id: &str) -> Result<(), StorageError> {
+    pub async fn delete_memory_hard(
+        &self,
+        tenant: &str,
+        memory_id: &str,
+    ) -> Result<(), StorageError> {
         let table = self
             .conn
             .open_table("memories")
@@ -2732,7 +2747,10 @@ impl MemoryRepository for LanceStore {
         Ok(())
     }
 
-    async fn get_memory(&self, memory_id: String) -> Result<Option<MemoryRecord>, StorageError> {
+    pub async fn get_memory(
+        &self,
+        memory_id: String,
+    ) -> Result<Option<MemoryRecord>, StorageError> {
         // Cross-tenant lookup (admin / version-chain path). DuckDB does the
         // same — filters only on memory_id.
         let filter = format!("memory_id = {}", sql_quote(&memory_id));
@@ -2743,12 +2761,18 @@ impl MemoryRepository for LanceStore {
             .next())
     }
 
-    async fn insert_episode(&self, episode: EpisodeRecord) -> Result<EpisodeRecord, StorageError> {
+    pub async fn insert_episode(
+        &self,
+        episode: EpisodeRecord,
+    ) -> Result<EpisodeRecord, StorageError> {
         let _ = episode;
         unimplemented!("LanceDb::insert_episode — see docs/repository.rs trait def")
     }
 
-    async fn list_memory_ids_for_tenant(&self, tenant: &str) -> Result<Vec<String>, StorageError> {
+    pub async fn list_memory_ids_for_tenant(
+        &self,
+        tenant: &str,
+    ) -> Result<Vec<String>, StorageError> {
         Ok(self
             .query_memories(format!("tenant = {}", sql_quote(tenant)), None)
             .await?
@@ -2757,7 +2781,7 @@ impl MemoryRepository for LanceStore {
             .collect())
     }
 
-    async fn touch_session(
+    pub async fn touch_session(
         &self,
         session_id: &str,
         last_seen_at: &str,
@@ -2766,7 +2790,7 @@ impl MemoryRepository for LanceStore {
         unimplemented!("LanceDb::touch_session — see docs/repository.rs trait def")
     }
 
-    async fn latest_active_session(
+    pub async fn latest_active_session(
         &self,
         tenant: &str,
         caller_agent: &str,
@@ -2775,7 +2799,7 @@ impl MemoryRepository for LanceStore {
         unimplemented!("LanceDb::latest_active_session — see docs/repository.rs trait def")
     }
 
-    async fn open_session(
+    pub async fn open_session(
         &self,
         session_id: &str,
         tenant: &str,
@@ -2786,12 +2810,16 @@ impl MemoryRepository for LanceStore {
         unimplemented!("LanceDb::open_session — see docs/repository.rs trait def")
     }
 
-    async fn close_session(&self, session_id: &str, ended_at: &str) -> Result<(), StorageError> {
+    pub async fn close_session(
+        &self,
+        session_id: &str,
+        ended_at: &str,
+    ) -> Result<(), StorageError> {
         let _ = (session_id, ended_at);
         unimplemented!("LanceDb::close_session — see docs/repository.rs trait def")
     }
 
-    async fn list_successful_episodes_for_tenant(
+    pub async fn list_successful_episodes_for_tenant(
         &self,
         tenant: &str,
     ) -> Result<Vec<EpisodeRecord>, StorageError> {
@@ -2801,7 +2829,7 @@ impl MemoryRepository for LanceStore {
         )
     }
 
-    async fn list_embedding_jobs(
+    pub async fn list_embedding_jobs(
         &self,
         tenant: &str,
         status_filter: Option<&str>,
@@ -2839,7 +2867,7 @@ impl MemoryRepository for LanceStore {
         Ok(out)
     }
 
-    async fn stale_live_embedding_jobs_for_memory(
+    pub async fn stale_live_embedding_jobs_for_memory(
         &self,
         tenant: &str,
         memory_id: &str,
@@ -2886,7 +2914,7 @@ impl MemoryRepository for LanceStore {
         }
     }
 
-    async fn get_memory_embedding_row(
+    pub async fn get_memory_embedding_row(
         &self,
         memory_id: &str,
     ) -> Result<Option<(String, String, String)>, StorageError> {
@@ -2944,7 +2972,7 @@ impl MemoryRepository for LanceStore {
         Ok(None)
     }
 
-    async fn latest_embedding_job_status_for_hash(
+    pub async fn latest_embedding_job_status_for_hash(
         &self,
         tenant: &str,
         memory_id: &str,
@@ -2967,7 +2995,7 @@ impl MemoryRepository for LanceStore {
 /// Read all `conversation_messages` rows matching `filter`, parsed into
 /// [`ConversationMessage`]s. Shared by every transcript read path.
 impl LanceStore {
-    async fn query_conversation_messages(
+    pub async fn query_conversation_messages(
         &self,
         filter: String,
     ) -> Result<Vec<ConversationMessage>, StorageError> {
@@ -2995,9 +3023,10 @@ impl LanceStore {
     }
 }
 
-#[async_trait]
-impl TranscriptRepository for LanceStore {
-    async fn create_conversation_message(
+/// Transcript-side methods — previously bound by the
+/// `TranscriptRepository` trait, now inherent on `LanceStore`.
+impl LanceStore {
+    pub async fn create_conversation_message(
         &self,
         msg: &ConversationMessage,
     ) -> Result<(), StorageError> {
@@ -3052,7 +3081,7 @@ impl TranscriptRepository for LanceStore {
         Ok(())
     }
 
-    async fn get_conversation_messages_by_session(
+    pub async fn get_conversation_messages_by_session(
         &self,
         tenant: &str,
         session_id: &str,
@@ -3068,7 +3097,7 @@ impl TranscriptRepository for LanceStore {
         Ok(msgs)
     }
 
-    async fn get_conversation_messages_by_session_paged(
+    pub async fn get_conversation_messages_by_session_paged(
         &self,
         tenant: &str,
         session_id: &str,
@@ -3115,7 +3144,7 @@ impl TranscriptRepository for LanceStore {
         Ok((msgs, has_more))
     }
 
-    async fn list_transcript_sessions(
+    pub async fn list_transcript_sessions(
         &self,
         tenant: &str,
     ) -> Result<Vec<TranscriptSessionSummary>, StorageError> {
@@ -3178,7 +3207,7 @@ impl TranscriptRepository for LanceStore {
         Ok(out)
     }
 
-    async fn fetch_conversation_messages_by_ids(
+    pub async fn fetch_conversation_messages_by_ids(
         &self,
         tenant: &str,
         ids: &[String],
@@ -3213,7 +3242,7 @@ impl TranscriptRepository for LanceStore {
         Ok(out)
     }
 
-    async fn context_window_for_block(
+    pub async fn context_window_for_block(
         &self,
         tenant: &str,
         primary_id: &str,
@@ -3305,7 +3334,7 @@ impl TranscriptRepository for LanceStore {
         })
     }
 
-    async fn anchor_session_candidates(
+    pub async fn anchor_session_candidates(
         &self,
         tenant: &str,
         session_id: &str,
@@ -3327,7 +3356,7 @@ impl TranscriptRepository for LanceStore {
         Ok(msgs.into_iter().map(|m| m.message_block_id).collect())
     }
 
-    async fn recent_conversation_messages(
+    pub async fn recent_conversation_messages(
         &self,
         tenant: &str,
         limit: usize,
@@ -3349,7 +3378,7 @@ impl TranscriptRepository for LanceStore {
         Ok(msgs)
     }
 
-    async fn bm25_transcript_candidates(
+    pub async fn bm25_transcript_candidates(
         &self,
         tenant: &str,
         query: &str,
@@ -3408,7 +3437,7 @@ fn sort_messages_chronological_asc(msgs: &mut [ConversationMessage]) {
 /// [`GraphEdge`]s. Helper shared by `neighbors`, `related_memory_ids`,
 /// and the existence check in `sync_memory_edges`.
 impl LanceStore {
-    async fn query_graph_edges(&self, filter: String) -> Result<Vec<GraphEdge>, GraphError> {
+    pub async fn query_graph_edges(&self, filter: String) -> Result<Vec<GraphEdge>, GraphError> {
         let table = self
             .conn
             .open_table("graph_edges")
@@ -3435,9 +3464,10 @@ impl LanceStore {
     }
 }
 
-#[async_trait]
-impl GraphStore for LanceStore {
-    async fn neighbors(&self, node_id: &str) -> Result<Vec<GraphEdge>, GraphError> {
+/// Graph methods — previously bound by `GraphStore` trait, now
+/// inherent.
+impl LanceStore {
+    pub async fn neighbors(&self, node_id: &str) -> Result<Vec<GraphEdge>, GraphError> {
         // Active edges only (valid_to is null) where the node sits on
         // either side. Order by (relation, from, to) to match DuckDB's
         // SQL — done in-memory because LanceDB has no ORDER BY.
@@ -3456,7 +3486,11 @@ impl GraphStore for LanceStore {
         Ok(edges)
     }
 
-    async fn sync_memory_edges(&self, edges: &[GraphEdge], now: &str) -> Result<(), GraphError> {
+    pub async fn sync_memory_edges(
+        &self,
+        edges: &[GraphEdge],
+        now: &str,
+    ) -> Result<(), GraphError> {
         if edges.is_empty() {
             return Ok(());
         }
@@ -3505,7 +3539,7 @@ impl GraphStore for LanceStore {
         Ok(())
     }
 
-    async fn close_edges_for_memory(&self, memory_id: &str) -> Result<usize, GraphError> {
+    pub async fn close_edges_for_memory(&self, memory_id: &str) -> Result<usize, GraphError> {
         let from = format!("memory:{memory_id}");
         let now = crate::storage::current_timestamp();
         let table = self
@@ -3536,7 +3570,7 @@ impl GraphStore for LanceStore {
         }
     }
 
-    async fn related_memory_ids(&self, node_ids: &[String]) -> Result<Vec<String>, GraphError> {
+    pub async fn related_memory_ids(&self, node_ids: &[String]) -> Result<Vec<String>, GraphError> {
         if node_ids.is_empty() {
             return Ok(vec![]);
         }
@@ -3575,9 +3609,10 @@ impl GraphStore for LanceStore {
     }
 }
 
-#[async_trait]
-impl EntityRegistry for LanceStore {
-    async fn resolve_or_create(
+/// Entity-registry methods — previously bound by `EntityRegistry`
+/// trait, now inherent.
+impl LanceStore {
+    pub async fn resolve_or_create(
         &self,
         tenant: &str,
         alias: &str,
@@ -3633,7 +3668,7 @@ impl EntityRegistry for LanceStore {
         Ok(entity_id)
     }
 
-    async fn get_entity(
+    pub async fn get_entity(
         &self,
         tenant: &str,
         entity_id: &str,
@@ -3715,7 +3750,7 @@ impl EntityRegistry for LanceStore {
         Ok(Some(EntityWithAliases { entity, aliases }))
     }
 
-    async fn add_alias(
+    pub async fn add_alias(
         &self,
         tenant: &str,
         entity_id: &str,
@@ -3752,7 +3787,7 @@ impl EntityRegistry for LanceStore {
         }
     }
 
-    async fn lookup_alias(
+    pub async fn lookup_alias(
         &self,
         tenant: &str,
         alias: &str,
@@ -3795,7 +3830,7 @@ impl EntityRegistry for LanceStore {
         Ok(None)
     }
 
-    async fn list_entities(
+    pub async fn list_entities(
         &self,
         tenant: &str,
         kind_filter: Option<EntityKind>,
@@ -3880,7 +3915,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn lancedb_insert_and_get_memory_round_trip() {
+    pub async fn lancedb_insert_and_get_memory_round_trip() {
         let dir = tempdir().unwrap();
         let path = dir.path().join("lance.store");
         let repo = LanceStore::open(&path).await.expect("open lancedb store");
@@ -3935,7 +3970,7 @@ mod tests {
     /// `fetch_memories_by_ids`, `list_pending_review`, `get_pending`,
     /// `get_memory`).
     #[tokio::test]
-    async fn lancedb_filter_methods_round_trip() {
+    pub async fn lancedb_filter_methods_round_trip() {
         let dir = tempdir().unwrap();
         let path = dir.path().join("lance.store");
         let repo = LanceStore::open(&path).await.unwrap();
@@ -4021,7 +4056,7 @@ mod tests {
     /// Mutating-method round-trip: accept_pending, reject_pending,
     /// replace_pending_with_successor, delete_memory_hard.
     #[tokio::test]
-    async fn lancedb_mutating_methods_round_trip() {
+    pub async fn lancedb_mutating_methods_round_trip() {
         let dir = tempdir().unwrap();
         let path = dir.path().join("lance.store");
         let repo = LanceStore::open(&path).await.unwrap();
@@ -4089,7 +4124,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn lancedb_feedback_round_trip() {
+    pub async fn lancedb_feedback_round_trip() {
         let dir = tempdir().unwrap();
         let path = dir.path().join("lance.store");
         let repo = LanceStore::open(&path).await.unwrap();
@@ -4178,7 +4213,7 @@ mod tests {
     /// vector ranked first. Also exercises tenant prefilter and
     /// `delete_memory_embedding`.
     #[tokio::test(flavor = "multi_thread")]
-    async fn lancedb_embedding_round_trip() {
+    pub async fn lancedb_embedding_round_trip() {
         let dir = tempdir().unwrap();
         let path = dir.path().join("lance.store");
         let repo = LanceStore::open(&path).await.unwrap();
@@ -4313,7 +4348,7 @@ mod tests {
     /// permanently_fail; mark_stale; list/filter; stale_live;
     /// delete_by_memory_id; latest_status_for_hash.
     #[tokio::test]
-    async fn lancedb_embedding_jobs_queue_round_trip() {
+    pub async fn lancedb_embedding_jobs_queue_round_trip() {
         let dir = tempdir().unwrap();
         let path = dir.path().join("lance.store");
         let repo = LanceStore::open(&path).await.unwrap();
@@ -4514,7 +4549,7 @@ mod tests {
     /// query — distinct from semantic_search_memories (vector ANN).
     /// Tenant filter must be honored; empty query / k == 0 returns [].
     #[tokio::test]
-    async fn lancedb_bm25_candidates_round_trip() {
+    pub async fn lancedb_bm25_candidates_round_trip() {
         let dir = tempdir().unwrap();
         let path = dir.path().join("lance.store");
         let repo = LanceStore::open(&path).await.unwrap();
@@ -4574,7 +4609,7 @@ mod tests {
     /// `GraphStore` round-trip: sync_memory_edges (idempotent) →
     /// neighbors → close_edges_for_memory → related_memory_ids.
     #[tokio::test]
-    async fn lancedb_graph_store_round_trip() {
+    pub async fn lancedb_graph_store_round_trip() {
         let dir = tempdir().unwrap();
         let path = dir.path().join("lance.store");
         let repo = LanceStore::open(&path).await.unwrap();
@@ -4665,7 +4700,7 @@ mod tests {
     /// (Inserted / AlreadyOnSameEntity / ConflictWithDifferentEntity),
     /// lookup_alias, list_entities (kind + LIKE filters).
     #[tokio::test]
-    async fn lancedb_entity_registry_round_trip() {
+    pub async fn lancedb_entity_registry_round_trip() {
         let dir = tempdir().unwrap();
         let path = dir.path().join("lance.store");
         let repo = LanceStore::open(&path).await.unwrap();
@@ -4826,7 +4861,7 @@ mod tests {
     /// include_tool_blocks toggle) → anchor_session_candidates →
     /// recent_conversation_messages → bm25_transcript_candidates.
     #[tokio::test]
-    async fn lancedb_transcript_repository_round_trip() {
+    pub async fn lancedb_transcript_repository_round_trip() {
         let dir = tempdir().unwrap();
         let path = dir.path().join("lance.store");
         let repo = LanceStore::open(&path).await.unwrap();

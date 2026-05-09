@@ -2,7 +2,6 @@ pub mod duckdb;
 pub mod duckdb_query;
 #[cfg(feature = "lancedb")]
 pub mod lance_store;
-pub mod repository;
 #[cfg(feature = "lancedb")]
 pub mod store;
 pub mod time;
@@ -12,10 +11,8 @@ pub mod vector_index_diagnose;
 pub(crate) use duckdb::{sweep_orphan_embeddings, sweep_orphan_jobs};
 pub use duckdb::{
     ClaimedEmbeddingJob, ClaimedTranscriptEmbeddingJob, ContextWindow, DuckDbGraphStore,
-    DuckDbRepository, EmbeddingJobInsert, EntityRegistry, FeedbackEvent, GraphError,
-    TranscriptSessionSummary,
+    DuckDbRepository, EmbeddingJobInsert, FeedbackEvent, GraphError, TranscriptSessionSummary,
 };
-pub use repository::{GraphStore, MemoryRepository, Repository, TranscriptRepository};
 #[cfg(feature = "lancedb")]
 pub use store::Store;
 pub use time::{current_timestamp, timestamp_add_ms};

@@ -480,8 +480,7 @@ impl MemoryService {
             .await?;
         let now = current_timestamp();
         let drafts = crate::pipeline::ingest::extract_graph_edge_drafts(&superseding);
-        let edges =
-            resolve_drafts_to_edges(drafts, &self.store, &superseding.tenant, &now).await?;
+        let edges = resolve_drafts_to_edges(drafts, &self.store, &superseding.tenant, &now).await?;
         self.store.sync_memory_edges(&edges, &now).await?;
 
         self.enqueue_embedding_job_for_memory(&superseding).await?;

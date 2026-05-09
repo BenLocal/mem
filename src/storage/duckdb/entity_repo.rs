@@ -11,16 +11,19 @@
 //! `AlreadyOnSameEntity` (idempotent re-add), or returns
 //! `ConflictWithDifferentEntity(other_id)` — all under the same lock hold.
 
-use async_trait::async_trait;
 use duckdb::OptionalExt;
 
-use super::{DuckDbRepository, EntityRegistry, StorageError};
+use super::{DuckDbRepository, StorageError};
 use crate::domain::{AddAliasOutcome, Entity, EntityKind, EntityWithAliases};
 use crate::pipeline::entity_normalize::normalize_alias;
 
-#[async_trait]
-impl EntityRegistry for DuckDbRepository {
-    async fn resolve_or_create(
+/// Inherent entity-registry methods on `DuckDbRepository`.
+/// Previously bound by the `EntityRegistry` trait — now plain
+/// inherent (the trait was deleted with the rest of the storage
+/// abstraction). Kept here on the legacy DuckDb backend until
+/// `cli/repair` is retired in a follow-up.
+impl DuckDbRepository {
+    pub async fn resolve_or_create(
         &self,
         tenant: &str,
         alias: &str,
@@ -59,7 +62,7 @@ impl EntityRegistry for DuckDbRepository {
         Ok(entity_id)
     }
 
-    async fn get_entity(
+    pub async fn get_entity(
         &self,
         tenant: &str,
         entity_id: &str,
@@ -106,7 +109,7 @@ impl EntityRegistry for DuckDbRepository {
         Ok(Some(EntityWithAliases { entity, aliases }))
     }
 
-    async fn add_alias(
+    pub async fn add_alias(
         &self,
         tenant: &str,
         entity_id: &str,
@@ -140,7 +143,7 @@ impl EntityRegistry for DuckDbRepository {
         }
     }
 
-    async fn lookup_alias(
+    pub async fn lookup_alias(
         &self,
         tenant: &str,
         alias: &str,
@@ -159,7 +162,7 @@ impl EntityRegistry for DuckDbRepository {
         Ok(owner)
     }
 
-    async fn list_entities(
+    pub async fn list_entities(
         &self,
         tenant: &str,
         kind_filter: Option<EntityKind>,
