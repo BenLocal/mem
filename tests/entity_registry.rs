@@ -7,6 +7,8 @@
 //! "alias already exists, idempotent re-add" case.
 //! Re-run the probe (`#[ignore]`'d below) on DuckDB upgrades.
 
+use std::sync::Arc;
+
 #[test]
 #[ignore]
 fn composite_pk_on_conflict_probe() {
@@ -47,14 +49,14 @@ fn composite_pk_on_conflict_probe() {
     }
 }
 
-use mem::storage::DuckDbRepository;
+use mem::storage::Store;
 use tempfile::TempDir;
 
 #[tokio::test]
 async fn schema_creates_entities_aliases_and_topics_column() {
     let tmp = TempDir::new().unwrap();
     let db = tmp.path().join("mem.duckdb");
-    let _repo = DuckDbRepository::open(&db).await.unwrap();
+    let _repo = Store::open(&db).await.unwrap();
 
     let conn = duckdb::Connection::open(&db).unwrap();
 
@@ -99,15 +101,14 @@ async fn schema_creates_entities_aliases_and_topics_column() {
 async fn schema_bootstrap_is_idempotent() {
     let tmp = TempDir::new().unwrap();
     let db = tmp.path().join("mem.duckdb");
-    let _repo1 = DuckDbRepository::open(&db).await.unwrap();
+    let _repo1 = Store::open(&db).await.unwrap();
     drop(_repo1);
-    let _repo2 = DuckDbRepository::open(&db).await.unwrap();
+    let _repo2 = Store::open(&db).await.unwrap();
     // No panic: re-opening must not fail on duplicate ALTER.
 }
 
 use mem::domain::memory::{MemoryRecord, MemoryStatus, MemoryType, Scope, Visibility};
 use mem::domain::{AddAliasOutcome, EntityKind};
-use mem::storage::EntityRegistry;
 
 const NOW: &str = "00000000020260502000";
 
@@ -147,7 +148,7 @@ fn baseline_memory(id: &str) -> MemoryRecord {
 async fn memory_record_topics_round_trip() {
     let tmp = TempDir::new().unwrap();
     let db = tmp.path().join("mem.duckdb");
-    let repo = DuckDbRepository::open(&db).await.unwrap();
+    let repo = Arc::new(Store::open(&db).await.unwrap());
 
     let memory = MemoryRecord {
         memory_id: "mem-test".to_string(),
@@ -174,7 +175,7 @@ async fn memory_record_topics_round_trip() {
 async fn memory_record_empty_topics_round_trips_as_empty_vec() {
     let tmp = TempDir::new().unwrap();
     let db = tmp.path().join("mem.duckdb");
-    let repo = DuckDbRepository::open(&db).await.unwrap();
+    let repo = Arc::new(Store::open(&db).await.unwrap());
 
     let memory = MemoryRecord {
         memory_id: "mem-empty".to_string(),
@@ -195,7 +196,7 @@ async fn memory_record_empty_topics_round_trips_as_empty_vec() {
 async fn memory_record_null_topics_in_legacy_row_decodes_as_empty_vec() {
     let tmp = TempDir::new().unwrap();
     let db = tmp.path().join("mem.duckdb");
-    let repo = DuckDbRepository::open(&db).await.unwrap();
+    let repo = Arc::new(Store::open(&db).await.unwrap());
 
     let memory = baseline_memory("mem-null-topics");
     repo.insert_memory(memory).await.unwrap();
@@ -227,7 +228,7 @@ async fn memory_record_null_topics_in_legacy_row_decodes_as_empty_vec() {
 async fn resolve_or_create_inserts_entity_and_alias_on_first_call() {
     let tmp = TempDir::new().unwrap();
     let db = tmp.path().join("mem.duckdb");
-    let repo = DuckDbRepository::open(&db).await.unwrap();
+    let repo = Arc::new(Store::open(&db).await.unwrap());
 
     let id = repo
         .resolve_or_create("local", "Rust", EntityKind::Topic, NOW)
@@ -270,7 +271,7 @@ async fn resolve_or_create_inserts_entity_and_alias_on_first_call() {
 async fn resolve_or_create_is_idempotent_on_alias_hit() {
     let tmp = TempDir::new().unwrap();
     let db = tmp.path().join("mem.duckdb");
-    let repo = DuckDbRepository::open(&db).await.unwrap();
+    let repo = Arc::new(Store::open(&db).await.unwrap());
 
     let id1 = repo
         .resolve_or_create("local", "Rust", EntityKind::Topic, NOW)
@@ -304,7 +305,7 @@ async fn resolve_or_create_is_idempotent_on_alias_hit() {
 async fn resolve_or_create_creates_separate_entities_for_distinct_aliases() {
     let tmp = TempDir::new().unwrap();
     let db = tmp.path().join("mem.duckdb");
-    let repo = DuckDbRepository::open(&db).await.unwrap();
+    let repo = Arc::new(Store::open(&db).await.unwrap());
 
     let rust = repo
         .resolve_or_create("local", "Rust", EntityKind::Topic, NOW)
@@ -321,7 +322,7 @@ async fn resolve_or_create_creates_separate_entities_for_distinct_aliases() {
 async fn add_alias_links_to_existing_entity() {
     let tmp = TempDir::new().unwrap();
     let db = tmp.path().join("mem.duckdb");
-    let repo = DuckDbRepository::open(&db).await.unwrap();
+    let repo = Arc::new(Store::open(&db).await.unwrap());
 
     let rust_id = repo
         .resolve_or_create("local", "Rust", EntityKind::Topic, NOW)
@@ -345,7 +346,7 @@ async fn add_alias_links_to_existing_entity() {
 async fn add_alias_returns_already_on_same_entity_when_idempotent() {
     let tmp = TempDir::new().unwrap();
     let db = tmp.path().join("mem.duckdb");
-    let repo = DuckDbRepository::open(&db).await.unwrap();
+    let repo = Arc::new(Store::open(&db).await.unwrap());
 
     let rust_id = repo
         .resolve_or_create("local", "Rust", EntityKind::Topic, NOW)
@@ -365,7 +366,7 @@ async fn add_alias_returns_already_on_same_entity_when_idempotent() {
 async fn add_alias_returns_conflict_when_alias_belongs_to_different_entity() {
     let tmp = TempDir::new().unwrap();
     let db = tmp.path().join("mem.duckdb");
-    let repo = DuckDbRepository::open(&db).await.unwrap();
+    let repo = Arc::new(Store::open(&db).await.unwrap());
 
     let rust_id = repo
         .resolve_or_create("local", "Rust", EntityKind::Topic, NOW)
@@ -386,7 +387,7 @@ async fn add_alias_returns_conflict_when_alias_belongs_to_different_entity() {
 async fn tenant_isolation_distinct_registries() {
     let tmp = TempDir::new().unwrap();
     let db = tmp.path().join("mem.duckdb");
-    let repo = DuckDbRepository::open(&db).await.unwrap();
+    let repo = Arc::new(Store::open(&db).await.unwrap());
 
     let a = repo
         .resolve_or_create("alice", "Rust", EntityKind::Topic, NOW)
@@ -403,7 +404,7 @@ async fn tenant_isolation_distinct_registries() {
 async fn list_entities_filters_by_kind_and_query() {
     let tmp = TempDir::new().unwrap();
     let db = tmp.path().join("mem.duckdb");
-    let repo = DuckDbRepository::open(&db).await.unwrap();
+    let repo = Arc::new(Store::open(&db).await.unwrap());
 
     repo.resolve_or_create("local", "Rust", EntityKind::Topic, NOW)
         .await
@@ -433,7 +434,7 @@ async fn list_entities_filters_by_kind_and_query() {
 async fn get_entity_returns_canonical_with_aliases_in_creation_order() {
     let tmp = TempDir::new().unwrap();
     let db = tmp.path().join("mem.duckdb");
-    let repo = DuckDbRepository::open(&db).await.unwrap();
+    let repo = Arc::new(Store::open(&db).await.unwrap());
 
     let id = repo
         .resolve_or_create("local", "Rust", EntityKind::Topic, "00000000020260502000")

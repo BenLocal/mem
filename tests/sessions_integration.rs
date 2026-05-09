@@ -1,3 +1,5 @@
+use std::sync::Arc;
+
 // Integration tests for session auto-bucket (ROADMAP #10).
 // Spec: docs/superpowers/specs/2026-04-29-sessions-design.md.
 //
@@ -7,12 +9,12 @@
 // Test 4 (idle eviction) is NOT an HTTP integration test here.  The pure logic (decide_session
 // returning OpenNew when last_seen_at is stale) is already covered by the unit tests in
 // src/pipeline/session.rs::tests.  Backdating a live session row would require either a
-// test-only mutation API on DuckDbRepository or sleeping the full idle window — both add
+// test-only mutation API on Store or sleeping the full idle window — both add
 // more friction than the value warrants for a path whose branching is already unit-tested.
 
 use axum::body::{to_bytes, Body};
 use axum::http::{Request, StatusCode};
-use mem::{http, storage::DuckDbRepository};
+use mem::{http, storage::Store};
 use serde_json::{json, Value};
 use tempfile::{tempdir, TempDir};
 use tower::util::ServiceExt;
@@ -90,7 +92,7 @@ impl TestApp {
 async fn fresh_app() -> TestApp {
     let temp_dir = tempdir().unwrap();
     let db_path = temp_dir.path().join("sessions-integration.duckdb");
-    let repo = DuckDbRepository::open(&db_path).await.unwrap();
+    let repo = Arc::new(Store::open(&db_path).await.unwrap());
 
     let state = common::test_app_state(repo.clone(), mem::service::MemoryService::new(repo));
 

@@ -9,7 +9,7 @@ use mem::{
     },
     embedding::{arc_embedding_provider, deterministic_embedding},
     service::MemoryService,
-    storage::{DuckDbGraphStore, DuckDbRepository, EntityRegistry},
+    storage::Store,
 };
 use tempfile::tempdir;
 
@@ -30,7 +30,7 @@ async fn hybrid_search_surfaces_semantic_match_without_lexical_overlap() {
 
     let dir = tempdir().unwrap();
     let db = dir.path().join("hybrid.duckdb");
-    let repo = DuckDbRepository::open(&db).await.unwrap();
+    let repo = Arc::new(Store::open(&db).await.unwrap());
 
     let query_text = "query-unique-semantic-anchor-xyz";
     let query_vec = deterministic_embedding(query_text, dim);
@@ -124,13 +124,7 @@ async fn hybrid_search_surfaces_semantic_match_without_lexical_overlap() {
     .await
     .unwrap();
 
-    let graph = Arc::new(DuckDbGraphStore::new(Arc::new(repo.clone())));
-    let service = MemoryService::with_graph_and_embedding_providers(
-        repo,
-        graph,
-        "fake".into(),
-        Some(provider),
-    );
+    let service = MemoryService::with_providers(repo, "fake".into(), Some(provider));
 
     let response = service
         .search(SearchMemoryRequest {
@@ -202,9 +196,8 @@ async fn ingest_for_e2e(
 async fn graph_boost_excludes_superseded_memory_from_related_memory_ids() {
     let dir = tempdir().unwrap();
     let db = dir.path().join("graph-boost.duckdb");
-    let repo = Arc::new(DuckDbRepository::open(&db).await.unwrap());
-    let graph = Arc::new(DuckDbGraphStore::new(repo.clone()));
-    let svc = MemoryService::new_with_graph((*repo).clone(), graph.clone());
+    let repo = Arc::new(Store::open(&db).await.unwrap());
+    let svc = MemoryService::new(repo.clone());
 
     // Ingest two memories sharing project=foo so graph edges link them via
     // the resolved entity node (entity:<uuid>) — Task 9 routed ingest through
@@ -221,7 +214,7 @@ async fn graph_boost_excludes_superseded_memory_from_related_memory_ids() {
     let project_node = format!("entity:{project_entity_id}");
 
     // Pre-condition: both memories are reachable from the shared project node.
-    let pre = graph
+    let pre = repo
         .related_memory_ids(std::slice::from_ref(&project_node))
         .await
         .unwrap();
@@ -234,10 +227,10 @@ async fn graph_boost_excludes_superseded_memory_from_related_memory_ids() {
     );
 
     // Simulate the supersede side-effect: close r1's outbound edges.
-    graph.close_edges_for_memory(&r1.memory_id).await.unwrap();
+    repo.close_edges_for_memory(&r1.memory_id).await.unwrap();
 
     // Post-condition: only r2 is reachable — r1 is excluded by graph_boost.
-    let post = graph
+    let post = repo
         .related_memory_ids(std::slice::from_ref(&project_node))
         .await
         .unwrap();

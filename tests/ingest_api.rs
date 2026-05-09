@@ -1,3 +1,5 @@
+use std::sync::Arc;
+
 use axum::{
     body::{to_bytes, Body},
     http::{Request, StatusCode},
@@ -9,7 +11,7 @@ use mem::{
     },
     http,
     pipeline::ingest::{compute_content_hash, initial_status},
-    storage::DuckDbRepository,
+    storage::Store,
 };
 use serde_json::{json, Value};
 use tempfile::{tempdir, TempDir};
@@ -137,7 +139,7 @@ fn sample_memory(
 async fn seeded_app(memories: Vec<MemoryRecord>) -> TestApp {
     let temp_dir = tempdir().unwrap();
     let db_path = temp_dir.path().join("ingest-api.duckdb");
-    let repo = DuckDbRepository::open(&db_path).await.unwrap();
+    let repo = Arc::new(Store::open(&db_path).await.unwrap());
     for memory in memories {
         repo.insert_memory(memory).await.unwrap();
     }
@@ -205,7 +207,7 @@ fn content_hash_is_deterministic_for_same_request() {
 async fn repository_dedupe_lookup_prefers_same_tenant_memory() {
     let temp_dir = tempdir().unwrap();
     let db_path = temp_dir.path().join("ingest-dedupe.duckdb");
-    let repo = DuckDbRepository::open(&db_path).await.unwrap();
+    let repo = Arc::new(Store::open(&db_path).await.unwrap());
 
     let make_memory = |tenant: &str, memory_id: &str| mem::domain::memory::MemoryRecord {
         memory_id: memory_id.into(),

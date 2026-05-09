@@ -6,7 +6,7 @@ use mem::{
         query::SearchMemoryRequest,
     },
     service::MemoryService,
-    storage::{DuckDbGraphStore, DuckDbRepository},
+    storage::{Store},
 };
 use tempfile::tempdir;
 
@@ -39,9 +39,8 @@ fn ingest_request(content: &str, summary: &str) -> IngestMemoryRequest {
 async fn bm25_ranks_textual_match_to_top() {
     let dir = tempdir().unwrap();
     let db = dir.path().join("bm25.duckdb");
-    let repo = DuckDbRepository::open(&db).await.unwrap();
-    let graph = Arc::new(DuckDbGraphStore::new(Arc::new(repo.clone())));
-    let svc = MemoryService::with_graph_and_embedding_providers(repo, graph, "fake".into(), None);
+    let repo = Arc::new(Store::open(&db).await.unwrap());
+    let svc = MemoryService::with_providers(repo, "fake".into(), None);
 
     let target = svc
         .ingest(ingest_request(
@@ -104,9 +103,8 @@ async fn bm25_ranks_textual_match_to_top() {
 async fn unrelated_query_returns_empty_sections() {
     let dir = tempdir().unwrap();
     let db = dir.path().join("empty.duckdb");
-    let repo = DuckDbRepository::open(&db).await.unwrap();
-    let graph = Arc::new(DuckDbGraphStore::new(Arc::new(repo.clone())));
-    let svc = MemoryService::with_graph_and_embedding_providers(repo, graph, "fake".into(), None);
+    let repo = Arc::new(Store::open(&db).await.unwrap());
+    let svc = MemoryService::with_providers(repo, "fake".into(), None);
 
     svc.ingest(ingest_request(
         "DuckDB stores canonical memory records and indexes locally",
