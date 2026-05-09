@@ -688,6 +688,63 @@ impl Store {
                 .await
         )
     }
+
+    /// Upsert a transcript-block embedding (transcript embedding
+    /// worker's hot path). Routes to LanceStore + DuckDbQuery refresh.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn upsert_conversation_message_embedding(
+        &self,
+        message_block_id: &str,
+        tenant: &str,
+        embedding_model: &str,
+        embedding_dim: i64,
+        embedding_blob: &[u8],
+        content_hash: &str,
+        source_updated_at: &str,
+        now: &str,
+    ) -> Result<(), StorageError> {
+        lance_write_then_refresh!(
+            self,
+            self.lance
+                .upsert_conversation_message_embedding(
+                    message_block_id,
+                    tenant,
+                    embedding_model,
+                    embedding_dim,
+                    embedding_blob,
+                    content_hash,
+                    source_updated_at,
+                    now,
+                )
+                .await
+        )
+    }
+
+    pub async fn delete_conversation_message_embedding(
+        &self,
+        message_block_id: &str,
+    ) -> Result<(), StorageError> {
+        lance_write_then_refresh!(
+            self,
+            self.lance
+                .delete_conversation_message_embedding(message_block_id)
+                .await
+        )
+    }
+
+    /// Semantic recall over transcript blocks. Routes to DuckDbQuery
+    /// (lance_vector_search SQL + JOIN conversation_messages, cosine
+    /// similarity via `1 - L²/2` for normalized embeddings).
+    pub async fn semantic_search_transcripts(
+        &self,
+        tenant: &str,
+        query_embedding: &[f32],
+        limit: usize,
+    ) -> Result<Vec<(ConversationMessage, f32)>, StorageError> {
+        self.query
+            .semantic_search_transcripts(tenant, query_embedding, limit)
+            .await
+    }
 }
 
 // ── Transcript reads (DuckDbQuery) ──────────────────────────────────
@@ -1244,6 +1301,110 @@ mod tests {
             .await
             .unwrap();
         assert!(claim6.is_empty());
+    }
+
+    /// Upsert + semantic_search round-trip on the transcript side.
+    /// Mirrors the memory-side `store_apply_time_decay_round_trip` /
+    /// duckdb_query semantic test: write 3 blocks (2 in tenant-a, 1
+    /// in tenant-b) with hand-rolled 4-d unit vectors, query with a
+    /// vector close to v1 in tenant-a, assert ordering, similarity
+    /// shape, and tenant scope.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn store_transcript_embedding_search_round_trip() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("store");
+        let store = Store::open(&path).await.unwrap();
+        store.set_transcript_job_provider("fake-test");
+
+        // Seed 3 conversation_messages first (must exist for the JOIN
+        // in semantic_search_transcripts to find them).
+        let blocks = [
+            ("blk_v1", "tenant-a", 10, [1.0_f32, 0.0, 0.0, 0.0]),
+            ("blk_v2", "tenant-a", 12, [0.0, 1.0, 0.0, 0.0]),
+            ("blk_v3", "tenant-b", 14, [0.0, 0.0, 1.0, 0.0]),
+        ];
+        for (id, tenant, line, _) in &blocks {
+            let m = cm(id, tenant, *line, 0, true, "00000001778000000000");
+            store.create_conversation_message(&m).await.unwrap();
+        }
+
+        // Upsert embeddings.
+        fn to_blob(v: &[f32]) -> Vec<u8> {
+            let mut out = Vec::with_capacity(v.len() * 4);
+            for f in v {
+                out.extend_from_slice(&f.to_ne_bytes());
+            }
+            out
+        }
+        let now = "00000001778000010000";
+        for (id, tenant, _, vec) in &blocks {
+            store
+                .upsert_conversation_message_embedding(
+                    id,
+                    tenant,
+                    "fake-test",
+                    4,
+                    &to_blob(vec),
+                    "h",
+                    now,
+                    now,
+                )
+                .await
+                .unwrap();
+        }
+
+        // Query close to v1 → blk_v1 first; blk_v2 second; blk_v3
+        // (tenant-b) excluded.
+        let q = vec![0.99_f32, 0.14, 0.0, 0.0];
+        let hits = store
+            .semantic_search_transcripts("tenant-a", &q, 10)
+            .await
+            .unwrap();
+        assert_eq!(
+            hits.len(),
+            2,
+            "tenant-a transcript hits → 2 (blk_v1, blk_v2); got {hits:?}"
+        );
+        assert_eq!(hits[0].0.message_block_id, "blk_v1");
+        assert_eq!(hits[1].0.message_block_id, "blk_v2");
+        assert!(hits[0].1 > hits[1].1, "similarity descending");
+        assert!(
+            hits[0].1 > 0.99,
+            "v1 ≈ query → cos_sim > 0.99; got {}",
+            hits[0].1
+        );
+
+        // Empty / 0-limit short-circuits.
+        let empty1 = store
+            .semantic_search_transcripts("tenant-a", &[], 10)
+            .await
+            .unwrap();
+        assert!(empty1.is_empty());
+        let empty2 = store
+            .semantic_search_transcripts("tenant-a", &q, 0)
+            .await
+            .unwrap();
+        assert!(empty2.is_empty());
+
+        // tenant-b sees its own row.
+        let b = store
+            .semantic_search_transcripts("tenant-b", &q, 10)
+            .await
+            .unwrap();
+        assert_eq!(b.len(), 1);
+        assert_eq!(b[0].0.message_block_id, "blk_v3");
+
+        // delete then re-query: corpus shrinks.
+        store
+            .delete_conversation_message_embedding("blk_v2")
+            .await
+            .unwrap();
+        let after_delete = store
+            .semantic_search_transcripts("tenant-a", &q, 10)
+            .await
+            .unwrap();
+        assert_eq!(after_delete.len(), 1);
+        assert_eq!(after_delete[0].0.message_block_id, "blk_v1");
     }
 
     /// Embed-eligible message inserted while no provider is

@@ -1127,6 +1127,81 @@ impl DuckDbQuery {
         .await
     }
 
+    /// Semantic recall over `conversation_message_embeddings`.
+    /// Mirrors `semantic_search_memories` 1:1 with `memories` →
+    /// `conversation_messages` and `memory_id` → `message_block_id`.
+    /// Routes through the lance extension's `lance_vector_search`
+    /// SQL function; joins back to `ns.main.conversation_messages`
+    /// for the full row. Returns `(message, similarity)` pairs in
+    /// descending similarity order.
+    ///
+    /// **Score**: cosine similarity ∈ `[0, 1]` for normalized
+    /// embeddings, derived from the L2² distance lance returns as
+    /// `1 - L2²/2` — see `semantic_search_memories` for the
+    /// derivation. Same workaround applies (lance extension's
+    /// `lance_vector_search` doesn't accept a `distance_type`
+    /// kwarg, so we transform the L2² return value).
+    ///
+    /// `embed_eligible = true` is enforced in the outer WHERE: the
+    /// transcript embedding worker only computes embeddings for
+    /// eligible blocks, but a defense-in-depth filter here keeps
+    /// non-eligible rows out of the result even if a stale row
+    /// somehow survived.
+    pub async fn semantic_search_transcripts(
+        &self,
+        tenant: &str,
+        query_embedding: &[f32],
+        limit: usize,
+    ) -> Result<Vec<(ConversationMessage, f32)>, StorageError> {
+        if query_embedding.is_empty() || limit == 0 {
+            return Ok(Vec::new());
+        }
+        let vector_lit = format!(
+            "[{}]::FLOAT[]",
+            query_embedding
+                .iter()
+                .map(|x| x.to_string())
+                .collect::<Vec<_>>()
+                .join(", "),
+        );
+        let conn = self.conn.clone();
+        let tenant = tenant.to_string();
+        let lim = i64::try_from(limit).unwrap_or(64).clamp(1, 1024);
+        let oversample = lim.saturating_mul(2);
+        spawn_blocking_storage(move || {
+            let conn = conn.lock().expect("duckdb_query mutex poisoned");
+            let c_cols = CONVERSATION_COLS
+                .split(',')
+                .map(|c| format!("c.{}", c.trim()))
+                .collect::<Vec<_>>()
+                .join(", ");
+            let sql = format!(
+                "SELECT {c_cols}, e._distance \
+                 FROM lance_vector_search( \
+                        'ns.main.conversation_message_embeddings', 'embedding', \
+                        {vector_lit}, k => ?1 \
+                      ) AS e \
+                 JOIN ns.main.conversation_messages AS c \
+                   ON c.message_block_id = e.message_block_id \
+                 WHERE c.tenant = ?2 AND c.embed_eligible = true \
+                 ORDER BY e._distance ASC \
+                 LIMIT ?3",
+            );
+            let mut stmt = conn.prepare(&sql)?;
+            let rows = stmt.query_map(params![oversample, tenant, lim], |row| {
+                let msg = row_to_conversation_message(row)?;
+                let l2_squared: f32 = row.get(15)?; // 15 conv cols → idx 15
+                Ok((msg, 1.0_f32 - l2_squared / 2.0_f32))
+            })?;
+            let mut out = Vec::new();
+            for r in rows {
+                out.push(r.map_err(StorageError::DuckDb)?);
+            }
+            Ok(out)
+        })
+        .await
+    }
+
     // ── Graph reads (`graph_edges` table) ───────────────────────────
 
     /// Active edges incident on `node_id`. Only edges with

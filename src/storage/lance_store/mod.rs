@@ -310,6 +310,22 @@ async fn ensure_memory_embeddings_table(conn: &Connection, dim: i32) -> Result<(
     ensure_table(conn, "memory_embeddings", memory_embeddings_schema(dim)).await
 }
 
+/// Counterpart of [`ensure_memory_embeddings_table`] for the
+/// transcript-side embeddings. Lazy-created on first
+/// `upsert_conversation_message_embedding` for the same reason
+/// memory_embeddings is lazy: dim is provider-dependent.
+async fn ensure_conversation_message_embeddings_table(
+    conn: &Connection,
+    dim: i32,
+) -> Result<(), StorageError> {
+    ensure_table(
+        conn,
+        "conversation_message_embeddings",
+        conversation_message_embeddings_schema(dim),
+    )
+    .await
+}
+
 async fn ensure_embedding_jobs_table(conn: &Connection) -> Result<(), StorageError> {
     ensure_table(conn, "embedding_jobs", embedding_jobs_schema()).await
 }
@@ -517,6 +533,81 @@ fn memory_embedding_to_record_batch(
     ];
     RecordBatch::try_new(schema, columns)
         .map_err(|e| StorageError::InvalidInput(format!("memory_embedding record batch: {e}")))
+}
+
+/// Arrow schema for `conversation_message_embeddings`. Mirrors
+/// `memory_embeddings` 1:1 with `memory_id` → `message_block_id`.
+fn conversation_message_embeddings_schema(dim: i32) -> Schema {
+    Schema::new(vec![
+        Field::new("message_block_id", DataType::Utf8, false),
+        Field::new("tenant", DataType::Utf8, false),
+        Field::new("embedding_model", DataType::Utf8, false),
+        Field::new("embedding_dim", DataType::Int64, false),
+        Field::new(
+            "embedding",
+            DataType::FixedSizeList(Arc::new(Field::new("item", DataType::Float32, true)), dim),
+            false,
+        ),
+        Field::new("content_hash", DataType::Utf8, false),
+        Field::new("source_updated_at", DataType::Utf8, false),
+        Field::new("created_at", DataType::Utf8, false),
+        Field::new("updated_at", DataType::Utf8, false),
+    ])
+}
+
+#[allow(clippy::too_many_arguments)]
+fn conversation_message_embedding_to_record_batch(
+    message_block_id: &str,
+    tenant: &str,
+    embedding_model: &str,
+    embedding_dim: i64,
+    embedding: &[f32],
+    content_hash: &str,
+    source_updated_at: &str,
+    now: &str,
+) -> Result<RecordBatch, StorageError> {
+    let dim = i32::try_from(embedding.len()).map_err(|_| {
+        StorageError::InvalidData("embedding dim does not fit in i32 for FixedSizeList")
+    })?;
+
+    let mut id_b = StringBuilder::new();
+    let mut tenant_b = StringBuilder::new();
+    let mut model_b = StringBuilder::new();
+    let mut dim_b = Int64Builder::new();
+    let mut hash_b = StringBuilder::new();
+    let mut src_ts_b = StringBuilder::new();
+    let mut created_b = StringBuilder::new();
+    let mut updated_b = StringBuilder::new();
+    id_b.append_value(message_block_id);
+    tenant_b.append_value(tenant);
+    model_b.append_value(embedding_model);
+    dim_b.append_value(embedding_dim);
+    hash_b.append_value(content_hash);
+    src_ts_b.append_value(source_updated_at);
+    created_b.append_value(now);
+    updated_b.append_value(now);
+
+    let mut emb_b = FixedSizeListBuilder::with_capacity(Float32Builder::new(), dim, 1);
+    for v in embedding {
+        emb_b.values().append_value(*v);
+    }
+    emb_b.append(true);
+
+    let schema = Arc::new(conversation_message_embeddings_schema(dim));
+    let columns: Vec<Arc<dyn Array>> = vec![
+        Arc::new(id_b.finish()),
+        Arc::new(tenant_b.finish()),
+        Arc::new(model_b.finish()),
+        Arc::new(dim_b.finish()),
+        Arc::new(emb_b.finish()),
+        Arc::new(hash_b.finish()),
+        Arc::new(src_ts_b.finish()),
+        Arc::new(created_b.finish()),
+        Arc::new(updated_b.finish()),
+    ];
+    RecordBatch::try_new(schema, columns).map_err(|e| {
+        StorageError::InvalidInput(format!("conversation_message_embedding record batch: {e}"))
+    })
 }
 
 /// Internal row representation for `embedding_jobs`. Mirrors DuckDB's
@@ -1727,6 +1818,88 @@ impl LanceStore {
             .column("last_error", sql_quote(last_error))
             .column("updated_at", sql_quote(now))
             .execute()
+            .await
+            .map_err(lancedb_err)?;
+        Ok(())
+    }
+
+    /// Upsert a transcript-block embedding into
+    /// `conversation_message_embeddings`. Mirrors
+    /// `MemoryRepository::upsert_memory_embedding` 1:1 with
+    /// `memory_id` → `message_block_id`. Lazy-creates the table on
+    /// first call (dim is provider-dependent and not known at
+    /// `LanceStore::open` time without a provider).
+    #[allow(clippy::too_many_arguments)]
+    pub async fn upsert_conversation_message_embedding(
+        &self,
+        message_block_id: &str,
+        tenant: &str,
+        embedding_model: &str,
+        embedding_dim: i64,
+        embedding_blob: &[u8],
+        content_hash: &str,
+        source_updated_at: &str,
+        now: &str,
+    ) -> Result<(), StorageError> {
+        let dim_i32 = i32::try_from(embedding_dim)
+            .map_err(|_| StorageError::InvalidData("embedding_dim does not fit in i32"))?;
+        let vector = decode_embedding_blob(embedding_blob, embedding_dim as usize)?;
+
+        ensure_conversation_message_embeddings_table(&self.conn, dim_i32).await?;
+        let table = self
+            .conn
+            .open_table("conversation_message_embeddings")
+            .execute()
+            .await
+            .map_err(lancedb_err)?;
+        // upsert = delete-then-insert (Lance has no PK).
+        table
+            .delete(&format!(
+                "message_block_id = {}",
+                sql_quote(message_block_id),
+            ))
+            .await
+            .map_err(lancedb_err)?;
+        let batch = conversation_message_embedding_to_record_batch(
+            message_block_id,
+            tenant,
+            embedding_model,
+            embedding_dim,
+            &vector,
+            content_hash,
+            source_updated_at,
+            now,
+        )?;
+        table.add(batch).execute().await.map_err(lancedb_err)?;
+        Ok(())
+    }
+
+    /// Delete a transcript-block embedding by `message_block_id`.
+    /// No-op if the lazy-created table doesn't exist yet.
+    pub async fn delete_conversation_message_embedding(
+        &self,
+        message_block_id: &str,
+    ) -> Result<(), StorageError> {
+        let names = self
+            .conn
+            .table_names()
+            .execute()
+            .await
+            .map_err(lancedb_err)?;
+        if !names.iter().any(|n| n == "conversation_message_embeddings") {
+            return Ok(());
+        }
+        let table = self
+            .conn
+            .open_table("conversation_message_embeddings")
+            .execute()
+            .await
+            .map_err(lancedb_err)?;
+        table
+            .delete(&format!(
+                "message_block_id = {}",
+                sql_quote(message_block_id),
+            ))
             .await
             .map_err(lancedb_err)?;
         Ok(())
