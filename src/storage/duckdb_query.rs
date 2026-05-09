@@ -62,7 +62,7 @@
 //! introduces the `Store` composition layer (writes via LanceStore,
 //! reads via DuckDbQuery) and starts the service-layer cutover.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use duckdb::types::Value;
@@ -82,6 +82,11 @@ use crate::pipeline::entity_normalize::normalize_alias;
 #[derive(Clone)]
 pub struct DuckDbQuery {
     conn: Arc<Mutex<Connection>>,
+    /// Original lance directory path. Stored so [`Self::refresh`]
+    /// can re-ATTACH after lance writes from outside the DuckDB
+    /// connection (which the extension's snapshot caching otherwise
+    /// hides).
+    lance_path: PathBuf,
 }
 
 impl DuckDbQuery {
@@ -98,10 +103,19 @@ impl DuckDbQuery {
     /// (~few MB) from `extensions.duckdb.org` into
     /// `~/.duckdb/extensions/<duckdb-version>/<platform>/`. Subsequent
     /// runs are offline.
+    ///
+    /// **Snapshot caching:** the lance extension caches the dataset
+    /// version at first query post-ATTACH. Subsequent writes via the
+    /// LanceDB Rust API (which is how `LanceStore` mutates) are
+    /// invisible to this connection until [`Self::refresh`] is
+    /// called. The `Store` wrapper does that refresh after every
+    /// mutating call; direct `DuckDbQuery` users (only the
+    /// per-module unit tests today) need to do it themselves.
     pub async fn open(lance_path: impl AsRef<Path>) -> Result<Self, StorageError> {
         let path = lance_path.as_ref().to_path_buf();
+        let path_for_thread = path.clone();
         let conn = tokio::task::spawn_blocking(move || -> Result<Connection, StorageError> {
-            let path_str = path
+            let path_str = path_for_thread
                 .to_str()
                 .ok_or(StorageError::InvalidData("lance path must be UTF-8"))?;
             let escaped = path_str.replace('\'', "''");
@@ -114,7 +128,50 @@ impl DuckDbQuery {
         .map_err(|e| StorageError::InvalidInput(format!("spawn_blocking join: {e}")))??;
         Ok(Self {
             conn: Arc::new(Mutex::new(conn)),
+            lance_path: path,
         })
+    }
+
+    /// Replace the in-process DuckDB connection with a fresh one
+    /// (re-INSTALL/LOAD the lance extension and re-ATTACH the
+    /// dataset). The lance extension caches the dataset version
+    /// inside a connection's extension state; DETACH + re-ATTACH on
+    /// the same connection isn't enough to clear that cache —
+    /// empirically (see `store_open_write_read_round_trip` test
+    /// probes), only a brand-new Connection picks up writes done
+    /// via the LanceDB Rust API since the previous attach.
+    ///
+    /// Cost: maybe 100ms per call (connection setup + extension
+    /// load + ATTACH). Called by `Store` after every mutating method
+    /// so reads from the same `DuckDbQuery` instance always see the
+    /// latest version. Read-heavy workloads pay nothing extra
+    /// because writes are the trigger.
+    ///
+    /// (TODO: investigate `lance-duckdb` extension internals — if
+    /// there's a cheaper way to invalidate the cache, e.g. a
+    /// `lance_refresh()` SQL function the extension may expose,
+    /// substitute it here.)
+    pub async fn refresh(&self) -> Result<(), StorageError> {
+        let conn_arc = self.conn.clone();
+        let path = self.lance_path.clone();
+        tokio::task::spawn_blocking(move || -> Result<(), StorageError> {
+            let path_str = path
+                .to_str()
+                .ok_or(StorageError::InvalidData("lance path must be UTF-8"))?;
+            let escaped = path_str.replace('\'', "''");
+            let new_conn = Connection::open_in_memory()?;
+            new_conn.execute_batch("INSTALL lance; LOAD lance;")?;
+            new_conn.execute_batch(&format!("ATTACH '{escaped}' AS ns (TYPE LANCE);"))?;
+            // Swap the inner connection. Previous prepared
+            // statements are dropped along with the old conn — that
+            // matters if a caller cached a `Statement` outside the
+            // mutex, but `DuckDbQuery` always re-prepares per call,
+            // so it's safe.
+            *conn_arc.lock().expect("duckdb_query mutex poisoned") = new_conn;
+            Ok(())
+        })
+        .await
+        .map_err(|e| StorageError::InvalidInput(format!("spawn_blocking join: {e}")))?
     }
 
     /// All memories for `tenant`. Mirrors the DuckDB-as-storage

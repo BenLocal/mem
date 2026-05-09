@@ -3,6 +3,8 @@ pub mod duckdb_query;
 #[cfg(feature = "lancedb")]
 pub mod lance_store;
 pub mod repository;
+#[cfg(feature = "lancedb")]
+pub mod store;
 pub mod time;
 pub mod vector_index;
 pub mod vector_index_diagnose;
@@ -14,6 +16,8 @@ pub use duckdb::{
     TranscriptSessionSummary,
 };
 pub use repository::{GraphStore, MemoryRepository, Repository, TranscriptRepository};
+#[cfg(feature = "lancedb")]
+pub use store::Store;
 pub use time::{current_timestamp, timestamp_add_ms};
 pub use vector_index::{
     sidecar_paths, transcript_sidecar_paths, EmbeddingRowSource, TranscriptEmbeddingRowSource,
