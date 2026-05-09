@@ -72,21 +72,23 @@ use serde::Serialize;
 
 use super::{ContextWindow, GraphError, StorageError, TranscriptSessionSummary};
 use crate::domain::memory::{GraphEdge, MemoryRecord, MemoryStatus, MemoryVersionLink};
-use crate::domain::{
-    BlockType, ConversationMessage, Entity, EntityKind, EntityWithAliases, MessageRole,
-};
-use crate::pipeline::entity_normalize::normalize_alias;
+use crate::domain::{BlockType, ConversationMessage, Entity, EntityKind, MessageRole};
+
+mod decay;
+mod embedding_jobs;
+mod entities;
+mod graph;
 
 /// Read-only DuckDB SQL client backed by lance datasets ATTACHed at
 /// open time. See module-level docs for the architecture.
 #[derive(Clone)]
 pub struct DuckDbQuery {
-    conn: Arc<Mutex<Connection>>,
+    pub(super) conn: Arc<Mutex<Connection>>,
     /// Original lance directory path. Stored so [`Self::refresh`]
     /// can re-ATTACH after lance writes from outside the DuckDB
     /// connection (which the extension's snapshot caching otherwise
     /// hides).
-    lance_path: PathBuf,
+    pub(super) lance_path: PathBuf,
 }
 
 impl DuckDbQuery {
@@ -1201,327 +1203,13 @@ impl DuckDbQuery {
         })
         .await
     }
-
-    // ── Graph reads (`graph_edges` table) ───────────────────────────
-
-    /// Active edges incident on `node_id`. Only edges with
-    /// `valid_to IS NULL` are surfaced — closed (superseded) edges
-    /// stay in the table for audit but never enter recall. Ordered
-    /// `(relation, from_node_id, to_node_id)` for deterministic
-    /// output (mirrors the legacy backend).
-    pub async fn neighbors(&self, node_id: &str) -> Result<Vec<GraphEdge>, GraphError> {
-        let conn = self.conn.clone();
-        let node_id = node_id.to_string();
-        spawn_blocking_graph(move || {
-            let conn = conn.lock().expect("duckdb_query mutex poisoned");
-            let mut stmt = conn.prepare(
-                "SELECT from_node_id, to_node_id, relation, valid_from, valid_to \
-                 FROM ns.main.graph_edges \
-                 WHERE (from_node_id = ?1 OR to_node_id = ?1) AND valid_to IS NULL \
-                 ORDER BY relation, from_node_id, to_node_id",
-            )?;
-            let rows = stmt.query_map(params![node_id], row_to_graph_edge)?;
-            let mut out = Vec::new();
-            for r in rows {
-                out.push(r?);
-            }
-            Ok(out)
-        })
-        .await
-    }
-
-    /// Memory ids reachable in one hop from any of `node_ids`,
-    /// across active edges only. Used by `pipeline::retrieve` to
-    /// expand the candidate pool with graph neighbors of seed
-    /// nodes (e.g. memories that share an entity).
-    ///
-    /// Implementation: pull all edges where either endpoint is in
-    /// `node_ids`, then for each edge keep the **opposite** endpoint
-    /// (the one not in the input set), strip the `memory:` prefix,
-    /// dedupe via HashSet, sort. SQL `IN (...)` push-down handles
-    /// the filter; the endpoint-selection logic stays in Rust
-    /// because it's per-row and DuckDB has no clean "the side that
-    /// is NOT in (...)" expression.
-    ///
-    /// Empty input short-circuits.
-    pub async fn related_memory_ids(&self, node_ids: &[String]) -> Result<Vec<String>, GraphError> {
-        if node_ids.is_empty() {
-            return Ok(Vec::new());
-        }
-        let conn = self.conn.clone();
-        let node_ids: Vec<String> = node_ids.to_vec();
-        spawn_blocking_graph(move || {
-            let conn = conn.lock().expect("duckdb_query mutex poisoned");
-            let placeholders = (1..=node_ids.len())
-                .map(|i| format!("?{i}"))
-                .collect::<Vec<_>>()
-                .join(", ");
-            let sql = format!(
-                "SELECT from_node_id, to_node_id FROM ns.main.graph_edges \
-                 WHERE (from_node_id IN ({placeholders}) OR to_node_id IN ({placeholders})) \
-                   AND valid_to IS NULL"
-            );
-            let mut stmt = conn.prepare(&sql)?;
-            // params are (bound 1..N then 1..N again — same set used
-            // twice, once per IN clause).
-            let mut params_vec: Vec<Box<dyn duckdb::ToSql>> = Vec::with_capacity(node_ids.len());
-            for n in &node_ids {
-                params_vec.push(Box::new(n.clone()));
-            }
-            let params_refs: Vec<&dyn duckdb::ToSql> =
-                params_vec.iter().map(|b| b.as_ref()).collect();
-            let rows = stmt.query_map(params_refs.as_slice(), |row| {
-                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
-            })?;
-
-            let node_set: std::collections::HashSet<&str> =
-                node_ids.iter().map(|s| s.as_str()).collect();
-            let mut memory_ids = std::collections::HashSet::new();
-            for r in rows {
-                let (from, to) = r?;
-                for endpoint in [&from, &to] {
-                    if !node_set.contains(endpoint.as_str()) {
-                        if let Some(mid) = endpoint.strip_prefix("memory:") {
-                            memory_ids.insert(mid.to_string());
-                        }
-                    }
-                }
-            }
-            let mut out: Vec<String> = memory_ids.into_iter().collect();
-            out.sort();
-            Ok(out)
-        })
-        .await
-    }
-
-    // ── Entity-registry reads (`entities` + `entity_aliases`) ───────
-
-    /// Fetch an entity row plus its alias list (ordered
-    /// `created_at ASC, alias_text ASC`). Returns `Ok(None)` when no
-    /// row matches `(tenant, entity_id)`. Two SELECTs because DuckDB
-    /// SQL `array_agg(... ORDER BY ...)` would force the alias rows
-    /// onto a single GROUP BY row but the legacy code keeps them
-    /// in distinct rows; we mirror its shape.
-    pub async fn get_entity(
-        &self,
-        tenant: &str,
-        entity_id: &str,
-    ) -> Result<Option<EntityWithAliases>, StorageError> {
-        let conn = self.conn.clone();
-        let tenant = tenant.to_string();
-        let entity_id = entity_id.to_string();
-        spawn_blocking_storage(move || {
-            let conn = conn.lock().expect("duckdb_query mutex poisoned");
-            let entity = conn
-                .query_row(
-                    "SELECT entity_id, tenant, canonical_name, kind, created_at \
-                     FROM ns.main.entities \
-                     WHERE tenant = ?1 AND entity_id = ?2",
-                    params![&tenant, &entity_id],
-                    row_to_entity,
-                )
-                .optional()
-                .map_err(StorageError::DuckDb)?;
-            let Some(entity) = entity else {
-                return Ok(None);
-            };
-
-            let mut stmt = conn.prepare(
-                "SELECT alias_text FROM ns.main.entity_aliases \
-                 WHERE tenant = ?1 AND entity_id = ?2 \
-                 ORDER BY created_at ASC, alias_text ASC",
-            )?;
-            let rows =
-                stmt.query_map(params![&tenant, &entity_id], |row| row.get::<_, String>(0))?;
-            let mut aliases = Vec::new();
-            for r in rows {
-                aliases.push(r.map_err(StorageError::DuckDb)?);
-            }
-            Ok(Some(EntityWithAliases { entity, aliases }))
-        })
-        .await
-    }
-
-    /// Read-only normalized-alias lookup: returns the `entity_id`
-    /// currently bound to `normalize_alias(alias)` under `tenant`,
-    /// or `None`. Used by service-layer flows that need to pre-check
-    /// alias ownership before attempting writes.
-    pub async fn lookup_alias(
-        &self,
-        tenant: &str,
-        alias: &str,
-    ) -> Result<Option<String>, StorageError> {
-        let normalized = normalize_alias(alias);
-        let conn = self.conn.clone();
-        let tenant = tenant.to_string();
-        spawn_blocking_storage(move || {
-            let conn = conn.lock().expect("duckdb_query mutex poisoned");
-            conn.query_row(
-                "SELECT entity_id FROM ns.main.entity_aliases \
-                 WHERE tenant = ?1 AND alias_text = ?2",
-                params![tenant, normalized],
-                |row| row.get::<_, String>(0),
-            )
-            .optional()
-            .map_err(StorageError::DuckDb)
-        })
-        .await
-    }
-
-    /// List entities under `tenant`, optionally filtered by `kind`
-    /// and a `LIKE`-substring on `canonical_name`. Ordered
-    /// `created_at DESC`, capped at `limit`.
-    ///
-    /// The `LIKE` pattern is parameterised — wrap the query in
-    /// `%...%` so substring match works without the caller knowing
-    /// about SQL wildcards. (DuckDB `LIKE` is case-sensitive; the
-    /// legacy backend was the same — kept for parity. A future
-    /// follow-up could swap to `ILIKE` for case-insensitive
-    /// search.)
-    pub async fn list_entities(
-        &self,
-        tenant: &str,
-        kind_filter: Option<EntityKind>,
-        query: Option<&str>,
-        limit: usize,
-    ) -> Result<Vec<Entity>, StorageError> {
-        let conn = self.conn.clone();
-        let tenant = tenant.to_string();
-        let kind_filter = kind_filter.map(|k| k.as_db_str().to_string());
-        let query = query.map(|q| format!("%{q}%"));
-        let lim = i64::try_from(limit).unwrap_or(64).clamp(1, 1024);
-        spawn_blocking_storage(move || {
-            let conn = conn.lock().expect("duckdb_query mutex poisoned");
-            let mut sql = String::from(
-                "SELECT entity_id, tenant, canonical_name, kind, created_at \
-                 FROM ns.main.entities WHERE tenant = ?1",
-            );
-            let mut params_vec: Vec<Box<dyn duckdb::ToSql>> = vec![Box::new(tenant)];
-            if let Some(k) = kind_filter {
-                sql.push_str(&format!(" AND kind = ?{}", params_vec.len() + 1));
-                params_vec.push(Box::new(k));
-            }
-            if let Some(pat) = query {
-                sql.push_str(&format!(
-                    " AND canonical_name LIKE ?{}",
-                    params_vec.len() + 1
-                ));
-                params_vec.push(Box::new(pat));
-            }
-            sql.push_str(" ORDER BY created_at DESC");
-            sql.push_str(&format!(" LIMIT ?{}", params_vec.len() + 1));
-            params_vec.push(Box::new(lim));
-
-            let mut stmt = conn.prepare(&sql)?;
-            let params_refs: Vec<&dyn duckdb::ToSql> =
-                params_vec.iter().map(|b| b.as_ref()).collect();
-            let rows = stmt.query_map(params_refs.as_slice(), row_to_entity)?;
-            let mut out = Vec::new();
-            for r in rows {
-                out.push(r.map_err(StorageError::DuckDb)?);
-            }
-            Ok(out)
-        })
-        .await
-    }
-
-    // ── Embedding job status helpers ────────────────────────────────
-
-    /// Read the `status` column of an embedding_jobs row by id. Used
-    /// by the embedding worker to skip mid-flight processing if a
-    /// concurrent caller (e.g. a supersede flow) marked the job
-    /// stale before the embed completed. `None` if the row is gone.
-    pub async fn get_embedding_job_status(
-        &self,
-        job_id: &str,
-    ) -> Result<Option<String>, StorageError> {
-        let conn = self.conn.clone();
-        let job_id = job_id.to_string();
-        spawn_blocking_storage(move || {
-            let conn = conn.lock().expect("duckdb_query mutex poisoned");
-            conn.query_row(
-                "SELECT status FROM ns.main.embedding_jobs WHERE job_id = ?1",
-                params![job_id],
-                |row| row.get::<_, String>(0),
-            )
-            .optional()
-            .map_err(StorageError::DuckDb)
-        })
-        .await
-    }
-
-    /// Same shape as [`Self::get_embedding_job_status`] but for the
-    /// transcript-side queue. Used by the transcript embedding worker
-    /// to skip mid-flight processing if the job got marked stale by
-    /// a concurrent caller.
-    pub async fn get_transcript_embedding_job_status(
-        &self,
-        job_id: &str,
-    ) -> Result<Option<String>, StorageError> {
-        let conn = self.conn.clone();
-        let job_id = job_id.to_string();
-        spawn_blocking_storage(move || {
-            let conn = conn.lock().expect("duckdb_query mutex poisoned");
-            conn.query_row(
-                "SELECT status FROM ns.main.transcript_embedding_jobs WHERE job_id = ?1",
-                params![job_id],
-                |row| row.get::<_, String>(0),
-            )
-            .optional()
-            .map_err(StorageError::DuckDb)
-        })
-        .await
-    }
-
-    // ── Bulk writes via DuckDB SQL ──────────────────────────────────
-
-    /// Bulk decay sweep: increment `memories.decay_score` for every
-    /// active row by a fraction of the days elapsed since
-    /// `updated_at`, capped at 1.0, and bump `updated_at` to `now`.
-    /// Used by the decay worker (called once per hour). Issued via
-    /// DuckDB SQL through the lance extension — single statement,
-    /// no Rust-side iteration.
-    ///
-    /// `now_ms` is the current timestamp in milliseconds (numeric);
-    /// `now_ms_str` is the same value zero-padded to the 20-char
-    /// string that mem uses for sortable timestamps.
-    /// `decay_rate_per_day` is the per-day delta multiplier (e.g.
-    /// `0.01` = 1% / day); `ms_per_day` is the time-base divisor
-    /// (constant 86_400_000 in production but exposed for tests).
-    ///
-    /// Writes via DuckDB-side SQL invalidate the connection's own
-    /// cache automatically (LanceStore Rust API writes do not — see
-    /// [`Self::refresh`] doc), so no manual refresh is needed here.
-    pub async fn apply_time_decay(
-        &self,
-        decay_rate_per_day: f64,
-        now_ms: f64,
-        ms_per_day: f64,
-        now_ms_str: &str,
-    ) -> Result<(), StorageError> {
-        let conn = self.conn.clone();
-        let now_ms_str = now_ms_str.to_string();
-        spawn_blocking_storage(move || {
-            let conn = conn.lock().expect("duckdb_query mutex poisoned");
-            conn.execute(
-                "UPDATE ns.main.memories \
-                 SET decay_score = least(1.0, decay_score + ?1 * ((?2 - updated_at::double) / ?3)), \
-                     updated_at = ?4 \
-                 WHERE status = 'active' AND decay_score < 1.0",
-                params![decay_rate_per_day, now_ms, ms_per_day, now_ms_str],
-            )
-            .map_err(StorageError::DuckDb)?;
-            Ok(())
-        })
-        .await
-    }
 }
 
 /// Run a synchronous DuckDB query body on a blocking-pool thread and
 /// surface the result back to the async caller. Standardizes the
 /// `spawn_blocking` ↔ `StorageError` conversion so individual methods
 /// stay clean.
-async fn spawn_blocking_storage<T, F>(f: F) -> Result<T, StorageError>
+pub(super) async fn spawn_blocking_storage<T, F>(f: F) -> Result<T, StorageError>
 where
     F: FnOnce() -> Result<T, StorageError> + Send + 'static,
     T: Send + 'static,
@@ -1536,7 +1224,7 @@ where
 /// `GraphError::Backend` for both spawn-join failures and per-row
 /// `duckdb::Error`s — same shape the legacy backend's
 /// `From<duckdb::Error> for GraphError` produced.
-async fn spawn_blocking_graph<T, F>(f: F) -> Result<T, GraphError>
+pub(super) async fn spawn_blocking_graph<T, F>(f: F) -> Result<T, GraphError>
 where
     F: FnOnce() -> Result<T, GraphError> + Send + 'static,
     T: Send + 'static,
@@ -1549,7 +1237,7 @@ where
 /// Decode a `graph_edges` row into a [`GraphEdge`]. The `valid_to`
 /// column is nullable (closed edges have a timestamp; active edges
 /// are NULL).
-fn row_to_graph_edge(row: &duckdb::Row<'_>) -> duckdb::Result<GraphEdge> {
+pub(super) fn row_to_graph_edge(row: &duckdb::Row<'_>) -> duckdb::Result<GraphEdge> {
     Ok(GraphEdge {
         from_node_id: row.get(0)?,
         to_node_id: row.get(1)?,
@@ -1564,7 +1252,7 @@ fn row_to_graph_edge(row: &duckdb::Row<'_>) -> duckdb::Result<GraphEdge> {
 /// we go through `EntityKind::from_db_str` rather than a serde round
 /// trip because the domain type already exposes that helper for the
 /// legacy DuckDB-as-storage code path.
-fn row_to_entity(row: &duckdb::Row<'_>) -> duckdb::Result<Entity> {
+pub(super) fn row_to_entity(row: &duckdb::Row<'_>) -> duckdb::Result<Entity> {
     let kind: String = row.get(3)?;
     Ok(Entity {
         entity_id: row.get(0)?,
@@ -1589,7 +1277,9 @@ const CONVERSATION_COLS: &str = "message_block_id, session_id, tenant, caller_ag
 
 /// Parse one row of the 15-column conversation_messages SELECT into a
 /// [`ConversationMessage`].
-fn row_to_conversation_message(row: &duckdb::Row<'_>) -> duckdb::Result<ConversationMessage> {
+pub(super) fn row_to_conversation_message(
+    row: &duckdb::Row<'_>,
+) -> duckdb::Result<ConversationMessage> {
     let role: String = row.get(8)?;
     let block_type: String = row.get(9)?;
     Ok(ConversationMessage {
@@ -1626,7 +1316,7 @@ fn row_to_conversation_message(row: &duckdb::Row<'_>) -> duckdb::Result<Conversa
 /// Collect rows from a conversation_messages `query_map` iterator
 /// into a `Vec<ConversationMessage>`, surfacing per-row
 /// `duckdb::Error` as `StorageError::DuckDb`.
-fn collect_messages<I>(rows: I) -> Result<Vec<ConversationMessage>, StorageError>
+pub(super) fn collect_messages<I>(rows: I) -> Result<Vec<ConversationMessage>, StorageError>
 where
     I: Iterator<Item = duckdb::Result<ConversationMessage>>,
 {
@@ -1639,7 +1329,7 @@ where
 
 /// Collect rows from a `query_map` iterator into a `Vec<MemoryRecord>`,
 /// converting the per-row `duckdb::Error` to `StorageError`.
-fn collect_memories<I>(rows: I) -> Result<Vec<MemoryRecord>, StorageError>
+pub(super) fn collect_memories<I>(rows: I) -> Result<Vec<MemoryRecord>, StorageError>
 where
     I: Iterator<Item = duckdb::Result<MemoryRecord>>,
 {
@@ -1654,7 +1344,7 @@ where
 /// LanceStore writes. Inverse of `parse_enum`. Used for SQL parameter
 /// binding when filtering by enum-string columns (e.g.
 /// `status = 'pending_confirmation'`).
-fn enum_to_text<T: Serialize>(value: &T) -> Result<String, StorageError> {
+pub(super) fn enum_to_text<T: Serialize>(value: &T) -> Result<String, StorageError> {
     serde_json::to_value(value)
         .ok()
         .and_then(|v| v.as_str().map(str::to_owned))
@@ -1682,7 +1372,7 @@ const MEMORY_COLS: &str = "memory_id, tenant, memory_type, status, scope, visibi
 /// here we round-trip them through `serde_json::Value::String` so
 /// `#[serde(rename_all = "snake_case")]` on the enum lookups them
 /// without needing a hand-written from-str table.
-fn row_to_memory_record(row: &duckdb::Row<'_>) -> duckdb::Result<MemoryRecord> {
+pub(super) fn row_to_memory_record(row: &duckdb::Row<'_>) -> duckdb::Result<MemoryRecord> {
     Ok(MemoryRecord {
         memory_id: row.get(0)?,
         tenant: row.get(1)?,
@@ -1714,7 +1404,7 @@ fn row_to_memory_record(row: &duckdb::Row<'_>) -> duckdb::Result<MemoryRecord> {
     })
 }
 
-fn parse_enum<T: DeserializeOwned>(value: &str) -> duckdb::Result<T> {
+pub(super) fn parse_enum<T: DeserializeOwned>(value: &str) -> duckdb::Result<T> {
     serde_json::from_value(serde_json::Value::String(value.to_owned())).map_err(|e| {
         duckdb::Error::FromSqlConversionFailure(0, duckdb::types::Type::Text, Box::new(e))
     })
@@ -1724,7 +1414,7 @@ fn parse_enum<T: DeserializeOwned>(value: &str) -> duckdb::Result<T> {
 /// doesn't ship a `FromSql` impl for `Vec<String>`, so we go through the
 /// `Value` enum. NULL list → empty Vec (mem semantics: missing list ==
 /// no items).
-fn get_string_list(row: &duckdb::Row<'_>, idx: usize) -> duckdb::Result<Vec<String>> {
+pub(super) fn get_string_list(row: &duckdb::Row<'_>, idx: usize) -> duckdb::Result<Vec<String>> {
     let v: Value = row.get(idx)?;
     let items = match v {
         Value::List(items) | Value::Array(items) => items,
