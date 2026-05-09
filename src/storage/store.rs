@@ -428,15 +428,6 @@ impl Store {
             .await
     }
 
-    pub async fn bm25_candidates(
-        &self,
-        tenant: &str,
-        query: &str,
-        k: usize,
-    ) -> Result<Vec<CapabilityCapsuleRecord>, StorageError> {
-        self.query.bm25_candidates(tenant, query, k).await
-    }
-
     pub async fn fetch_capability_capsules_by_ids(
         &self,
         tenant: &str,
@@ -463,17 +454,6 @@ impl Store {
     ) -> Result<Vec<CapabilityCapsuleVersionLink>, StorageError> {
         self.query
             .list_capability_capsule_versions_for_tenant(tenant, capability_capsule_id)
-            .await
-    }
-
-    pub async fn semantic_search_capability_capsules(
-        &self,
-        tenant: &str,
-        query_embedding: &[f32],
-        limit: usize,
-    ) -> Result<Vec<(CapabilityCapsuleRecord, f32)>, StorageError> {
-        self.query
-            .semantic_search_capability_capsules(tenant, query_embedding, limit)
             .await
     }
 

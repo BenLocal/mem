@@ -146,7 +146,7 @@ async fn get_capability_capsule(app: &TestApp, capability_capsule_id: &str) -> V
 }
 
 fn session_id_of(memory_detail: &Value) -> String {
-    memory_detail["memory"]["session_id"]
+    memory_detail["capability_capsule"]["session_id"]
         .as_str()
         .expect("session_id should be a string in stored memory")
         .to_string()

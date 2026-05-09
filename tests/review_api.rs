@@ -323,14 +323,14 @@ async fn editing_pending_memory_rejects_original_and_creates_active_successor() 
         .await;
 
     assert_eq!(response.status(), 200);
-    assert_eq!(response.json()["original_memory_id"], "mem_123");
-    assert_eq!(response.json()["memory"]["status"], "active");
+    assert_eq!(response.json()["original_capability_capsule_id"], "mem_123");
+    assert_eq!(response.json()["capability_capsule"]["status"], "active");
     assert_eq!(
-        response.json()["memory"]["supersedes_capability_capsule_id"],
+        response.json()["capability_capsule"]["supersedes_capability_capsule_id"],
         "mem_123"
     );
     assert_ne!(
-        response.json()["memory"]["capability_capsule_id"],
+        response.json()["capability_capsule"]["capability_capsule_id"],
         "mem_123"
     );
 
@@ -342,7 +342,7 @@ async fn editing_pending_memory_rejects_original_and_creates_active_successor() 
         .expect("original memory should exist");
     assert_eq!(original.status, CapabilityCapsuleStatus::Rejected);
 
-    let successor_id = response.json()["memory"]["capability_capsule_id"]
+    let successor_id = response.json()["capability_capsule"]["capability_capsule_id"]
         .as_str()
         .expect("successor memory id should be present")
         .to_string();
@@ -387,8 +387,12 @@ async fn submitting_feedback_updates_summary_and_lifecycle_fields() {
     assert_eq!(detail.status(), 200);
     assert_eq!(detail.json()["feedback_summary"]["total"], 1);
     assert_eq!(detail.json()["feedback_summary"]["useful"], 1);
-    let detail_confidence = detail.json()["memory"]["confidence"].as_f64().unwrap();
-    let detail_decay_score = detail.json()["memory"]["decay_score"].as_f64().unwrap();
+    let detail_confidence = detail.json()["capability_capsule"]["confidence"]
+        .as_f64()
+        .unwrap();
+    let detail_decay_score = detail.json()["capability_capsule"]["decay_score"]
+        .as_f64()
+        .unwrap();
     assert!((detail_confidence - 0.8).abs() < 1e-6);
     assert!((detail_decay_score - 0.2).abs() < 1e-6);
 }

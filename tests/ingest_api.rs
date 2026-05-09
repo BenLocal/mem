@@ -390,14 +390,14 @@ async fn get_memory_returns_full_record() {
 
     assert_eq!(response.status(), 200);
     assert_eq!(
-        response.json()["memory"]["capability_capsule_id"],
+        response.json()["capability_capsule"]["capability_capsule_id"],
         capability_capsule_id
     );
     assert_eq!(
-        response.json()["memory"]["content"],
+        response.json()["capability_capsule"]["content"],
         "invalidate cache when schema changes"
     );
-    assert!(response.json()["memory"]["content_hash"].is_string());
+    assert!(response.json()["capability_capsule"]["content_hash"].is_string());
     assert!(response.json()["version_chain"].is_array());
     assert_eq!(response.json()["graph_links"], json!([]));
     assert_eq!(response.json()["feedback_summary"]["total"], 0);
@@ -433,10 +433,10 @@ async fn get_memory_defaults_tenant_to_local() {
 
     assert_eq!(response.status(), 200);
     assert_eq!(
-        response.json()["memory"]["capability_capsule_id"],
+        response.json()["capability_capsule"]["capability_capsule_id"],
         "mem_123"
     );
-    assert_eq!(response.json()["memory"]["tenant"], "tenant-a");
+    assert_eq!(response.json()["capability_capsule"]["tenant"], "tenant-a");
 }
 
 #[tokio::test]
@@ -451,7 +451,10 @@ async fn get_memory_returns_full_version_chain_for_successor_ids() {
     let response = app.get("/capability_capsules/mem_v2?tenant=local").await;
 
     assert_eq!(response.status(), 200);
-    assert_eq!(response.json()["memory"]["capability_capsule_id"], "mem_v2");
+    assert_eq!(
+        response.json()["capability_capsule"]["capability_capsule_id"],
+        "mem_v2"
+    );
     assert_eq!(
         response.json()["version_chain"],
         json!([
@@ -538,7 +541,7 @@ async fn ingest_accepts_caller_summary_and_stores_it() {
         .await;
     assert_eq!(detail.status(), 200);
     assert_eq!(
-        detail.json()["memory"]["summary"],
+        detail.json()["capability_capsule"]["summary"],
         caller_summary,
         "stored summary should be the caller-supplied value, not the auto-derived one"
     );
