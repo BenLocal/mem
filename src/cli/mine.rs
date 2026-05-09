@@ -63,6 +63,10 @@ pub struct ArchivedBlock {
     pub content: String,
     pub tool_name: Option<String>,
     pub tool_use_id: Option<String>,
+    /// JSON-encoded envelope/per-block metadata (cwd, git_branch,
+    /// parent_uuid, is_error). `None` when no metadata fields were
+    /// present on the source JSONL line.
+    pub meta_json: Option<String>,
 }
 
 /// Backwards-compatible wrapper retained for the legacy unit tests in
@@ -106,6 +110,20 @@ pub fn parse_transcript_full(path: &Path) -> Result<(Vec<ExtractedMemory>, Vec<A
         let timestamp = value["timestamp"].as_str().unwrap_or("").to_string();
         let message_uuid = value["uuid"].as_str().map(|s| s.to_string());
 
+        // Envelope-level metadata (cwd, git_branch, parent_uuid).
+        // Repeated identically on every block of this message — the
+        // redundancy is the price of a flat row schema, traded against
+        // not storing a parent table for envelope-level fields.
+        // Claude Code uses both `gitBranch` and `git_branch` over time
+        // — accept either.
+        let envelope_cwd = value["cwd"].as_str();
+        let envelope_branch = value["gitBranch"]
+            .as_str()
+            .or_else(|| value["git_branch"].as_str());
+        let envelope_parent = value["parentUuid"]
+            .as_str()
+            .or_else(|| value["parent_uuid"].as_str());
+
         // Claude Code emits user messages in two shapes: an array of
         // structured blocks (when the message has tool-uses or
         // attachments) and a plain string (the common case for raw
@@ -127,6 +145,20 @@ pub fn parse_transcript_full(path: &Path) -> Result<(Vec<ExtractedMemory>, Vec<A
 
         for (block_idx, item) in content_array.iter().enumerate() {
             let block_type = item["type"].as_str().unwrap_or("");
+
+            // Compose meta_json: always include envelope fields when
+            // present; tool_result blocks additionally carry is_error.
+            let block_is_error = if block_type == "tool_result" {
+                item["is_error"].as_bool()
+            } else {
+                None
+            };
+            let meta_json = build_meta_json(
+                envelope_cwd,
+                envelope_branch,
+                envelope_parent,
+                block_is_error,
+            );
 
             // Memory extraction (legacy path) only runs on assistant
             // text blocks — same condition the original code enforced.
@@ -158,6 +190,7 @@ pub fn parse_transcript_full(path: &Path) -> Result<(Vec<ExtractedMemory>, Vec<A
                     content: item["text"].as_str().unwrap_or("").to_string(),
                     tool_name: None,
                     tool_use_id: None,
+                    meta_json: meta_json.clone(),
                 }),
                 "thinking" => Some(ArchivedBlock {
                     session_id: session_id.clone(),
@@ -170,6 +203,7 @@ pub fn parse_transcript_full(path: &Path) -> Result<(Vec<ExtractedMemory>, Vec<A
                     content: item["thinking"].as_str().unwrap_or("").to_string(),
                     tool_name: None,
                     tool_use_id: None,
+                    meta_json: meta_json.clone(),
                 }),
                 "tool_use" => Some(ArchivedBlock {
                     session_id: session_id.clone(),
@@ -182,6 +216,7 @@ pub fn parse_transcript_full(path: &Path) -> Result<(Vec<ExtractedMemory>, Vec<A
                     content: serde_json::to_string(&item["input"]).unwrap_or_default(),
                     tool_name: item["name"].as_str().map(|s| s.to_string()),
                     tool_use_id: item["id"].as_str().map(|s| s.to_string()),
+                    meta_json: meta_json.clone(),
                 }),
                 "tool_result" => Some(ArchivedBlock {
                     session_id: session_id.clone(),
@@ -191,9 +226,10 @@ pub fn parse_transcript_full(path: &Path) -> Result<(Vec<ExtractedMemory>, Vec<A
                     message_uuid: message_uuid.clone(),
                     role: role.to_string(),
                     block_type: "tool_result".to_string(),
-                    content: extract_tool_result_content(&item["content"]),
+                    content: serialize_tool_result_content(&item["content"]),
                     tool_name: None,
                     tool_use_id: item["tool_use_id"].as_str().map(|s| s.to_string()),
+                    meta_json: meta_json.clone(),
                 }),
                 _ => {
                     // Unknown block type: silently drop. Logging would
@@ -212,29 +248,60 @@ pub fn parse_transcript_full(path: &Path) -> Result<(Vec<ExtractedMemory>, Vec<A
 }
 
 /// `tool_result.content` in Claude Code transcripts comes in two shapes:
-/// a plain string (older runs) or an array of `{type, text}` objects
-/// (newer multi-part results). Concatenate text parts when an array is
-/// supplied; pass strings through verbatim. Anything else stringifies
-/// the whole JSON value as a fallback so no information is lost.
-fn extract_tool_result_content(value: &Value) -> String {
+/// a plain string (older runs) or an array of structured items like
+/// `{"type": "text", "text": ...}` / `{"type": "image", ...}` (newer
+/// multi-part results). Preserve both shapes as-is for downstream
+/// compression / slot extraction:
+///
+///   - Strings → returned verbatim (no JSON quoting), so simple
+///     consumers (e.g. wake-up text rendering) can use the column
+///     directly without parsing.
+///   - Arrays / objects → serialized to JSON so structure (text vs
+///     image, multiple parts, embedded metadata) survives.
+///   - Null → empty string.
+///
+/// **Design note**: this changed in 2026-05 from `\n`-joining text
+/// parts (which lost multi-part structure + dropped non-text parts)
+/// to verbatim JSON preservation. Slot-based compression
+/// (`commands_run` / `errors_encountered`) needs the structure.
+fn serialize_tool_result_content(value: &Value) -> String {
     if let Some(s) = value.as_str() {
         return s.to_string();
-    }
-    if let Some(arr) = value.as_array() {
-        let mut parts = Vec::with_capacity(arr.len());
-        for item in arr {
-            if let Some(t) = item["text"].as_str() {
-                parts.push(t.to_string());
-            } else if let Some(s) = item.as_str() {
-                parts.push(s.to_string());
-            }
-        }
-        return parts.join("\n");
     }
     if value.is_null() {
         return String::new();
     }
     serde_json::to_string(value).unwrap_or_default()
+}
+
+/// Build a JSON-encoded metadata blob from envelope + per-block fields,
+/// returning `None` when every input is empty so callers can store NULL
+/// instead of `"{}"`. Field names use snake_case to match the
+/// `MessageRole` / `BlockType` serde rename rules.
+fn build_meta_json(
+    cwd: Option<&str>,
+    git_branch: Option<&str>,
+    parent_uuid: Option<&str>,
+    is_error: Option<bool>,
+) -> Option<String> {
+    let mut map = serde_json::Map::new();
+    if let Some(s) = cwd.filter(|s| !s.is_empty()) {
+        map.insert("cwd".into(), Value::String(s.to_string()));
+    }
+    if let Some(s) = git_branch.filter(|s| !s.is_empty()) {
+        map.insert("git_branch".into(), Value::String(s.to_string()));
+    }
+    if let Some(s) = parent_uuid.filter(|s| !s.is_empty()) {
+        map.insert("parent_uuid".into(), Value::String(s.to_string()));
+    }
+    if let Some(b) = is_error {
+        map.insert("is_error".into(), Value::Bool(b));
+    }
+    if map.is_empty() {
+        None
+    } else {
+        Some(Value::Object(map).to_string())
+    }
 }
 
 fn extract_memory(text: &str) -> Option<String> {
@@ -342,6 +409,7 @@ pub async fn run(args: MineArgs) -> i32 {
             "tool_use_id": b.tool_use_id,
             "embed_eligible": embed_eligible,
             "created_at": b.timestamp,
+            "meta_json": b.meta_json,
         });
 
         match client

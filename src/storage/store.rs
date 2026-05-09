@@ -1246,6 +1246,7 @@ mod tests {
             tool_use_id: None,
             embed_eligible,
             created_at: created_at.into(),
+            meta_json: None,
         }
     }
 

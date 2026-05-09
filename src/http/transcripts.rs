@@ -82,6 +82,11 @@ pub struct IngestRequest {
     pub tool_use_id: Option<String>,
     pub embed_eligible: bool,
     pub created_at: String,
+    /// Optional JSON-encoded envelope/per-block metadata. See
+    /// `domain::ConversationMessage::meta_json` for conventional keys
+    /// (cwd, git_branch, parent_uuid, is_error). Stored verbatim.
+    #[serde(default)]
+    pub meta_json: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -112,6 +117,7 @@ async fn post_message(
         tool_use_id: req.tool_use_id,
         embed_eligible: req.embed_eligible,
         created_at: req.created_at,
+        meta_json: req.meta_json,
     };
     state.transcript_service.ingest(msg).await?;
     Ok(Json(IngestResponse {

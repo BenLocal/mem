@@ -809,6 +809,7 @@ mod tests {
             tool_use_id: None,
             embed_eligible: matches!(block_type, BlockType::Text | BlockType::Thinking),
             created_at: created_at.into(),
+            meta_json: None,
         }
     }
 

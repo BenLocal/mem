@@ -17,6 +17,22 @@ pub struct ConversationMessage {
     pub tool_use_id: Option<String>,
     pub embed_eligible: bool,
     pub created_at: String,
+    /// Optional JSON-serialized envelope/per-block metadata that
+    /// `mine.rs` extracts from the source JSONL but doesn't have a
+    /// first-class column for. Convention (all keys optional):
+    ///
+    ///   - `cwd`: working directory at message time (envelope-level)
+    ///   - `git_branch`: branch at message time (envelope-level)
+    ///   - `parent_uuid`: thread-topology link (envelope-level)
+    ///   - `is_error`: tool_result-only flag indicating tool failure
+    ///
+    /// Stored as a JSON string so additional fields can be added
+    /// without schema migration. `None` (NULL on disk) when the
+    /// caller didn't supply any metadata — typical for clients
+    /// POSTing to `/transcripts/messages` directly without the
+    /// JSONL envelope.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub meta_json: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]

@@ -8,13 +8,13 @@ use super::{spawn_blocking_storage, DuckDbQuery};
 use crate::domain::{BlockType, ConversationMessage, MessageRole};
 use crate::storage::types::{ContextWindow, StorageError, TranscriptSessionSummary};
 
-/// 15-column projection shared by every conversation_messages read.
+/// 16-column projection shared by every conversation_messages read.
 /// Order must match `row_to_conversation_message` below — keep in sync.
 const CONVERSATION_COLS: &str = "message_block_id, session_id, tenant, caller_agent, \
     transcript_path, line_number, block_index, message_uuid, role, block_type, content, \
-    tool_name, tool_use_id, embed_eligible, created_at";
+    tool_name, tool_use_id, embed_eligible, created_at, meta_json";
 
-/// Parse one row of the 15-column conversation_messages SELECT into a
+/// Parse one row of the 16-column conversation_messages SELECT into a
 /// [`ConversationMessage`].
 fn row_to_conversation_message(row: &duckdb::Row<'_>) -> duckdb::Result<ConversationMessage> {
     let role: String = row.get(8)?;
@@ -47,6 +47,7 @@ fn row_to_conversation_message(row: &duckdb::Row<'_>) -> duckdb::Result<Conversa
         tool_use_id: row.get(12)?,
         embed_eligible: row.get(13)?,
         created_at: row.get(14)?,
+        meta_json: row.get::<_, Option<String>>(15)?,
     })
 }
 
@@ -591,7 +592,7 @@ impl DuckDbQuery {
             let mut stmt = conn.prepare(&sql)?;
             let rows = stmt.query_map(params![oversample, tenant, lim], |row| {
                 let msg = row_to_conversation_message(row)?;
-                let l2_squared: f32 = row.get(15)?; // 15 conv cols → idx 15
+                let l2_squared: f32 = row.get(16)?; // 16 conv cols → idx 16
                 Ok((msg, 1.0_f32 - l2_squared / 2.0_f32))
             })?;
             let mut out = Vec::new();
@@ -638,6 +639,7 @@ mod tests {
             tool_use_id: None,
             embed_eligible: matches!(block_type, BlockType::Text | BlockType::Thinking),
             created_at: created_at.into(),
+            meta_json: None,
         }
     }
 

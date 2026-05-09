@@ -312,6 +312,7 @@ mod tests {
             tool_use_id: None,
             embed_eligible: true,
             created_at: created.to_string(),
+            meta_json: None,
         }
     }
 
@@ -590,6 +591,7 @@ mod window_tests {
             tool_use_id: None,
             embed_eligible: true,
             created_at: created.to_string(),
+            meta_json: None,
         }
     }
 

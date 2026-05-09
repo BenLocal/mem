@@ -23,6 +23,7 @@ fn sample_message(suffix: &str, embed: bool, block_type: BlockType) -> Conversat
         tool_use_id: None,
         embed_eligible: embed,
         created_at: "2026-04-30T00:00:00Z".to_string(),
+        meta_json: None,
     }
 }
 

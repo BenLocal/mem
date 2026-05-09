@@ -89,6 +89,7 @@ fn sample_block(
         tool_use_id: None,
         embed_eligible: embed,
         created_at: "00000000020260430000".to_string(),
+        meta_json: None,
     }
 }
 

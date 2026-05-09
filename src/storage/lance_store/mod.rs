@@ -1128,6 +1128,10 @@ fn conversation_messages_schema() -> Schema {
         Field::new("tool_use_id", DataType::Utf8, true),
         Field::new("embed_eligible", DataType::Boolean, false),
         Field::new("created_at", DataType::Utf8, false),
+        // Catch-all JSON envelope/per-block metadata (cwd, git_branch,
+        // parent_uuid, is_error, ...). Nullable so old rows + clients
+        // that don't supply it stay valid.
+        Field::new("meta_json", DataType::Utf8, true),
     ])
 }
 
@@ -1151,6 +1155,7 @@ pub(super) fn conversation_message_to_record_batch(
     let mut tool_use_id = StringBuilder::new();
     let mut embed_eligible = BooleanBuilder::new();
     let mut created_at = StringBuilder::new();
+    let mut meta_json = StringBuilder::new();
 
     message_block_id.append_value(&msg.message_block_id);
     match &msg.session_id {
@@ -1179,6 +1184,10 @@ pub(super) fn conversation_message_to_record_batch(
     }
     embed_eligible.append_value(msg.embed_eligible);
     created_at.append_value(&msg.created_at);
+    match &msg.meta_json {
+        Some(s) => meta_json.append_value(s),
+        None => meta_json.append_null(),
+    }
 
     let columns: Vec<Arc<dyn Array>> = vec![
         Arc::new(message_block_id.finish()),
@@ -1196,6 +1205,7 @@ pub(super) fn conversation_message_to_record_batch(
         Arc::new(tool_use_id.finish()),
         Arc::new(embed_eligible.finish()),
         Arc::new(created_at.finish()),
+        Arc::new(meta_json.finish()),
     ];
     RecordBatch::try_new(Arc::new(conversation_messages_schema()), columns)
         .map_err(|e| StorageError::InvalidInput(format!("conversation_message record batch: {e}")))
@@ -1232,6 +1242,11 @@ pub(super) fn record_batch_to_conversation_messages(
     let tool_use_id = col::<StringArray>(batch, "tool_use_id")?;
     let embed_eligible = col::<BooleanArray>(batch, "embed_eligible")?;
     let created_at = col::<StringArray>(batch, "created_at")?;
+    // meta_json is optional in the batch — older datasets that
+    // pre-date the column won't have it. Read defensively.
+    let meta_json = batch
+        .column_by_name("meta_json")
+        .and_then(|c| c.as_any().downcast_ref::<StringArray>());
 
     let opt = |arr: &StringArray, i: usize| -> Option<String> {
         if arr.is_null(i) {
@@ -1263,6 +1278,7 @@ pub(super) fn record_batch_to_conversation_messages(
             tool_use_id: opt(tool_use_id, i),
             embed_eligible: embed_eligible.value(i),
             created_at: created_at.value(i).to_string(),
+            meta_json: meta_json.and_then(|arr| opt(arr, i)),
         });
     }
     Ok(out)
