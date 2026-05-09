@@ -52,7 +52,6 @@ fn composite_pk_on_conflict_probe() {
 use mem::storage::Store;
 use tempfile::TempDir;
 
-
 #[tokio::test]
 async fn schema_bootstrap_is_idempotent() {
     let tmp = TempDir::new().unwrap();
@@ -147,9 +146,6 @@ async fn memory_record_empty_topics_round_trips_as_empty_vec() {
         .unwrap();
     assert!(fetched.topics.is_empty());
 }
-
-
-
 
 #[tokio::test]
 async fn resolve_or_create_creates_separate_entities_for_distinct_aliases() {
@@ -318,8 +314,6 @@ use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use serde_json::json;
 use tower::util::ServiceExt;
-
-
 
 // ---------------------------------------------------------------------------
 // HTTP routes (Task 10): POST/GET /entities, POST /entities/{id}/aliases.
