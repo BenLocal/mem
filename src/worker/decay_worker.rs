@@ -28,7 +28,7 @@ async fn apply_time_decay(store: &Store) -> Result<(), Box<dyn std::error::Error
     Ok(())
 }
 
-#[cfg(all(test, feature = "lancedb"))]
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::domain::memory::{MemoryRecord, MemoryStatus};

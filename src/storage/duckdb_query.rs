@@ -1751,7 +1751,7 @@ fn get_string_list(row: &duckdb::Row<'_>, idx: usize) -> duckdb::Result<Vec<Stri
         .collect()
 }
 
-#[cfg(all(test, feature = "lancedb"))]
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::domain::memory::{MemoryStatus, MemoryType, Scope, Visibility};

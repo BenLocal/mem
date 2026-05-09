@@ -19,8 +19,6 @@ enum Command {
     Serve,
     /// Run the MCP (Model Context Protocol) stdio server.
     Mcp,
-    /// Diagnose or rebuild the vector index sidecar.
-    Repair(mem::cli::repair::RepairArgs),
     /// Mine memories from Claude Code transcript.
     Mine(mem::cli::mine::MineArgs),
     /// Query and format memories for session start injection.
@@ -37,15 +35,11 @@ async fn main() -> error::Result<()> {
     let cli = Cli::parse();
     let command = cli.command.unwrap_or(Command::Serve);
 
-    init_tracing(matches!(command, Command::Mcp | Command::Repair(_)));
+    init_tracing(matches!(command, Command::Mcp));
 
     match command {
         Command::Serve => mem::cli::serve::run().await,
         Command::Mcp => mem::cli::mcp::run().await,
-        Command::Repair(args) => {
-            let code = mem::cli::repair::run(args).await;
-            std::process::exit(code);
-        }
         Command::Mine(args) => {
             let code = mem::cli::mine::run(args).await;
             std::process::exit(code);

@@ -503,7 +503,7 @@ impl MemoryService {
             .await?
             .ok_or(ServiceError::NotFound)?;
 
-        let feedback = crate::storage::duckdb::FeedbackEvent {
+        let feedback = crate::storage::FeedbackEvent {
             feedback_id: next_feedback_id(),
             memory_id: memory.memory_id.clone(),
             feedback_kind: feedback_kind.as_str().to_string(),

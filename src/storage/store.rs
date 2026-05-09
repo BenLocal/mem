@@ -939,7 +939,7 @@ impl Store {
     }
 }
 
-#[cfg(all(test, feature = "lancedb"))]
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::domain::memory::{MemoryStatus, MemoryType, Scope, Visibility};
