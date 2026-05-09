@@ -2,9 +2,13 @@ use tiktoken_rs::{o200k_base_singleton, CoreBPE};
 
 use crate::domain::{
     capability_capsule::{CapabilityCapsuleRecord, CapabilityCapsuleType},
-    query::{DirectiveItem, FactItem, PatternItem, SearchCapabilityCapsuleResponse},
+    query::{
+        ConversationHighlight, ConversationSnippet, DirectiveItem, FactItem, PatternItem,
+        SearchCapabilityCapsuleResponse,
+    },
     workflow::WorkflowOutline,
 };
+use crate::service::RecentSession;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Section {
@@ -79,6 +83,7 @@ pub fn compress(
         relevant_facts,
         reusable_patterns,
         suggested_workflow,
+        recent_conversations: Vec::new(),
     }
 }
 
@@ -234,6 +239,48 @@ fn max_items(budget: usize) -> usize {
         251..=450 => 3,
         _ => 4,
     }
+}
+
+/// Compress a wake-up `Vec<RecentSession>` into the
+/// `ConversationSnippet` shape on `SearchCapabilityCapsuleResponse`.
+/// Each session's per-block budget is `total / sessions / blocks`,
+/// rounded down. Empty input → empty Vec; zero `total_budget` short-
+/// circuits to empty (the `recent_conversations` field is then
+/// omitted from the JSON via `serde(skip_serializing_if = Vec::is_empty)`).
+pub fn compress_recent_sessions(
+    sessions: Vec<RecentSession>,
+    total_budget: usize,
+) -> Vec<ConversationSnippet> {
+    if sessions.is_empty() || total_budget == 0 {
+        return Vec::new();
+    }
+    let n_sessions = sessions.len();
+    let per_session = (total_budget / n_sessions).max(40);
+    sessions
+        .into_iter()
+        .map(|s| {
+            let n_blocks = s.highlights.len().max(1);
+            let per_block = (per_session / n_blocks).max(20);
+            let highlights = s
+                .highlights
+                .into_iter()
+                .map(|m| ConversationHighlight {
+                    message_block_id: m.message_block_id,
+                    role: format!("{:?}", m.role).to_lowercase(),
+                    block_type: format!("{:?}", m.block_type).to_lowercase(),
+                    text: compress_text(&m.content, per_block),
+                    created_at: m.created_at,
+                })
+                .collect();
+            ConversationSnippet {
+                session_id: s.session_id,
+                last_at: s.last_at,
+                block_count: s.block_count,
+                caller_agent: s.caller_agent,
+                highlights,
+            }
+        })
+        .collect()
 }
 
 #[cfg(test)]

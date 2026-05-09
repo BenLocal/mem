@@ -17,7 +17,7 @@ pub struct AppState {
     pub capability_capsule_service: CapabilityCapsuleService,
     pub config: crate::config::Config,
     /// Service façade backing the `/transcripts/*` HTTP routes.
-    pub transcript_service: TranscriptService,
+    pub transcript_service: Arc<TranscriptService>,
     /// Service façade backing the `/entities/*` HTTP routes.
     pub entity_service: EntityService,
 }
@@ -83,10 +83,14 @@ impl AppState {
 
         // ── Services ────────────────────────────────────────────
         let embedding_provider_id = config.embedding.job_provider_id().to_string();
-        let transcript_service = TranscriptService::new(store.clone(), Some(provider.clone()));
+        let transcript_service = Arc::new(TranscriptService::new(
+            store.clone(),
+            Some(provider.clone()),
+        ));
         let entity_service = EntityService::new(store.clone());
         let capability_capsule_service =
-            CapabilityCapsuleService::with_providers(store, embedding_provider_id, Some(provider));
+            CapabilityCapsuleService::with_providers(store, embedding_provider_id, Some(provider))
+                .with_transcript_service(transcript_service.clone());
 
         Ok(Self {
             capability_capsule_service,

@@ -182,6 +182,7 @@ fn search_response_serializes_compressed_shapes() {
             steps: vec!["write tests".into(), "implement".into(), "verify".into()],
             success_signals: vec!["tests pass".into()],
         }),
+        recent_conversations: Vec::new(),
     };
 
     let value = serde_json::to_value(response).unwrap();

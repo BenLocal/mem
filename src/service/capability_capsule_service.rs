@@ -63,6 +63,13 @@ pub struct CapabilityCapsuleService {
     embedding_job_provider: String,
     /// When set, search runs hybrid lexical + semantic retrieval.
     embedding_search_provider: Option<Arc<dyn EmbeddingProvider>>,
+    /// Optional handle to the transcript-archive service. Only used
+    /// by the wake-up fast path to populate
+    /// `SearchCapabilityCapsuleResponse.recent_conversations`. When
+    /// `None`, wake-up still works — it just omits the section.
+    /// Tests / unit fixtures that don't need transcript enrichment
+    /// pass `None` via [`Self::new`] / [`Self::with_providers`].
+    transcript_service: Option<Arc<crate::service::TranscriptService>>,
 }
 
 impl CapabilityCapsuleService {
@@ -74,6 +81,7 @@ impl CapabilityCapsuleService {
             store,
             embedding_job_provider: "fake".to_string(),
             embedding_search_provider: None,
+            transcript_service: None,
         }
     }
 
@@ -89,6 +97,7 @@ impl CapabilityCapsuleService {
             store,
             embedding_job_provider: settings.job_provider_id().to_string(),
             embedding_search_provider: None,
+            transcript_service: None,
         }
     }
 
@@ -104,7 +113,19 @@ impl CapabilityCapsuleService {
             store,
             embedding_job_provider,
             embedding_search_provider,
+            transcript_service: None,
         }
+    }
+
+    /// Attach a transcript service so the wake-up fast path can
+    /// surface `recent_conversations`. Builder-style — no-op when
+    /// not called (typical test path).
+    pub fn with_transcript_service(
+        mut self,
+        transcript_service: Arc<crate::service::TranscriptService>,
+    ) -> Self {
+        self.transcript_service = Some(transcript_service);
+        self
     }
 
     pub async fn ingest(
@@ -619,12 +640,40 @@ impl CapabilityCapsuleService {
         // does the per-section truncation by token budget.
         if query.intent == "wake_up" && query.query.trim().is_empty() {
             const WAKE_UP_LIMIT: usize = 64;
+            // 70% capsules / 30% transcripts when transcript service is
+            // attached; full budget to capsules when it's not (keeps
+            // the legacy shape for tests / providers without the
+            // transcript pipeline wired).
+            let (capsule_budget, transcript_budget) = if self.transcript_service.is_some() {
+                let cap = (query.token_budget * 70 / 100).max(80);
+                (cap, query.token_budget.saturating_sub(cap))
+            } else {
+                (query.token_budget, 0)
+            };
+
             let candidates = self
                 .store
                 .recent_active_capability_capsules(tenant, WAKE_UP_LIMIT)
                 .await
                 .map_err(ServiceError::Storage)?;
-            return Ok(compress::compress(&candidates, query.token_budget));
+            let mut response = compress::compress(&candidates, capsule_budget);
+
+            if let Some(transcripts) = self.transcript_service.as_ref() {
+                if transcript_budget > 0 {
+                    // 3 sessions × 4 highlights — small budget keeps
+                    // the wake-up payload bounded; the agent is
+                    // expected to reverse-look up via session_id if
+                    // it wants more depth.
+                    let recent = transcripts
+                        .recent_for_wake_up(tenant, 3, 4)
+                        .await
+                        .unwrap_or_default();
+                    response.recent_conversations =
+                        compress::compress_recent_sessions(recent, transcript_budget);
+                }
+            }
+
+            return Ok(response);
         }
 
         // Single SQL hybrid call replaces the dual lex/sem fan-out:

@@ -221,6 +221,21 @@ pub struct CapabilityCapsuleGetArgs {
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct TranscriptSessionGetArgs {
+    /// Claude Code session id, as exposed on
+    /// `SearchCapabilityCapsuleResponse.recent_conversations[].session_id`
+    /// from the wake-up call.
+    pub session_id: String,
+    /// Defaults to MEM_TENANT when omitted.
+    #[serde(default)]
+    pub tenant: Option<String>,
+    /// Block-page size. Defaults to 200 (the admin web's default);
+    /// max 1000 (server-side cap in `TranscriptService::get_by_session_paged`).
+    #[serde(default)]
+    pub limit: Option<usize>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct CapabilityCapsuleFeedbackArgs {
     #[serde(default)]
     pub tenant: Option<String>,
@@ -396,7 +411,7 @@ impl MemMcpServer {
             "expand_graph": args.expand_graph.unwrap_or(true),
             "tenant": self.resolve_tenant(args.tenant.as_ref()),
         });
-        self.post_json("memories/search", &body).await
+        self.post_json("capability_capsules/search", &body).await
     }
 
     // ------------------- capability_capsule_bootstrap -------------------
@@ -418,7 +433,7 @@ impl MemMcpServer {
         });
         match self
             .client
-            .request_json(Method::POST, "memories/search", Some(&body))
+            .request_json(Method::POST, "capability_capsules/search", Some(&body))
             .await
         {
             Ok(v) => Ok(ok_json(&pick_search_summary(&v))),
@@ -459,7 +474,7 @@ impl MemMcpServer {
         });
         match self
             .client
-            .request_json(Method::POST, "memories/search", Some(&body))
+            .request_json(Method::POST, "capability_capsules/search", Some(&body))
             .await
         {
             Ok(v) => Ok(ok_json(&pick_search_summary(&v))),
@@ -679,12 +694,15 @@ impl MemMcpServer {
     #[tool(
         description = "Fetch one memory by id (detail, version chain, graph links, embedding metadata)."
     )]
-    async fn memory_get(
+    async fn capability_capsule_get(
         &self,
         Parameters(args): Parameters<CapabilityCapsuleGetArgs>,
     ) -> Result<CallToolResult, McpError> {
         let tenant = self.resolve_tenant(args.tenant.as_ref());
-        let path = format!("memories/{}", encode_segment(&args.capability_capsule_id));
+        let path = format!(
+            "capability_capsules/{}",
+            encode_segment(&args.capability_capsule_id)
+        );
         self.get_with_query(&path, &[("tenant", tenant)]).await
     }
 
@@ -699,7 +717,7 @@ impl MemMcpServer {
             "capability_capsule_id": args.capability_capsule_id,
             "feedback_kind": args.feedback_kind,
         });
-        self.post_json("memories/feedback", &body).await
+        self.post_json("capability_capsules/feedback", &body).await
     }
 
     // ------------------- capability_capsule_apply_feedback -------------------
@@ -715,7 +733,7 @@ impl MemMcpServer {
             "capability_capsule_id": args.capability_capsule_id,
             "feedback_kind": args.kind,
         });
-        self.post_json("memories/feedback", &body).await
+        self.post_json("capability_capsules/feedback", &body).await
     }
 
     // ------------------- capability_capsule_list_pending_review -------------------
@@ -840,6 +858,22 @@ impl MemMcpServer {
     ) -> Result<CallToolResult, McpError> {
         let path = format!("graph/neighbors/{}", encode_segment(&args.node_id));
         self.get_with_query(&path, &[]).await
+    }
+
+    // ------------------- transcript_session_get -------------------
+    #[tool(
+        description = "Fetch the full block sequence for one Claude Code transcript session, identified by `session_id` (as exposed on the wake-up response's `recent_conversations[].session_id`). Returns chronological text/thinking/tool blocks; use this when you saw a session reference in the wake-up payload and want the full conversation."
+    )]
+    async fn transcript_session_get(
+        &self,
+        Parameters(args): Parameters<TranscriptSessionGetArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        let body = json!({
+            "tenant": self.resolve_tenant(args.tenant.as_ref()),
+            "session_id": args.session_id,
+            "limit": args.limit.unwrap_or(200),
+        });
+        self.post_json("transcripts", &body).await
     }
 
     // ------------------- embeddings_list_jobs (admin) -------------------

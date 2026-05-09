@@ -54,6 +54,22 @@ pub struct TranscriptSearchResult {
     pub windows: Vec<MergedWindow>,
 }
 
+/// A single recent session's metadata + N freshest embed_eligible
+/// blocks. Returned by [`TranscriptService::recent_for_wake_up`];
+/// the caller (capsule service wake-up branch) compresses each
+/// highlight's text under a token budget before exposing it on
+/// `SearchCapabilityCapsuleResponse.recent_conversations`.
+#[derive(Debug, Clone)]
+pub struct RecentSession {
+    pub session_id: String,
+    pub last_at: String,
+    pub block_count: i64,
+    pub caller_agent: Option<String>,
+    /// Newest-first (the order produced by
+    /// `Store::recent_conversation_messages`). Capped per call.
+    pub highlights: Vec<ConversationMessage>,
+}
+
 #[derive(Clone)]
 pub struct TranscriptService {
     /// Shared storage handle. Writes flow to LanceStore (incl.
@@ -125,6 +141,66 @@ impl TranscriptService {
                 tenant, session_id, since, until, cursor, limit,
             )
             .await
+    }
+
+    /// Wake-up enrichment: pick the N most recently active transcript
+    /// sessions for `tenant`, hydrate up to `blocks_per_session` of
+    /// each session's freshest embed_eligible blocks (text / thinking
+    /// only — agents don't want tool_use / tool_result noise on
+    /// session boot), and return a flat list of (session_id, highlights)
+    /// pairs. Caller layers `compress_text` over each highlight to
+    /// honor the wake-up token budget.
+    ///
+    /// Sessions are ordered by `last_at DESC` (newest activity first).
+    /// Session metadata (block_count, caller_agent) comes from the
+    /// existing `list_transcript_sessions` aggregate; highlights are
+    /// pulled per-session via `recent_conversation_messages` filtered
+    /// to that session id and embed_eligible.
+    ///
+    /// Empty result is returned when the tenant has no transcript
+    /// activity yet — handler must treat as "no recent conversations
+    /// to surface" and skip rendering the section.
+    pub async fn recent_for_wake_up(
+        &self,
+        tenant: &str,
+        max_sessions: usize,
+        blocks_per_session: usize,
+    ) -> Result<Vec<RecentSession>, StorageError> {
+        let max_sessions = max_sessions.clamp(1, 10);
+        let blocks_per_session = blocks_per_session.clamp(1, 10);
+
+        let sessions = self.store.list_transcript_sessions(tenant).await?;
+        let mut out = Vec::with_capacity(max_sessions.min(sessions.len()));
+        for session in sessions.into_iter().take(max_sessions) {
+            // Filter the recent feed by this session_id. The current
+            // recent_conversation_messages is tenant-scoped only, so
+            // we widen its limit and drop non-matching rows. For typical
+            // sessions of 100s–1000s of blocks this is acceptable; if it
+            // becomes hot, push the predicate into SQL via a new repo
+            // method.
+            let recent_widened = blocks_per_session.saturating_mul(20).max(50);
+            let blocks = self
+                .store
+                .recent_conversation_messages(tenant, recent_widened)
+                .await?;
+            let highlights: Vec<ConversationMessage> = blocks
+                .into_iter()
+                .filter(|m| {
+                    m.session_id.as_deref() == Some(session.session_id.as_str())
+                        && m.embed_eligible
+                        && matches!(m.block_type, BlockType::Text | BlockType::Thinking)
+                })
+                .take(blocks_per_session)
+                .collect();
+            out.push(RecentSession {
+                session_id: session.session_id,
+                last_at: session.last_at,
+                block_count: session.block_count,
+                caller_agent: session.caller_agent,
+                highlights,
+            });
+        }
+        Ok(out)
     }
 
     /// Three-channel hybrid recall:

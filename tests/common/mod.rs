@@ -51,7 +51,7 @@ pub fn test_app_state(
     store: Arc<Store>,
     capability_capsule_service: CapabilityCapsuleService,
 ) -> AppState {
-    let transcript_service = TranscriptService::new(store.clone(), None);
+    let transcript_service = Arc::new(TranscriptService::new(store.clone(), None));
     let entity_service = EntityService::new(store);
     AppState {
         capability_capsule_service,

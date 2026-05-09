@@ -79,6 +79,35 @@ pub async fn run(args: WakeUpArgs) -> Result<String> {
                 }
             }
         }
+
+        // Recent conversations — populated only on the wake-up fast
+        // path. Each entry is one Claude Code session's freshest
+        // text/thinking blocks. The session_id is exposed so the
+        // agent can reverse-look up the full session via
+        // POST /transcripts {session_id} or the
+        // mcp__mem__transcript_session_get MCP tool.
+        if let Some(sessions) = data["recent_conversations"].as_array() {
+            if !sessions.is_empty() {
+                output.push_str("\n## Recent Conversations\n\n");
+                for s in sessions {
+                    let session_id = s["session_id"].as_str().unwrap_or("?");
+                    let last_at = s["last_at"].as_str().unwrap_or("");
+                    let agent = s["caller_agent"].as_str().unwrap_or("agent");
+                    let block_count = s["block_count"].as_i64().unwrap_or(0);
+                    output.push_str(&format!(
+                        "### session {session_id}  ({agent}, {block_count} blocks, last: {last_at})\n",
+                    ));
+                    if let Some(highlights) = s["highlights"].as_array() {
+                        for h in highlights {
+                            let role = h["role"].as_str().unwrap_or("?");
+                            let text = h["text"].as_str().unwrap_or("");
+                            output.push_str(&format!("- **{role}:** {text}\n"));
+                        }
+                    }
+                    output.push('\n');
+                }
+            }
+        }
     }
 
     Ok(output)
