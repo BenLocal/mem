@@ -6,3 +6,4 @@
 6. 数据库文档以及之间的依赖关系
 7. 不需要加feature了，目前用lancedb + duckdb的方式，`storage`做按照`capability_capsule`和`transcripts`模块做抽象即可
 8. cli中的有些共通参数合并成一个struct，如`tenant`和`base_url`
+9. tiktoken-rs现在还有没有用途
