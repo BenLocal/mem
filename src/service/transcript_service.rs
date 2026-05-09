@@ -20,9 +20,7 @@ use crate::embedding::EmbeddingProvider;
 use crate::pipeline::transcript_recall::{
     merge_windows, score_candidates, MergedWindow, PrimaryWithContext, ScoringOpts,
 };
-use crate::storage::{
-    ContextWindow, DuckDbRepository, StorageError, TranscriptRepository, VectorIndex,
-};
+use crate::storage::{ContextWindow, StorageError, Store};
 
 /// Optional filters layered on top of the candidate set returned by
 /// scoring. All fields are AND-ed.
@@ -58,32 +56,29 @@ pub struct TranscriptSearchResult {
 
 #[derive(Clone)]
 pub struct TranscriptService {
-    /// Storage backend, accessed through the [`TranscriptRepository`] trait —
-    /// portable across DuckDB / future LanceDB / Milvus backends. Concrete
-    /// `DuckDbRepository` is wrapped at the constructor.
-    repo: Arc<dyn TranscriptRepository + Send + Sync>,
-    index: Arc<VectorIndex>,
+    /// Shared storage handle. Writes flow to LanceStore (incl.
+    /// `transcript_embedding_jobs` enqueue inside
+    /// `create_conversation_message`); reads (BM25 + semantic) flow
+    /// to DuckDbQuery.
+    store: Arc<Store>,
+    /// Optional embedding provider for the **query** vector — the
+    /// transcript embedding *worker* writes vectors out-of-band; this
+    /// provider only embeds the search query at request time. When
+    /// `None`, the semantic channel is silently skipped (BM25-only
+    /// hybrid). Tests / unit fixtures use the `None` path.
     provider: Option<Arc<dyn EmbeddingProvider>>,
 }
 
 impl TranscriptService {
-    pub fn new(
-        repo: DuckDbRepository,
-        index: Arc<VectorIndex>,
-        provider: Option<Arc<dyn EmbeddingProvider>>,
-    ) -> Self {
-        Self {
-            repo: Arc::new(repo),
-            index,
-            provider,
-        }
+    pub fn new(store: Arc<Store>, provider: Option<Arc<dyn EmbeddingProvider>>) -> Self {
+        Self { store, provider }
     }
 
     /// Inserts a single transcript block via the repository's idempotent
     /// `create_conversation_message`. Embedding job enqueueing is handled
     /// inside the repository; this method does not touch the HNSW index.
     pub async fn ingest(&self, msg: ConversationMessage) -> Result<(), StorageError> {
-        self.repo.create_conversation_message(&msg).await
+        self.store.create_conversation_message(&msg).await
     }
 
     /// Per-session aggregate summary of the transcript archive. Backs the
@@ -93,7 +88,7 @@ impl TranscriptService {
         &self,
         tenant: &str,
     ) -> Result<Vec<crate::storage::TranscriptSessionSummary>, StorageError> {
-        self.repo.list_transcript_sessions(tenant).await
+        self.store.list_transcript_sessions(tenant).await
     }
 
     /// Returns every transcript block belonging to `session_id` in
@@ -104,7 +99,7 @@ impl TranscriptService {
         tenant: &str,
         session_id: &str,
     ) -> Result<Vec<ConversationMessage>, StorageError> {
-        self.repo
+        self.store
             .get_conversation_messages_by_session(tenant, session_id)
             .await
     }
@@ -125,7 +120,7 @@ impl TranscriptService {
         limit: usize,
     ) -> Result<(Vec<ConversationMessage>, bool), StorageError> {
         let limit = limit.clamp(1, 1000);
-        self.repo
+        self.store
             .get_conversation_messages_by_session_paged(
                 tenant, session_id, since, until, cursor, limit,
             )
@@ -178,7 +173,7 @@ impl TranscriptService {
         if !query.trim().is_empty() {
             // BM25 channel — always available.
             let bm25_hits = self
-                .repo
+                .store
                 .bm25_transcript_candidates(tenant, query, oversample)
                 .await?;
             for (rank0, m) in bm25_hits.iter().enumerate() {
@@ -186,26 +181,31 @@ impl TranscriptService {
                 all_ids.insert(m.message_block_id.clone());
             }
 
-            // HNSW channel — only if provider attached.
+            // Semantic channel — only if provider attached.
+            // Routes through `Store::semantic_search_transcripts`,
+            // which runs `lance_vector_search` against
+            // `conversation_message_embeddings` and JOINs back to
+            // `conversation_messages` for the full row. We only need
+            // the message_block_id + rank position, so we discard
+            // the message body and similarity score here.
             if let Some(provider) = &self.provider {
                 let q_vec = provider
                     .embed_text(query)
                     .await
                     .map_err(|e| StorageError::InvalidInput(format!("query embed failed: {e}")))?;
                 let sem_hits = self
-                    .index
-                    .search(&q_vec, oversample)
-                    .await
-                    .map_err(|e| StorageError::VectorIndex(e.to_string()))?;
-                for (rank0, (id, _score)) in sem_hits.iter().enumerate() {
-                    semantic_ranks.insert(id.clone(), rank0 + 1);
-                    all_ids.insert(id.clone());
+                    .store
+                    .semantic_search_transcripts(tenant, &q_vec, oversample)
+                    .await?;
+                for (rank0, (msg, _sim)) in sem_hits.iter().enumerate() {
+                    semantic_ranks.insert(msg.message_block_id.clone(), rank0 + 1);
+                    all_ids.insert(msg.message_block_id.clone());
                 }
             }
         } else {
             // Empty query: recent-time browse mode.
             let recent = self
-                .repo
+                .store
                 .recent_conversation_messages(tenant, oversample)
                 .await?;
             for m in recent {
@@ -216,7 +216,7 @@ impl TranscriptService {
         // Anchor session injection (independent of channel).
         if let Some(anchor) = opts.anchor_session_id.as_deref() {
             let injected = self
-                .repo
+                .store
                 .anchor_session_candidates(tenant, anchor, oversample)
                 .await?;
             for id in injected {
@@ -231,7 +231,7 @@ impl TranscriptService {
         // ─── Phase 2: hydrate.
         let id_vec: Vec<String> = all_ids.into_iter().collect();
         let candidates = self
-            .repo
+            .store
             .fetch_conversation_messages_by_ids(tenant, &id_vec)
             .await?;
 
@@ -268,7 +268,7 @@ impl TranscriptService {
         let mut items: Vec<PrimaryWithContext> = Vec::with_capacity(scored.len());
         for sb in scored {
             let cw: ContextWindow = self
-                .repo
+                .store
                 .context_window_for_block(
                     tenant,
                     &sb.message.message_block_id,

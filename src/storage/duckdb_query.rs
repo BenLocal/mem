@@ -1450,6 +1450,29 @@ impl DuckDbQuery {
         .await
     }
 
+    /// Same shape as [`Self::get_embedding_job_status`] but for the
+    /// transcript-side queue. Used by the transcript embedding worker
+    /// to skip mid-flight processing if the job got marked stale by
+    /// a concurrent caller.
+    pub async fn get_transcript_embedding_job_status(
+        &self,
+        job_id: &str,
+    ) -> Result<Option<String>, StorageError> {
+        let conn = self.conn.clone();
+        let job_id = job_id.to_string();
+        spawn_blocking_storage(move || {
+            let conn = conn.lock().expect("duckdb_query mutex poisoned");
+            conn.query_row(
+                "SELECT status FROM ns.main.transcript_embedding_jobs WHERE job_id = ?1",
+                params![job_id],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()
+            .map_err(StorageError::DuckDb)
+        })
+        .await
+    }
+
     // ── Bulk writes via DuckDB SQL ──────────────────────────────────
 
     /// Bulk decay sweep: increment `memories.decay_score` for every
@@ -2259,6 +2282,10 @@ mod tests {
         let dir = tempdir().unwrap();
         let path = dir.path().join("store");
         let lance = LanceStore::open(&path).await.unwrap();
+        // Required: create_conversation_message enqueues an
+        // embedding job when embed_eligible, and the enqueue stamps
+        // `provider` from the configured value.
+        lance.set_transcript_job_provider("fake-test");
 
         // Seed: 3 blocks for sess_a (text → tool_use → thinking), 1
         // for sess_b in tenant-b, 1 null-session block in tenant-a.

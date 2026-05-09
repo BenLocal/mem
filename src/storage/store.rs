@@ -534,6 +534,15 @@ impl Store {
         self.query.get_embedding_job_status(job_id).await
     }
 
+    /// Same shape as [`Self::get_embedding_job_status`] for the
+    /// transcript-side queue.
+    pub async fn get_transcript_embedding_job_status(
+        &self,
+        job_id: &str,
+    ) -> Result<Option<String>, StorageError> {
+        self.query.get_transcript_embedding_job_status(job_id).await
+    }
+
     /// Bulk decay sweep over `memories.decay_score`. Routes to
     /// DuckDbQuery — issued as a single SQL UPDATE via the lance
     /// extension (per-row Rust iteration is not viable for this
@@ -871,6 +880,30 @@ impl Store {
             };
         }
         result
+    }
+}
+
+/// Re-impl `GraphStore` on `Store` so callers like
+/// `pipeline::retrieve::rank_with_graph_hybrid` (which take a
+/// `&dyn GraphStore`) can pass a `&Store` directly. The trait
+/// surface is a strict subset of `Store`'s inherent methods —
+/// everything here is one-line forwarder.
+#[async_trait::async_trait]
+impl GraphStoreTrait for Store {
+    async fn neighbors(&self, node_id: &str) -> Result<Vec<GraphEdge>, GraphError> {
+        Store::neighbors(self, node_id).await
+    }
+
+    async fn sync_memory_edges(&self, edges: &[GraphEdge], now: &str) -> Result<(), GraphError> {
+        Store::sync_memory_edges(self, edges, now).await
+    }
+
+    async fn close_edges_for_memory(&self, memory_id: &str) -> Result<usize, GraphError> {
+        Store::close_edges_for_memory(self, memory_id).await
+    }
+
+    async fn related_memory_ids(&self, node_ids: &[String]) -> Result<Vec<String>, GraphError> {
+        Store::related_memory_ids(self, node_ids).await
     }
 }
 

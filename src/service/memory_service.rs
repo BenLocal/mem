@@ -24,10 +24,7 @@ use crate::{
     },
     pipeline::workflow,
     pipeline::{compress, retrieve},
-    storage::{
-        current_timestamp, DuckDbGraphStore, DuckDbRepository, EmbeddingJobInsert, EntityRegistry,
-        GraphError, GraphStore, Repository, StorageError,
-    },
+    storage::{current_timestamp, EmbeddingJobInsert, GraphError, StorageError, Store},
 };
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
@@ -58,13 +55,12 @@ impl From<MemoryRecord> for IngestMemoryResponse {
 
 #[derive(Clone)]
 pub struct MemoryService {
-    /// Storage backend, accessed through the [`MemoryRepository`] trait so
-    /// `MemoryService` is portable across DuckDB / future LanceDB / Milvus
-    /// backends. Constructors still accept `DuckDbRepository` for now
-    /// because `DuckDbGraphStore::new` (constructed alongside) requires
-    /// the concrete type — abstracting graph storage is a follow-up.
-    repository: Arc<dyn Repository>,
-    graph: Arc<dyn GraphStore>,
+    /// Shared storage handle. Writes flow to LanceStore; reads
+    /// (incl. graph reads via `pipeline::retrieve::rank_with_graph_*`)
+    /// flow to DuckDbQuery. The graph surface lives on `Store`'s
+    /// `GraphStore` trait impl — passed as `&dyn GraphStore` to the
+    /// pipeline.
+    store: Arc<Store>,
     /// Value stored on `embedding_jobs.provider` (e.g. `fake`, `openai`).
     embedding_job_provider: String,
     /// When set, search runs hybrid lexical + semantic retrieval.
@@ -72,70 +68,42 @@ pub struct MemoryService {
 }
 
 impl MemoryService {
-    /// Primary constructor. Creates a fresh `DuckDbGraphStore` backed by the same repository.
-    pub fn new(repository: DuckDbRepository) -> Self {
-        let repo_arc = Arc::new(repository.clone());
-        let graph = Arc::new(DuckDbGraphStore::new(repo_arc));
-        Self::new_with_graph(repository, graph)
+    /// Primary constructor. `embedding_job_provider` defaults to
+    /// `"fake"` (legacy compat); search provider is `None` (BM25-only
+    /// recall). Use [`Self::with_providers`] to override.
+    pub fn new(store: Arc<Store>) -> Self {
+        Self {
+            store,
+            embedding_job_provider: "fake".to_string(),
+            embedding_search_provider: None,
+        }
     }
 
-    /// Constructor that also attaches a vector index before building the service.
-    pub fn new_with_index(
-        repository: DuckDbRepository,
-        vector_index: Arc<crate::storage::VectorIndex>,
-    ) -> Self {
-        repository.attach_vector_index(vector_index);
-        Self::new(repository)
-    }
-
-    /// Like [`MemoryService::new`] but derives the `embedding_jobs.provider`
-    /// value from `settings.job_provider_id()` so the worker's runtime
-    /// provider check (`embedding_worker::tick`) succeeds against jobs this
+    /// Constructor that derives `embedding_jobs.provider` from
+    /// `settings.job_provider_id()` so the worker's runtime provider
+    /// check (`embedding_worker::tick`) succeeds against jobs this
     /// service enqueues.
-    ///
-    /// The default `new` constructor hardcodes `"fake"` for legacy
-    /// compatibility; tests that build an [`EmbeddingSettings`] should prefer
-    /// this constructor so the configured provider id flows through.
     pub fn new_with_settings(
-        repository: DuckDbRepository,
+        store: Arc<Store>,
         settings: &crate::config::EmbeddingSettings,
     ) -> Self {
-        let repo_arc = Arc::new(repository.clone());
-        let graph = Arc::new(DuckDbGraphStore::new(repo_arc));
-        Self::with_graph_and_embedding_providers(
-            repository,
-            graph,
-            settings.job_provider_id().to_string(),
-            None,
-        )
+        Self {
+            store,
+            embedding_job_provider: settings.job_provider_id().to_string(),
+            embedding_search_provider: None,
+        }
     }
 
-    /// Constructor that accepts a pre-built `DuckDbGraphStore` (used by tests and `app.rs`).
-    pub fn new_with_graph(repository: DuckDbRepository, graph: Arc<DuckDbGraphStore>) -> Self {
-        Self::with_graph_and_embedding_providers(repository, graph, "fake".to_string(), None)
-    }
-
-    /// Kept for compatibility with call-sites that supply a graph and a provider id.
-    pub fn with_graph_and_embedding_provider(
-        repository: DuckDbRepository,
-        graph: Arc<DuckDbGraphStore>,
-        embedding_job_provider: String,
-    ) -> Self {
-        Self::with_graph_and_embedding_providers(repository, graph, embedding_job_provider, None)
-    }
-
-    /// Full constructor used by `app.rs`. Accepts the concrete
-    /// `DuckDbRepository` (it's the only backend today) and stores it as
-    /// an `Arc<dyn MemoryRepository>` trait object internally.
-    pub fn with_graph_and_embedding_providers(
-        repository: DuckDbRepository,
-        graph: Arc<DuckDbGraphStore>,
+    /// Full constructor used by `app.rs`. Wires both the
+    /// `embedding_jobs.provider` stamp and the search-time embedding
+    /// provider (so semantic recall is enabled).
+    pub fn with_providers(
+        store: Arc<Store>,
         embedding_job_provider: String,
         embedding_search_provider: Option<Arc<dyn EmbeddingProvider>>,
     ) -> Self {
         Self {
-            repository: Arc::new(repository),
-            graph,
+            store,
             embedding_job_provider,
             embedding_search_provider,
         }
@@ -148,7 +116,7 @@ impl MemoryService {
         let content_hash = compute_content_hash(&request);
 
         if let Some(existing) = self
-            .repository
+            .store
             .find_by_idempotency_or_hash(&request.tenant, &request.idempotency_key, &content_hash)
             .await?
         {
@@ -169,7 +137,7 @@ impl MemoryService {
             .unwrap_or_else(|| summarize(&request.content));
 
         let session_id = crate::pipeline::session::resolve_session(
-            &*self.repository,
+            &self.store,
             &request.tenant,
             &request.source_agent,
             &now,
@@ -208,18 +176,12 @@ impl MemoryService {
             last_validated_at: None,
         };
 
-        let stored = self.repository.insert_memory(memory).await?;
+        let stored = self.store.insert_memory(memory).await?;
         let drafts = crate::pipeline::ingest::extract_graph_edge_drafts(&stored);
-        let edges = resolve_drafts_to_edges(
-            drafts,
-            self.repository.as_entity_registry(),
-            &stored.tenant,
-            &now,
-        )
-        .await?;
-        self.graph.sync_memory_edges(&edges, &now).await?;
+        let edges = resolve_drafts_to_edges(drafts, &self.store, &stored.tenant, &now).await?;
+        self.store.sync_memory_edges(&edges, &now).await?;
         self.enqueue_embedding_job_for_memory(&stored).await?;
-        self.repository
+        self.store
             .touch_session(&session_id, &now)
             .await
             .map_err(ServiceError::Storage)?;
@@ -254,7 +216,7 @@ impl MemoryService {
 
         let mut workflow_candidate = {
             let mut episodes = self
-                .repository
+                .store
                 .list_successful_episodes_for_tenant(&episode.tenant)
                 .await?;
             episodes.push(episode.clone());
@@ -269,7 +231,7 @@ impl MemoryService {
             episode.workflow_candidate = Some(candidate.clone());
         }
 
-        self.repository.insert_episode(episode).await?;
+        self.store.insert_episode(episode).await?;
 
         Ok(EpisodeResponse {
             episode_id,
@@ -282,13 +244,13 @@ impl MemoryService {
         &self,
         tenant: &str,
     ) -> Result<Vec<MemoryRecord>, ServiceError> {
-        Ok(self.repository.list_pending_review(tenant).await?)
+        Ok(self.store.list_pending_review(tenant).await?)
     }
 
     /// All memories for a tenant, regardless of status, ordered by created_at
     /// ascending. Backs the admin web page (`GET /memories?tenant=…`).
     pub async fn list_memories(&self, tenant: &str) -> Result<Vec<MemoryRecord>, ServiceError> {
-        Ok(self.repository.list_memories_for_tenant(tenant).await?)
+        Ok(self.store.list_memories_for_tenant(tenant).await?)
     }
 
     /// Hard-delete a memory and all its references. **Irreversible.**
@@ -306,14 +268,12 @@ impl MemoryService {
         tenant: &str,
         memory_id: &str,
     ) -> Result<(), ServiceError> {
-        self.repository
+        self.store
             .get_memory_for_tenant(tenant, memory_id)
             .await?
             .ok_or(ServiceError::NotFound)?;
 
-        self.repository
-            .delete_memory_hard(tenant, memory_id)
-            .await?;
+        self.store.delete_memory_hard(tenant, memory_id).await?;
         // Vector-index sidecar removal happens inside
         // `DuckDbRepository::delete_memory_hard` itself; service code no
         // longer needs to know the backend uses HNSW.
@@ -326,30 +286,26 @@ impl MemoryService {
         memory_id: &str,
     ) -> Result<MemoryDetailResponse, ServiceError> {
         let memory = match tenant {
-            Some(tenant) => {
-                self.repository
-                    .get_memory_for_tenant(tenant, memory_id)
-                    .await?
-            }
-            None => self.repository.get_memory(memory_id.to_string()).await?,
+            Some(tenant) => self.store.get_memory_for_tenant(tenant, memory_id).await?,
+            None => self.store.get_memory(memory_id.to_string()).await?,
         }
         .ok_or(ServiceError::NotFound)?;
 
         let embedding = self.embedding_meta_for_memory(&memory).await?;
 
         let graph_links = self
-            .graph
+            .store
             .neighbors(&memory_node_id(memory_id))
             .await
             .unwrap_or_default();
 
         Ok(MemoryDetailResponse {
             version_chain: self
-                .repository
+                .store
                 .list_memory_versions_for_tenant(&memory.tenant, memory_id)
                 .await?,
             graph_links,
-            feedback_summary: self.repository.feedback_summary(memory_id).await?,
+            feedback_summary: self.store.feedback_summary(memory_id).await?,
             memory,
             embedding,
         })
@@ -363,7 +319,7 @@ impl MemoryService {
         limit: usize,
     ) -> Result<Vec<EmbeddingJobInfo>, ServiceError> {
         Ok(self
-            .repository
+            .store
             .list_embedding_jobs(tenant, status, memory_id, limit)
             .await?)
     }
@@ -375,7 +331,7 @@ impl MemoryService {
         force: bool,
     ) -> Result<EmbeddingsRebuildResponse, ServiceError> {
         let ids: Vec<String> = if memory_ids.is_empty() {
-            self.repository.list_memory_ids_for_tenant(tenant).await?
+            self.store.list_memory_ids_for_tenant(tenant).await?
         } else {
             memory_ids.to_vec()
         };
@@ -383,15 +339,15 @@ impl MemoryService {
         let mut enqueued: u32 = 0;
         for mid in ids {
             let memory = self
-                .repository
+                .store
                 .get_memory_for_tenant(tenant, &mid)
                 .await?
                 .ok_or(ServiceError::NotFound)?;
 
             let now = current_timestamp();
             if force {
-                self.repository.delete_memory_embedding(&mid).await?;
-                self.repository
+                self.store.delete_memory_embedding(&mid).await?;
+                self.store
                     .stale_live_embedding_jobs_for_memory(
                         tenant,
                         &mid,
@@ -411,7 +367,7 @@ impl MemoryService {
                 created_at: now.clone(),
                 updated_at: now,
             };
-            if self.repository.try_enqueue_embedding_job(insert).await? {
+            if self.store.try_enqueue_embedding_job(insert).await? {
                 enqueued += 1;
             }
         }
@@ -424,7 +380,7 @@ impl MemoryService {
         memory: &MemoryRecord,
     ) -> Result<MemoryEmbeddingMeta, ServiceError> {
         if let Some((model, hash, updated_at)) = self
-            .repository
+            .store
             .get_memory_embedding_row(&memory.memory_id)
             .await?
         {
@@ -445,7 +401,7 @@ impl MemoryService {
         }
 
         let job_status = self
-            .repository
+            .store
             .latest_embedding_job_status_for_hash(
                 &memory.tenant,
                 &memory.memory_id,
@@ -473,11 +429,11 @@ impl MemoryService {
         tenant: &str,
         memory_id: &str,
     ) -> Result<MemoryRecord, ServiceError> {
-        self.repository
+        self.store
             .get_pending(tenant, memory_id)
             .await?
             .ok_or(ServiceError::NotFound)?;
-        Ok(self.repository.accept_pending(tenant, memory_id).await?)
+        Ok(self.store.accept_pending(tenant, memory_id).await?)
     }
 
     pub async fn reject_pending(
@@ -485,11 +441,11 @@ impl MemoryService {
         tenant: &str,
         memory_id: &str,
     ) -> Result<MemoryRecord, ServiceError> {
-        self.repository
+        self.store
             .get_pending(tenant, memory_id)
             .await?
             .ok_or(ServiceError::NotFound)?;
-        Ok(self.repository.reject_pending(tenant, memory_id).await?)
+        Ok(self.store.reject_pending(tenant, memory_id).await?)
     }
 
     /// Supersede flow: accept a pending memory by replacing it with an edited active version.
@@ -504,13 +460,13 @@ impl MemoryService {
     ) -> Result<EditPendingResponse, ServiceError> {
         let original_memory_id = patch.memory_id.clone();
         let original = self
-            .repository
+            .store
             .get_pending(tenant, &original_memory_id)
             .await?
             .ok_or(ServiceError::NotFound)?;
 
         let superseding = self
-            .repository
+            .store
             .replace_pending_with_successor(
                 tenant,
                 &original_memory_id,
@@ -519,19 +475,14 @@ impl MemoryService {
             .await?;
 
         // Close v1's graph edges, then open v2's — order matters.
-        self.graph
+        self.store
             .close_edges_for_memory(&original.memory_id)
             .await?;
         let now = current_timestamp();
         let drafts = crate::pipeline::ingest::extract_graph_edge_drafts(&superseding);
-        let edges = resolve_drafts_to_edges(
-            drafts,
-            self.repository.as_entity_registry(),
-            &superseding.tenant,
-            &now,
-        )
-        .await?;
-        self.graph.sync_memory_edges(&edges, &now).await?;
+        let edges =
+            resolve_drafts_to_edges(drafts, &self.store, &superseding.tenant, &now).await?;
+        self.store.sync_memory_edges(&edges, &now).await?;
 
         self.enqueue_embedding_job_for_memory(&superseding).await?;
 
@@ -548,7 +499,7 @@ impl MemoryService {
         feedback_kind: FeedbackKind,
     ) -> Result<MemoryRecord, ServiceError> {
         let memory = self
-            .repository
+            .store
             .get_memory_for_tenant(tenant, memory_id)
             .await?
             .ok_or(ServiceError::NotFound)?;
@@ -560,7 +511,7 @@ impl MemoryService {
             created_at: current_timestamp(),
         };
 
-        Ok(self.repository.apply_feedback(&memory, feedback).await?)
+        Ok(self.store.apply_feedback(&memory, feedback).await?)
     }
 
     fn superseding_active_version(
@@ -621,7 +572,7 @@ impl MemoryService {
     }
 
     pub async fn graph_neighbors(&self, node_id: &str) -> Result<Vec<GraphEdge>, ServiceError> {
-        Ok(self.graph.neighbors(node_id).await?)
+        Ok(self.store.neighbors(node_id).await?)
     }
 
     pub async fn search(
@@ -648,7 +599,7 @@ impl MemoryService {
         if query.intent == "wake_up" && query.query.trim().is_empty() {
             const WAKE_UP_LIMIT: usize = 64;
             let candidates = self
-                .repository
+                .store
                 .recent_active_memories(tenant, WAKE_UP_LIMIT)
                 .await
                 .map_err(ServiceError::Storage)?;
@@ -669,7 +620,7 @@ impl MemoryService {
                 Ok(v) => v,
                 Err(_) => return Vec::new(),
             };
-            self.repository
+            self.store
                 .semantic_search_memories(tenant, &q, 48)
                 .await
                 .unwrap_or_default()
@@ -681,7 +632,7 @@ impl MemoryService {
             lexical,
             semantic.clone(),
             &query,
-            self.graph.as_ref(),
+            self.store.as_ref(),
         )
         .await
         {
@@ -720,7 +671,7 @@ impl MemoryService {
         const BM25_TOP_K: usize = 48;
 
         let all = self
-            .repository
+            .store
             .search_candidates(tenant)
             .await
             .map_err(ServiceError::Storage)?;
@@ -730,7 +681,7 @@ impl MemoryService {
         }
 
         let bm25 = self
-            .repository
+            .store
             .bm25_candidates(tenant, query, BM25_TOP_K)
             .await
             .map_err(ServiceError::Storage)?;
@@ -764,7 +715,7 @@ impl MemoryService {
             created_at: now.clone(),
             updated_at: now,
         };
-        self.repository.try_enqueue_embedding_job(insert).await?;
+        self.store.try_enqueue_embedding_job(insert).await?;
         Ok(())
     }
 }
@@ -785,7 +736,7 @@ impl MemoryService {
 /// of the entity-registry roadmap.
 pub(crate) async fn resolve_drafts_to_edges(
     drafts: Vec<GraphEdgeDraft>,
-    registry: &(impl EntityRegistry + ?Sized),
+    registry: &Store,
     tenant: &str,
     now: &str,
 ) -> Result<Vec<GraphEdge>, StorageError> {

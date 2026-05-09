@@ -4830,6 +4830,11 @@ mod tests {
         let dir = tempdir().unwrap();
         let path = dir.path().join("lance.store");
         let repo = LanceStore::open(&path).await.unwrap();
+        // Required because `create_conversation_message` now enqueues
+        // a transcript_embedding_jobs row when the message is
+        // embed_eligible — the enqueue stamps `provider`, which must
+        // be configured up front.
+        repo.set_transcript_job_provider("fake-test");
 
         // 4 blocks, 2 sessions × 2 tenants.
         let m1 = msg(

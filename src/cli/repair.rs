@@ -451,9 +451,9 @@ pub async fn run(args: RepairArgs) -> i32 {
 pub async fn compute_rebuild_graph_outcome(
     config: &Config,
 ) -> Result<RebuildGraphOutcome, anyhow::Error> {
-    use crate::pipeline::ingest::extract_graph_edge_drafts;
-    use crate::service::memory_service::resolve_drafts_to_edges;
-    use crate::storage::current_timestamp;
+    use crate::domain::memory::GraphEdge;
+    use crate::pipeline::ingest::{extract_graph_edge_drafts, ToNodeKind};
+    use crate::storage::{current_timestamp, EntityRegistry};
 
     let started = std::time::Instant::now();
     let repo = DuckDbRepository::open(&config.db_path).await?;
@@ -466,14 +466,34 @@ pub async fn compute_rebuild_graph_outcome(
     for tenant in tenants {
         let memories = repo.list_memories_for_tenant(&tenant).await?;
 
-        // Collect all edges for this tenant first, then atomically replace the
-        // old graph in a single transaction.  This avoids a partially-demolished
-        // tenant graph on mid-rebuild kill.
+        // Collect all edges for this tenant first, then atomically
+        // replace the old graph in a single transaction. Inlines the
+        // body of `service::memory_service::resolve_drafts_to_edges`
+        // because that helper now takes `&Store` (the new
+        // LanceStore-based architecture); cli/repair is the legacy
+        // DuckDB-as-storage path and will be retired entirely in a
+        // follow-up commit. Until then, calling
+        // `EntityRegistry::resolve_or_create` directly on the local
+        // `DuckDbRepository` keeps the rebuild path working.
         let mut tenant_edges = Vec::new();
         for memory in &memories {
             let drafts = extract_graph_edge_drafts(memory);
-            let edges = resolve_drafts_to_edges(drafts, &repo, &tenant, &now).await?;
-            tenant_edges.extend(edges);
+            for draft in drafts {
+                let to_node_id = match draft.to_kind {
+                    ToNodeKind::LiteralMemory(memory_id) => format!("memory:{memory_id}"),
+                    ToNodeKind::EntityRef { kind, alias } => {
+                        let id = repo.resolve_or_create(&tenant, &alias, kind, &now).await?;
+                        format!("entity:{id}")
+                    }
+                };
+                tenant_edges.push(GraphEdge {
+                    from_node_id: draft.from_node_id,
+                    to_node_id,
+                    relation: draft.relation,
+                    valid_from: now.clone(),
+                    valid_to: None,
+                });
+            }
         }
 
         let inserted = repo.rebuild_tenant_graph(&tenant, &tenant_edges).await?;

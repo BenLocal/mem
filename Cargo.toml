@@ -8,11 +8,13 @@ default-run = "mem"
 doctest = false
 
 [features]
-default = []
-# Compile in the LanceDB backend (`mem::storage::lancedb`). Off by default —
-# pulls in the lance/arrow stack, which is heavy and orthogonal to the DuckDB
-# happy path. Enable with `cargo build --features lancedb` to use the alternate
-# backend.
+# `lancedb` is the production storage backend (LanceDB on disk +
+# DuckDB SQL via the lance core extension). On by default — services
+# / workers / app.rs all hold an `Arc<storage::Store>` whose internal
+# `LanceStore` is gated on this feature. Disabling it currently means
+# only the `cli/repair` legacy DuckDB-as-storage tooling compiles;
+# that path will be retired in a follow-up.
+default = ["lancedb"]
 lancedb = ["dep:lancedb", "dep:arrow-array", "dep:futures"]
 
 [dependencies]

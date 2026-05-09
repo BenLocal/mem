@@ -1,5 +1,5 @@
 use crate::domain::session::Session;
-use crate::storage::{MemoryRepository, StorageError};
+use crate::storage::{StorageError, Store};
 
 /// Read `MEM_SESSION_IDLE_MINUTES` from the environment.  Returns 30 if unset or invalid.
 pub fn idle_minutes_from_env() -> u64 {
@@ -63,7 +63,7 @@ pub fn decide_session(
 /// Opens a new session if none is active or the most recent one has been idle
 /// for at least `idle_minutes`.  Closes the stale session first when opening new.
 pub async fn resolve_session(
-    repo: &(dyn MemoryRepository + Send + Sync),
+    repo: &Store,
     tenant: &str,
     caller_agent: &str,
     now: &str,
