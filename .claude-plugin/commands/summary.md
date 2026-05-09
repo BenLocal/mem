@@ -12,9 +12,9 @@ Procedure:
 
 2. Service health — call `mcp__mem__mem_health`. If it errors, stop and tell the user `mem serve` is down and how to start it (`/mem:health` for the canonical liveness check).
 
-3. Pending review queue — call `mcp__mem__memory_list_pending_review` with `tenant: TENANT, limit: 50`. Capture the count and the top 3 oldest entries' summaries.
+3. Pending review queue — call `mcp__mem__capability_capsule_list_pending_review` with `tenant: TENANT, limit: 50`. Capture the count and the top 3 oldest entries' summaries.
 
-4. Recent activity — call `mcp__mem__memory_search` with `tenant: TENANT, query: "", limit: 10` (empty query falls through to the recent-active path). Note the most-recent `updated_at` and how many distinct `tags` / `topics` appeared.
+4. Recent activity — call `mcp__mem__capability_capsule_search` with `tenant: TENANT, query: "", limit: 10` (empty query falls through to the recent-active path). Note the most-recent `updated_at` and how many distinct `tags` / `topics` appeared.
 
 5. Wake-up context — call `mem wake-up --tenant "$TENANT" --token-budget 600` for the high-confidence highlights (the same block the SessionStart hook injects).
 

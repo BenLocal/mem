@@ -1,24 +1,18 @@
 use anyhow::Result;
 use clap::Args;
 
+use super::common::RemoteArgs;
+
 #[derive(Debug, Args)]
 pub struct WakeUpArgs {
-    #[arg(long, default_value = "local")]
-    pub tenant: String,
+    #[command(flatten)]
+    pub remote: RemoteArgs,
 
     #[arg(long, default_value = "800")]
     pub token_budget: usize,
-
-    #[arg(long, default_value = "http://127.0.0.1:3000")]
-    pub base_url: String,
 }
 
 pub async fn run(args: WakeUpArgs) -> Result<String> {
-    let base_url = std::env::var("MEM_BASE_URL")
-        .ok()
-        .filter(|s| !s.is_empty())
-        .unwrap_or(args.base_url);
-
     let mut output = String::from("## Recent Context\n\n");
 
     // L0: Identity file
@@ -32,7 +26,7 @@ pub async fn run(args: WakeUpArgs) -> Result<String> {
     // L1: Query recent memories
     let client = reqwest::Client::new();
     let payload = serde_json::json!({
-        "tenant": args.tenant,
+        "tenant": args.remote.tenant,
         "query": "",
         "intent": "wake_up",
         "scope_filters": [],
@@ -42,7 +36,10 @@ pub async fn run(args: WakeUpArgs) -> Result<String> {
     });
 
     let resp = client
-        .post(format!("{}/capability_capsules/search", base_url))
+        .post(format!(
+            "{}/capability_capsules/search",
+            args.remote.base_url
+        ))
         .json(&payload)
         .send()
         .await?;

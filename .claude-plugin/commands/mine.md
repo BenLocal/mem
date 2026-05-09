@@ -21,9 +21,9 @@ Run `mem mine` against a transcript. Two paths:
 Output of `mem mine` looks like:
 
 ```
-Mined: memories sent=X/Y blocks sent=A/B (server-side dedup applied)
+Mined: capsules sent=X/Y blocks sent=A/B (server-side dedup applied)
 ```
 
-Report the numerator/denominator to the user. `memories sent=0/N` is normal — the extractor only picks up the explicit `<mem-save>...</mem-save>` tag (the prose-cue heuristics like "我会记住：" / "Important:" were removed after a recursive false-positive bug; the verbatim block archive `blocks sent` is non-discriminating and everything goes in there).
+Report the numerator/denominator to the user. `capsules sent=0/N` is normal — the extractor only picks up the explicit `<mem-save>...</mem-save>` tag (the prose-cue heuristics like "我会记住：" / "Important:" were removed after a recursive false-positive bug; the verbatim block archive `blocks sent` is non-discriminating and everything goes in there).
 
-If the user wants a memory written from this conversation, they should either embed `<mem-save>...</mem-save>` in the assistant turn or use `mcp__mem__memory_ingest` directly with structured fields. Do not rely on `mem mine` to infer memory-worthiness from prose.
+If the user wants a memory written from this conversation, they should either embed `<mem-save>...</mem-save>` in the assistant turn or use `mcp__mem__capability_capsule_ingest` directly with structured fields. Do not rely on `mem mine` to infer memory-worthiness from prose.

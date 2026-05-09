@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Claude Code Stop hook: every ~15 user exchanges, run `mem mine` and emit
-# a status notification ("✦ mem · N memories + K blocks woven into the
+# a status notification ("✦ mem · N capsules + K blocks woven into the
 # archive") via `systemMessage`. Mining is synchronous so the count is
 # accurate at the time the line shows; on a typical 15-exchange increment
 # the post-loopback HTTP POSTs finish in well under a second.
@@ -41,12 +41,12 @@ if [ $((EXCHANGE_COUNT - LAST_SAVE)) -lt 15 ]; then
 fi
 
 # Sync mine, capped at 60 s. Output looks like:
-#   "Mined: memories sent=3/3 blocks sent=3244/3244 (server-side dedup applied)"
+#   "Mined: capsules sent=3/3 blocks sent=3244/3244 (server-side dedup applied)"
 MINE_OUT=$(timeout 60 mem mine "$TRANSCRIPT" --agent claude-code 2>&1 || true)
 
 echo "$EXCHANGE_COUNT" > "$LAST_SAVE_FILE"
 
-# Auto-feedback: scan the same transcript for mcp__mem__memory_search
+# Auto-feedback: scan the same transcript for mcp__mem__capability_capsule_search
 # results whose text was referenced in subsequent assistant blocks, and
 # POST `applies_here` for each. Capped at 30 s; failures are logged to
 # stderr but never break the hook (we don't want a flaky feedback round
@@ -54,14 +54,14 @@ echo "$EXCHANGE_COUNT" > "$LAST_SAVE_FILE"
 FEEDBACK_OUT=$(timeout 30 mem feedback-from-transcript "$TRANSCRIPT" --tenant local 2>&1 || true)
 FEEDBACK_SENT=$(echo "$FEEDBACK_OUT" | sed -n 's/.*sent=\([0-9]*\).*/\1/p' | head -1)
 
-MEMS=$(echo "$MINE_OUT" | sed -n 's/.*memories sent=\([0-9]*\/[0-9]*\).*/\1/p' | head -1)
+MEMS=$(echo "$MINE_OUT" | sed -n 's/.*capsules sent=\([0-9]*\/[0-9]*\).*/\1/p' | head -1)
 BLOCKS=$(echo "$MINE_OUT" | sed -n 's/.*blocks sent=\([0-9]*\/[0-9]*\).*/\1/p' | head -1)
 
 if [ -n "$MEMS" ] && [ -n "$BLOCKS" ]; then
     if [ -n "$FEEDBACK_SENT" ] && [ "$FEEDBACK_SENT" != "0" ]; then
-        MSG=$(printf '✦ mem · %s memories + %s blocks archived · %s feedback applied' "$MEMS" "$BLOCKS" "$FEEDBACK_SENT")
+        MSG=$(printf '✦ mem · %s capsules + %s blocks archived · %s feedback applied' "$MEMS" "$BLOCKS" "$FEEDBACK_SENT")
     else
-        MSG=$(printf '✦ mem · %s memories + %s blocks woven into the archive' "$MEMS" "$BLOCKS")
+        MSG=$(printf '✦ mem · %s capsules + %s blocks woven into the archive' "$MEMS" "$BLOCKS")
     fi
     jq -n --arg msg "$MSG" '{"systemMessage": $msg}'
 else

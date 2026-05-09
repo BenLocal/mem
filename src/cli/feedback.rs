@@ -23,6 +23,8 @@ use std::fs::File;
 use std::io::{BufRead, BufReader};
 use std::path::PathBuf;
 
+use super::common::RemoteArgs;
+
 /// Memory-search MCP tool names we care about. Both share the same
 /// response shape (`domain::query::SearchCapabilityCapsuleResponse`).
 const SEARCH_TOOL_NAMES: &[&str] = &[
@@ -41,18 +43,13 @@ pub struct FeedbackFromTranscriptArgs {
     /// Path to the Claude Code transcript JSONL file.
     pub transcript_path: PathBuf,
 
-    /// Tenant identifier (passed through to `/capability_capsules/feedback`).
-    #[arg(long, default_value = "local")]
-    pub tenant: String,
+    #[command(flatten)]
+    pub remote: RemoteArgs,
 
     /// One of: `useful`, `applies_here`, `outdated`, `does_not_apply_here`,
     /// `incorrect`. The default is the mildest positive signal.
     #[arg(long, default_value = "applies_here")]
     pub kind: String,
-
-    /// Base URL for the local mem service.
-    #[arg(long, default_value = "http://127.0.0.1:3000")]
-    pub base_url: String,
 
     /// Skip the "consumed" heuristic and signal every retrieved memory.
     /// Use when you want a uniform soft-positive after every search,
@@ -78,12 +75,15 @@ pub async fn run(args: FeedbackFromTranscriptArgs) -> i32 {
     let mut failed = 0usize;
     for mid in &consumed {
         let body = serde_json::json!({
-            "tenant": args.tenant,
+            "tenant": args.remote.tenant,
             "capability_capsule_id": mid,
             "feedback_kind": args.kind,
         });
         match client
-            .post(format!("{}/capability_capsules/feedback", args.base_url))
+            .post(format!(
+                "{}/capability_capsules/feedback",
+                args.remote.base_url
+            ))
             .json(&body)
             .send()
             .await

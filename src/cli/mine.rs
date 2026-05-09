@@ -7,6 +7,8 @@ use std::fs::File;
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 
+use super::common::RemoteArgs;
+
 // Only the explicit `<mem-save>...</mem-save>` tag triggers extraction.
 //
 // Earlier (pre-2026-05-08) the extractor also matched prose cues like
@@ -24,17 +26,12 @@ pub struct MineArgs {
     /// Path to Claude Code transcript file
     pub transcript_path: PathBuf,
 
-    /// Tenant ID
-    #[arg(long, default_value = "local")]
-    pub tenant: String,
+    #[command(flatten)]
+    pub remote: RemoteArgs,
 
     /// Source agent name
     #[arg(long, default_value = "claude-code")]
     pub agent: String,
-
-    /// Base URL for mem service
-    #[arg(long, default_value = "http://127.0.0.1:3000")]
-    pub base_url: String,
 }
 
 pub struct ExtractedMemory {
@@ -293,7 +290,7 @@ pub async fn run(args: MineArgs) -> i32 {
         let idempotency_key = format!("{}:{}", args.transcript_path.display(), memory.line_number);
 
         let payload = serde_json::json!({
-            "tenant": args.tenant,
+            "tenant": args.remote.tenant,
             "capability_capsule_type": "experience",
             "content": memory.content,
             "scope": "global",
@@ -303,7 +300,7 @@ pub async fn run(args: MineArgs) -> i32 {
         });
 
         match client
-            .post(format!("{}/memories", args.base_url))
+            .post(format!("{}/capability_capsules", args.remote.base_url))
             .json(&payload)
             .send()
             .await
@@ -332,7 +329,7 @@ pub async fn run(args: MineArgs) -> i32 {
         let embed_eligible = matches!(b.block_type.as_str(), "text" | "thinking");
         let payload = serde_json::json!({
             "session_id": b.session_id,
-            "tenant": args.tenant,
+            "tenant": args.remote.tenant,
             "caller_agent": args.agent,
             "transcript_path": args.transcript_path.display().to_string(),
             "line_number": b.line_number,
@@ -348,7 +345,7 @@ pub async fn run(args: MineArgs) -> i32 {
         });
 
         match client
-            .post(format!("{}/transcripts/messages", args.base_url))
+            .post(format!("{}/transcripts/messages", args.remote.base_url))
             .json(&payload)
             .send()
             .await
@@ -374,7 +371,7 @@ pub async fn run(args: MineArgs) -> i32 {
     // returns 2xx without double-inserting. Use `mem-cli` / DuckDB queries
     // to count rows on disk if you need exact insert deltas.
     println!(
-        "Mined: memories sent={}/{} blocks sent={}/{} (server-side dedup applied)",
+        "Mined: capsules sent={}/{} blocks sent={}/{} (server-side dedup applied)",
         mem_ok,
         mem_ok + mem_fail,
         block_ok,

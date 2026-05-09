@@ -27,7 +27,7 @@ futures = "0.3"
 anyhow = "1"
 async-trait = "0.1"
 axum = "0.8"
-clap = { version = "4", features = ["derive"] }
+clap = { version = "4", features = ["derive", "env"] }
 # duckdb is the SQL query engine: in-process Connection with the
 # `lance` core extension loaded, ATTACHing the on-disk lance datasets
 # under namespace `ns`. No DuckDB tables of our own; all storage is in

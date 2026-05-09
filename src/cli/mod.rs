@@ -1,3 +1,4 @@
+pub mod common;
 pub mod feedback;
 pub mod mcp;
 pub mod mine;

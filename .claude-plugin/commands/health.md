@@ -11,7 +11,7 @@ Procedure:
 2. Hit a cheap endpoint to verify the server is up:
 
    ```bash
-   curl -sS -o /dev/null -w "HTTP %{http_code}\n" "$MEM_BASE_URL/memories/search" \
+   curl -sS -o /dev/null -w "HTTP %{http_code}\n" "$MEM_BASE_URL/capability_capsules/search" \
      -H 'content-type: application/json' \
      -d '{"tenant":"'"${MEM_TENANT:-local}"'","query":"ping","limit":1}'
    ```

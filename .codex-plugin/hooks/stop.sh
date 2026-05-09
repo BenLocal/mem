@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Codex Stop hook: every ~15 user exchanges, run `mem mine` and emit a
-# status line ("✦ mem · N memories + K blocks woven into the archive")
+# status line ("✦ mem · N capsules + K blocks woven into the archive")
 # via `systemMessage`. Mirrors the Claude Code variant; only differences
 # are the per-runtime --agent label, the throttle file, and the transcript
 # path probe (Codex hook payload field shape varies; fall back to the
@@ -36,11 +36,11 @@ MINE_OUT=$(timeout 60 mem mine "$TRANSCRIPT" --agent codex 2>&1 || true)
 
 echo "$EXCHANGE_COUNT" > "$LAST_SAVE_FILE"
 
-MEMS=$(echo "$MINE_OUT" | sed -n 's/.*memories sent=\([0-9]*\).*/\1/p' | head -1)
+MEMS=$(echo "$MINE_OUT" | sed -n 's/.*capsules sent=\([0-9]*\).*/\1/p' | head -1)
 BLOCKS=$(echo "$MINE_OUT" | sed -n 's/.*blocks sent=\([0-9]*\).*/\1/p' | head -1)
 
 if [ -n "$MEMS" ] && [ -n "$BLOCKS" ]; then
-    MSG=$(printf '✦ mem · %s memories + %s blocks woven into the archive' "$MEMS" "$BLOCKS")
+    MSG=$(printf '✦ mem · %s capsules + %s blocks woven into the archive' "$MEMS" "$BLOCKS")
     jq -n --arg msg "$MSG" '{"systemMessage": $msg}'
 else
     echo '{}'
