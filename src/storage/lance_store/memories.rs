@@ -17,9 +17,7 @@ use super::{
     LanceStore,
 };
 use crate::domain::embeddings::EmbeddingJobInfo;
-use crate::domain::episode::EpisodeRecord;
 use crate::domain::memory::{FeedbackSummary, MemoryRecord, MemoryVersionLink};
-use crate::domain::session::Session;
 use crate::storage::types::{ClaimedEmbeddingJob, EmbeddingJobInsert, FeedbackEvent, StorageError};
 
 impl LanceStore {
@@ -916,10 +914,42 @@ impl LanceStore {
         tenant: &str,
         memory_id: &str,
     ) -> Result<Vec<MemoryVersionLink>, StorageError> {
-        let _ = (tenant, memory_id);
-        unimplemented!(
-            "LanceDb::list_memory_versions_for_tenant — see docs/repository.rs trait def"
-        )
+        // Walk the supersedes chain backwards: start from `memory_id`,
+        // follow `supersedes_memory_id` to predecessors, and append each
+        // record. Output ordered newest → oldest by version DESC.
+        let mut chain: Vec<MemoryRecord> = Vec::new();
+        let mut cursor = Some(memory_id.to_string());
+        // Cap depth — the chain should be short (typically 1–3) and a
+        // cycle would loop forever otherwise.
+        for _ in 0..32 {
+            let Some(id) = cursor.take() else { break };
+            let rec = self
+                .query_memories(
+                    format!(
+                        "tenant = {} AND memory_id = {}",
+                        sql_quote(tenant),
+                        sql_quote(&id)
+                    ),
+                    Some(1),
+                )
+                .await?
+                .into_iter()
+                .next();
+            let Some(r) = rec else { break };
+            cursor = r.supersedes_memory_id.clone();
+            chain.push(r);
+        }
+        chain.sort_by(|a, b| b.version.cmp(&a.version));
+        Ok(chain
+            .into_iter()
+            .map(|r| MemoryVersionLink {
+                memory_id: r.memory_id,
+                version: r.version,
+                status: r.status,
+                updated_at: r.updated_at,
+                supersedes_memory_id: r.supersedes_memory_id,
+            })
+            .collect())
     }
 
     pub async fn feedback_summary(&self, memory_id: &str) -> Result<FeedbackSummary, StorageError> {
@@ -986,13 +1016,7 @@ impl LanceStore {
             .next())
     }
 
-    pub async fn insert_episode(
-        &self,
-        episode: EpisodeRecord,
-    ) -> Result<EpisodeRecord, StorageError> {
-        let _ = episode;
-        unimplemented!("LanceDb::insert_episode — see docs/repository.rs trait def")
-    }
+    // insert_episode lives in `super::episodes`
 
     pub async fn list_memory_ids_for_tenant(
         &self,
@@ -1006,53 +1030,8 @@ impl LanceStore {
             .collect())
     }
 
-    pub async fn touch_session(
-        &self,
-        session_id: &str,
-        last_seen_at: &str,
-    ) -> Result<(), StorageError> {
-        let _ = (session_id, last_seen_at);
-        unimplemented!("LanceDb::touch_session — see docs/repository.rs trait def")
-    }
-
-    pub async fn latest_active_session(
-        &self,
-        tenant: &str,
-        caller_agent: &str,
-    ) -> Result<Option<Session>, StorageError> {
-        let _ = (tenant, caller_agent);
-        unimplemented!("LanceDb::latest_active_session — see docs/repository.rs trait def")
-    }
-
-    pub async fn open_session(
-        &self,
-        session_id: &str,
-        tenant: &str,
-        caller_agent: &str,
-        now: &str,
-    ) -> Result<Session, StorageError> {
-        let _ = (session_id, tenant, caller_agent, now);
-        unimplemented!("LanceDb::open_session — see docs/repository.rs trait def")
-    }
-
-    pub async fn close_session(
-        &self,
-        session_id: &str,
-        ended_at: &str,
-    ) -> Result<(), StorageError> {
-        let _ = (session_id, ended_at);
-        unimplemented!("LanceDb::close_session — see docs/repository.rs trait def")
-    }
-
-    pub async fn list_successful_episodes_for_tenant(
-        &self,
-        tenant: &str,
-    ) -> Result<Vec<EpisodeRecord>, StorageError> {
-        let _ = tenant;
-        unimplemented!(
-            "LanceDb::list_successful_episodes_for_tenant — see docs/repository.rs trait def"
-        )
-    }
+    // session methods are implemented in `super::sessions`
+    // episode methods are implemented in `super::episodes`
 
     pub async fn list_embedding_jobs(
         &self,

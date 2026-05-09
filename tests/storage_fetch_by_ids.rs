@@ -1,14 +1,16 @@
+use std::sync::Arc;
+
 use mem::domain::memory::{IngestMemoryRequest, MemoryType, Scope, Visibility, WriteMode};
 use mem::service::MemoryService;
-use mem::storage::DuckDbRepository;
+use mem::storage::Store;
 use tempfile::tempdir;
 
 #[tokio::test]
 async fn fetch_by_ids_filters_tenant_and_status() {
     let dir = tempdir().unwrap();
-    let db = dir.path().join("fetch.duckdb");
-    let repo = DuckDbRepository::open(&db).await.unwrap();
-    let svc = MemoryService::new(repo.clone());
+    let db = dir.path().join("fetch.lance");
+    let store = Arc::new(Store::open(&db).await.unwrap());
+    let svc = MemoryService::new(store.clone());
 
     let make = |tenant: &str, content: &str| IngestMemoryRequest {
         tenant: tenant.into(),
@@ -38,7 +40,7 @@ async fn fetch_by_ids_filters_tenant_and_status() {
         b.memory_id.as_str(),
         c.memory_id.as_str(),
     ];
-    let rows = repo.fetch_memories_by_ids("ten-a", &ids).await.unwrap();
+    let rows = store.fetch_memories_by_ids("ten-a", &ids).await.unwrap();
 
     let returned: std::collections::HashSet<_> =
         rows.iter().map(|m| m.memory_id.as_str()).collect();

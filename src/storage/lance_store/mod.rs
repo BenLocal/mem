@@ -67,8 +67,10 @@ use serde::{de::DeserializeOwned, Serialize};
 
 mod embedding;
 mod entities;
+mod episodes;
 mod graph;
 mod memories;
+mod sessions;
 mod transcripts;
 
 use crate::domain::memory::{GraphEdge, MemoryRecord};
@@ -159,9 +161,10 @@ impl LanceStore {
         ensure_entity_aliases_table(&conn).await?;
         ensure_conversation_messages_table(&conn).await?;
         ensure_transcript_embedding_jobs_table(&conn).await?;
+        ensure_sessions_table(&conn).await?;
+        ensure_episodes_table(&conn).await?;
         // memory_embeddings is lazy-created on first upsert (dim is
         // provider-dependent and unknown here without provider).
-        // TODO: ensure_episodes_table, ensure_sessions_table.
 
         // FTS indexes for the BM25 read paths. Built once at open
         // time on empty tables — building the index is cheap when
@@ -352,6 +355,57 @@ async fn ensure_conversation_messages_table(conn: &Connection) -> Result<(), Sto
         conversation_messages_schema(),
     )
     .await
+}
+
+pub(super) async fn ensure_sessions_table(conn: &Connection) -> Result<(), StorageError> {
+    ensure_table(conn, "sessions", sessions_schema()).await
+}
+
+pub(super) async fn ensure_episodes_table(conn: &Connection) -> Result<(), StorageError> {
+    ensure_table(conn, "episodes", episodes_schema()).await
+}
+
+/// Arrow schema for the `sessions` table. Mirrors the legacy DuckDB
+/// schema 1:1: session_id PK, tenant + caller_agent for identity,
+/// started_at + last_seen_at + ended_at (nullable) for lifecycle, goal
+/// (nullable string), memory_count (uint32) for usage stats.
+fn sessions_schema() -> Schema {
+    Schema::new(vec![
+        Field::new("session_id", DataType::Utf8, false),
+        Field::new("tenant", DataType::Utf8, false),
+        Field::new("caller_agent", DataType::Utf8, false),
+        Field::new("started_at", DataType::Utf8, false),
+        Field::new("last_seen_at", DataType::Utf8, false),
+        Field::new("ended_at", DataType::Utf8, true),
+        Field::new("goal", DataType::Utf8, true),
+        Field::new("memory_count", DataType::UInt32, false),
+    ])
+}
+
+/// Arrow schema for the `episodes` table.
+fn episodes_schema() -> Schema {
+    let list_str = || DataType::List(Arc::new(Field::new("item", DataType::Utf8, false)));
+    Schema::new(vec![
+        Field::new("episode_id", DataType::Utf8, false),
+        Field::new("tenant", DataType::Utf8, false),
+        Field::new("goal", DataType::Utf8, false),
+        Field::new("steps", list_str(), false),
+        Field::new("outcome", DataType::Utf8, false),
+        Field::new("evidence", list_str(), false),
+        Field::new("scope", DataType::Utf8, false),
+        Field::new("visibility", DataType::Utf8, false),
+        Field::new("project", DataType::Utf8, true),
+        Field::new("repo", DataType::Utf8, true),
+        Field::new("module", DataType::Utf8, true),
+        Field::new("tags", list_str(), false),
+        Field::new("source_agent", DataType::Utf8, false),
+        Field::new("idempotency_key", DataType::Utf8, true),
+        Field::new("created_at", DataType::Utf8, false),
+        Field::new("updated_at", DataType::Utf8, false),
+        // workflow_candidate as JSON-encoded string (nullable) — saves
+        // schema churn vs. modeling the nested struct natively.
+        Field::new("workflow_candidate", DataType::Utf8, true),
+    ])
 }
 
 /// Idempotent `create_empty_table` — checks `Connection::table_names()`
