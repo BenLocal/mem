@@ -30,12 +30,15 @@
 //!   - `find_by_idempotency_or_hash`
 //!   - `list_pending_review`
 //!   - `recent_active_memories`
+//!   - `search_candidates`
+//!   - `fetch_memories_by_ids`
+//!   - `list_memory_ids_for_tenant`
+//!   - `list_memory_versions_for_tenant`
 //!
-//! Subsequent commits add `search_candidates`, `fetch_memories_by_ids`,
-//! `bm25_candidates` (via `lance_fts`), `semantic_search_memories`
-//! (via `lance_vector_search`), the transcript reads, the graph reads,
-//! and the entity-registry reads — one cluster per commit so each
-//! addition is reviewable.
+//! Subsequent commits add `bm25_candidates` (via `lance_fts`),
+//! `semantic_search_memories` (via `lance_vector_search`), the
+//! transcript reads, the graph reads, and the entity-registry reads
+//! — one cluster per commit so each addition is reviewable.
 
 use std::path::Path;
 use std::sync::{Arc, Mutex};
@@ -46,7 +49,7 @@ use serde::de::DeserializeOwned;
 use serde::Serialize;
 
 use super::StorageError;
-use crate::domain::memory::{MemoryRecord, MemoryStatus};
+use crate::domain::memory::{MemoryRecord, MemoryStatus, MemoryVersionLink};
 
 /// Read-only DuckDB SQL client backed by lance datasets ATTACHed at
 /// open time. See module-level docs for the architecture.
@@ -263,6 +266,158 @@ impl DuckDbQuery {
                 row_to_memory_record,
             )?;
             collect_memories(rows)
+        })
+        .await
+    }
+
+    /// Candidate pool for the ranking pipeline. Same row shape /
+    /// ordering as `recent_active_memories` but **unbounded** — pulls
+    /// the entire live (non-rejected, non-archived) set for `tenant`
+    /// and returns it. Used by `pipeline::retrieve` to score every
+    /// candidate; service code is expected to top-N afterward.
+    ///
+    /// For tenants with thousands of memories the wake-up fast path
+    /// uses `recent_active_memories` instead — same filter, push the
+    /// LIMIT to SQL.
+    ///
+    /// We do the status filter in SQL (rather than the legacy "fetch
+    /// all then filter in Rust") because pushing predicates is the
+    /// whole point of having DuckDB on top — every byte of an archived
+    /// row that doesn't make it into Rust is a win.
+    pub async fn search_candidates(&self, tenant: &str) -> Result<Vec<MemoryRecord>, StorageError> {
+        let conn = self.conn.clone();
+        let tenant = tenant.to_string();
+        let rejected = enum_to_text(&MemoryStatus::Rejected)?;
+        let archived = enum_to_text(&MemoryStatus::Archived)?;
+        spawn_blocking_storage(move || {
+            let conn = conn.lock().expect("duckdb_query mutex poisoned");
+            let sql = format!(
+                "SELECT {MEMORY_COLS} FROM ns.main.memories \
+                 WHERE tenant = ?1 AND status NOT IN (?2, ?3) \
+                 ORDER BY updated_at DESC, version DESC, memory_id ASC",
+                MEMORY_COLS = MEMORY_COLS,
+            );
+            let mut stmt = conn.prepare(&sql)?;
+            let rows = stmt.query_map(params![tenant, rejected, archived], row_to_memory_record)?;
+            collect_memories(rows)
+        })
+        .await
+    }
+
+    /// Bulk fetch by memory_id list, scoped to `tenant`. Uses
+    /// `WHERE memory_id IN (?, ?, ...)` with N parameter binders.
+    /// Returns rows in DB-natural order, **not** in input slice order;
+    /// callers that need to preserve `ids` ordering reshape via a
+    /// HashMap (the legacy hybrid-search path does this).
+    ///
+    /// Empty `ids` short-circuits to `Ok(vec![])` without touching the
+    /// connection.
+    ///
+    /// Used by post-search hydration in `pipeline::retrieve`: ANN /
+    /// BM25 returns memory_ids only; this fills the row data.
+    pub async fn fetch_memories_by_ids(
+        &self,
+        tenant: &str,
+        ids: &[&str],
+    ) -> Result<Vec<MemoryRecord>, StorageError> {
+        if ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let conn = self.conn.clone();
+        let tenant = tenant.to_string();
+        let ids: Vec<String> = ids.iter().map(|s| s.to_string()).collect();
+        spawn_blocking_storage(move || {
+            let conn = conn.lock().expect("duckdb_query mutex poisoned");
+            // ?1 is tenant; ?2..?(N+1) are the ids. Build the
+            // placeholder list to match.
+            let placeholders = (2..=ids.len() + 1)
+                .map(|i| format!("?{i}"))
+                .collect::<Vec<_>>()
+                .join(", ");
+            let sql = format!(
+                "SELECT {MEMORY_COLS} FROM ns.main.memories \
+                 WHERE tenant = ?1 AND memory_id IN ({placeholders})",
+                MEMORY_COLS = MEMORY_COLS,
+            );
+            let mut stmt = conn.prepare(&sql)?;
+            let mut params_vec: Vec<Box<dyn duckdb::ToSql>> = vec![Box::new(tenant)];
+            for id in ids {
+                params_vec.push(Box::new(id));
+            }
+            let params_refs: Vec<&dyn duckdb::ToSql> =
+                params_vec.iter().map(|b| b.as_ref()).collect();
+            let rows = stmt.query_map(params_refs.as_slice(), row_to_memory_record)?;
+            collect_memories(rows)
+        })
+        .await
+    }
+
+    /// Project just `memory_id` column for `tenant`, ordered
+    /// `updated_at DESC`. Cheap admin / repair operation that doesn't
+    /// need to hydrate the full row.
+    pub async fn list_memory_ids_for_tenant(
+        &self,
+        tenant: &str,
+    ) -> Result<Vec<String>, StorageError> {
+        let conn = self.conn.clone();
+        let tenant = tenant.to_string();
+        spawn_blocking_storage(move || {
+            let conn = conn.lock().expect("duckdb_query mutex poisoned");
+            let mut stmt = conn.prepare(
+                "SELECT memory_id FROM ns.main.memories \
+                 WHERE tenant = ?1 ORDER BY updated_at DESC",
+            )?;
+            let rows = stmt.query_map(params![tenant], |row| row.get::<_, String>(0))?;
+            let mut out = Vec::new();
+            for r in rows {
+                out.push(r.map_err(StorageError::DuckDb)?);
+            }
+            Ok(out)
+        })
+        .await
+    }
+
+    /// Version-chain metadata for `tenant` (every memory's version
+    /// link, ordered `version DESC, updated_at DESC`).
+    ///
+    /// **TODO:** the legacy DuckDB-as-storage signature accepts a
+    /// `memory_id` parameter but ignores it — the SQL only filters by
+    /// tenant. Service-layer callers (`get_memory_detail`) expect the
+    /// returned chain to be tenant-scoped *and* memory-scoped, so
+    /// they're getting a too-broad answer today. Mirroring the broken
+    /// behavior here for cutover parity; will fix with a proper
+    /// version-chain walk (`WHERE memory_id = ?2 OR
+    /// supersedes_memory_id = ?2`, recursive) in a follow-up.
+    pub async fn list_memory_versions_for_tenant(
+        &self,
+        tenant: &str,
+        memory_id: &str,
+    ) -> Result<Vec<MemoryVersionLink>, StorageError> {
+        let _ = memory_id;
+        let conn = self.conn.clone();
+        let tenant = tenant.to_string();
+        spawn_blocking_storage(move || {
+            let conn = conn.lock().expect("duckdb_query mutex poisoned");
+            let mut stmt = conn.prepare(
+                "SELECT memory_id, version, status, updated_at, supersedes_memory_id \
+                 FROM ns.main.memories \
+                 WHERE tenant = ?1 \
+                 ORDER BY version DESC, updated_at DESC",
+            )?;
+            let rows = stmt.query_map(params![tenant], |row| {
+                Ok(MemoryVersionLink {
+                    memory_id: row.get(0)?,
+                    version: row.get::<_, u64>(1)?,
+                    status: parse_enum(&row.get::<_, String>(2)?)?,
+                    updated_at: row.get(3)?,
+                    supersedes_memory_id: row.get(4)?,
+                })
+            })?;
+            let mut out = Vec::new();
+            for r in rows {
+                out.push(r.map_err(StorageError::DuckDb)?);
+            }
+            Ok(out)
         })
         .await
     }
@@ -623,5 +778,111 @@ mod tests {
         // legacy DuckDB-as-storage clamp).
         let recent_clamped = q.recent_active_memories("tenant-a", 0).await.unwrap();
         assert_eq!(recent_clamped.len(), 1);
+    }
+
+    /// Cluster A round-trip: `search_candidates`,
+    /// `fetch_memories_by_ids`, `list_memory_ids_for_tenant`,
+    /// `list_memory_versions_for_tenant`. All four operate on the
+    /// memories table only; share the same fixture seeding.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn duckdb_query_memory_collections() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("store");
+        let lance = LanceStore::open(&path).await.unwrap();
+
+        // Seed: 4 memories — 2 active, 1 archived (excluded from
+        // candidates), 1 in tenant-b. Spread updated_at so DESC
+        // ordering is observable.
+        let mut a = fixture("m_a", "tenant-a");
+        a.updated_at = "00000001778000000050".into();
+        a.version = 2;
+        let mut b = fixture("m_b", "tenant-a");
+        b.updated_at = "00000001778000000040".into();
+        b.version = 1;
+        let mut arc = fixture("m_arc", "tenant-a");
+        arc.status = MemoryStatus::Archived;
+        arc.updated_at = "00000001778000000030".into();
+        let mut bv2 = fixture("m_b_v2", "tenant-a");
+        bv2.supersedes_memory_id = Some("m_b".into());
+        bv2.version = 2;
+        bv2.updated_at = "00000001778000000060".into();
+        let mut other = fixture("m_other", "tenant-b");
+        other.updated_at = "00000001778000000020".into();
+        for m in [&a, &b, &arc, &bv2, &other] {
+            lance.insert_memory(m.clone()).await.unwrap();
+        }
+
+        let q = DuckDbQuery::open(&path).await.unwrap();
+
+        // search_candidates: archived/rejected excluded; tenant-scoped;
+        // ordered (updated_at DESC, version DESC, memory_id ASC).
+        let cands = q.search_candidates("tenant-a").await.unwrap();
+        let cand_ids: Vec<&str> = cands.iter().map(|m| m.memory_id.as_str()).collect();
+        assert_eq!(
+            cand_ids,
+            vec!["m_b_v2", "m_a", "m_b"],
+            "tenant-a candidates: archived excluded, ordered by updated_at DESC"
+        );
+        let cands_b = q.search_candidates("tenant-b").await.unwrap();
+        assert_eq!(cands_b.len(), 1);
+
+        // fetch_memories_by_ids: in-clause batch lookup. Empty → empty.
+        let empty = q.fetch_memories_by_ids("tenant-a", &[]).await.unwrap();
+        assert!(empty.is_empty());
+
+        let some = q
+            .fetch_memories_by_ids("tenant-a", &["m_a", "m_b", "does-not-exist"])
+            .await
+            .unwrap();
+        let some_ids: std::collections::HashSet<&str> =
+            some.iter().map(|m| m.memory_id.as_str()).collect();
+        assert_eq!(some.len(), 2);
+        assert!(some_ids.contains("m_a"));
+        assert!(some_ids.contains("m_b"));
+
+        // tenant filter scopes the IN-clause: same id under different
+        // tenant returns nothing.
+        let cross = q.fetch_memories_by_ids("tenant-b", &["m_a"]).await.unwrap();
+        assert!(
+            cross.is_empty(),
+            "tenant-a id must not appear in tenant-b lookup"
+        );
+
+        // list_memory_ids_for_tenant: just IDs, ordered updated_at DESC.
+        let ids_a = q.list_memory_ids_for_tenant("tenant-a").await.unwrap();
+        assert_eq!(
+            ids_a,
+            vec!["m_b_v2", "m_a", "m_b", "m_arc"],
+            "all 4 tenant-a rows incl. archived; updated_at DESC"
+        );
+        let ids_empty = q
+            .list_memory_ids_for_tenant("does-not-exist")
+            .await
+            .unwrap();
+        assert!(ids_empty.is_empty());
+
+        // list_memory_versions_for_tenant: ordered (version DESC,
+        // updated_at DESC). NOTE: passes memory_id but the legacy
+        // implementation ignores it; we mirror that here so behavior
+        // stays parity until a follow-up fixes the version-chain
+        // walk.
+        let chain = q
+            .list_memory_versions_for_tenant("tenant-a", "m_b")
+            .await
+            .unwrap();
+        // Returns ALL tenant-a rows' version links — m_b_v2 (v=2) +
+        // m_a (v=2) + m_b (v=1) + m_arc (v=1, fixture default).
+        assert_eq!(chain.len(), 4);
+        // The supersedes link is preserved.
+        let bv2_link = chain
+            .iter()
+            .find(|l| l.memory_id == "m_b_v2")
+            .expect("m_b_v2 in chain");
+        assert_eq!(bv2_link.supersedes_memory_id.as_deref(), Some("m_b"));
+        let b_link = chain
+            .iter()
+            .find(|l| l.memory_id == "m_b")
+            .expect("m_b in chain");
+        assert!(b_link.supersedes_memory_id.is_none());
     }
 }
