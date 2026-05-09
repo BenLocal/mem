@@ -68,16 +68,18 @@ use lancedb::{Connection, DistanceType};
 use serde::{de::DeserializeOwned, Serialize};
 
 mod embedding;
+mod entities;
+mod graph;
 
 use crate::domain::embeddings::EmbeddingJobInfo;
 use crate::domain::episode::EpisodeRecord;
 use crate::domain::memory::{FeedbackSummary, GraphEdge, MemoryRecord, MemoryVersionLink};
 use crate::domain::session::Session;
-use crate::domain::{AddAliasOutcome, Entity, EntityKind, EntityWithAliases};
 use crate::domain::{BlockType, ConversationMessage, MessageRole};
+use crate::domain::{Entity, EntityKind};
 use crate::storage::{
     ClaimedEmbeddingJob, ClaimedTranscriptEmbeddingJob, ContextWindow, EmbeddingJobInsert,
-    FeedbackEvent, GraphError, StorageError, TranscriptSessionSummary,
+    FeedbackEvent, StorageError, TranscriptSessionSummary,
 };
 
 /// LanceDB-backed implementation of the storage trait surface.
@@ -247,7 +249,7 @@ async fn ensure_fts_index(
 /// Map a `lancedb::Error` into our generic [`StorageError`]. We lose the
 /// rich variant info but the upper layers don't care — they only branch
 /// on `NotFound` vs everything-else.
-fn lancedb_err(e: lancedb::Error) -> StorageError {
+pub(super) fn lancedb_err(e: lancedb::Error) -> StorageError {
     StorageError::InvalidInput(format!("lancedb: {e}"))
 }
 
@@ -385,7 +387,9 @@ fn feedback_events_schema() -> Schema {
     ])
 }
 
-fn feedback_events_to_record_batch(events: &[FeedbackEvent]) -> Result<RecordBatch, StorageError> {
+pub(super) fn feedback_events_to_record_batch(
+    events: &[FeedbackEvent],
+) -> Result<RecordBatch, StorageError> {
     let mut feedback_id = StringBuilder::new();
     let mut memory_id = StringBuilder::new();
     let mut feedback_kind = StringBuilder::new();
@@ -407,7 +411,7 @@ fn feedback_events_to_record_batch(events: &[FeedbackEvent]) -> Result<RecordBat
         .map_err(|e| StorageError::InvalidInput(format!("feedback record batch: {e}")))
 }
 
-fn record_batch_to_feedback_events(
+pub(super) fn record_batch_to_feedback_events(
     batch: &RecordBatch,
 ) -> Result<Vec<FeedbackEvent>, StorageError> {
     fn col<'a, T: 'static>(
@@ -464,7 +468,10 @@ fn memory_embeddings_schema(dim: i32) -> Schema {
 /// `f32::from_ne_bytes`-chunking — every embedding row in mem (DuckDB or
 /// LanceDB) ultimately came from the same `EmbeddingProvider`, which
 /// produces native-endian f32 bytes.
-fn decode_embedding_blob(blob: &[u8], expected_dim: usize) -> Result<Vec<f32>, StorageError> {
+pub(super) fn decode_embedding_blob(
+    blob: &[u8],
+    expected_dim: usize,
+) -> Result<Vec<f32>, StorageError> {
     if blob.len() != expected_dim * 4 {
         return Err(StorageError::InvalidData(
             "embedding blob length mismatch (expected dim * 4 bytes)",
@@ -480,7 +487,7 @@ fn decode_embedding_blob(blob: &[u8], expected_dim: usize) -> Result<Vec<f32>, S
 /// Build a one-row `RecordBatch` for `memory_embeddings`. `embedding`
 /// must already be the decoded `Vec<f32>` of length `dim`.
 #[allow(clippy::too_many_arguments)]
-fn memory_embedding_to_record_batch(
+pub(super) fn memory_embedding_to_record_batch(
     memory_id: &str,
     tenant: &str,
     embedding_model: &str,
@@ -554,7 +561,7 @@ fn conversation_message_embeddings_schema(dim: i32) -> Schema {
 }
 
 #[allow(clippy::too_many_arguments)]
-fn conversation_message_embedding_to_record_batch(
+pub(super) fn conversation_message_embedding_to_record_batch(
     message_block_id: &str,
     tenant: &str,
     embedding_model: &str,
@@ -647,7 +654,9 @@ fn embedding_jobs_schema() -> Schema {
     ])
 }
 
-fn embedding_job_row_to_record_batch(row: &EmbeddingJobRow) -> Result<RecordBatch, StorageError> {
+pub(super) fn embedding_job_row_to_record_batch(
+    row: &EmbeddingJobRow,
+) -> Result<RecordBatch, StorageError> {
     let mut job_id = StringBuilder::new();
     let mut tenant = StringBuilder::new();
     let mut memory_id = StringBuilder::new();
@@ -690,7 +699,7 @@ fn embedding_job_row_to_record_batch(row: &EmbeddingJobRow) -> Result<RecordBatc
         .map_err(|e| StorageError::InvalidInput(format!("embedding_job record batch: {e}")))
 }
 
-fn record_batch_to_embedding_job_rows(
+pub(super) fn record_batch_to_embedding_job_rows(
     batch: &RecordBatch,
 ) -> Result<Vec<EmbeddingJobRow>, StorageError> {
     fn col<'a, T: 'static>(
@@ -775,7 +784,7 @@ fn transcript_embedding_jobs_schema() -> Schema {
     ])
 }
 
-fn transcript_embedding_job_row_to_record_batch(
+pub(super) fn transcript_embedding_job_row_to_record_batch(
     row: &TranscriptEmbeddingJobRow,
 ) -> Result<RecordBatch, StorageError> {
     let mut job_id = StringBuilder::new();
@@ -818,7 +827,7 @@ fn transcript_embedding_job_row_to_record_batch(
     })
 }
 
-fn record_batch_to_transcript_embedding_job_rows(
+pub(super) fn record_batch_to_transcript_embedding_job_rows(
     batch: &RecordBatch,
 ) -> Result<Vec<TranscriptEmbeddingJobRow>, StorageError> {
     fn col<'a, T: 'static>(
@@ -877,7 +886,7 @@ fn graph_edges_schema() -> Schema {
     ])
 }
 
-fn graph_edge_to_record_batch(edge: &GraphEdge) -> Result<RecordBatch, StorageError> {
+pub(super) fn graph_edge_to_record_batch(edge: &GraphEdge) -> Result<RecordBatch, StorageError> {
     let mut from = StringBuilder::new();
     let mut to = StringBuilder::new();
     let mut relation = StringBuilder::new();
@@ -902,7 +911,9 @@ fn graph_edge_to_record_batch(edge: &GraphEdge) -> Result<RecordBatch, StorageEr
         .map_err(|e| StorageError::InvalidInput(format!("graph_edge record batch: {e}")))
 }
 
-fn record_batch_to_graph_edges(batch: &RecordBatch) -> Result<Vec<GraphEdge>, StorageError> {
+pub(super) fn record_batch_to_graph_edges(
+    batch: &RecordBatch,
+) -> Result<Vec<GraphEdge>, StorageError> {
     fn col<'a, T: 'static>(
         batch: &'a RecordBatch,
         name: &'static str,
@@ -947,7 +958,7 @@ fn entities_schema() -> Schema {
     ])
 }
 
-fn entity_to_record_batch(entity: &Entity) -> Result<RecordBatch, StorageError> {
+pub(super) fn entity_to_record_batch(entity: &Entity) -> Result<RecordBatch, StorageError> {
     let mut entity_id = StringBuilder::new();
     let mut tenant = StringBuilder::new();
     let mut canonical_name = StringBuilder::new();
@@ -969,7 +980,7 @@ fn entity_to_record_batch(entity: &Entity) -> Result<RecordBatch, StorageError> 
         .map_err(|e| StorageError::InvalidInput(format!("entity record batch: {e}")))
 }
 
-fn record_batch_to_entities(batch: &RecordBatch) -> Result<Vec<Entity>, StorageError> {
+pub(super) fn record_batch_to_entities(batch: &RecordBatch) -> Result<Vec<Entity>, StorageError> {
     fn col<'a, T: 'static>(
         batch: &'a RecordBatch,
         name: &'static str,
@@ -1014,7 +1025,7 @@ fn entity_aliases_schema() -> Schema {
     ])
 }
 
-fn entity_alias_to_record_batch(
+pub(super) fn entity_alias_to_record_batch(
     tenant_v: &str,
     alias_text_v: &str,
     entity_id_v: &str,
@@ -1063,7 +1074,7 @@ fn conversation_messages_schema() -> Schema {
     ])
 }
 
-fn conversation_message_to_record_batch(
+pub(super) fn conversation_message_to_record_batch(
     msg: &ConversationMessage,
 ) -> Result<RecordBatch, StorageError> {
     use arrow_array::builder::{BooleanBuilder, UInt32Builder};
@@ -1133,7 +1144,7 @@ fn conversation_message_to_record_batch(
         .map_err(|e| StorageError::InvalidInput(format!("conversation_message record batch: {e}")))
 }
 
-fn record_batch_to_conversation_messages(
+pub(super) fn record_batch_to_conversation_messages(
     batch: &RecordBatch,
 ) -> Result<Vec<ConversationMessage>, StorageError> {
     use arrow_array::{BooleanArray, UInt32Array};
@@ -1203,7 +1214,7 @@ fn record_batch_to_conversation_messages(
 /// Mirror of DuckDB's private `feedback_adjustments` helper. Resolves a
 /// raw `feedback_kind` string to the deltas that `apply_feedback` must
 /// apply to the parent memory's confidence / decay / status fields.
-fn feedback_adjustments(
+pub(super) fn feedback_adjustments(
     feedback_kind: &str,
 ) -> Option<(f32, f32, Option<crate::domain::memory::MemoryStatus>, bool)> {
     use crate::domain::memory::FeedbackKind;
@@ -1226,7 +1237,7 @@ fn feedback_adjustments(
 
 /// Mirror of the DuckDB `encode_text` helper: serialize a snake_case-encoded
 /// enum (e.g. `MemoryType`, `MemoryStatus`) to its plain JSON string token.
-fn enum_to_str<T: Serialize>(v: &T) -> Result<String, StorageError> {
+pub(super) fn enum_to_str<T: Serialize>(v: &T) -> Result<String, StorageError> {
     serde_json::to_value(v)
         .map_err(StorageError::Serde)?
         .as_str()
@@ -1238,14 +1249,16 @@ fn enum_to_str<T: Serialize>(v: &T) -> Result<String, StorageError> {
 
 /// Inverse of `enum_to_str`. Used when materializing a `MemoryRecord` from
 /// a `RecordBatch` row.
-fn enum_from_str<T: DeserializeOwned>(s: &str) -> Result<T, StorageError> {
+pub(super) fn enum_from_str<T: DeserializeOwned>(s: &str) -> Result<T, StorageError> {
     serde_json::from_value(serde_json::Value::String(s.to_string())).map_err(StorageError::Serde)
 }
 
 /// Serialize one or more `MemoryRecord`s to an Arrow `RecordBatch` matching
 /// the [`memories_schema`] layout. Used by `insert_memory` to feed
 /// `Table::add(...)`.
-fn memories_to_record_batch(memories: &[MemoryRecord]) -> Result<RecordBatch, StorageError> {
+pub(super) fn memories_to_record_batch(
+    memories: &[MemoryRecord],
+) -> Result<RecordBatch, StorageError> {
     let mut memory_id = StringBuilder::new();
     let mut tenant = StringBuilder::new();
     let mut memory_type = StringBuilder::new();
@@ -1376,7 +1389,9 @@ fn memories_to_record_batch(memories: &[MemoryRecord]) -> Result<RecordBatch, St
 
 /// Inverse of `memories_to_record_batch`: parse a Lance query result into
 /// `MemoryRecord`s.
-fn record_batch_to_memories(batch: &RecordBatch) -> Result<Vec<MemoryRecord>, StorageError> {
+pub(super) fn record_batch_to_memories(
+    batch: &RecordBatch,
+) -> Result<Vec<MemoryRecord>, StorageError> {
     fn col<'a, T: 'static>(
         batch: &'a RecordBatch,
         name: &'static str,
@@ -1470,7 +1485,7 @@ fn record_batch_to_memories(batch: &RecordBatch) -> Result<Vec<MemoryRecord>, St
 /// Escape a string literal for a LanceDB filter expression. LanceDB uses
 /// DuckDB's predicate flavor — single quotes for string literals, doubled
 /// to escape an embedded quote.
-fn sql_quote(s: &str) -> String {
+pub(super) fn sql_quote(s: &str) -> String {
     format!("'{}'", s.replace('\'', "''"))
 }
 
@@ -3424,456 +3439,13 @@ impl LanceStore {
 
 /// In-memory chronological ASC sort matching DuckDB's
 /// `(created_at, line_number, block_index)` SQL ORDER BY.
-fn sort_messages_chronological_asc(msgs: &mut [ConversationMessage]) {
+pub(super) fn sort_messages_chronological_asc(msgs: &mut [ConversationMessage]) {
     msgs.sort_by(|a, b| {
         a.created_at
             .cmp(&b.created_at)
             .then_with(|| a.line_number.cmp(&b.line_number))
             .then_with(|| a.block_index.cmp(&b.block_index))
     });
-}
-
-/// Read all `graph_edges` rows matching `filter`, parsed into
-/// [`GraphEdge`]s. Helper shared by `neighbors`, `related_memory_ids`,
-/// and the existence check in `sync_memory_edges`.
-impl LanceStore {
-    pub async fn query_graph_edges(&self, filter: String) -> Result<Vec<GraphEdge>, GraphError> {
-        let table = self
-            .conn
-            .open_table("graph_edges")
-            .execute()
-            .await
-            .map_err(|e| GraphError::Backend(e.to_string()))?;
-        let stream = table
-            .query()
-            .only_if(filter)
-            .execute()
-            .await
-            .map_err(|e| GraphError::Backend(e.to_string()))?;
-        let batches: Vec<RecordBatch> = stream
-            .try_collect()
-            .await
-            .map_err(|e| GraphError::Backend(format!("lancedb stream: {e}")))?;
-        let mut out = Vec::new();
-        for b in &batches {
-            out.extend(
-                record_batch_to_graph_edges(b).map_err(|e| GraphError::Backend(e.to_string()))?,
-            );
-        }
-        Ok(out)
-    }
-}
-
-/// Graph methods — previously bound by `GraphStore` trait, now
-/// inherent.
-impl LanceStore {
-    pub async fn neighbors(&self, node_id: &str) -> Result<Vec<GraphEdge>, GraphError> {
-        // Active edges only (valid_to is null) where the node sits on
-        // either side. Order by (relation, from, to) to match DuckDB's
-        // SQL — done in-memory because LanceDB has no ORDER BY.
-        let mut edges = self
-            .query_graph_edges(format!(
-                "(from_node_id = {0} OR to_node_id = {0}) AND valid_to IS NULL",
-                sql_quote(node_id),
-            ))
-            .await?;
-        edges.sort_by(|a, b| {
-            a.relation
-                .cmp(&b.relation)
-                .then_with(|| a.from_node_id.cmp(&b.from_node_id))
-                .then_with(|| a.to_node_id.cmp(&b.to_node_id))
-        });
-        Ok(edges)
-    }
-
-    pub async fn sync_memory_edges(
-        &self,
-        edges: &[GraphEdge],
-        now: &str,
-    ) -> Result<(), GraphError> {
-        if edges.is_empty() {
-            return Ok(());
-        }
-        let table = self
-            .conn
-            .open_table("graph_edges")
-            .execute()
-            .await
-            .map_err(|e| GraphError::Backend(e.to_string()))?;
-        // Idempotent insert: skip rows where an active edge with the
-        // same (from, to, relation) already exists. LanceDB has no
-        // transactions; a concurrent writer could race the existence
-        // check, but mem serve is single-instance per DB so this is
-        // safe in practice (same posture as embedding_jobs enqueue).
-        for edge in edges {
-            let exists = table
-                .count_rows(Some(format!(
-                    "from_node_id = {} AND to_node_id = {} AND relation = {} AND valid_to IS NULL",
-                    sql_quote(&edge.from_node_id),
-                    sql_quote(&edge.to_node_id),
-                    sql_quote(&edge.relation),
-                )))
-                .await
-                .map_err(|e| GraphError::Backend(e.to_string()))?;
-            if exists > 0 {
-                continue;
-            }
-            // Server overrides valid_from with `now` (matching DuckDB
-            // behavior — callers don't need to think about clocks) and
-            // forces valid_to = NULL (active).
-            let to_write = GraphEdge {
-                from_node_id: edge.from_node_id.clone(),
-                to_node_id: edge.to_node_id.clone(),
-                relation: edge.relation.clone(),
-                valid_from: now.to_string(),
-                valid_to: None,
-            };
-            let batch = graph_edge_to_record_batch(&to_write)
-                .map_err(|e| GraphError::Backend(e.to_string()))?;
-            table
-                .add(batch)
-                .execute()
-                .await
-                .map_err(|e| GraphError::Backend(e.to_string()))?;
-        }
-        Ok(())
-    }
-
-    pub async fn close_edges_for_memory(&self, memory_id: &str) -> Result<usize, GraphError> {
-        let from = format!("memory:{memory_id}");
-        let now = crate::storage::current_timestamp();
-        let table = self
-            .conn
-            .open_table("graph_edges")
-            .execute()
-            .await
-            .map_err(|e| GraphError::Backend(e.to_string()))?;
-        let filter = format!("from_node_id = {} AND valid_to IS NULL", sql_quote(&from));
-        let count = table
-            .count_rows(Some(filter.clone()))
-            .await
-            .map_err(|e| GraphError::Backend(e.to_string()))?;
-        if count == 0 {
-            return Ok(0);
-        }
-        let result = table
-            .update()
-            .only_if(filter)
-            .column("valid_to", sql_quote(&now))
-            .execute()
-            .await
-            .map_err(|e| GraphError::Backend(e.to_string()))?;
-        if result.rows_updated == 0 {
-            Ok(count)
-        } else {
-            Ok(usize::try_from(result.rows_updated).unwrap_or(count))
-        }
-    }
-
-    pub async fn related_memory_ids(&self, node_ids: &[String]) -> Result<Vec<String>, GraphError> {
-        if node_ids.is_empty() {
-            return Ok(vec![]);
-        }
-        // Build "id IN ('a', 'b', ...)" — LanceDB supports SQL IN, so
-        // we match the DuckDB shape directly. No CASE expression
-        // though, so we project both endpoints in Rust below.
-        let in_list = node_ids
-            .iter()
-            .map(|n| sql_quote(n))
-            .collect::<Vec<_>>()
-            .join(",");
-        let filter = format!(
-            "(from_node_id IN ({0}) OR to_node_id IN ({0})) AND valid_to IS NULL",
-            in_list,
-        );
-        let edges = self.query_graph_edges(filter).await?;
-        let node_set: std::collections::HashSet<&str> =
-            node_ids.iter().map(|s| s.as_str()).collect();
-        let mut memory_ids = std::collections::HashSet::new();
-        for e in edges {
-            // Adjacency: pick the endpoint that's NOT in node_ids; if
-            // both sides are in node_ids, both are recorded (matches
-            // the DuckDB "case when from in (...) then to else from"
-            // semantics — the SELECT DISTINCT collapses the duplicate).
-            for endpoint in [&e.from_node_id, &e.to_node_id] {
-                if !node_set.contains(endpoint.as_str()) {
-                    if let Some(memory_id) = endpoint.strip_prefix("memory:") {
-                        memory_ids.insert(memory_id.to_string());
-                    }
-                }
-            }
-        }
-        let mut out: Vec<String> = memory_ids.into_iter().collect();
-        out.sort();
-        Ok(out)
-    }
-}
-
-/// Entity-registry methods — previously bound by `EntityRegistry`
-/// trait, now inherent.
-impl LanceStore {
-    pub async fn resolve_or_create(
-        &self,
-        tenant: &str,
-        alias: &str,
-        kind: EntityKind,
-        now: &str,
-    ) -> Result<String, StorageError> {
-        use crate::pipeline::entity_normalize::normalize_alias;
-        let normalized = normalize_alias(alias);
-
-        // Lookup first.
-        if let Some(id) = self.lookup_alias(tenant, alias).await? {
-            return Ok(id);
-        }
-
-        // Auto-promote: insert entity + first alias. No transaction (LanceDB
-        // doesn't have them) — under concurrent enqueue the
-        // single-writer assumption holds (see embedding_jobs comment).
-        let entity_id = uuid::Uuid::now_v7().to_string();
-        let entity = Entity {
-            entity_id: entity_id.clone(),
-            tenant: tenant.to_string(),
-            canonical_name: alias.to_string(),
-            kind,
-            created_at: now.to_string(),
-        };
-        let entities = self
-            .conn
-            .open_table("entities")
-            .execute()
-            .await
-            .map_err(lancedb_err)?;
-        entities
-            .add(entity_to_record_batch(&entity)?)
-            .execute()
-            .await
-            .map_err(lancedb_err)?;
-        let aliases = self
-            .conn
-            .open_table("entity_aliases")
-            .execute()
-            .await
-            .map_err(lancedb_err)?;
-        aliases
-            .add(entity_alias_to_record_batch(
-                tenant,
-                &normalized,
-                &entity_id,
-                now,
-            )?)
-            .execute()
-            .await
-            .map_err(lancedb_err)?;
-        Ok(entity_id)
-    }
-
-    pub async fn get_entity(
-        &self,
-        tenant: &str,
-        entity_id: &str,
-    ) -> Result<Option<EntityWithAliases>, StorageError> {
-        let entities = self
-            .conn
-            .open_table("entities")
-            .execute()
-            .await
-            .map_err(lancedb_err)?;
-        let stream = entities
-            .query()
-            .only_if(format!(
-                "tenant = {} AND entity_id = {}",
-                sql_quote(tenant),
-                sql_quote(entity_id),
-            ))
-            .limit(1)
-            .execute()
-            .await
-            .map_err(lancedb_err)?;
-        let batches: Vec<RecordBatch> = stream
-            .try_collect()
-            .await
-            .map_err(|e| StorageError::InvalidInput(format!("lancedb stream: {e}")))?;
-        let mut entity_iter = batches
-            .iter()
-            .flat_map(|b| record_batch_to_entities(b).unwrap_or_default().into_iter());
-        let Some(entity) = entity_iter.next() else {
-            return Ok(None);
-        };
-
-        // Pull aliases for this entity, sorted by created_at ASC then
-        // alias_text ASC (mirror DuckDB SQL).
-        let aliases_table = self
-            .conn
-            .open_table("entity_aliases")
-            .execute()
-            .await
-            .map_err(lancedb_err)?;
-        let stream2 = aliases_table
-            .query()
-            .only_if(format!(
-                "tenant = {} AND entity_id = {}",
-                sql_quote(tenant),
-                sql_quote(entity_id),
-            ))
-            .execute()
-            .await
-            .map_err(lancedb_err)?;
-        let batches2: Vec<RecordBatch> = stream2
-            .try_collect()
-            .await
-            .map_err(|e| StorageError::InvalidInput(format!("lancedb stream: {e}")))?;
-        let mut alias_rows: Vec<(String, String)> = Vec::new(); // (created_at, alias_text)
-        for b in &batches2 {
-            fn col<'a, T: 'static>(
-                batch: &'a RecordBatch,
-                name: &'static str,
-            ) -> Result<&'a T, StorageError> {
-                batch
-                    .column_by_name(name)
-                    .ok_or(StorageError::InvalidData("missing column"))?
-                    .as_any()
-                    .downcast_ref::<T>()
-                    .ok_or(StorageError::InvalidData("column type mismatch"))
-            }
-            let alias_text = col::<StringArray>(b, "alias_text")?;
-            let created_at = col::<StringArray>(b, "created_at")?;
-            for i in 0..b.num_rows() {
-                alias_rows.push((
-                    created_at.value(i).to_string(),
-                    alias_text.value(i).to_string(),
-                ));
-            }
-        }
-        alias_rows.sort();
-        let aliases: Vec<String> = alias_rows.into_iter().map(|(_, a)| a).collect();
-        Ok(Some(EntityWithAliases { entity, aliases }))
-    }
-
-    pub async fn add_alias(
-        &self,
-        tenant: &str,
-        entity_id: &str,
-        alias: &str,
-        now: &str,
-    ) -> Result<AddAliasOutcome, StorageError> {
-        use crate::pipeline::entity_normalize::normalize_alias;
-        let normalized = normalize_alias(alias);
-
-        // Existing-owner check: who currently owns the normalized form?
-        let existing_owner = self.lookup_alias(tenant, alias).await?;
-        match existing_owner {
-            None => {
-                let aliases_table = self
-                    .conn
-                    .open_table("entity_aliases")
-                    .execute()
-                    .await
-                    .map_err(lancedb_err)?;
-                aliases_table
-                    .add(entity_alias_to_record_batch(
-                        tenant,
-                        &normalized,
-                        entity_id,
-                        now,
-                    )?)
-                    .execute()
-                    .await
-                    .map_err(lancedb_err)?;
-                Ok(AddAliasOutcome::Inserted)
-            }
-            Some(owner) if owner == entity_id => Ok(AddAliasOutcome::AlreadyOnSameEntity),
-            Some(other) => Ok(AddAliasOutcome::ConflictWithDifferentEntity(other)),
-        }
-    }
-
-    pub async fn lookup_alias(
-        &self,
-        tenant: &str,
-        alias: &str,
-    ) -> Result<Option<String>, StorageError> {
-        use crate::pipeline::entity_normalize::normalize_alias;
-        let normalized = normalize_alias(alias);
-        let table = self
-            .conn
-            .open_table("entity_aliases")
-            .execute()
-            .await
-            .map_err(lancedb_err)?;
-        let stream = table
-            .query()
-            .only_if(format!(
-                "tenant = {} AND alias_text = {}",
-                sql_quote(tenant),
-                sql_quote(&normalized),
-            ))
-            .limit(1)
-            .execute()
-            .await
-            .map_err(lancedb_err)?;
-        let batches: Vec<RecordBatch> = stream
-            .try_collect()
-            .await
-            .map_err(|e| StorageError::InvalidInput(format!("lancedb stream: {e}")))?;
-        for b in &batches {
-            if b.num_rows() == 0 {
-                continue;
-            }
-            let entity_id = b
-                .column_by_name("entity_id")
-                .ok_or(StorageError::InvalidData("missing entity_id column"))?
-                .as_any()
-                .downcast_ref::<StringArray>()
-                .ok_or(StorageError::InvalidData("entity_id column type mismatch"))?;
-            return Ok(Some(entity_id.value(0).to_string()));
-        }
-        Ok(None)
-    }
-
-    pub async fn list_entities(
-        &self,
-        tenant: &str,
-        kind_filter: Option<EntityKind>,
-        query: Option<&str>,
-        limit: usize,
-    ) -> Result<Vec<Entity>, StorageError> {
-        let mut filter = format!("tenant = {}", sql_quote(tenant));
-        if let Some(k) = kind_filter {
-            filter.push_str(&format!(" AND kind = {}", sql_quote(k.as_db_str())));
-        }
-        // canonical_name LIKE '%query%' — LanceDB's filter parser accepts
-        // SQL LIKE patterns with `%` wildcards.
-        if let Some(q) = query {
-            filter.push_str(&format!(
-                " AND canonical_name LIKE {}",
-                sql_quote(&format!("%{q}%")),
-            ));
-        }
-        let table = self
-            .conn
-            .open_table("entities")
-            .execute()
-            .await
-            .map_err(lancedb_err)?;
-        let stream = table
-            .query()
-            .only_if(filter)
-            .execute()
-            .await
-            .map_err(lancedb_err)?;
-        let batches: Vec<RecordBatch> = stream
-            .try_collect()
-            .await
-            .map_err(|e| StorageError::InvalidInput(format!("lancedb stream: {e}")))?;
-        let mut entities = Vec::new();
-        for b in &batches {
-            entities.extend(record_batch_to_entities(b)?);
-        }
-        // ORDER BY created_at DESC — sort in-memory.
-        entities.sort_by(|a, b| b.created_at.cmp(&a.created_at));
-        entities.truncate(limit);
-        Ok(entities)
-    }
 }
 
 #[cfg(test)]
