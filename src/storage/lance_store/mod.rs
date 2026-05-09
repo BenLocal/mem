@@ -78,8 +78,8 @@ use crate::domain::{AddAliasOutcome, Entity, EntityKind, EntityWithAliases};
 use crate::domain::{BlockType, ConversationMessage, MessageRole};
 use crate::storage::duckdb::{ClaimedEmbeddingJob, EmbeddingJobInsert, EntityRegistry};
 use crate::storage::{
-    ContextWindow, FeedbackEvent, GraphError, GraphStore, MemoryRepository, StorageError,
-    TranscriptRepository, TranscriptSessionSummary,
+    ClaimedTranscriptEmbeddingJob, ContextWindow, FeedbackEvent, GraphError, GraphStore,
+    MemoryRepository, StorageError, TranscriptRepository, TranscriptSessionSummary,
 };
 
 /// LanceDB-backed implementation of the storage trait surface.
@@ -90,12 +90,17 @@ use crate::storage::{
 /// concurrency internally.
 #[derive(Clone)]
 pub struct LanceStore {
-    /// LanceDB connection. Currently unused — every trait method is
-    /// `unimplemented!()` placeholder. The first real method to write is
-    /// `open()` (creates / opens the schema tables); afterwards method
-    /// bodies will hit `self.conn.open_table(...)` etc.
-    #[allow(dead_code)]
+    /// LanceDB connection.
     conn: Arc<Connection>,
+    /// Embedding-provider id for `transcript_embedding_jobs.provider`
+    /// rows enqueued by [`Self::create_conversation_message`]. Set
+    /// once at startup via [`Self::set_transcript_job_provider`]; if
+    /// `None` when a transcript row is inserted with
+    /// `embed_eligible == true`, `create_conversation_message`
+    /// errors loudly rather than silently substituting a default
+    /// that may diverge from the configured provider. Mirrors the
+    /// legacy `DuckDbRepository` field of the same name.
+    transcript_job_provider: Arc<std::sync::RwLock<Option<String>>>,
 }
 
 impl LanceStore {
@@ -159,6 +164,7 @@ impl LanceStore {
         ensure_entities_table(&conn).await?;
         ensure_entity_aliases_table(&conn).await?;
         ensure_conversation_messages_table(&conn).await?;
+        ensure_transcript_embedding_jobs_table(&conn).await?;
         // memory_embeddings is lazy-created on first upsert (dim is
         // provider-dependent and unknown here without provider).
         // TODO: ensure_episodes_table, ensure_sessions_table.
@@ -176,7 +182,32 @@ impl LanceStore {
 
         Ok(Self {
             conn: Arc::new(conn),
+            transcript_job_provider: Arc::new(std::sync::RwLock::new(None)),
         })
+    }
+
+    /// Configure the embedding provider id stamped on
+    /// `transcript_embedding_jobs.provider` rows enqueued by
+    /// [`Self::create_conversation_message`]. Called once during
+    /// startup (typically from `app.rs` right after
+    /// `Store::open_with_provider`). Until set, embed-eligible
+    /// transcript writes return [`StorageError::InvalidData`] —
+    /// failing loudly is preferable to silently writing with a
+    /// default that mismatches the worker's
+    /// `EmbeddingSettings::job_provider_id()`.
+    pub fn set_transcript_job_provider(&self, provider: impl Into<String>) {
+        *self
+            .transcript_job_provider
+            .write()
+            .expect("transcript_job_provider lock poisoned") = Some(provider.into());
+    }
+
+    /// Read the configured transcript-job provider id, if any.
+    pub(crate) fn transcript_job_provider(&self) -> Option<String> {
+        self.transcript_job_provider
+            .read()
+            .expect("transcript_job_provider lock poisoned")
+            .clone()
     }
 }
 
@@ -293,6 +324,15 @@ async fn ensure_entities_table(conn: &Connection) -> Result<(), StorageError> {
 
 async fn ensure_entity_aliases_table(conn: &Connection) -> Result<(), StorageError> {
     ensure_table(conn, "entity_aliases", entity_aliases_schema()).await
+}
+
+async fn ensure_transcript_embedding_jobs_table(conn: &Connection) -> Result<(), StorageError> {
+    ensure_table(
+        conn,
+        "transcript_embedding_jobs",
+        transcript_embedding_jobs_schema(),
+    )
+    .await
 }
 
 async fn ensure_conversation_messages_table(conn: &Connection) -> Result<(), StorageError> {
@@ -594,6 +634,132 @@ fn record_batch_to_embedding_job_rows(
             tenant: tenant.value(i).to_string(),
             memory_id: memory_id.value(i).to_string(),
             target_content_hash: target_content_hash.value(i).to_string(),
+            provider: provider.value(i).to_string(),
+            status: status.value(i).to_string(),
+            attempt_count: attempt_count.value(i),
+            last_error: if last_error.is_null(i) {
+                None
+            } else {
+                Some(last_error.value(i).to_string())
+            },
+            available_at: available_at.value(i).to_string(),
+            created_at: created_at.value(i).to_string(),
+            updated_at: updated_at.value(i).to_string(),
+        });
+    }
+    Ok(out)
+}
+
+/// Internal row representation for `transcript_embedding_jobs`.
+/// Mirrors `EmbeddingJobRow` (memories side) with `memory_id` →
+/// `message_block_id` and `target_content_hash` dropped (transcript
+/// blocks are immutable, so the row id IS the hash).
+#[derive(Debug, Clone)]
+struct TranscriptEmbeddingJobRow {
+    job_id: String,
+    tenant: String,
+    message_block_id: String,
+    provider: String,
+    status: String,
+    attempt_count: i64,
+    last_error: Option<String>,
+    available_at: String,
+    created_at: String,
+    updated_at: String,
+}
+
+/// Arrow schema for the `transcript_embedding_jobs` LanceDB table.
+/// 10 columns, scalar-only — same shape as `embedding_jobs` minus
+/// `target_content_hash`.
+fn transcript_embedding_jobs_schema() -> Schema {
+    Schema::new(vec![
+        Field::new("job_id", DataType::Utf8, false),
+        Field::new("tenant", DataType::Utf8, false),
+        Field::new("message_block_id", DataType::Utf8, false),
+        Field::new("provider", DataType::Utf8, false),
+        Field::new("status", DataType::Utf8, false),
+        Field::new("attempt_count", DataType::Int64, false),
+        Field::new("last_error", DataType::Utf8, true),
+        Field::new("available_at", DataType::Utf8, false),
+        Field::new("created_at", DataType::Utf8, false),
+        Field::new("updated_at", DataType::Utf8, false),
+    ])
+}
+
+fn transcript_embedding_job_row_to_record_batch(
+    row: &TranscriptEmbeddingJobRow,
+) -> Result<RecordBatch, StorageError> {
+    let mut job_id = StringBuilder::new();
+    let mut tenant = StringBuilder::new();
+    let mut message_block_id = StringBuilder::new();
+    let mut provider = StringBuilder::new();
+    let mut status = StringBuilder::new();
+    let mut attempt_count = Int64Builder::new();
+    let mut last_error = StringBuilder::new();
+    let mut available_at = StringBuilder::new();
+    let mut created_at = StringBuilder::new();
+    let mut updated_at = StringBuilder::new();
+    job_id.append_value(&row.job_id);
+    tenant.append_value(&row.tenant);
+    message_block_id.append_value(&row.message_block_id);
+    provider.append_value(&row.provider);
+    status.append_value(&row.status);
+    attempt_count.append_value(row.attempt_count);
+    match &row.last_error {
+        Some(s) => last_error.append_value(s),
+        None => last_error.append_null(),
+    }
+    available_at.append_value(&row.available_at);
+    created_at.append_value(&row.created_at);
+    updated_at.append_value(&row.updated_at);
+    let columns: Vec<Arc<dyn Array>> = vec![
+        Arc::new(job_id.finish()),
+        Arc::new(tenant.finish()),
+        Arc::new(message_block_id.finish()),
+        Arc::new(provider.finish()),
+        Arc::new(status.finish()),
+        Arc::new(attempt_count.finish()),
+        Arc::new(last_error.finish()),
+        Arc::new(available_at.finish()),
+        Arc::new(created_at.finish()),
+        Arc::new(updated_at.finish()),
+    ];
+    RecordBatch::try_new(Arc::new(transcript_embedding_jobs_schema()), columns).map_err(|e| {
+        StorageError::InvalidInput(format!("transcript_embedding_job record batch: {e}"))
+    })
+}
+
+fn record_batch_to_transcript_embedding_job_rows(
+    batch: &RecordBatch,
+) -> Result<Vec<TranscriptEmbeddingJobRow>, StorageError> {
+    fn col<'a, T: 'static>(
+        batch: &'a RecordBatch,
+        name: &'static str,
+    ) -> Result<&'a T, StorageError> {
+        batch
+            .column_by_name(name)
+            .ok_or(StorageError::InvalidData("missing column"))?
+            .as_any()
+            .downcast_ref::<T>()
+            .ok_or(StorageError::InvalidData("column type mismatch"))
+    }
+    use arrow_array::Int64Array;
+    let job_id = col::<StringArray>(batch, "job_id")?;
+    let tenant = col::<StringArray>(batch, "tenant")?;
+    let message_block_id = col::<StringArray>(batch, "message_block_id")?;
+    let provider = col::<StringArray>(batch, "provider")?;
+    let status = col::<StringArray>(batch, "status")?;
+    let attempt_count = col::<Int64Array>(batch, "attempt_count")?;
+    let last_error = col::<StringArray>(batch, "last_error")?;
+    let available_at = col::<StringArray>(batch, "available_at")?;
+    let created_at = col::<StringArray>(batch, "created_at")?;
+    let updated_at = col::<StringArray>(batch, "updated_at")?;
+    let mut out = Vec::with_capacity(batch.num_rows());
+    for i in 0..batch.num_rows() {
+        out.push(TranscriptEmbeddingJobRow {
+            job_id: job_id.value(i).to_string(),
+            tenant: tenant.value(i).to_string(),
+            message_block_id: message_block_id.value(i).to_string(),
             provider: provider.value(i).to_string(),
             status: status.value(i).to_string(),
             attempt_count: attempt_count.value(i),
@@ -1323,6 +1489,247 @@ impl LanceStore {
             out.extend(record_batch_to_embedding_job_rows(b)?);
         }
         Ok(out)
+    }
+
+    /// Counterpart of `query_embedding_jobs` for the transcript queue.
+    async fn query_transcript_embedding_jobs(
+        &self,
+        filter: String,
+    ) -> Result<Vec<TranscriptEmbeddingJobRow>, StorageError> {
+        let table = self
+            .conn
+            .open_table("transcript_embedding_jobs")
+            .execute()
+            .await
+            .map_err(lancedb_err)?;
+        let stream = table
+            .query()
+            .only_if(filter)
+            .execute()
+            .await
+            .map_err(lancedb_err)?;
+        let batches: Vec<RecordBatch> = stream
+            .try_collect()
+            .await
+            .map_err(|e| StorageError::InvalidInput(format!("lancedb stream: {e}")))?;
+        let mut out = Vec::new();
+        for b in &batches {
+            out.extend(record_batch_to_transcript_embedding_job_rows(b)?);
+        }
+        Ok(out)
+    }
+}
+
+/// Transcript embedding queue methods. Mirror the memories-side
+/// queue (`try_enqueue_embedding_job` etc.) with `memory_id` →
+/// `message_block_id` and `target_content_hash` dropped (transcript
+/// blocks are immutable). All inherent on `LanceStore` — they're
+/// not part of the trait surface (which never abstracted the
+/// transcript queue).
+impl LanceStore {
+    /// Enqueue a `pending` row in `transcript_embedding_jobs`.
+    /// Internal: `create_conversation_message` calls this when
+    /// `embed_eligible == true`. No idempotency check — the
+    /// underlying `conversation_messages` insert is itself
+    /// idempotent on (transcript_path, line_number, block_index)
+    /// and only enqueues on a fresh insert, so duplicate jobs can't
+    /// be produced from this code path.
+    pub async fn try_enqueue_transcript_embedding_job(
+        &self,
+        job_id: String,
+        tenant: String,
+        message_block_id: String,
+        provider: String,
+        now: String,
+    ) -> Result<(), StorageError> {
+        let table = self
+            .conn
+            .open_table("transcript_embedding_jobs")
+            .execute()
+            .await
+            .map_err(lancedb_err)?;
+        let row = TranscriptEmbeddingJobRow {
+            job_id,
+            tenant,
+            message_block_id,
+            provider,
+            status: "pending".to_string(),
+            attempt_count: 0,
+            last_error: None,
+            available_at: now.clone(),
+            created_at: now.clone(),
+            updated_at: now,
+        };
+        let batch = transcript_embedding_job_row_to_record_batch(&row)?;
+        table.add(batch).execute().await.map_err(lancedb_err)?;
+        Ok(())
+    }
+
+    /// Mirror of `claim_next_n_embedding_jobs` for the transcript
+    /// queue. Eligible rows are `pending` or `failed` with
+    /// `attempt_count < max_retries`, ordered `(available_at,
+    /// created_at) ASC`. Each successful claim flips status to
+    /// `processing` via optimistic UPDATE (skip if a racer beat us).
+    pub async fn claim_next_n_transcript_embedding_jobs(
+        &self,
+        now: &str,
+        max_retries: u32,
+        n: usize,
+    ) -> Result<Vec<ClaimedTranscriptEmbeddingJob>, StorageError> {
+        if n == 0 {
+            return Ok(vec![]);
+        }
+        let max_r = i64::from(max_retries);
+        let filter = format!(
+            "available_at <= {} AND (status = 'pending' OR (status = 'failed' AND attempt_count < {}))",
+            sql_quote(now),
+            max_r,
+        );
+        let mut rows = self.query_transcript_embedding_jobs(filter).await?;
+        rows.sort_by(|a, b| {
+            a.available_at
+                .cmp(&b.available_at)
+                .then_with(|| a.created_at.cmp(&b.created_at))
+        });
+        rows.truncate(n);
+        if rows.is_empty() {
+            return Ok(vec![]);
+        }
+
+        let table = self
+            .conn
+            .open_table("transcript_embedding_jobs")
+            .execute()
+            .await
+            .map_err(lancedb_err)?;
+        let mut claimed = Vec::with_capacity(rows.len());
+        for r in rows {
+            let result = table
+                .update()
+                .only_if(format!(
+                    "job_id = {} AND (status = 'pending' OR (status = 'failed' AND attempt_count < {}))",
+                    sql_quote(&r.job_id),
+                    max_r,
+                ))
+                .column("status", "'processing'")
+                .column("updated_at", sql_quote(now))
+                .execute()
+                .await
+                .map_err(lancedb_err)?;
+            if result.rows_updated == 0 {
+                continue;
+            }
+            claimed.push(ClaimedTranscriptEmbeddingJob {
+                job_id: r.job_id,
+                tenant: r.tenant,
+                message_block_id: r.message_block_id,
+                provider: r.provider,
+                attempt_count: r.attempt_count,
+            });
+        }
+        Ok(claimed)
+    }
+
+    pub async fn complete_transcript_embedding_job(
+        &self,
+        job_id: &str,
+        now: &str,
+    ) -> Result<(), StorageError> {
+        let table = self
+            .conn
+            .open_table("transcript_embedding_jobs")
+            .execute()
+            .await
+            .map_err(lancedb_err)?;
+        table
+            .update()
+            .only_if(format!(
+                "job_id = {} AND status = 'processing'",
+                sql_quote(job_id),
+            ))
+            .column("status", "'completed'")
+            .column("last_error", "CAST(NULL AS string)")
+            .column("updated_at", sql_quote(now))
+            .execute()
+            .await
+            .map_err(lancedb_err)?;
+        Ok(())
+    }
+
+    pub async fn mark_transcript_embedding_job_stale(
+        &self,
+        job_id: &str,
+        now: &str,
+    ) -> Result<(), StorageError> {
+        let table = self
+            .conn
+            .open_table("transcript_embedding_jobs")
+            .execute()
+            .await
+            .map_err(lancedb_err)?;
+        table
+            .update()
+            .only_if(format!("job_id = {}", sql_quote(job_id)))
+            .column("status", "'stale'")
+            .column("updated_at", sql_quote(now))
+            .execute()
+            .await
+            .map_err(lancedb_err)?;
+        Ok(())
+    }
+
+    pub async fn reschedule_transcript_embedding_job_failure(
+        &self,
+        job_id: &str,
+        new_attempt_count: i64,
+        last_error: &str,
+        available_at: &str,
+        now: &str,
+    ) -> Result<(), StorageError> {
+        let table = self
+            .conn
+            .open_table("transcript_embedding_jobs")
+            .execute()
+            .await
+            .map_err(lancedb_err)?;
+        table
+            .update()
+            .only_if(format!("job_id = {}", sql_quote(job_id)))
+            .column("status", "'failed'")
+            .column("attempt_count", new_attempt_count.to_string())
+            .column("last_error", sql_quote(last_error))
+            .column("available_at", sql_quote(available_at))
+            .column("updated_at", sql_quote(now))
+            .execute()
+            .await
+            .map_err(lancedb_err)?;
+        Ok(())
+    }
+
+    pub async fn permanently_fail_transcript_embedding_job(
+        &self,
+        job_id: &str,
+        new_attempt_count: i64,
+        last_error: &str,
+        now: &str,
+    ) -> Result<(), StorageError> {
+        let table = self
+            .conn
+            .open_table("transcript_embedding_jobs")
+            .execute()
+            .await
+            .map_err(lancedb_err)?;
+        table
+            .update()
+            .only_if(format!("job_id = {}", sql_quote(job_id)))
+            .column("status", "'failed'")
+            .column("attempt_count", new_attempt_count.to_string())
+            .column("last_error", sql_quote(last_error))
+            .column("updated_at", sql_quote(now))
+            .execute()
+            .await
+            .map_err(lancedb_err)?;
+        Ok(())
     }
 }
 
@@ -2422,12 +2829,10 @@ impl TranscriptRepository for LanceStore {
         msg: &ConversationMessage,
     ) -> Result<(), StorageError> {
         // Idempotent on (transcript_path, line_number, block_index).
-        // Note: the DuckDB impl also enqueues a transcript_embedding_jobs
-        // row when the message is embed_eligible. The LanceDB backend
-        // doesn't carry that table yet (transcript_embedding_jobs is
-        // currently DuckDB-specific via methods outside this trait). If
-        // we wire the transcript embedding worker for LanceDB later, the
-        // enqueue will land here.
+        // When the row is freshly written and `embed_eligible`, also
+        // enqueue a transcript_embedding_jobs row so the worker
+        // picks it up. Idempotent re-inserts (existing row) skip
+        // enqueue, matching the DuckDB-as-storage contract.
         let table = self
             .conn
             .open_table("conversation_messages")
@@ -2448,6 +2853,29 @@ impl TranscriptRepository for LanceStore {
         }
         let batch = conversation_message_to_record_batch(msg)?;
         table.add(batch).execute().await.map_err(lancedb_err)?;
+
+        if msg.embed_eligible {
+            // Provider id is configured once at startup via
+            // `set_transcript_job_provider`. Failing loudly here is
+            // preferable to silently substituting a default that
+            // would later mismatch the worker's `job_provider_id()`.
+            let provider = self
+                .transcript_job_provider()
+                .ok_or(StorageError::InvalidData(
+                    "transcript embedding job provider not configured; \
+                     call LanceStore::set_transcript_job_provider during startup",
+                ))?;
+            let job_id = uuid::Uuid::now_v7().to_string();
+            let now = crate::storage::current_timestamp();
+            self.try_enqueue_transcript_embedding_job(
+                job_id,
+                msg.tenant.clone(),
+                msg.message_block_id.clone(),
+                provider,
+                now,
+            )
+            .await?;
+        }
         Ok(())
     }
 

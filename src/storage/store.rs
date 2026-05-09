@@ -53,9 +53,9 @@ use std::sync::Arc;
 use super::duckdb_query::DuckDbQuery;
 use super::lance_store::LanceStore;
 use super::{
-    ClaimedEmbeddingJob, ContextWindow, EmbeddingJobInsert, EntityRegistry, FeedbackEvent,
-    GraphError, GraphStore as GraphStoreTrait, MemoryRepository, StorageError,
-    TranscriptRepository, TranscriptSessionSummary,
+    ClaimedEmbeddingJob, ClaimedTranscriptEmbeddingJob, ContextWindow, EmbeddingJobInsert,
+    EntityRegistry, FeedbackEvent, GraphError, GraphStore as GraphStoreTrait, MemoryRepository,
+    StorageError, TranscriptRepository, TranscriptSessionSummary,
 };
 use crate::domain::embeddings::EmbeddingJobInfo;
 use crate::domain::episode::EpisodeRecord;
@@ -590,11 +590,103 @@ impl Store {
 
 // ── Transcript writes (LanceStore + refresh) ────────────────────────
 impl Store {
+    /// Configure the embedding-provider id stamped on
+    /// `transcript_embedding_jobs.provider` rows enqueued by
+    /// [`Self::create_conversation_message`]. Called once during
+    /// startup (typically from `app.rs` right after `Store::open*`),
+    /// before any transcript writes. Until set, embed-eligible
+    /// transcript writes return `StorageError::InvalidData`.
+    pub fn set_transcript_job_provider(&self, provider: impl Into<String>) {
+        self.lance.set_transcript_job_provider(provider);
+    }
+
     pub async fn create_conversation_message(
         &self,
         msg: &ConversationMessage,
     ) -> Result<(), StorageError> {
         lance_write_then_refresh!(self, self.lance.create_conversation_message(msg).await)
+    }
+
+    pub async fn claim_next_n_transcript_embedding_jobs(
+        &self,
+        now: &str,
+        max_retries: u32,
+        n: usize,
+    ) -> Result<Vec<ClaimedTranscriptEmbeddingJob>, StorageError> {
+        lance_write_then_refresh!(
+            self,
+            self.lance
+                .claim_next_n_transcript_embedding_jobs(now, max_retries, n)
+                .await
+        )
+    }
+
+    pub async fn complete_transcript_embedding_job(
+        &self,
+        job_id: &str,
+        now: &str,
+    ) -> Result<(), StorageError> {
+        lance_write_then_refresh!(
+            self,
+            self.lance
+                .complete_transcript_embedding_job(job_id, now)
+                .await
+        )
+    }
+
+    pub async fn mark_transcript_embedding_job_stale(
+        &self,
+        job_id: &str,
+        now: &str,
+    ) -> Result<(), StorageError> {
+        lance_write_then_refresh!(
+            self,
+            self.lance
+                .mark_transcript_embedding_job_stale(job_id, now)
+                .await
+        )
+    }
+
+    pub async fn reschedule_transcript_embedding_job_failure(
+        &self,
+        job_id: &str,
+        new_attempt_count: i64,
+        last_error: &str,
+        available_at: &str,
+        now: &str,
+    ) -> Result<(), StorageError> {
+        lance_write_then_refresh!(
+            self,
+            self.lance
+                .reschedule_transcript_embedding_job_failure(
+                    job_id,
+                    new_attempt_count,
+                    last_error,
+                    available_at,
+                    now,
+                )
+                .await
+        )
+    }
+
+    pub async fn permanently_fail_transcript_embedding_job(
+        &self,
+        job_id: &str,
+        new_attempt_count: i64,
+        last_error: &str,
+        now: &str,
+    ) -> Result<(), StorageError> {
+        lance_write_then_refresh!(
+            self,
+            self.lance
+                .permanently_fail_transcript_embedding_job(
+                    job_id,
+                    new_attempt_count,
+                    last_error,
+                    now
+                )
+                .await
+        )
     }
 }
 
@@ -989,5 +1081,183 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(prov_after.decay_score, 0.0);
+    }
+
+    fn cm(
+        id: &str,
+        tenant: &str,
+        line: u64,
+        block_idx: u32,
+        embed_eligible: bool,
+        created_at: &str,
+    ) -> ConversationMessage {
+        use crate::domain::{BlockType, MessageRole};
+        ConversationMessage {
+            message_block_id: id.into(),
+            session_id: Some("sess".into()),
+            tenant: tenant.into(),
+            caller_agent: "claude-code".into(),
+            transcript_path: format!("/tmp/{id}.jsonl"),
+            line_number: line,
+            block_index: block_idx,
+            message_uuid: None,
+            role: MessageRole::Assistant,
+            block_type: if embed_eligible {
+                BlockType::Text
+            } else {
+                BlockType::ToolUse
+            },
+            content: "block content".into(),
+            tool_name: None,
+            tool_use_id: None,
+            embed_eligible,
+            created_at: created_at.into(),
+        }
+    }
+
+    /// Transcript embedding queue end-to-end via `Store`:
+    ///   - create_conversation_message with embed_eligible=true
+    ///     enqueues a transcript_embedding_jobs row.
+    ///   - tool_use blocks (embed_eligible=false) don't enqueue.
+    ///   - claim → status='processing', returned job has the right
+    ///     fields.
+    ///   - complete clears it; reschedule + claim picks it back up
+    ///     with bumped attempt_count.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn store_transcript_embedding_queue_round_trip() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("store");
+        let store = Store::open(&path).await.unwrap();
+        store.set_transcript_job_provider("fake-test-model");
+
+        // Eligible block → job enqueued.
+        let m1 = cm("blk_e1", "tenant-a", 10, 0, true, "00000001778000000010");
+        store.create_conversation_message(&m1).await.unwrap();
+
+        // Tool-use block → no job enqueued.
+        let m2 = cm("blk_e2", "tenant-a", 12, 0, false, "00000001778000000020");
+        store.create_conversation_message(&m2).await.unwrap();
+
+        // Idempotent re-create on the same (path, line, idx) does
+        // not re-enqueue. The natural-key uniqueness check is on
+        // (transcript_path, line_number, block_index), so we have
+        // to override transcript_path on the dup explicitly (the
+        // `cm` helper derives it from id).
+        let mut m1_dup = cm(
+            "blk_e1_dup",
+            "tenant-a",
+            10,
+            0,
+            true,
+            "00000001778000000011",
+        );
+        m1_dup.transcript_path = m1.transcript_path.clone();
+        store.create_conversation_message(&m1_dup).await.unwrap();
+
+        // Claim 5 → only 1 should be there (blk_e1's job).
+        let claimed = store
+            .claim_next_n_transcript_embedding_jobs("99999999999999999999", 5, 5)
+            .await
+            .unwrap();
+        assert_eq!(claimed.len(), 1, "got {claimed:?}");
+        assert_eq!(claimed[0].message_block_id, "blk_e1");
+        assert_eq!(claimed[0].provider, "fake-test-model");
+        assert_eq!(claimed[0].attempt_count, 0);
+
+        // Re-claim returns nothing.
+        let recl = store
+            .claim_next_n_transcript_embedding_jobs("99999999999999999999", 5, 5)
+            .await
+            .unwrap();
+        assert!(recl.is_empty());
+
+        // Reschedule pushes it back to failed → re-claim with budget.
+        store
+            .reschedule_transcript_embedding_job_failure(
+                &claimed[0].job_id,
+                1,
+                "transient",
+                "00000001778000020000",
+                "00000001778000020000",
+            )
+            .await
+            .unwrap();
+        let now2 = "99999999999999999999";
+        let recl2 = store
+            .claim_next_n_transcript_embedding_jobs(now2, 3, 5)
+            .await
+            .unwrap();
+        assert_eq!(recl2.len(), 1);
+        assert_eq!(recl2[0].attempt_count, 1);
+
+        // Complete it.
+        store
+            .complete_transcript_embedding_job(&recl2[0].job_id, "00000001778000040000")
+            .await
+            .unwrap();
+        let recl3 = store
+            .claim_next_n_transcript_embedding_jobs(now2, 3, 5)
+            .await
+            .unwrap();
+        assert!(recl3.is_empty(), "completed jobs are not re-claimable");
+
+        // Permanently fail / mark stale exercised on a fresh seed
+        // for symmetry with the memory-side test.
+        let m3 = cm("blk_e3", "tenant-a", 14, 0, true, "00000001778000050000");
+        store.create_conversation_message(&m3).await.unwrap();
+        let claim3 = store
+            .claim_next_n_transcript_embedding_jobs("99999999999999999999", 5, 5)
+            .await
+            .unwrap();
+        assert_eq!(claim3.len(), 1);
+        store
+            .mark_transcript_embedding_job_stale(&claim3[0].job_id, "00000001778000070000")
+            .await
+            .unwrap();
+        // Stale rows are not re-claimable.
+        let claim4 = store
+            .claim_next_n_transcript_embedding_jobs("99999999999999999999", 5, 5)
+            .await
+            .unwrap();
+        assert!(claim4.is_empty());
+
+        // permanently_fail bumps attempt_count past budget so future
+        // claims with the same budget skip the row.
+        let m4 = cm("blk_e4", "tenant-a", 16, 0, true, "00000001778000090000");
+        store.create_conversation_message(&m4).await.unwrap();
+        let claim5 = store
+            .claim_next_n_transcript_embedding_jobs("99999999999999999999", 5, 5)
+            .await
+            .unwrap();
+        assert_eq!(claim5.len(), 1);
+        store
+            .permanently_fail_transcript_embedding_job(
+                &claim5[0].job_id,
+                10,
+                "boom",
+                "00000001778000110000",
+            )
+            .await
+            .unwrap();
+        let claim6 = store
+            .claim_next_n_transcript_embedding_jobs("99999999999999999999", 5, 5)
+            .await
+            .unwrap();
+        assert!(claim6.is_empty());
+    }
+
+    /// Embed-eligible message inserted while no provider is
+    /// configured → `InvalidData`. The `set_transcript_job_provider`
+    /// call must precede the first eligible write.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn store_transcript_eligible_without_provider_errs() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("store");
+        let store = Store::open(&path).await.unwrap();
+        // intentionally do NOT call set_transcript_job_provider
+
+        let m = cm("blk", "tenant-a", 1, 0, true, "00000001778000000000");
+        let err = store.create_conversation_message(&m).await.unwrap_err();
+        assert!(matches!(err, StorageError::InvalidData(_)), "got {err:?}");
     }
 }
