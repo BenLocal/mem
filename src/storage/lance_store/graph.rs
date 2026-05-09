@@ -180,3 +180,98 @@ impl LanceStore {
         Ok(out)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::domain::memory::GraphEdge;
+    use tempfile::tempdir;
+
+    /// neighbors → close_edges_for_memory → related_memory_ids.
+    #[tokio::test]
+    pub async fn lancedb_graph_store_round_trip() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("lance.store");
+        let repo = LanceStore::open(&path).await.unwrap();
+
+        let edges = vec![
+            GraphEdge {
+                from_node_id: "memory:m1".into(),
+                to_node_id: "entity:e1".into(),
+                relation: "mentions".into(),
+                valid_from: "00000001778000000000".into(),
+                valid_to: None,
+            },
+            GraphEdge {
+                from_node_id: "memory:m2".into(),
+                to_node_id: "entity:e1".into(),
+                relation: "mentions".into(),
+                valid_from: "00000001778000000000".into(),
+                valid_to: None,
+            },
+            GraphEdge {
+                from_node_id: "memory:m1".into(),
+                to_node_id: "entity:e2".into(),
+                relation: "discusses".into(),
+                valid_from: "00000001778000000000".into(),
+                valid_to: None,
+            },
+        ];
+        repo.sync_memory_edges(&edges, "00000001778000010000")
+            .await
+            .unwrap();
+        // Idempotent: re-sync same edges → no duplicates.
+        repo.sync_memory_edges(&edges, "00000001778000020000")
+            .await
+            .unwrap();
+        let after_dup_sync = repo.neighbors("entity:e1").await.unwrap();
+        assert_eq!(
+            after_dup_sync.len(),
+            2,
+            "duplicate sync should not create new rows"
+        );
+
+        // neighbors at e1: 2 active edges (m1, m2 both 'mentions')
+        let n_e1 = repo.neighbors("entity:e1").await.unwrap();
+        assert_eq!(n_e1.len(), 2);
+        // ordered by relation,from,to — mentions/m1, mentions/m2
+        assert_eq!(n_e1[0].from_node_id, "memory:m1");
+        assert_eq!(n_e1[1].from_node_id, "memory:m2");
+
+        // related_memory_ids for [e1, e2]: should give {m1, m2}.
+        let related = repo
+            .related_memory_ids(&["entity:e1".into(), "entity:e2".into()])
+            .await
+            .unwrap();
+        assert_eq!(related, vec!["m1".to_string(), "m2".to_string()]);
+
+        // Close all edges from m1 (mentions e1 + discusses e2).
+        let closed = repo.close_edges_for_memory("m1").await.unwrap();
+        assert_eq!(closed, 2);
+
+        // After close, neighbors(e1) drops to just m2's edge.
+        let n_after = repo.neighbors("entity:e1").await.unwrap();
+        assert_eq!(n_after.len(), 1);
+        assert_eq!(n_after[0].from_node_id, "memory:m2");
+
+        // related_memory_ids reflects the close — m1 is gone.
+        let related2 = repo
+            .related_memory_ids(&["entity:e1".into(), "entity:e2".into()])
+            .await
+            .unwrap();
+        assert_eq!(related2, vec!["m2".to_string()]);
+
+        // close on a memory with no active edges → 0.
+        let zero = repo.close_edges_for_memory("nope").await.unwrap();
+        assert_eq!(zero, 0);
+
+        // Empty input edge list → no-op (no errors).
+        repo.sync_memory_edges(&[], "00000001778000030000")
+            .await
+            .unwrap();
+
+        // Empty input node_ids → empty Vec.
+        let empty = repo.related_memory_ids(&[]).await.unwrap();
+        assert!(empty.is_empty());
+    }
+}

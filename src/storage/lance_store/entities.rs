@@ -277,3 +277,137 @@ impl LanceStore {
         Ok(entities)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::domain::AddAliasOutcome;
+    use tempfile::tempdir;
+
+    /// lookup_alias, list_entities (kind + LIKE filters).
+    #[tokio::test]
+    pub async fn lancedb_entity_registry_round_trip() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("lance.store");
+        let repo = LanceStore::open(&path).await.unwrap();
+
+        let id1 = repo
+            .resolve_or_create(
+                "tenant-a",
+                "Rust Async",
+                EntityKind::Topic,
+                "00000001778000000000",
+            )
+            .await
+            .unwrap();
+        // Same alias under different casing/whitespace → same entity.
+        let id1b = repo
+            .resolve_or_create(
+                "tenant-a",
+                "  rust   ASYNC  ",
+                EntityKind::Topic,
+                "00000001778000000001",
+            )
+            .await
+            .unwrap();
+        assert_eq!(id1, id1b, "normalized alias must round-trip to same entity");
+
+        let id2 = repo
+            .resolve_or_create(
+                "tenant-a",
+                "DuckDB",
+                EntityKind::Project,
+                "00000001778000000002",
+            )
+            .await
+            .unwrap();
+        assert_ne!(id1, id2);
+
+        // Different tenant, same alias → distinct entity.
+        let id3 = repo
+            .resolve_or_create(
+                "tenant-b",
+                "Rust Async",
+                EntityKind::Topic,
+                "00000001778000000003",
+            )
+            .await
+            .unwrap();
+        assert_ne!(id1, id3);
+
+        let with_aliases = repo
+            .get_entity("tenant-a", &id1)
+            .await
+            .unwrap()
+            .expect("entity should exist");
+        assert_eq!(with_aliases.entity.canonical_name, "Rust Async");
+        assert_eq!(with_aliases.entity.kind, EntityKind::Topic);
+        assert_eq!(with_aliases.aliases, vec!["rust async".to_string()]);
+
+        let none = repo.get_entity("tenant-a", "does-not-exist").await.unwrap();
+        assert!(none.is_none());
+
+        // add_alias: new alias on same entity → Inserted.
+        let r1 = repo
+            .add_alias("tenant-a", &id1, "Tokio", "00000001778000000010")
+            .await
+            .unwrap();
+        assert_eq!(r1, AddAliasOutcome::Inserted);
+
+        // Same alias re-added → AlreadyOnSameEntity (idempotent).
+        let r2 = repo
+            .add_alias("tenant-a", &id1, "tokio", "00000001778000000011")
+            .await
+            .unwrap();
+        assert_eq!(r2, AddAliasOutcome::AlreadyOnSameEntity);
+
+        // Different entity claiming the same alias → Conflict.
+        let r3 = repo
+            .add_alias("tenant-a", &id2, "Tokio", "00000001778000000012")
+            .await
+            .unwrap();
+        assert_eq!(
+            r3,
+            AddAliasOutcome::ConflictWithDifferentEntity(id1.clone())
+        );
+
+        // lookup_alias short-circuit.
+        let look = repo.lookup_alias("tenant-a", "Rust Async").await.unwrap();
+        assert_eq!(look.as_deref(), Some(id1.as_str()));
+        let look_none = repo.lookup_alias("tenant-a", "unknown").await.unwrap();
+        assert!(look_none.is_none());
+
+        // list_entities: tenant-a has 2 entities, ORDER BY created_at DESC.
+        let all_a = repo
+            .list_entities("tenant-a", None, None, 10)
+            .await
+            .unwrap();
+        assert_eq!(all_a.len(), 2);
+        assert_eq!(all_a[0].entity_id, id2);
+        assert_eq!(all_a[1].entity_id, id1);
+
+        // kind filter.
+        let topics = repo
+            .list_entities("tenant-a", Some(EntityKind::Topic), None, 10)
+            .await
+            .unwrap();
+        assert_eq!(topics.len(), 1);
+        assert_eq!(topics[0].entity_id, id1);
+
+        // LIKE filter on canonical_name.
+        let like = repo
+            .list_entities("tenant-a", None, Some("Rust"), 10)
+            .await
+            .unwrap();
+        assert_eq!(like.len(), 1);
+        assert_eq!(like[0].canonical_name, "Rust Async");
+
+        // tenant-b has just the cross-tenant duplicate.
+        let all_b = repo
+            .list_entities("tenant-b", None, None, 10)
+            .await
+            .unwrap();
+        assert_eq!(all_b.len(), 1);
+        assert_eq!(all_b[0].entity_id, id3);
+    }
+}

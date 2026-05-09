@@ -775,3 +775,283 @@ impl LanceStore {
         Ok(out)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::domain::{BlockType, ConversationMessage, MessageRole};
+    use tempfile::tempdir;
+
+    fn msg(
+        id: &str,
+        tenant: &str,
+        session: Option<&str>,
+        line: u64,
+        block_idx: u32,
+        block_type: BlockType,
+        content: &str,
+        created_at: &str,
+    ) -> ConversationMessage {
+        ConversationMessage {
+            message_block_id: id.into(),
+            session_id: session.map(String::from),
+            tenant: tenant.into(),
+            caller_agent: "claude-code".into(),
+            transcript_path: format!("/tmp/{id}.jsonl"),
+            line_number: line,
+            block_index: block_idx,
+            message_uuid: None,
+            role: MessageRole::Assistant,
+            block_type,
+            content: content.into(),
+            tool_name: None,
+            tool_use_id: None,
+            embed_eligible: matches!(block_type, BlockType::Text | BlockType::Thinking),
+            created_at: created_at.into(),
+        }
+    }
+
+    /// recent_conversation_messages → bm25_transcript_candidates.
+    #[tokio::test]
+    pub async fn lancedb_transcript_repository_round_trip() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("lance.store");
+        let repo = LanceStore::open(&path).await.unwrap();
+        // Required because `create_conversation_message` now enqueues
+        // a transcript_embedding_jobs row when the message is
+        // embed_eligible — the enqueue stamps `provider`, which must
+        // be configured up front.
+        repo.set_transcript_job_provider("fake-test");
+
+        // 4 blocks, 2 sessions × 2 tenants.
+        let m1 = msg(
+            "blk_1",
+            "tenant-a",
+            Some("sess_a"),
+            10,
+            0,
+            BlockType::Text,
+            "DuckDB single mutex serializes writes",
+            "00000001778000000010",
+        );
+        let m2 = msg(
+            "blk_2",
+            "tenant-a",
+            Some("sess_a"),
+            12,
+            0,
+            BlockType::ToolUse,
+            "{\"tool\":\"Bash\"}",
+            "00000001778000000020",
+        );
+        let m3 = msg(
+            "blk_3",
+            "tenant-a",
+            Some("sess_a"),
+            14,
+            0,
+            BlockType::Thinking,
+            "let's switch to LanceDB native FTS",
+            "00000001778000000030",
+        );
+        let m4 = msg(
+            "blk_4",
+            "tenant-b",
+            Some("sess_b"),
+            5,
+            0,
+            BlockType::Text,
+            "another tenant transcript",
+            "00000001778000000040",
+        );
+
+        for m in [&m1, &m2, &m3, &m4] {
+            repo.create_conversation_message(m).await.unwrap();
+        }
+        // Idempotent re-create — same (transcript_path, line, idx) is a no-op.
+        repo.create_conversation_message(&m1).await.unwrap();
+
+        // get_by_session: 3 blocks for sess_a, ordered ASC by
+        // (created_at, line_number, block_index).
+        let sess_a = repo
+            .get_conversation_messages_by_session("tenant-a", "sess_a")
+            .await
+            .unwrap();
+        assert_eq!(sess_a.len(), 3, "got {sess_a:?}");
+        assert_eq!(sess_a[0].message_block_id, "blk_1");
+        assert_eq!(sess_a[1].message_block_id, "blk_2");
+        assert_eq!(sess_a[2].message_block_id, "blk_3");
+
+        // list_sessions: tenant-a has 1, tenant-b has 1.
+        let summaries_a = repo.list_transcript_sessions("tenant-a").await.unwrap();
+        assert_eq!(summaries_a.len(), 1);
+        assert_eq!(summaries_a[0].session_id, "sess_a");
+        assert_eq!(summaries_a[0].block_count, 3);
+        assert_eq!(summaries_a[0].first_at, "00000001778000000010");
+        assert_eq!(summaries_a[0].last_at, "00000001778000000030");
+        let summaries_b = repo.list_transcript_sessions("tenant-b").await.unwrap();
+        assert_eq!(summaries_b.len(), 1);
+        assert_eq!(summaries_b[0].session_id, "sess_b");
+
+        // fetch_by_ids: input-order preserving; missing ids dropped.
+        let by_ids = repo
+            .fetch_conversation_messages_by_ids(
+                "tenant-a",
+                &["blk_3".into(), "blk_1".into(), "missing".into()],
+            )
+            .await
+            .unwrap();
+        assert_eq!(by_ids.len(), 2);
+        assert_eq!(by_ids[0].message_block_id, "blk_3");
+        assert_eq!(by_ids[1].message_block_id, "blk_1");
+
+        // context_window for blk_2 (the tool_use middle block).
+        // include_tool_blocks=true → before=[blk_1], after=[blk_3].
+        let win_with = repo
+            .context_window_for_block("tenant-a", "blk_2", 5, 5, true)
+            .await
+            .unwrap();
+        assert_eq!(win_with.primary.message_block_id, "blk_2");
+        assert_eq!(win_with.before.len(), 1);
+        assert_eq!(win_with.before[0].message_block_id, "blk_1");
+        assert_eq!(win_with.after.len(), 1);
+        assert_eq!(win_with.after[0].message_block_id, "blk_3");
+
+        // include_tool_blocks=false on blk_2 itself: primary still
+        // returned, neighbors only contain text/thinking. blk_1 (text)
+        // before, blk_3 (thinking) after — both eligible.
+        let win_no = repo
+            .context_window_for_block("tenant-a", "blk_2", 5, 5, false)
+            .await
+            .unwrap();
+        assert_eq!(win_no.primary.message_block_id, "blk_2");
+        assert_eq!(win_no.before.len(), 1);
+        assert_eq!(win_no.after.len(), 1);
+
+        // context_window with k_before/k_after = 0 → empty windows.
+        let win_zero = repo
+            .context_window_for_block("tenant-a", "blk_2", 0, 0, true)
+            .await
+            .unwrap();
+        assert!(win_zero.before.is_empty());
+        assert!(win_zero.after.is_empty());
+
+        // context_window for unknown block → NotFound.
+        let nf = repo
+            .context_window_for_block("tenant-a", "does-not-exist", 5, 5, true)
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            nf,
+            StorageError::NotFound("transcript primary block")
+        ));
+
+        // anchor_session_candidates: embed_eligible only, DESC by created_at.
+        // sess_a has 2 eligible blocks (blk_1 text, blk_3 thinking) —
+        // blk_2 is tool_use → ineligible.
+        let anchors = repo
+            .anchor_session_candidates("tenant-a", "sess_a", 5)
+            .await
+            .unwrap();
+        assert_eq!(anchors.len(), 2);
+        assert_eq!(anchors[0], "blk_3"); // newest first
+        assert_eq!(anchors[1], "blk_1");
+        // k=0 → empty.
+        let z = repo
+            .anchor_session_candidates("tenant-a", "sess_a", 0)
+            .await
+            .unwrap();
+        assert!(z.is_empty());
+
+        // recent_conversation_messages: tenant-a embed_eligible only.
+        let recent = repo
+            .recent_conversation_messages("tenant-a", 10)
+            .await
+            .unwrap();
+        assert_eq!(recent.len(), 2);
+        assert_eq!(recent[0].message_block_id, "blk_3");
+        assert_eq!(recent[1].message_block_id, "blk_1");
+
+        // bm25_transcript_candidates: lazy FTS index, embed_eligible filter.
+        // "DuckDB" → matches blk_1 (text). "LanceDB" → blk_3 (thinking).
+        // tenant-b's matching block (if any) should be filtered out.
+        let bm25_duck = repo
+            .bm25_transcript_candidates("tenant-a", "DuckDB", 5)
+            .await
+            .unwrap();
+        let duck_ids: Vec<&str> = bm25_duck
+            .iter()
+            .map(|m| m.message_block_id.as_str())
+            .collect();
+        assert!(duck_ids.contains(&"blk_1"), "got {duck_ids:?}");
+        let bm25_lance = repo
+            .bm25_transcript_candidates("tenant-a", "LanceDB", 5)
+            .await
+            .unwrap();
+        let lance_ids: Vec<&str> = bm25_lance
+            .iter()
+            .map(|m| m.message_block_id.as_str())
+            .collect();
+        assert!(lance_ids.contains(&"blk_3"), "got {lance_ids:?}");
+
+        // empty query / k=0 short-circuits.
+        let empty1 = repo
+            .bm25_transcript_candidates("tenant-a", "", 5)
+            .await
+            .unwrap();
+        assert!(empty1.is_empty());
+        let empty2 = repo
+            .bm25_transcript_candidates("tenant-a", "anything", 0)
+            .await
+            .unwrap();
+        assert!(empty2.is_empty());
+
+        // get_paged: cursor + has_more.
+        let (page1, more1) = repo
+            .get_conversation_messages_by_session_paged("tenant-a", "sess_a", None, None, None, 2)
+            .await
+            .unwrap();
+        assert_eq!(page1.len(), 2);
+        assert!(more1);
+        assert_eq!(page1[0].message_block_id, "blk_1");
+        assert_eq!(page1[1].message_block_id, "blk_2");
+
+        let last = page1.last().unwrap();
+        let (page2, more2) = repo
+            .get_conversation_messages_by_session_paged(
+                "tenant-a",
+                "sess_a",
+                None,
+                None,
+                Some((
+                    last.created_at.as_str(),
+                    last.line_number as i64,
+                    last.block_index as i64,
+                )),
+                10,
+            )
+            .await
+            .unwrap();
+        assert_eq!(page2.len(), 1);
+        assert!(!more2);
+        assert_eq!(page2[0].message_block_id, "blk_3");
+
+        // since/until window narrows the query.
+        let (windowed, _) = repo
+            .get_conversation_messages_by_session_paged(
+                "tenant-a",
+                "sess_a",
+                Some("00000001778000000020"),
+                Some("00000001778000000031"),
+                None,
+                10,
+            )
+            .await
+            .unwrap();
+        let win_ids: Vec<&str> = windowed
+            .iter()
+            .map(|m| m.message_block_id.as_str())
+            .collect();
+        assert_eq!(win_ids, vec!["blk_2", "blk_3"]);
+    }
+}

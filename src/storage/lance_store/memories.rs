@@ -1216,3 +1216,735 @@ impl LanceStore {
         Ok(rows.into_iter().next().map(|r| r.status))
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::domain::memory::{MemoryStatus, MemoryType, Scope, Visibility};
+    use crate::storage::types::EmbeddingJobInsert;
+    use tempfile::tempdir;
+
+    fn fixture(memory_id: &str, tenant: &str) -> MemoryRecord {
+        MemoryRecord {
+            memory_id: memory_id.into(),
+            tenant: tenant.into(),
+            memory_type: MemoryType::Implementation,
+            status: MemoryStatus::Active,
+            scope: Scope::Project,
+            visibility: Visibility::Shared,
+            version: 1,
+            summary: "round-trip test".into(),
+            content: "use bun for fast installs".into(),
+            evidence: vec!["src/main.rs:42".into(), "Cargo.toml:11".into()],
+            code_refs: vec!["foo::bar()".into()],
+            project: Some("mem".into()),
+            repo: Some("mem".into()),
+            module: None,
+            task_type: None,
+            tags: vec!["tooling".into()],
+            topics: vec![],
+            confidence: 0.7,
+            decay_score: 0.0,
+            content_hash: "h".repeat(64),
+            idempotency_key: Some("idemp-1".into()),
+            session_id: None,
+            supersedes_memory_id: None,
+            source_agent: "test".into(),
+            created_at: "00000001778000000000".into(),
+            updated_at: "00000001778000000000".into(),
+            last_validated_at: None,
+        }
+    }
+
+    #[tokio::test]
+    pub async fn lancedb_insert_and_get_memory_round_trip() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("lance.store");
+        let repo = LanceStore::open(&path).await.expect("open lancedb store");
+
+        let memory = fixture("mem_lance_001", "tenant-a");
+        repo.insert_memory(memory.clone())
+            .await
+            .expect("insert_memory");
+
+        let got = repo
+            .get_memory_for_tenant("tenant-a", "mem_lance_001")
+            .await
+            .expect("get_memory_for_tenant")
+            .expect("memory should exist");
+
+        assert_eq!(got.memory_id, memory.memory_id);
+        assert_eq!(got.tenant, memory.tenant);
+        assert_eq!(got.memory_type, memory.memory_type);
+        assert_eq!(got.status, memory.status);
+        assert_eq!(got.summary, memory.summary);
+        assert_eq!(got.content, memory.content);
+        assert_eq!(got.evidence, memory.evidence);
+        assert_eq!(got.code_refs, memory.code_refs);
+        assert_eq!(got.project, memory.project);
+        assert_eq!(got.module, memory.module);
+        assert_eq!(got.tags, memory.tags);
+        assert_eq!(got.topics, memory.topics);
+        assert_eq!(got.confidence, memory.confidence);
+        assert_eq!(got.content_hash, memory.content_hash);
+        assert_eq!(got.idempotency_key, memory.idempotency_key);
+        assert_eq!(got.created_at, memory.created_at);
+        assert_eq!(got.updated_at, memory.updated_at);
+        assert_eq!(got.last_validated_at, memory.last_validated_at);
+
+        let missing = repo
+            .get_memory_for_tenant("tenant-a", "does-not-exist")
+            .await
+            .expect("missing query");
+        assert!(missing.is_none());
+
+        // Cross-tenant filter must not leak.
+        let wrong_tenant = repo
+            .get_memory_for_tenant("tenant-b", "mem_lance_001")
+            .await
+            .expect("cross-tenant query");
+        assert!(wrong_tenant.is_none());
+    }
+
+    /// Exercises the batch-impl filter methods (`list_memories_for_tenant`,
+    /// `list_memory_ids_for_tenant`, `find_by_idempotency_or_hash`,
+    /// `search_candidates`, `recent_active_memories`,
+    /// `fetch_memories_by_ids`, `list_pending_review`, `get_pending`,
+    /// `get_memory`).
+    #[tokio::test]
+    pub async fn lancedb_filter_methods_round_trip() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("lance.store");
+        let repo = LanceStore::open(&path).await.unwrap();
+
+        let mut a1 = fixture("mem_a_001", "tenant-a");
+        a1.idempotency_key = Some("idem-a-1".into());
+        let mut a2 = fixture("mem_a_002", "tenant-a");
+        a2.status = MemoryStatus::PendingConfirmation;
+        a2.content_hash = "h2".repeat(32);
+        let mut a3 = fixture("mem_a_003", "tenant-a");
+        a3.status = MemoryStatus::Archived;
+        let b1 = fixture("mem_b_001", "tenant-b");
+
+        for m in [&a1, &a2, &a3, &b1] {
+            repo.insert_memory(m.clone()).await.unwrap();
+        }
+
+        // list_memories_for_tenant
+        let a_all = repo.list_memories_for_tenant("tenant-a").await.unwrap();
+        assert_eq!(a_all.len(), 3);
+        let b_all = repo.list_memories_for_tenant("tenant-b").await.unwrap();
+        assert_eq!(b_all.len(), 1);
+
+        // list_memory_ids_for_tenant
+        let mut ids_a = repo.list_memory_ids_for_tenant("tenant-a").await.unwrap();
+        ids_a.sort();
+        assert_eq!(ids_a, vec!["mem_a_001", "mem_a_002", "mem_a_003"]);
+
+        // find_by_idempotency_or_hash — match via idempotency_key
+        let by_idem = repo
+            .find_by_idempotency_or_hash("tenant-a", &Some("idem-a-1".into()), "no-such-hash")
+            .await
+            .unwrap();
+        assert_eq!(by_idem.unwrap().memory_id, "mem_a_001");
+
+        // ... match via content_hash when no idempotency_key supplied
+        let by_hash = repo
+            .find_by_idempotency_or_hash("tenant-a", &None, &a2.content_hash)
+            .await
+            .unwrap();
+        assert_eq!(by_hash.unwrap().memory_id, "mem_a_002");
+
+        // search_candidates — drops `archived`
+        let cands = repo.search_candidates("tenant-a").await.unwrap();
+        let mut cand_ids: Vec<_> = cands.iter().map(|m| m.memory_id.clone()).collect();
+        cand_ids.sort();
+        assert_eq!(cand_ids, vec!["mem_a_001", "mem_a_002"]);
+
+        // recent_active_memories — same filter, with limit
+        let recent = repo.recent_active_memories("tenant-a", 1).await.unwrap();
+        assert_eq!(recent.len(), 1);
+
+        // fetch_memories_by_ids — IN clause
+        let by_ids = repo
+            .fetch_memories_by_ids("tenant-a", &["mem_a_001", "mem_a_002"])
+            .await
+            .unwrap();
+        assert_eq!(by_ids.len(), 2);
+        // Empty input — short-circuit, no query.
+        assert!(repo
+            .fetch_memories_by_ids("tenant-a", &[])
+            .await
+            .unwrap()
+            .is_empty());
+
+        // list_pending_review
+        let pending = repo.list_pending_review("tenant-a").await.unwrap();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].memory_id, "mem_a_002");
+
+        // get_pending — exact one
+        let p = repo.get_pending("tenant-a", "mem_a_002").await.unwrap();
+        assert_eq!(p.unwrap().memory_id, "mem_a_002");
+        // get_pending — wrong status returns None
+        let np = repo.get_pending("tenant-a", "mem_a_001").await.unwrap();
+        assert!(np.is_none());
+
+        // get_memory — cross-tenant (no tenant filter)
+        let cross = repo.get_memory("mem_b_001".into()).await.unwrap();
+        assert_eq!(cross.unwrap().tenant, "tenant-b");
+    }
+
+    /// Mutating-method round-trip: accept_pending, reject_pending,
+    /// replace_pending_with_successor, delete_memory_hard.
+    #[tokio::test]
+    pub async fn lancedb_mutating_methods_round_trip() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("lance.store");
+        let repo = LanceStore::open(&path).await.unwrap();
+
+        let mut p = fixture("mem_p", "tenant");
+        p.status = MemoryStatus::PendingConfirmation;
+        let mut q = fixture("mem_q", "tenant");
+        q.status = MemoryStatus::PendingConfirmation;
+        let r = fixture("mem_r", "tenant");
+        let s = fixture("mem_s", "tenant");
+        for m in [&p, &q, &r, &s] {
+            repo.insert_memory(m.clone()).await.unwrap();
+        }
+
+        // accept_pending → status active
+        let accepted = repo.accept_pending("tenant", "mem_p").await.unwrap();
+        assert_eq!(accepted.status, MemoryStatus::Active);
+        assert_eq!(accepted.memory_id, "mem_p");
+
+        // reject_pending → status rejected
+        let rejected = repo.reject_pending("tenant", "mem_q").await.unwrap();
+        assert_eq!(rejected.status, MemoryStatus::Rejected);
+
+        // After accept/reject, list_pending_review is empty
+        let pending = repo.list_pending_review("tenant").await.unwrap();
+        assert!(pending.is_empty());
+
+        // replace_pending_with_successor: archive r, insert successor
+        let mut succ = fixture("mem_r_v2", "tenant");
+        succ.supersedes_memory_id = Some("mem_r".into());
+        succ.version = 2;
+        let returned = repo
+            .replace_pending_with_successor("tenant", "mem_r", succ.clone())
+            .await
+            .unwrap();
+        assert_eq!(returned.memory_id, "mem_r_v2");
+        let archived = repo
+            .get_memory_for_tenant("tenant", "mem_r")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(archived.status, MemoryStatus::Archived);
+        let successor_row = repo
+            .get_memory_for_tenant("tenant", "mem_r_v2")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(successor_row.supersedes_memory_id, Some("mem_r".into()));
+        assert_eq!(successor_row.version, 2);
+
+        // delete_memory_hard
+        repo.delete_memory_hard("tenant", "mem_s").await.unwrap();
+        let gone = repo.get_memory_for_tenant("tenant", "mem_s").await.unwrap();
+        assert!(gone.is_none());
+
+        // delete on non-existent → NotFound-equivalent error
+        let err = repo
+            .delete_memory_hard("tenant", "does-not-exist")
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, StorageError::InvalidData("memory not found")),
+            "expected NotFound-equivalent, got {err:?}",
+        );
+    }
+
+    #[tokio::test]
+    pub async fn lancedb_feedback_round_trip() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("lance.store");
+        let repo = LanceStore::open(&path).await.unwrap();
+
+        let memory = fixture("mem_fb", "tenant");
+        repo.insert_memory(memory.clone()).await.unwrap();
+
+        // Apply 3 feedbacks of different kinds
+        let make = |kind: &str, ts: &str, suffix: &str| FeedbackEvent {
+            feedback_id: format!("fb_{suffix}"),
+            memory_id: memory.memory_id.clone(),
+            feedback_kind: kind.into(),
+            created_at: ts.into(),
+        };
+        let _ = repo
+            .apply_feedback(&memory, make("useful", "2026-05-08T01:00:00Z", "1"))
+            .await
+            .unwrap();
+        let after_useful = repo
+            .get_memory_for_tenant("tenant", "mem_fb")
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            after_useful.confidence > memory.confidence,
+            "useful must increase confidence: {} vs {}",
+            after_useful.confidence,
+            memory.confidence,
+        );
+        assert!(after_useful.last_validated_at.is_some());
+
+        let _ = repo
+            .apply_feedback(&after_useful, make("outdated", "2026-05-08T02:00:00Z", "2"))
+            .await
+            .unwrap();
+        let after_outdated = repo
+            .get_memory_for_tenant("tenant", "mem_fb")
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            after_outdated.decay_score > after_useful.decay_score,
+            "outdated must increase decay",
+        );
+
+        let _ = repo
+            .apply_feedback(
+                &after_outdated,
+                make("incorrect", "2026-05-08T03:00:00Z", "3"),
+            )
+            .await
+            .unwrap();
+        let after_incorrect = repo
+            .get_memory_for_tenant("tenant", "mem_fb")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            after_incorrect.status,
+            MemoryStatus::Archived,
+            "incorrect must archive",
+        );
+
+        // list_feedback_for_memory — sorted ASC by created_at
+        let events = repo.list_feedback_for_memory("mem_fb").await.unwrap();
+        let kinds: Vec<_> = events.iter().map(|e| e.feedback_kind.as_str()).collect();
+        assert_eq!(kinds, vec!["useful", "outdated", "incorrect"]);
+
+        // feedback_summary — counts per kind
+        let summary = repo.feedback_summary("mem_fb").await.unwrap();
+        assert_eq!(summary.total, 3);
+        assert_eq!(summary.useful, 1);
+        assert_eq!(summary.outdated, 1);
+        assert_eq!(summary.incorrect, 1);
+        assert_eq!(summary.applies_here, 0);
+        assert_eq!(summary.does_not_apply_here, 0);
+
+        // Empty feedback for a memory with none
+        let summary_none = repo.feedback_summary("never-feedback'd").await.unwrap();
+        assert_eq!(summary_none.total, 0);
+    }
+
+    /// `upsert_memory_embedding` + `semantic_search_memories` round-trip:
+    /// insert two memories, write their embeddings, search by a query
+    /// vector, expect both back in cosine-distance order with the closer
+    /// vector ranked first. Also exercises tenant prefilter and
+    /// `delete_memory_embedding`.
+    #[tokio::test(flavor = "multi_thread")]
+    pub async fn lancedb_embedding_round_trip() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("lance.store");
+        let repo = LanceStore::open(&path).await.unwrap();
+
+        // Two memories under "tenant-a", one under "tenant-b" (cross-tenant
+        // leak test).
+        let a1 = fixture("mem_emb_1", "tenant-a");
+        let a2 = fixture("mem_emb_2", "tenant-a");
+        let b1 = fixture("mem_emb_3", "tenant-b");
+        for m in [&a1, &a2, &b1] {
+            repo.insert_memory(m.clone()).await.unwrap();
+        }
+
+        // Hand-rolled 4-d unit vectors. q ≈ v1 (close), v2 different,
+        // v3 belongs to tenant-b and must not appear in tenant-a search.
+        fn to_blob(v: &[f32]) -> Vec<u8> {
+            let mut out = Vec::with_capacity(v.len() * 4);
+            for f in v {
+                out.extend_from_slice(&f.to_ne_bytes());
+            }
+            out
+        }
+        let v1 = vec![1.0_f32, 0.0, 0.0, 0.0];
+        let v2 = vec![0.0_f32, 1.0, 0.0, 0.0];
+        let v3 = vec![0.0_f32, 0.0, 1.0, 0.0];
+        repo.upsert_memory_embedding(
+            "mem_emb_1",
+            "tenant-a",
+            "fake-test",
+            4,
+            &to_blob(&v1),
+            "h1",
+            "00000001778000000000",
+            "00000001778000000000",
+        )
+        .await
+        .unwrap();
+        repo.upsert_memory_embedding(
+            "mem_emb_2",
+            "tenant-a",
+            "fake-test",
+            4,
+            &to_blob(&v2),
+            "h2",
+            "00000001778000000000",
+            "00000001778000000000",
+        )
+        .await
+        .unwrap();
+        repo.upsert_memory_embedding(
+            "mem_emb_3",
+            "tenant-b",
+            "fake-test",
+            4,
+            &to_blob(&v3),
+            "h3",
+            "00000001778000000000",
+            "00000001778000000000",
+        )
+        .await
+        .unwrap();
+
+        // Query close to v1 → mem_emb_1 should rank first; mem_emb_3
+        // (tenant-b) must be filtered out.
+        let q = vec![0.99_f32, 0.14, 0.0, 0.0]; // ≈ unit, close to v1
+        let hits = repo
+            .semantic_search_memories("tenant-a", &q, 10)
+            .await
+            .unwrap();
+        assert_eq!(hits.len(), 2, "tenant-a should have 2 hits, got {hits:?}");
+        assert_eq!(hits[0].0.memory_id, "mem_emb_1", "v1 should rank first");
+        assert_eq!(hits[1].0.memory_id, "mem_emb_2");
+        // similarity ∈ (0, 1] for close-but-not-identical normalized vecs;
+        // strictly greater than the v2 score.
+        assert!(hits[0].1 > hits[1].1);
+
+        // Upsert overwrite: re-write mem_emb_1 with v2 — now query close
+        // to v1 should rank mem_emb_2 first (because both rows now have
+        // v2-like vectors, but mem_emb_1 will be slightly off due to
+        // float roundtrip, so we just check the row count stays at 2).
+        repo.upsert_memory_embedding(
+            "mem_emb_1",
+            "tenant-a",
+            "fake-test",
+            4,
+            &to_blob(&v2),
+            "h1b",
+            "00000001778000000001",
+            "00000001778000000001",
+        )
+        .await
+        .unwrap();
+        let after_overwrite = repo
+            .semantic_search_memories("tenant-a", &q, 10)
+            .await
+            .unwrap();
+        assert_eq!(after_overwrite.len(), 2);
+
+        // delete_memory_embedding removes the row from the search corpus.
+        repo.delete_memory_embedding("mem_emb_2").await.unwrap();
+        let after_delete = repo
+            .semantic_search_memories("tenant-a", &q, 10)
+            .await
+            .unwrap();
+        assert_eq!(after_delete.len(), 1);
+        assert_eq!(after_delete[0].0.memory_id, "mem_emb_1");
+
+        // delete on no-row is a no-op (table exists but no matching row).
+        repo.delete_memory_embedding("does-not-exist")
+            .await
+            .unwrap();
+
+        // Search before any upsert (fresh repo, no memory_embeddings
+        // table) returns empty without error.
+        let dir2 = tempdir().unwrap();
+        let path2 = dir2.path().join("empty.store");
+        let empty_repo = LanceStore::open(&path2).await.unwrap();
+        let empty_hits = empty_repo
+            .semantic_search_memories("tenant-a", &q, 10)
+            .await
+            .unwrap();
+        assert!(empty_hits.is_empty());
+        // And delete on a missing table is a no-op.
+        empty_repo
+            .delete_memory_embedding("anything")
+            .await
+            .unwrap();
+    }
+
+    /// embedding_jobs queue end-to-end:
+    /// enqueue (idempotent) → claim → complete; reschedule → re-claim;
+    /// permanently_fail; mark_stale; list/filter; stale_live;
+    /// delete_by_memory_id; latest_status_for_hash.
+    #[tokio::test]
+    pub async fn lancedb_embedding_jobs_queue_round_trip() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("lance.store");
+        let repo = LanceStore::open(&path).await.unwrap();
+
+        let m1 = fixture("mem_q1", "tenant-a");
+        let m2 = fixture("mem_q2", "tenant-a");
+        for m in [&m1, &m2] {
+            repo.insert_memory(m.clone()).await.unwrap();
+        }
+
+        // Enqueue: first call creates, second is idempotent (dup detected).
+        let insert1 = EmbeddingJobInsert {
+            job_id: "job_1".into(),
+            tenant: "tenant-a".into(),
+            memory_id: "mem_q1".into(),
+            target_content_hash: "hash_q1".into(),
+            provider: "fake-test".into(),
+            available_at: "00000001778000000000".into(),
+            created_at: "00000001778000000000".into(),
+            updated_at: "00000001778000000000".into(),
+        };
+        let enq1 = repo
+            .try_enqueue_embedding_job(insert1.clone())
+            .await
+            .unwrap();
+        assert!(enq1, "first enqueue should create");
+        let enq1b = repo.try_enqueue_embedding_job(insert1).await.unwrap();
+        assert!(!enq1b, "duplicate enqueue must return false");
+
+        let first = repo
+            .first_embedding_job_id_for_memory("mem_q1")
+            .await
+            .unwrap();
+        assert_eq!(first, Some("job_1".into()));
+        let none = repo
+            .first_embedding_job_id_for_memory("does-not-exist")
+            .await
+            .unwrap();
+        assert!(none.is_none());
+
+        let status = repo
+            .latest_embedding_job_status_for_hash("tenant-a", "mem_q1", "hash_q1")
+            .await
+            .unwrap();
+        assert_eq!(status.as_deref(), Some("pending"));
+
+        // Add a second job (different memory) so claim ordering is testable.
+        let insert2 = EmbeddingJobInsert {
+            job_id: "job_2".into(),
+            tenant: "tenant-a".into(),
+            memory_id: "mem_q2".into(),
+            target_content_hash: "hash_q2".into(),
+            provider: "fake-test".into(),
+            available_at: "00000001778000000001".into(),
+            created_at: "00000001778000000001".into(),
+            updated_at: "00000001778000000001".into(),
+        };
+        repo.try_enqueue_embedding_job(insert2).await.unwrap();
+
+        // Claim 5: only 2 available; ordered by available_at ASC then
+        // created_at ASC (job_1 first because earlier available_at).
+        let now = "00000001778000010000";
+        let claimed = repo.claim_next_n_embedding_jobs(now, 5, 5).await.unwrap();
+        assert_eq!(claimed.len(), 2);
+        assert_eq!(claimed[0].job_id, "job_1");
+        assert_eq!(claimed[1].job_id, "job_2");
+        assert_eq!(claimed[0].attempt_count, 0);
+
+        // After claim, both rows are 'processing'.
+        let status_after = repo
+            .latest_embedding_job_status_for_hash("tenant-a", "mem_q1", "hash_q1")
+            .await
+            .unwrap();
+        assert_eq!(status_after.as_deref(), Some("processing"));
+
+        // Re-claim returns nothing.
+        let recl = repo.claim_next_n_embedding_jobs(now, 5, 5).await.unwrap();
+        assert!(recl.is_empty());
+
+        repo.complete_embedding_job("job_1", "00000001778000020000")
+            .await
+            .unwrap();
+        let s1 = repo
+            .latest_embedding_job_status_for_hash("tenant-a", "mem_q1", "hash_q1")
+            .await
+            .unwrap();
+        assert_eq!(s1.as_deref(), Some("completed"));
+
+        repo.reschedule_embedding_job_failure(
+            "job_2",
+            1,
+            "transient",
+            "00000001778000040000",
+            "00000001778000030000",
+        )
+        .await
+        .unwrap();
+        let s2 = repo
+            .latest_embedding_job_status_for_hash("tenant-a", "mem_q2", "hash_q2")
+            .await
+            .unwrap();
+        assert_eq!(s2.as_deref(), Some("failed"));
+
+        // Re-claim with budget=2 should pick job_2 again (failed,
+        // attempt_count < max_retries, available_at <= now).
+        let now2 = "00000001778000050000";
+        let recl2 = repo.claim_next_n_embedding_jobs(now2, 2, 5).await.unwrap();
+        assert_eq!(recl2.len(), 1);
+        assert_eq!(recl2[0].job_id, "job_2");
+        assert_eq!(recl2[0].attempt_count, 1);
+
+        // Permanently fail it (attempt_count beyond budget).
+        repo.permanently_fail_embedding_job("job_2", 5, "boom", "00000001778000060000")
+            .await
+            .unwrap();
+        let recl3 = repo.claim_next_n_embedding_jobs(now2, 2, 5).await.unwrap();
+        // Failed but attempt_count (5) >= max_retries (2) → not eligible.
+        assert!(recl3.is_empty());
+
+        repo.mark_embedding_job_stale("job_1", "00000001778000070000")
+            .await
+            .unwrap();
+        let s_stale = repo
+            .latest_embedding_job_status_for_hash("tenant-a", "mem_q1", "hash_q1")
+            .await
+            .unwrap();
+        assert_eq!(s_stale.as_deref(), Some("stale"));
+
+        // list_embedding_jobs: tenant filter.
+        let all = repo
+            .list_embedding_jobs("tenant-a", None, None, 50)
+            .await
+            .unwrap();
+        assert_eq!(all.len(), 2);
+
+        // status filter.
+        let only_failed = repo
+            .list_embedding_jobs("tenant-a", Some("failed"), None, 50)
+            .await
+            .unwrap();
+        assert_eq!(only_failed.len(), 1);
+        assert_eq!(only_failed[0].job_id, "job_2");
+        assert_eq!(only_failed[0].attempt_count, 5);
+
+        // memory_id filter.
+        let only_q1 = repo
+            .list_embedding_jobs("tenant-a", None, Some("mem_q1"), 50)
+            .await
+            .unwrap();
+        assert_eq!(only_q1.len(), 1);
+        assert_eq!(only_q1[0].memory_id, "mem_q1");
+
+        // stale_live: enqueue a fresh pending row, then sweep it stale.
+        let insert3 = EmbeddingJobInsert {
+            job_id: "job_3".into(),
+            tenant: "tenant-a".into(),
+            memory_id: "mem_q1".into(),
+            target_content_hash: "hash_q1_v2".into(),
+            provider: "fake-test".into(),
+            available_at: "00000001778000080000".into(),
+            created_at: "00000001778000080000".into(),
+            updated_at: "00000001778000080000".into(),
+        };
+        repo.try_enqueue_embedding_job(insert3).await.unwrap();
+        let staled = repo
+            .stale_live_embedding_jobs_for_memory(
+                "tenant-a",
+                "mem_q1",
+                "fake-test",
+                "00000001778000090000",
+            )
+            .await
+            .unwrap();
+        assert_eq!(staled, 1);
+
+        let deleted = repo
+            .delete_embedding_jobs_by_memory_id("mem_q1")
+            .await
+            .unwrap();
+        assert_eq!(deleted, 2);
+        let remaining = repo
+            .list_embedding_jobs("tenant-a", None, None, 50)
+            .await
+            .unwrap();
+        assert_eq!(remaining.len(), 1);
+        assert_eq!(remaining[0].memory_id, "mem_q2");
+
+        // delete on no-row → 0.
+        let zero = repo
+            .delete_embedding_jobs_by_memory_id("nope")
+            .await
+            .unwrap();
+        assert_eq!(zero, 0);
+    }
+
+    /// `bm25_candidates` lazy-creates the FTS index on `memories.content`
+    /// the first time it's called, then BM25-ranks rows matching the
+    /// query — distinct from semantic_search_memories (vector ANN).
+    /// Tenant filter must be honored; empty query / k == 0 returns [].
+    #[tokio::test]
+    pub async fn lancedb_bm25_candidates_round_trip() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("lance.store");
+        let repo = LanceStore::open(&path).await.unwrap();
+
+        let mut a = fixture("mem_b1", "tenant-a");
+        a.content = "DuckDB single mutex serializes all writes".into();
+        let mut b = fixture("mem_b2", "tenant-a");
+        b.content = "LanceDB native vector search uses ANN".into();
+        let mut c = fixture("mem_b3", "tenant-a");
+        c.content = "Tantivy provides BM25 in DuckDB build".into();
+        let mut d = fixture("mem_b4", "tenant-b");
+        d.content = "DuckDB connection pool tenant-b".into();
+        for m in [&a, &b, &c, &d] {
+            repo.insert_memory(m.clone()).await.unwrap();
+        }
+
+        // Empty query → []; k=0 → [].
+        let none1 = repo.bm25_candidates("tenant-a", "", 10).await.unwrap();
+        assert!(none1.is_empty());
+        let none2 = repo.bm25_candidates("tenant-a", "DuckDB", 0).await.unwrap();
+        assert!(none2.is_empty());
+
+        // Real query: 'DuckDB' should match mem_b1 + mem_b3 (tenant-a)
+        // but NOT mem_b4 (tenant-b filter).
+        let hits = repo
+            .bm25_candidates("tenant-a", "DuckDB", 10)
+            .await
+            .unwrap();
+        let ids: Vec<&str> = hits.iter().map(|m| m.memory_id.as_str()).collect();
+        assert!(ids.contains(&"mem_b1"), "got {ids:?}");
+        assert!(ids.contains(&"mem_b3"), "got {ids:?}");
+        assert!(!ids.contains(&"mem_b2"));
+        assert!(
+            !ids.contains(&"mem_b4"),
+            "tenant filter must exclude tenant-b"
+        );
+
+        // Index now exists — second call should reuse, not rebuild.
+        let table = repo.conn.open_table("memories").execute().await.unwrap();
+        let indices = table.list_indices().await.unwrap();
+        assert!(
+            indices
+                .iter()
+                .any(|c| c.columns.iter().any(|col| col == "content")),
+            "FTS index should exist on content column after first call",
+        );
+
+        // Different query, same tenant.
+        let lance_hits = repo
+            .bm25_candidates("tenant-a", "LanceDB", 10)
+            .await
+            .unwrap();
+        let lance_ids: Vec<&str> = lance_hits.iter().map(|m| m.memory_id.as_str()).collect();
+        assert!(lance_ids.contains(&"mem_b2"));
+    }
+}
