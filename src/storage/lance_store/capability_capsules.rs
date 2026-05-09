@@ -10,7 +10,7 @@ use lancedb::query::{ExecutableQuery, QueryBase};
 
 use super::{
     capability_capsule_embedding_to_record_batch, capability_capsules_to_record_batch,
-    decode_embedding_blob, embedding_job_row_to_record_batch,
+    decode_embedding_blob, embedding_job_row_to_record_batch, embedding_job_rows_to_record_batch,
     ensure_capability_capsule_embeddings_table, enum_to_str, feedback_adjustments,
     feedback_events_to_record_batch, lancedb_err, record_batch_to_capability_capsules,
     record_batch_to_embedding_job_rows, record_batch_to_feedback_events, sql_quote,
@@ -149,6 +149,70 @@ impl LanceStore {
         // iterator. (Re-checking lancedb-0.27.2/src/data/scannable.rs L70.)
         table.add(batch).execute().await.map_err(lancedb_err)?;
         Ok(memory)
+    }
+
+    /// Multi-row insert. One Arrow `RecordBatch` carrying every row, one
+    /// `table.add` call. No-op when `memories` is empty (avoids minting an
+    /// empty batch). Caller is responsible for upstream dedup
+    /// (`find_by_idempotency_or_hash`) — this method does not perform it.
+    pub async fn insert_capability_capsules_batch(
+        &self,
+        memories: &[CapabilityCapsuleRecord],
+    ) -> Result<(), StorageError> {
+        if memories.is_empty() {
+            return Ok(());
+        }
+        let table = self
+            .conn
+            .open_table("capability_capsules")
+            .execute()
+            .await
+            .map_err(lancedb_err)?;
+        let batch = capability_capsules_to_record_batch(memories)?;
+        table.add(batch).execute().await.map_err(lancedb_err)?;
+        Ok(())
+    }
+
+    /// Multi-row enqueue for `embedding_jobs`. One `table.add` of an
+    /// N-row `RecordBatch`, no per-row idempotency probe. Caller must
+    /// ensure the inserts target *fresh* capsules (just-inserted by
+    /// `insert_capability_capsules_batch`) so no live (pending |
+    /// processing) row can yet exist for the
+    /// `(tenant, capability_capsule_id, target_content_hash, provider)`
+    /// tuple — the same invariant the single-row variant relies on at
+    /// the application level. No-op when `inserts` is empty.
+    pub async fn enqueue_embedding_jobs_batch(
+        &self,
+        inserts: &[EmbeddingJobInsert],
+    ) -> Result<(), StorageError> {
+        if inserts.is_empty() {
+            return Ok(());
+        }
+        let table = self
+            .conn
+            .open_table("embedding_jobs")
+            .execute()
+            .await
+            .map_err(lancedb_err)?;
+        let rows: Vec<EmbeddingJobRow> = inserts
+            .iter()
+            .map(|insert| EmbeddingJobRow {
+                job_id: insert.job_id.clone(),
+                tenant: insert.tenant.clone(),
+                capability_capsule_id: insert.capability_capsule_id.clone(),
+                target_content_hash: insert.target_content_hash.clone(),
+                provider: insert.provider.clone(),
+                status: "pending".to_string(),
+                attempt_count: 0,
+                last_error: None,
+                available_at: insert.available_at.clone(),
+                created_at: insert.created_at.clone(),
+                updated_at: insert.updated_at.clone(),
+            })
+            .collect();
+        let batch = embedding_job_rows_to_record_batch(&rows)?;
+        table.add(batch).execute().await.map_err(lancedb_err)?;
+        Ok(())
     }
 
     pub async fn try_enqueue_embedding_job(

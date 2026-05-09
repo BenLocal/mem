@@ -714,6 +714,12 @@ fn embedding_jobs_schema() -> Schema {
 pub(super) fn embedding_job_row_to_record_batch(
     row: &EmbeddingJobRow,
 ) -> Result<RecordBatch, StorageError> {
+    embedding_job_rows_to_record_batch(std::slice::from_ref(row))
+}
+
+pub(super) fn embedding_job_rows_to_record_batch(
+    rows: &[EmbeddingJobRow],
+) -> Result<RecordBatch, StorageError> {
     let mut job_id = StringBuilder::new();
     let mut tenant = StringBuilder::new();
     let mut capability_capsule_id = StringBuilder::new();
@@ -725,20 +731,22 @@ pub(super) fn embedding_job_row_to_record_batch(
     let mut available_at = StringBuilder::new();
     let mut created_at = StringBuilder::new();
     let mut updated_at = StringBuilder::new();
-    job_id.append_value(&row.job_id);
-    tenant.append_value(&row.tenant);
-    capability_capsule_id.append_value(&row.capability_capsule_id);
-    target_content_hash.append_value(&row.target_content_hash);
-    provider.append_value(&row.provider);
-    status.append_value(&row.status);
-    attempt_count.append_value(row.attempt_count);
-    match &row.last_error {
-        Some(s) => last_error.append_value(s),
-        None => last_error.append_null(),
+    for row in rows {
+        job_id.append_value(&row.job_id);
+        tenant.append_value(&row.tenant);
+        capability_capsule_id.append_value(&row.capability_capsule_id);
+        target_content_hash.append_value(&row.target_content_hash);
+        provider.append_value(&row.provider);
+        status.append_value(&row.status);
+        attempt_count.append_value(row.attempt_count);
+        match &row.last_error {
+            Some(s) => last_error.append_value(s),
+            None => last_error.append_null(),
+        }
+        available_at.append_value(&row.available_at);
+        created_at.append_value(&row.created_at);
+        updated_at.append_value(&row.updated_at);
     }
-    available_at.append_value(&row.available_at);
-    created_at.append_value(&row.created_at);
-    updated_at.append_value(&row.updated_at);
     let columns: Vec<Arc<dyn Array>> = vec![
         Arc::new(job_id.finish()),
         Arc::new(tenant.finish()),
@@ -844,6 +852,12 @@ fn transcript_embedding_jobs_schema() -> Schema {
 pub(super) fn transcript_embedding_job_row_to_record_batch(
     row: &TranscriptEmbeddingJobRow,
 ) -> Result<RecordBatch, StorageError> {
+    transcript_embedding_job_rows_to_record_batch(std::slice::from_ref(row))
+}
+
+pub(super) fn transcript_embedding_job_rows_to_record_batch(
+    rows: &[TranscriptEmbeddingJobRow],
+) -> Result<RecordBatch, StorageError> {
     let mut job_id = StringBuilder::new();
     let mut tenant = StringBuilder::new();
     let mut message_block_id = StringBuilder::new();
@@ -854,19 +868,21 @@ pub(super) fn transcript_embedding_job_row_to_record_batch(
     let mut available_at = StringBuilder::new();
     let mut created_at = StringBuilder::new();
     let mut updated_at = StringBuilder::new();
-    job_id.append_value(&row.job_id);
-    tenant.append_value(&row.tenant);
-    message_block_id.append_value(&row.message_block_id);
-    provider.append_value(&row.provider);
-    status.append_value(&row.status);
-    attempt_count.append_value(row.attempt_count);
-    match &row.last_error {
-        Some(s) => last_error.append_value(s),
-        None => last_error.append_null(),
+    for row in rows {
+        job_id.append_value(&row.job_id);
+        tenant.append_value(&row.tenant);
+        message_block_id.append_value(&row.message_block_id);
+        provider.append_value(&row.provider);
+        status.append_value(&row.status);
+        attempt_count.append_value(row.attempt_count);
+        match &row.last_error {
+            Some(s) => last_error.append_value(s),
+            None => last_error.append_null(),
+        }
+        available_at.append_value(&row.available_at);
+        created_at.append_value(&row.created_at);
+        updated_at.append_value(&row.updated_at);
     }
-    available_at.append_value(&row.available_at);
-    created_at.append_value(&row.created_at);
-    updated_at.append_value(&row.updated_at);
     let columns: Vec<Arc<dyn Array>> = vec![
         Arc::new(job_id.finish()),
         Arc::new(tenant.finish()),
@@ -1135,8 +1151,8 @@ fn conversation_messages_schema() -> Schema {
     ])
 }
 
-pub(super) fn conversation_message_to_record_batch(
-    msg: &ConversationMessage,
+pub(super) fn conversation_messages_to_record_batch(
+    msgs: &[ConversationMessage],
 ) -> Result<RecordBatch, StorageError> {
     use arrow_array::builder::{BooleanBuilder, UInt32Builder};
 
@@ -1157,36 +1173,38 @@ pub(super) fn conversation_message_to_record_batch(
     let mut created_at = StringBuilder::new();
     let mut meta_json = StringBuilder::new();
 
-    message_block_id.append_value(&msg.message_block_id);
-    match &msg.session_id {
-        Some(s) => session_id.append_value(s),
-        None => session_id.append_null(),
-    }
-    tenant.append_value(&msg.tenant);
-    caller_agent.append_value(&msg.caller_agent);
-    transcript_path.append_value(&msg.transcript_path);
-    line_number.append_value(msg.line_number);
-    block_index.append_value(msg.block_index);
-    match &msg.message_uuid {
-        Some(s) => message_uuid.append_value(s),
-        None => message_uuid.append_null(),
-    }
-    role.append_value(msg.role.as_db_str());
-    block_type.append_value(msg.block_type.as_db_str());
-    content.append_value(&msg.content);
-    match &msg.tool_name {
-        Some(s) => tool_name.append_value(s),
-        None => tool_name.append_null(),
-    }
-    match &msg.tool_use_id {
-        Some(s) => tool_use_id.append_value(s),
-        None => tool_use_id.append_null(),
-    }
-    embed_eligible.append_value(msg.embed_eligible);
-    created_at.append_value(&msg.created_at);
-    match &msg.meta_json {
-        Some(s) => meta_json.append_value(s),
-        None => meta_json.append_null(),
+    for msg in msgs {
+        message_block_id.append_value(&msg.message_block_id);
+        match &msg.session_id {
+            Some(s) => session_id.append_value(s),
+            None => session_id.append_null(),
+        }
+        tenant.append_value(&msg.tenant);
+        caller_agent.append_value(&msg.caller_agent);
+        transcript_path.append_value(&msg.transcript_path);
+        line_number.append_value(msg.line_number);
+        block_index.append_value(msg.block_index);
+        match &msg.message_uuid {
+            Some(s) => message_uuid.append_value(s),
+            None => message_uuid.append_null(),
+        }
+        role.append_value(msg.role.as_db_str());
+        block_type.append_value(msg.block_type.as_db_str());
+        content.append_value(&msg.content);
+        match &msg.tool_name {
+            Some(s) => tool_name.append_value(s),
+            None => tool_name.append_null(),
+        }
+        match &msg.tool_use_id {
+            Some(s) => tool_use_id.append_value(s),
+            None => tool_use_id.append_null(),
+        }
+        embed_eligible.append_value(msg.embed_eligible);
+        created_at.append_value(&msg.created_at);
+        match &msg.meta_json {
+            Some(s) => meta_json.append_value(s),
+            None => meta_json.append_null(),
+        }
     }
 
     let columns: Vec<Arc<dyn Array>> = vec![

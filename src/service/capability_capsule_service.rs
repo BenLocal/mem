@@ -32,6 +32,28 @@ pub struct IngestCapabilityCapsuleResponse {
     pub status: CapabilityCapsuleStatus,
 }
 
+/// Per-item outcome for [`CapabilityCapsuleService::ingest_batch`]. Wire
+/// shape (snake_case via serde):
+///
+/// ```json
+/// { "result": "ok", "capability_capsule_id": "mem_…", "status": "active" }
+/// { "result": "err", "error": "…" }
+/// ```
+///
+/// Order matches the input `requests` slice 1:1 — index `i` in the
+/// response array corresponds to index `i` in the request array.
+#[derive(Debug, Clone, Serialize)]
+#[serde(tag = "result", rename_all = "snake_case")]
+pub enum BatchIngestItem {
+    Ok {
+        #[serde(flatten)]
+        response: IngestCapabilityCapsuleResponse,
+    },
+    Err {
+        error: String,
+    },
+}
+
 #[derive(Debug, Error)]
 pub enum ServiceError {
     #[error("memory not found")]
@@ -205,6 +227,187 @@ impl CapabilityCapsuleService {
             .await
             .map_err(ServiceError::Storage)?;
         Ok(stored.into())
+    }
+
+    /// Bulk version of [`Self::ingest`]. Each request is prepared
+    /// independently (idempotency probe / verbatim validation / session
+    /// resolve / record build), then the new rows are flushed as a single
+    /// Lance write + single DuckDB refresh — same for the graph-edge sync
+    /// and the embedding-job enqueue. Per-item failures are isolated:
+    /// the slot in the result vector becomes `BatchIngestItem::Err`,
+    /// other items still land. Output preserves input order 1:1.
+    pub async fn ingest_batch(
+        &self,
+        requests: Vec<IngestCapabilityCapsuleRequest>,
+    ) -> Result<Vec<BatchIngestItem>, ServiceError> {
+        if requests.is_empty() {
+            return Ok(vec![]);
+        }
+        let now = current_timestamp();
+
+        // ── Phase 1: prepare per-item state. Reads are sequential
+        //    (idempotency probe + session resolve both hit storage) but
+        //    cheap relative to the per-row writes we used to do.
+        let mut outcomes: Vec<Option<BatchIngestItem>> = vec![None; requests.len()];
+        let mut to_insert: Vec<CapabilityCapsuleRecord> = Vec::new();
+        let mut session_ids: Vec<String> = Vec::new();
+
+        for (idx, request) in requests.into_iter().enumerate() {
+            match self.prepare_one(request, &now).await {
+                Ok(PreparedIngest::Existing(resp)) => {
+                    outcomes[idx] = Some(BatchIngestItem::Ok { response: resp });
+                }
+                Ok(PreparedIngest::New { record, session_id }) => {
+                    session_ids.push(session_id);
+                    to_insert.push(*record);
+                }
+                Err(e) => {
+                    outcomes[idx] = Some(BatchIngestItem::Err {
+                        error: e.to_string(),
+                    });
+                }
+            }
+        }
+
+        // ── Phase 2: bulk insert.
+        if !to_insert.is_empty() {
+            self.store.insert_capability_capsules(&to_insert).await?;
+
+            // Collect graph edges across all new rows; resolve through
+            // the entity registry; flush in one sync_memory_edges call.
+            let mut all_edges: Vec<GraphEdge> = Vec::new();
+            for stored in &to_insert {
+                let drafts = crate::pipeline::ingest::extract_graph_edge_drafts(stored);
+                let edges =
+                    resolve_drafts_to_edges(drafts, &self.store, &stored.tenant, &now).await?;
+                all_edges.extend(edges);
+            }
+            self.store.sync_memory_edges(&all_edges, &now).await?;
+
+            // One bulk enqueue for embedding jobs.
+            let inserts: Vec<EmbeddingJobInsert> = to_insert
+                .iter()
+                .map(|m| EmbeddingJobInsert {
+                    job_id: next_embedding_job_id(),
+                    tenant: m.tenant.clone(),
+                    capability_capsule_id: m.capability_capsule_id.clone(),
+                    target_content_hash: m.content_hash.clone(),
+                    provider: self.embedding_job_provider.clone(),
+                    available_at: now.clone(),
+                    created_at: now.clone(),
+                    updated_at: now.clone(),
+                })
+                .collect();
+            self.store.enqueue_embedding_jobs(&inserts).await?;
+
+            // Touch each distinct session once. `resolve_session` already
+            // either re-uses an open session or opened a fresh one for
+            // each item — `touch_session` only updates `last_active_at`,
+            // so dedup is purely an I/O reduction.
+            let mut unique_sessions = session_ids.clone();
+            unique_sessions.sort();
+            unique_sessions.dedup();
+            for sid in &unique_sessions {
+                self.store
+                    .touch_session(sid, &now)
+                    .await
+                    .map_err(ServiceError::Storage)?;
+            }
+        }
+
+        // ── Phase 3: stitch outcomes.
+        let mut new_iter = to_insert.into_iter();
+        let result: Vec<BatchIngestItem> = outcomes
+            .into_iter()
+            .map(|slot| match slot {
+                Some(item) => item,
+                None => {
+                    // The order of `to_insert` matches the order of
+                    // `None` slots (we only pushed to `to_insert` from
+                    // the New branch above), so a single forward
+                    // iterator stays in lockstep.
+                    let stored = new_iter
+                        .next()
+                        .expect("to_insert length matches None-slot count");
+                    BatchIngestItem::Ok {
+                        response: stored.into(),
+                    }
+                }
+            })
+            .collect();
+        Ok(result)
+    }
+
+    /// Run the per-item half of `ingest`: dedup probe, validate,
+    /// summarize, resolve session, build the record. Returns
+    /// `PreparedIngest::Existing` if the row already exists,
+    /// `PreparedIngest::New` if a fresh row is ready to insert.
+    async fn prepare_one(
+        &self,
+        request: IngestCapabilityCapsuleRequest,
+        now: &str,
+    ) -> Result<PreparedIngest, ServiceError> {
+        let content_hash = compute_content_hash(&request);
+        if let Some(existing) = self
+            .store
+            .find_by_idempotency_or_hash(&request.tenant, &request.idempotency_key, &content_hash)
+            .await?
+        {
+            return Ok(PreparedIngest::Existing(existing.into()));
+        }
+
+        let status = initial_status(&request.capability_capsule_type, &request.write_mode);
+        crate::pipeline::ingest::validate_verbatim(&request.content, request.summary.as_deref())
+            .map_err(|e| ServiceError::Storage(StorageError::InvalidInput(e)))?;
+        let summary = request
+            .summary
+            .as_deref()
+            .filter(|s| !s.is_empty())
+            .map(|s| s.to_string())
+            .unwrap_or_else(|| summarize(&request.content));
+        let session_id = crate::pipeline::session::resolve_session(
+            &self.store,
+            &request.tenant,
+            &request.source_agent,
+            now,
+            crate::pipeline::session::idle_minutes_from_env(),
+        )
+        .await
+        .map_err(ServiceError::Storage)?;
+
+        let record = CapabilityCapsuleRecord {
+            capability_capsule_id: next_memory_id(),
+            tenant: request.tenant,
+            capability_capsule_type: request.capability_capsule_type,
+            status: status.clone(),
+            scope: request.scope,
+            visibility: request.visibility,
+            version: 1,
+            summary,
+            content: request.content,
+            evidence: request.evidence,
+            code_refs: request.code_refs,
+            project: request.project,
+            repo: request.repo,
+            module: request.module,
+            task_type: request.task_type,
+            tags: request.tags,
+            topics: request.topics,
+            confidence: default_confidence(&status),
+            decay_score: 0.0,
+            content_hash,
+            idempotency_key: request.idempotency_key,
+            session_id: Some(session_id.clone()),
+            supersedes_capability_capsule_id: None,
+            source_agent: request.source_agent,
+            created_at: now.to_string(),
+            updated_at: now.to_string(),
+            last_validated_at: None,
+        };
+        Ok(PreparedIngest::New {
+            record: Box::new(record),
+            session_id,
+        })
     }
 
     pub async fn ingest_episode(
@@ -821,6 +1024,19 @@ fn next_embedding_job_id() -> String {
 
 fn next_memory_id() -> String {
     format!("mem_{}", uuid::Uuid::now_v7())
+}
+
+/// Result of `CapabilityCapsuleService::prepare_one` — either an early
+/// dedup hit (existing row) or a fresh record ready to be flushed in
+/// the batch insert. The `New` variant boxes the record because
+/// `CapabilityCapsuleRecord` is large (~512 B); without the box clippy
+/// flags `large_enum_variant`.
+enum PreparedIngest {
+    Existing(IngestCapabilityCapsuleResponse),
+    New {
+        record: Box<CapabilityCapsuleRecord>,
+        session_id: String,
+    },
 }
 
 fn next_episode_id() -> String {

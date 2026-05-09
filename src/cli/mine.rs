@@ -34,6 +34,11 @@ pub struct MineArgs {
     pub agent: String,
 }
 
+/// Chunk size used by `mine` when fanning out to the `/batch` endpoints.
+/// Sized so that one chunk fits comfortably in a single Lance write +
+/// DuckDB refresh while keeping HTTP body sizes reasonable.
+const MINE_BATCH_CHUNK: usize = 100;
+
 pub struct ExtractedMemory {
     pub content: String,
     pub session_id: String,
@@ -350,84 +355,136 @@ pub async fn run(args: MineArgs) -> i32 {
     let mut block_ok: u32 = 0;
     let mut block_fail: u32 = 0;
 
-    // Legacy memories pipeline — unchanged from the original
-    // implementation. The idempotency_key shape and 409-as-success
-    // handling are explicitly preserved.
-    for memory in memories {
-        let idempotency_key = format!("{}:{}", args.transcript_path.display(), memory.line_number);
+    // ── Capsules: chunked POST to /capability_capsules/batch.
+    //
+    // Each request body is the same shape as the single endpoint plus
+    // the array wrapper; the server flushes one Lance write + one DuckDB
+    // refresh per chunk (vs. per row). 201 = all-ok, 207 = mixed; in
+    // both cases we parse the per-item `result` field. Any pre-existing
+    // capsule (idempotency_key match) returns `result: ok` because the
+    // service treats dedup-hit-with-existing-row as success.
+    let capsule_payloads: Vec<serde_json::Value> = memories
+        .into_iter()
+        .map(|memory| {
+            let idempotency_key =
+                format!("{}:{}", args.transcript_path.display(), memory.line_number);
+            serde_json::json!({
+                "tenant": args.remote.tenant,
+                "capability_capsule_type": "experience",
+                "content": memory.content,
+                "scope": "global",
+                "source_agent": args.agent,
+                "idempotency_key": idempotency_key,
+                "write_mode": "auto",
+            })
+        })
+        .collect();
 
-        let payload = serde_json::json!({
-            "tenant": args.remote.tenant,
-            "capability_capsule_type": "experience",
-            "content": memory.content,
-            "scope": "global",
-            "source_agent": args.agent,
-            "idempotency_key": idempotency_key,
-            "write_mode": "auto",
-        });
-
+    for chunk in capsule_payloads.chunks(MINE_BATCH_CHUNK) {
         match client
-            .post(format!("{}/capability_capsules", args.remote.base_url))
-            .json(&payload)
+            .post(format!(
+                "{}/capability_capsules/batch",
+                args.remote.base_url
+            ))
+            .json(chunk)
             .send()
             .await
         {
-            Ok(resp) if resp.status().is_success() || resp.status() == 409 => {
-                mem_ok += 1;
+            Ok(resp) if resp.status().is_success() || resp.status() == 207 => {
+                let v: serde_json::Value = match resp.json().await {
+                    Ok(v) => v,
+                    Err(e) => {
+                        eprintln!("Capsule batch parse error: {}", e);
+                        mem_fail += chunk.len() as u32;
+                        continue;
+                    }
+                };
+                let items = v.get("items").and_then(|x| x.as_array());
+                match items {
+                    Some(arr) => {
+                        for item in arr {
+                            let kind = item.get("result").and_then(|x| x.as_str()).unwrap_or("");
+                            if kind == "ok" {
+                                mem_ok += 1;
+                            } else {
+                                let err = item
+                                    .get("error")
+                                    .and_then(|x| x.as_str())
+                                    .unwrap_or("unknown");
+                                eprintln!("Capsule item error: {}", err);
+                                mem_fail += 1;
+                            }
+                        }
+                    }
+                    None => {
+                        eprintln!("Capsule batch: missing items array");
+                        mem_fail += chunk.len() as u32;
+                    }
+                }
             }
             Ok(resp) => {
-                eprintln!("Failed to save memory: {}", resp.status());
-                mem_fail += 1;
+                eprintln!("Failed to save capsule batch: {}", resp.status());
+                mem_fail += chunk.len() as u32;
             }
             Err(e) => {
-                eprintln!("Request error: {}", e);
-                mem_fail += 1;
+                eprintln!("Capsule batch request error: {}", e);
+                mem_fail += chunk.len() as u32;
             }
         }
     }
 
-    // New transcript-archive pipeline. Block-level idempotency is
-    // enforced server-side by the `(transcript_path, line_number,
-    // block_index)` unique constraint; a duplicate insert still returns
-    // 200 OK (with a freshly minted message_block_id that the server
-    // discards via `INSERT ... ON CONFLICT DO NOTHING`), so we only
-    // need to count 2xx responses.
-    for b in blocks {
-        let embed_eligible = matches!(b.block_type.as_str(), "text" | "thinking");
-        let payload = serde_json::json!({
-            "session_id": b.session_id,
-            "tenant": args.remote.tenant,
-            "caller_agent": args.agent,
-            "transcript_path": args.transcript_path.display().to_string(),
-            "line_number": b.line_number,
-            "block_index": b.block_index,
-            "message_uuid": b.message_uuid,
-            "role": b.role,
-            "block_type": b.block_type,
-            "content": b.content,
-            "tool_name": b.tool_name,
-            "tool_use_id": b.tool_use_id,
-            "embed_eligible": embed_eligible,
-            "created_at": b.timestamp,
-            "meta_json": b.meta_json,
-        });
+    // ── Transcript blocks: chunked POST to /transcripts/messages/batch.
+    //
+    // Block-level idempotency is enforced server-side by the
+    // `(transcript_path, line_number, block_index)` triple; the batch
+    // endpoint silently skips already-present rows and reports the
+    // landed count via `inserted`. We count every block we successfully
+    // sent (regardless of dedup status) as `block_ok` to mirror the
+    // single-row endpoint's "2xx → ok" semantic.
+    let block_payloads: Vec<serde_json::Value> = blocks
+        .into_iter()
+        .map(|b| {
+            let embed_eligible = matches!(b.block_type.as_str(), "text" | "thinking");
+            serde_json::json!({
+                "session_id": b.session_id,
+                "tenant": args.remote.tenant,
+                "caller_agent": args.agent,
+                "transcript_path": args.transcript_path.display().to_string(),
+                "line_number": b.line_number,
+                "block_index": b.block_index,
+                "message_uuid": b.message_uuid,
+                "role": b.role,
+                "block_type": b.block_type,
+                "content": b.content,
+                "tool_name": b.tool_name,
+                "tool_use_id": b.tool_use_id,
+                "embed_eligible": embed_eligible,
+                "created_at": b.timestamp,
+                "meta_json": b.meta_json,
+            })
+        })
+        .collect();
 
+    for chunk in block_payloads.chunks(MINE_BATCH_CHUNK) {
         match client
-            .post(format!("{}/transcripts/messages", args.remote.base_url))
-            .json(&payload)
+            .post(format!(
+                "{}/transcripts/messages/batch",
+                args.remote.base_url
+            ))
+            .json(chunk)
             .send()
             .await
         {
             Ok(resp) if resp.status().is_success() => {
-                block_ok += 1;
+                block_ok += chunk.len() as u32;
             }
             Ok(resp) => {
-                eprintln!("Failed to archive block: {}", resp.status());
-                block_fail += 1;
+                eprintln!("Failed to archive block batch: {}", resp.status());
+                block_fail += chunk.len() as u32;
             }
             Err(e) => {
-                eprintln!("Block POST error: {}", e);
-                block_fail += 1;
+                eprintln!("Block batch request error: {}", e);
+                block_fail += chunk.len() as u32;
             }
         }
     }

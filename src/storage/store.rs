@@ -150,11 +150,42 @@ impl Store {
         lance_write_then_refresh!(self, self.lance.insert_capability_capsule(m).await)
     }
 
+    /// Multi-row insert. Single Lance write + single DuckDB refresh,
+    /// regardless of `memories.len()`. No-op (and no refresh) when empty.
+    pub async fn insert_capability_capsules(
+        &self,
+        memories: &[CapabilityCapsuleRecord],
+    ) -> Result<(), StorageError> {
+        if memories.is_empty() {
+            return Ok(());
+        }
+        lance_write_then_refresh!(
+            self,
+            self.lance.insert_capability_capsules_batch(memories).await
+        )
+    }
+
     pub async fn try_enqueue_embedding_job(
         &self,
         insert: EmbeddingJobInsert,
     ) -> Result<bool, StorageError> {
         lance_write_then_refresh!(self, self.lance.try_enqueue_embedding_job(insert).await)
+    }
+
+    /// Multi-row variant of [`Self::try_enqueue_embedding_job`]. Skips the
+    /// per-row `(tenant, capability_capsule_id, target_content_hash,
+    /// provider)` idempotency probe that the single-row form runs — the
+    /// caller (service-level batch ingest) only invokes this immediately
+    /// after a fresh `insert_capability_capsules`, so by construction no
+    /// live job can already exist for those tuples. No-op when empty.
+    pub async fn enqueue_embedding_jobs(
+        &self,
+        inserts: &[EmbeddingJobInsert],
+    ) -> Result<(), StorageError> {
+        if inserts.is_empty() {
+            return Ok(());
+        }
+        lance_write_then_refresh!(self, self.lance.enqueue_embedding_jobs_batch(inserts).await)
     }
 
     pub async fn claim_next_n_embedding_jobs(
@@ -665,6 +696,25 @@ impl Store {
         msg: &ConversationMessage,
     ) -> Result<(), StorageError> {
         lance_write_then_refresh!(self, self.lance.create_conversation_message(msg).await)
+    }
+
+    /// Multi-row variant of [`Self::create_conversation_message`]. One
+    /// bulk dedup probe + one Lance write for the messages table + one
+    /// Lance write for the embedding-jobs table + one DuckDB refresh,
+    /// regardless of `msgs.len()`. Returns the number of rows that
+    /// actually landed (input minus dedup-skipped rows). No-op (and no
+    /// refresh) when empty.
+    pub async fn create_conversation_messages(
+        &self,
+        msgs: &[ConversationMessage],
+    ) -> Result<usize, StorageError> {
+        if msgs.is_empty() {
+            return Ok(0);
+        }
+        lance_write_then_refresh!(
+            self,
+            self.lance.create_conversation_messages_batch(msgs).await
+        )
     }
 
     pub async fn claim_next_n_transcript_embedding_jobs(
@@ -1498,5 +1548,69 @@ mod tests {
         let m = cm("blk", "tenant-a", 1, 0, true, "00000001778000000000");
         let err = store.create_conversation_message(&m).await.unwrap_err();
         assert!(matches!(err, StorageError::InvalidData(_)), "got {err:?}");
+    }
+
+    /// Cross-stack batch round-trip: a multi-row insert reaches DuckDB
+    /// after a single refresh, and the rows survive intra-batch dedup
+    /// of identical (transcript_path, line_number, block_index) keys.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn store_create_conversation_messages_batch_round_trip() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("store");
+        let store = Store::open(&path).await.unwrap();
+        store.set_transcript_job_provider("fake-test");
+
+        let a = cm("blk_a", "tenant-a", 1, 0, true, "00000001778000000010");
+        let b = cm("blk_b", "tenant-a", 2, 0, false, "00000001778000000020");
+        let inserted = store
+            .create_conversation_messages(&[a.clone(), b.clone()])
+            .await
+            .unwrap();
+        assert_eq!(inserted, 2);
+
+        let rows = store
+            .get_conversation_messages_by_session("tenant-a", "sess")
+            .await
+            .unwrap();
+        let ids: Vec<&str> = rows.iter().map(|m| m.message_block_id.as_str()).collect();
+        assert_eq!(ids.len(), 2);
+        assert!(ids.contains(&"blk_a"));
+        assert!(ids.contains(&"blk_b"));
+    }
+
+    /// Cross-stack batch capsule insert: multiple capsules land via a
+    /// single refresh and are visible to the DuckDB read side.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn store_insert_capability_capsules_batch_round_trip() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("store");
+        let store = Store::open(&path).await.unwrap();
+        let m1 = fixture("m_b1", "tenant-a");
+        let mut m2 = fixture("m_b2", "tenant-a");
+        m2.content_hash = "j".repeat(64);
+        store
+            .insert_capability_capsules(std::slice::from_ref(&m1))
+            .await
+            .unwrap();
+        // Second batch — verifies the refresh runs every call, not
+        // just on the first write.
+        store
+            .insert_capability_capsules(std::slice::from_ref(&m2))
+            .await
+            .unwrap();
+        let all = store
+            .list_capability_capsules_for_tenant("tenant-a")
+            .await
+            .unwrap();
+        let ids: Vec<&str> = all
+            .iter()
+            .map(|m| m.capability_capsule_id.as_str())
+            .collect();
+        assert!(ids.contains(&"m_b1"));
+        assert!(ids.contains(&"m_b2"));
+
+        // Empty batch is a no-op (does not panic, does not refresh
+        // when there is nothing to write).
+        store.insert_capability_capsules(&[]).await.unwrap();
     }
 }

@@ -15,7 +15,7 @@ use crate::{
     domain::episode::{EpisodeResponse, IngestEpisodeRequest},
     domain::query::SearchCapabilityCapsuleRequest,
     error::AppError,
-    service::IngestCapabilityCapsuleResponse,
+    service::{BatchIngestItem, IngestCapabilityCapsuleResponse},
 };
 
 pub fn router() -> Router<AppState> {
@@ -23,6 +23,10 @@ pub fn router() -> Router<AppState> {
         .route(
             "/capability_capsules",
             post(ingest_capability_capsule).get(list_capability_capsules),
+        )
+        .route(
+            "/capability_capsules/batch",
+            post(ingest_capability_capsules_batch),
         )
         .route("/episodes", post(ingest_episode))
         .route(
@@ -135,6 +139,38 @@ async fn ingest_capability_capsule(
         .ingest(request.into())
         .await?;
     Ok((StatusCode::CREATED, Json(response)))
+}
+
+/// Bulk capsule ingest. Body is a JSON array of the same shape as the
+/// single endpoint accepts. Response is `{ "items": [<per-item>] }`,
+/// where each item is `{"result":"ok",…}` or `{"result":"err","error":"…"}`,
+/// preserving input order. Returns 207 (Multi-Status) when any item
+/// failed; 201 otherwise. Service-level (non-per-item) errors still
+/// return 5xx via `AppError`.
+async fn ingest_capability_capsules_batch(
+    State(app): State<AppState>,
+    Json(requests): Json<Vec<HttpIngestMemoryRequest>>,
+) -> Result<(StatusCode, Json<BatchIngestResponse>), AppError> {
+    let domain_requests: Vec<IngestCapabilityCapsuleRequest> =
+        requests.into_iter().map(Into::into).collect();
+    let items = app
+        .capability_capsule_service
+        .ingest_batch(domain_requests)
+        .await?;
+    let any_err = items
+        .iter()
+        .any(|i| matches!(i, BatchIngestItem::Err { .. }));
+    let status = if any_err {
+        StatusCode::MULTI_STATUS
+    } else {
+        StatusCode::CREATED
+    };
+    Ok((status, Json(BatchIngestResponse { items })))
+}
+
+#[derive(Debug, serde::Serialize)]
+struct BatchIngestResponse {
+    items: Vec<BatchIngestItem>,
 }
 
 async fn ingest_episode(

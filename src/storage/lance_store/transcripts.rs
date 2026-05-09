@@ -8,11 +8,11 @@ use futures::TryStreamExt;
 use lancedb::query::{ExecutableQuery, QueryBase};
 
 use super::{
-    conversation_message_embedding_to_record_batch, conversation_message_to_record_batch,
+    conversation_message_embedding_to_record_batch, conversation_messages_to_record_batch,
     decode_embedding_blob, ensure_conversation_message_embeddings_table, lancedb_err,
     record_batch_to_conversation_messages, record_batch_to_transcript_embedding_job_rows,
     sort_messages_chronological_asc, sql_quote, transcript_embedding_job_row_to_record_batch,
-    LanceStore, TranscriptEmbeddingJobRow,
+    transcript_embedding_job_rows_to_record_batch, LanceStore, TranscriptEmbeddingJobRow,
 };
 use crate::domain::{BlockType, ConversationMessage};
 use crate::storage::types::{
@@ -407,7 +407,7 @@ impl LanceStore {
         if exists > 0 {
             return Ok(());
         }
-        let batch = conversation_message_to_record_batch(msg)?;
+        let batch = conversation_messages_to_record_batch(std::slice::from_ref(msg))?;
         table.add(batch).execute().await.map_err(lancedb_err)?;
 
         if msg.embed_eligible {
@@ -433,6 +433,116 @@ impl LanceStore {
             .await?;
         }
         Ok(())
+    }
+
+    /// Bulk variant of [`Self::create_conversation_message`]. Idempotent on
+    /// (transcript_path, line_number, block_index) like the single-row form,
+    /// but batches the dedup probe (one Lance filter per call rather than
+    /// per row) and the writes (one `table.add` for messages + one for
+    /// embedding jobs).
+    ///
+    /// Returns the number of rows that actually landed (input length minus
+    /// rows that already existed and minus intra-batch duplicates).
+    pub async fn create_conversation_messages_batch(
+        &self,
+        msgs: &[ConversationMessage],
+    ) -> Result<usize, StorageError> {
+        use std::collections::HashSet;
+
+        if msgs.is_empty() {
+            return Ok(0);
+        }
+
+        // 1. Build a single filter that pulls every existing row whose
+        //    `transcript_path` appears in the batch. For typical
+        //    `mem mine` chunks this is one path; even for fan-in writers
+        //    the path-set is tiny vs. row count.
+        let mut paths: Vec<&str> = msgs.iter().map(|m| m.transcript_path.as_str()).collect();
+        paths.sort_unstable();
+        paths.dedup();
+        let in_list = paths
+            .iter()
+            .map(|p| sql_quote(p))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let table = self
+            .conn
+            .open_table("conversation_messages")
+            .execute()
+            .await
+            .map_err(lancedb_err)?;
+        let existing = self
+            .query_conversation_messages(format!("transcript_path IN ({in_list})"))
+            .await?;
+        let mut seen: HashSet<(String, u64, u32)> = existing
+            .into_iter()
+            .map(|m| (m.transcript_path, m.line_number, m.block_index))
+            .collect();
+
+        // 2. Walk the input, dropping rows whose key is already in
+        //    `seen` (DB OR intra-batch dup). Insert key into `seen` so a
+        //    subsequent row with the same key is also skipped.
+        let mut to_insert: Vec<&ConversationMessage> = Vec::with_capacity(msgs.len());
+        for msg in msgs {
+            let key = (
+                msg.transcript_path.clone(),
+                msg.line_number,
+                msg.block_index,
+            );
+            if seen.insert(key) {
+                to_insert.push(msg);
+            }
+        }
+        if to_insert.is_empty() {
+            return Ok(0);
+        }
+
+        // 3. One multi-row insert.
+        let owned: Vec<ConversationMessage> = to_insert.iter().map(|m| (*m).clone()).collect();
+        let batch = conversation_messages_to_record_batch(&owned)?;
+        table.add(batch).execute().await.map_err(lancedb_err)?;
+
+        // 4. One multi-row enqueue for the embed-eligible subset.
+        let mut jobs: Vec<TranscriptEmbeddingJobRow> = Vec::new();
+        if to_insert.iter().any(|m| m.embed_eligible) {
+            let provider = self
+                .transcript_job_provider()
+                .ok_or(StorageError::InvalidData(
+                    "transcript embedding job provider not configured; \
+                         call LanceStore::set_transcript_job_provider during startup",
+                ))?;
+            let now = crate::storage::current_timestamp();
+            for msg in to_insert.iter().filter(|m| m.embed_eligible) {
+                jobs.push(TranscriptEmbeddingJobRow {
+                    job_id: uuid::Uuid::now_v7().to_string(),
+                    tenant: msg.tenant.clone(),
+                    message_block_id: msg.message_block_id.clone(),
+                    provider: provider.clone(),
+                    status: "pending".to_string(),
+                    attempt_count: 0,
+                    last_error: None,
+                    available_at: now.clone(),
+                    created_at: now.clone(),
+                    updated_at: now.clone(),
+                });
+            }
+        }
+        if !jobs.is_empty() {
+            let job_table = self
+                .conn
+                .open_table("transcript_embedding_jobs")
+                .execute()
+                .await
+                .map_err(lancedb_err)?;
+            let job_batch = transcript_embedding_job_rows_to_record_batch(&jobs)?;
+            job_table
+                .add(job_batch)
+                .execute()
+                .await
+                .map_err(lancedb_err)?;
+        }
+
+        Ok(to_insert.len())
     }
 
     pub async fn get_conversation_messages_by_session(
@@ -1055,5 +1165,131 @@ mod tests {
             .map(|m| m.message_block_id.as_str())
             .collect();
         assert_eq!(win_ids, vec!["blk_2", "blk_3"]);
+    }
+
+    /// Bulk insert path: dedup against existing rows + intra-batch
+    /// dedup + bulk job enqueue. Counts must match `inserted` and the
+    /// transcript_embedding_jobs row count must equal the embed-eligible
+    /// new rows.
+    #[tokio::test]
+    pub async fn create_conversation_messages_batch_dedups_and_enqueues() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("lance.store");
+        let repo = LanceStore::open(&path).await.unwrap();
+        repo.set_transcript_job_provider("fake-test");
+
+        // All rows share the same transcript_path so the dedup key
+        // `(transcript_path, line, block)` actually collides for
+        // duplicates. (The `msg` helper derives transcript_path from
+        // `id`, which we override below.)
+        let shared_path = "/tmp/shared.jsonl";
+
+        // Pre-seed one row so dedup against existing has something to
+        // hit.
+        let mut pre = msg(
+            "pre_1",
+            "tenant-a",
+            Some("sess_a"),
+            10,
+            0,
+            BlockType::Text,
+            "pre-existing block",
+            "00000001778000000010",
+        );
+        pre.transcript_path = shared_path.to_string();
+        repo.create_conversation_message(&pre).await.unwrap();
+
+        // Build 4 rows: one duplicate of the pre-seeded key, two
+        // intra-batch duplicates of the same fresh key, and two unique
+        // fresh keys (one text=embed_eligible, one tool_use=ineligible).
+        let mut dup_pre = msg(
+            "dup_pre",
+            "tenant-a",
+            Some("sess_a"),
+            10,
+            0,
+            BlockType::Text,
+            "duplicate of pre_1",
+            "00000001778000000011",
+        );
+        dup_pre.transcript_path = shared_path.to_string();
+        let mut new_a = msg(
+            "new_a",
+            "tenant-a",
+            Some("sess_a"),
+            12,
+            0,
+            BlockType::Text,
+            "new fresh block A",
+            "00000001778000000020",
+        );
+        new_a.transcript_path = shared_path.to_string();
+        let mut new_a_dup = msg(
+            "new_a_dup",
+            "tenant-a",
+            Some("sess_a"),
+            12,
+            0,
+            BlockType::Text,
+            "intra-batch dup of new_a",
+            "00000001778000000021",
+        );
+        new_a_dup.transcript_path = shared_path.to_string();
+        let mut new_b = msg(
+            "new_b",
+            "tenant-a",
+            Some("sess_a"),
+            14,
+            0,
+            BlockType::ToolUse,
+            "{\"tool\":\"Bash\"}",
+            "00000001778000000030",
+        );
+        new_b.transcript_path = shared_path.to_string();
+
+        let inserted = repo
+            .create_conversation_messages_batch(&[
+                dup_pre.clone(),
+                new_a.clone(),
+                new_a_dup.clone(),
+                new_b.clone(),
+            ])
+            .await
+            .unwrap();
+        assert_eq!(inserted, 2, "only new_a + new_b should land");
+
+        // Verify the table actually contains pre_1 + new_a + new_b
+        // (3 distinct ids).
+        let all = repo
+            .get_conversation_messages_by_session("tenant-a", "sess_a")
+            .await
+            .unwrap();
+        let ids: Vec<&str> = all.iter().map(|m| m.message_block_id.as_str()).collect();
+        assert_eq!(ids.len(), 3);
+        assert!(ids.contains(&"pre_1"));
+        assert!(ids.contains(&"new_a"));
+        assert!(ids.contains(&"new_b"));
+
+        // Embedding jobs: pre-seed enqueued one (text=embed_eligible),
+        // batch enqueued one more (new_a is text; new_b is tool_use,
+        // ineligible). Expect 2 total.
+        let jobs = repo
+            .query_transcript_embedding_jobs(format!("tenant = {}", super::sql_quote("tenant-a")))
+            .await
+            .unwrap();
+        assert_eq!(jobs.len(), 2);
+    }
+
+    /// Empty input is a clean no-op (no Lance write, no embedding-job
+    /// enqueue, no panic when the provider hasn't been configured).
+    #[tokio::test]
+    pub async fn create_conversation_messages_batch_empty_is_noop() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("lance.store");
+        let repo = LanceStore::open(&path).await.unwrap();
+        // Note: provider intentionally NOT configured — empty path
+        // must not touch the enqueue branch.
+        let inserted = repo.create_conversation_messages_batch(&[]).await.unwrap();
+        assert_eq!(inserted, 0);
     }
 }

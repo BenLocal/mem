@@ -512,4 +512,159 @@ mod http_routes {
              (tool_use is embed-ineligible)"
         );
     }
+
+    #[tokio::test]
+    async fn post_transcripts_messages_batch_lands_all_rows() {
+        let (app, _dir, _repo) = build_router().await;
+
+        let body = json!([
+            {
+                "session_id": "sess-batch",
+                "tenant": "local",
+                "caller_agent": "claude-code",
+                "transcript_path": "/tmp/batch.jsonl",
+                "line_number": 1,
+                "block_index": 0,
+                "role": "user",
+                "block_type": "text",
+                "content": "first batch block",
+                "embed_eligible": true,
+                "created_at": "2026-04-30T00:00:01Z"
+            },
+            {
+                "session_id": "sess-batch",
+                "tenant": "local",
+                "caller_agent": "claude-code",
+                "transcript_path": "/tmp/batch.jsonl",
+                "line_number": 2,
+                "block_index": 0,
+                "role": "assistant",
+                "block_type": "text",
+                "content": "second batch block",
+                "embed_eligible": true,
+                "created_at": "2026-04-30T00:00:02Z"
+            }
+        ]);
+
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/transcripts/messages/batch")
+                    .header("content-type", "application/json")
+                    .body(Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let v: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(v["inserted"], 2);
+        let ids = v["message_block_ids"].as_array().expect("ids array");
+        assert_eq!(ids.len(), 2);
+
+        // Verify rows are queryable.
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/transcripts")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        json!({"session_id": "sess-batch", "tenant": "local"}).to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let v: Value = serde_json::from_slice(&bytes).unwrap();
+        let messages = v["messages"].as_array().expect("messages array");
+        assert_eq!(messages.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn post_transcripts_messages_batch_dedupes_against_existing() {
+        let (app, _dir, _repo) = build_router().await;
+
+        // Pre-seed one row via the single endpoint.
+        let pre = json!({
+            "session_id": "sess-dedupe",
+            "tenant": "local",
+            "caller_agent": "claude-code",
+            "transcript_path": "/tmp/dedupe.jsonl",
+            "line_number": 5,
+            "block_index": 0,
+            "role": "user",
+            "block_type": "text",
+            "content": "pre-existing",
+            "embed_eligible": true,
+            "created_at": "2026-04-30T00:00:01Z"
+        });
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/transcripts/messages")
+                    .header("content-type", "application/json")
+                    .body(Body::from(pre.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        // Batch contains one duplicate of the pre-seeded key + one fresh
+        // row. Server reports `inserted = 1` and only the fresh row
+        // lands.
+        let body = json!([
+            {
+                "session_id": "sess-dedupe",
+                "tenant": "local",
+                "caller_agent": "claude-code",
+                "transcript_path": "/tmp/dedupe.jsonl",
+                "line_number": 5,
+                "block_index": 0,
+                "role": "user",
+                "block_type": "text",
+                "content": "duplicate of pre-existing",
+                "embed_eligible": true,
+                "created_at": "2026-04-30T00:00:02Z"
+            },
+            {
+                "session_id": "sess-dedupe",
+                "tenant": "local",
+                "caller_agent": "claude-code",
+                "transcript_path": "/tmp/dedupe.jsonl",
+                "line_number": 6,
+                "block_index": 0,
+                "role": "assistant",
+                "block_type": "text",
+                "content": "fresh row",
+                "embed_eligible": true,
+                "created_at": "2026-04-30T00:00:03Z"
+            }
+        ]);
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/transcripts/messages/batch")
+                    .header("content-type", "application/json")
+                    .body(Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let v: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(v["inserted"], 1, "only the fresh row should land");
+    }
 }

@@ -32,6 +32,7 @@ use crate::service::{TranscriptSearchFilters, TranscriptSearchOpts};
 pub fn router() -> Router<AppState> {
     Router::new()
         .route("/transcripts/messages", post(post_message))
+        .route("/transcripts/messages/batch", post(post_messages_batch))
         .route("/transcripts/search", post(post_search))
         .route("/transcripts/sessions", get(get_sessions))
         .route("/transcripts", post(post_get_by_session))
@@ -101,8 +102,50 @@ async fn post_message(
     // The HTTP boundary mints the id (UUID v7 keeps the surface ID convention
     // consistent with the memories pipeline — see commit 3100d49).
     let id = uuid::Uuid::now_v7().to_string();
-    let msg = ConversationMessage {
-        message_block_id: id.clone(),
+    let msg = ingest_request_to_message(req, id.clone());
+    state.transcript_service.ingest(msg).await?;
+    Ok(Json(IngestResponse {
+        message_block_id: id,
+    }))
+}
+
+#[derive(Debug, Serialize)]
+pub struct BatchIngestResponse {
+    /// One id per input row, preserving input order. The id is minted
+    /// at the HTTP boundary regardless of dedup outcome — when a row
+    /// already exists in the archive (idempotency hit on the
+    /// `(transcript_path, line_number, block_index)` triple), the
+    /// pre-existing row is kept and the freshly minted id is
+    /// discarded by the storage layer. The response still echoes the
+    /// minted id so callers can correlate slot-for-slot, matching the
+    /// single-row endpoint's semantic.
+    pub message_block_ids: Vec<String>,
+    /// Number of rows that actually landed (input length minus
+    /// dedup-skipped rows).
+    pub inserted: usize,
+}
+
+async fn post_messages_batch(
+    State(state): State<AppState>,
+    Json(reqs): Json<Vec<IngestRequest>>,
+) -> Result<Json<BatchIngestResponse>, AppError> {
+    let mut ids = Vec::with_capacity(reqs.len());
+    let mut msgs = Vec::with_capacity(reqs.len());
+    for req in reqs {
+        let id = uuid::Uuid::now_v7().to_string();
+        ids.push(id.clone());
+        msgs.push(ingest_request_to_message(req, id));
+    }
+    let inserted = state.transcript_service.ingest_batch(msgs).await?;
+    Ok(Json(BatchIngestResponse {
+        message_block_ids: ids,
+        inserted,
+    }))
+}
+
+fn ingest_request_to_message(req: IngestRequest, id: String) -> ConversationMessage {
+    ConversationMessage {
+        message_block_id: id,
         session_id: req.session_id,
         tenant: req.tenant,
         caller_agent: req.caller_agent,
@@ -118,11 +161,7 @@ async fn post_message(
         embed_eligible: req.embed_eligible,
         created_at: req.created_at,
         meta_json: req.meta_json,
-    };
-    state.transcript_service.ingest(msg).await?;
-    Ok(Json(IngestResponse {
-        message_block_id: id,
-    }))
+    }
 }
 
 // ---------------------------------------------------------------------------

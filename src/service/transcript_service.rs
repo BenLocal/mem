@@ -97,6 +97,22 @@ impl TranscriptService {
         self.store.create_conversation_message(&msg).await
     }
 
+    /// Bulk ingest of transcript blocks. Idempotent on
+    /// `(transcript_path, line_number, block_index)` like the single-row
+    /// form, but dedup + write + embedding-job enqueue all happen in
+    /// one Lance round-trip per table — so total cost is independent of
+    /// `msgs.len()`. Returns the number of rows that actually landed
+    /// (input length minus dedup-skipped rows).
+    pub async fn ingest_batch(
+        &self,
+        msgs: Vec<ConversationMessage>,
+    ) -> Result<usize, StorageError> {
+        if msgs.is_empty() {
+            return Ok(0);
+        }
+        self.store.create_conversation_messages(&msgs).await
+    }
+
     /// Per-session aggregate summary of the transcript archive. Backs the
     /// admin web page's transcripts list (one row per session, newest last
     /// activity first).

@@ -546,3 +546,69 @@ async fn ingest_accepts_caller_summary_and_stores_it() {
         "stored summary should be the caller-supplied value, not the auto-derived one"
     );
 }
+
+#[tokio::test]
+async fn batch_ingest_returns_per_item_results() {
+    let app = test_app().await;
+    let body = json!([
+        {
+            "capability_capsule_type": "implementation",
+            "content": "alpha — first capsule of the batch",
+            "scope": "repo",
+            "write_mode": "auto",
+            "idempotency_key": "batch-alpha"
+        },
+        {
+            "capability_capsule_type": "implementation",
+            "content": "beta — second capsule of the batch",
+            "scope": "repo",
+            "write_mode": "auto",
+            "idempotency_key": "batch-beta"
+        }
+    ]);
+    let resp = app.post_json("/capability_capsules/batch", body).await;
+    assert_eq!(resp.status(), 201);
+    let v = resp.json();
+    let items = v["items"].as_array().expect("items array");
+    assert_eq!(items.len(), 2);
+    for item in items {
+        assert_eq!(item["result"], "ok");
+        assert!(item["capability_capsule_id"].is_string());
+        assert_eq!(item["status"], "active");
+    }
+}
+
+#[tokio::test]
+async fn batch_ingest_dedupes_against_existing_idempotency_key() {
+    let app = test_app().await;
+    let single = json!({
+        "capability_capsule_type": "implementation",
+        "content": "shared — pre-seeded via single endpoint",
+        "scope": "repo",
+        "write_mode": "auto",
+        "idempotency_key": "shared-key"
+    });
+    let pre = app.post_json("/capability_capsules", single).await;
+    assert_eq!(pre.status(), 201);
+    let pre_id = pre.json()["capability_capsule_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    // Same idempotency_key inside a batch → must return the same id
+    // as the pre-seeded row, not a new one.
+    let body = json!([{
+        "capability_capsule_type": "implementation",
+        "content": "shared — pre-seeded via single endpoint",
+        "scope": "repo",
+        "write_mode": "auto",
+        "idempotency_key": "shared-key"
+    }]);
+    let resp = app.post_json("/capability_capsules/batch", body).await;
+    assert_eq!(resp.status(), 201);
+    let v = resp.json();
+    let items = v["items"].as_array().expect("items array");
+    assert_eq!(items.len(), 1);
+    assert_eq!(items[0]["result"], "ok");
+    assert_eq!(items[0]["capability_capsule_id"], pre_id);
+}
