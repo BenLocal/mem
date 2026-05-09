@@ -812,7 +812,7 @@ impl LanceStore {
                 sql_quote(tenant),
                 sql_quote(original_memory_id),
             ))
-            .column("status", "'archived'")
+            .column("status", "'rejected'")
             .column("updated_at", sql_quote(&now))
             .execute()
             .await
@@ -1419,7 +1419,7 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        assert_eq!(archived.status, MemoryStatus::Archived);
+        assert_eq!(archived.status, MemoryStatus::Rejected);
         let successor_row = repo
             .get_memory_for_tenant("tenant", "mem_r_v2")
             .await

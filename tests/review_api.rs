@@ -54,10 +54,11 @@ fn sample_memory_for_tenant(memory_id: &str, tenant: &str, status: MemoryStatus)
     }
 }
 
-async fn test_duckdb_repo() -> Store {
+async fn test_duckdb_repo() -> (TempDir, Store) {
     let temp_dir = tempdir().unwrap();
     let db_path = temp_dir.path().join("review-test.duckdb");
-    Store::open(&db_path).await.unwrap()
+    let store = Store::open(&db_path).await.unwrap();
+    (temp_dir, store)
 }
 
 struct TestApp {
@@ -166,7 +167,7 @@ async fn seeded_app_with_active_preference() -> TestApp {
 
 #[tokio::test]
 async fn duckdb_repository_lists_pending_review_rows() {
-    let repo = test_duckdb_repo().await;
+    let (_dir, repo) = test_duckdb_repo().await;
     repo.insert_memory(sample_memory("001", MemoryStatus::PendingConfirmation))
         .await
         .unwrap();
