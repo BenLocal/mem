@@ -217,8 +217,8 @@ pub struct EditPendingRequest {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "snake_case")]
 pub struct EditPendingResponse {
-    pub original_memory_id: String,
-    pub memory: CapabilityCapsuleRecord,
+    pub original_capability_capsule_id: String,
+    pub capability_capsule: CapabilityCapsuleRecord,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -256,7 +256,7 @@ pub struct FeedbackSummary {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "snake_case")]
 pub struct CapabilityCapsuleDetailResponse {
-    pub memory: CapabilityCapsuleRecord,
+    pub capability_capsule: CapabilityCapsuleRecord,
     pub version_chain: Vec<CapabilityCapsuleVersionLink>,
     pub graph_links: Vec<GraphEdge>,
     pub feedback_summary: FeedbackSummary,

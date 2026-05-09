@@ -322,7 +322,7 @@ impl CapabilityCapsuleService {
                 .await?,
             graph_links,
             feedback_summary: self.store.feedback_summary(capability_capsule_id).await?,
-            memory,
+            capability_capsule: memory,
             embedding,
         })
     }
@@ -510,8 +510,8 @@ impl CapabilityCapsuleService {
         self.enqueue_embedding_job_for_memory(&superseding).await?;
 
         Ok(EditPendingResponse {
-            original_memory_id: original.capability_capsule_id,
-            memory: superseding,
+            original_capability_capsule_id: original.capability_capsule_id,
+            capability_capsule: superseding,
         })
     }
 

@@ -1,6 +1,6 @@
 'use strict';
 
-// All DOM nodes representing memory data are built with createElement +
+// All DOM nodes representing capability capsule data are built with createElement +
 // textContent + setAttribute — never innerHTML on user-supplied strings —
 // so summary/content/tags containing angle brackets, quotes, or script tags
 // can never become an XSS sink.
@@ -88,7 +88,7 @@ function showToast(msg, err = false) {
 function fmtDate(s) {
   if (!s) return '—';
   // Two formats land here:
-  //   1. memories side — `current_timestamp()` (src/storage/time.rs)
+  //   1. capability_capsules side — `current_timestamp()` (src/storage/time.rs)
   //      writes `{millis:020}`, so a 20-digit zero-padded epoch millis
   //      string like "00000001778060883021".
   //   2. transcripts side — `conversation_messages.created_at` is the
@@ -259,7 +259,7 @@ btnYes.addEventListener('click', async () => {
   btnYes.disabled = true;
   btnYes.textContent = 'sending…';
   try {
-    const r = await fetch('/capability_capsules?/feedback', {
+    const r = await fetch('/capability_capsules/feedback', {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
       body: JSON.stringify({ tenant: TENANT, capability_capsule_id: id, feedback_kind: 'incorrect' })
@@ -313,7 +313,7 @@ function section(title, ...children) {
 }
 
 function buildDetail(detail) {
-  const m = detail.memory || {};
+  const m = detail.capability_capsule || {};
   const t = m.capability_capsule_type || '';
   const status = m.status || 'active';
 
@@ -454,7 +454,7 @@ function buildDetail(detail) {
 /// The footer lives outside `.detail-body` so it always sits at the
 /// panel's bottom (flex sibling), no `position: sticky` games.
 function populateActions(detail) {
-  const m = detail.memory || {};
+  const m = detail.capability_capsule || {};
   const status = m.status || 'active';
   const removed = ['archived', 'rejected'].includes(status);
   detailNote.textContent = removed
@@ -476,7 +476,7 @@ async function openDetail(id) {
   while (detailBody.firstChild) detailBody.removeChild(detailBody.firstChild);
   detailBody.appendChild(buildPlaceholder('retrieving record', id, 'loading'));
   try {
-    const r = await fetch(`/capability_capsules?/${encodeURIComponent(id)}?tenant=${encodeURIComponent(TENANT)}`);
+    const r = await fetch(`/capability_capsules/${encodeURIComponent(id)}?tenant=${encodeURIComponent(TENANT)}`);
     if (!r.ok) {
       const t = await r.text();
       throw new Error(`HTTP ${r.status}: ${t.slice(0, 160)}`);
@@ -526,7 +526,7 @@ deleteBtnYes.addEventListener('click', async () => {
   deleteBtnYes.disabled = true;
   deleteBtnYes.textContent = 'erasing…';
   try {
-    const r = await fetch(`/capability_capsules?/${encodeURIComponent(id)}?tenant=${encodeURIComponent(TENANT)}`, {
+    const r = await fetch(`/capability_capsules/${encodeURIComponent(id)}?tenant=${encodeURIComponent(TENANT)}`, {
       method: 'DELETE',
     });
     if (!r.ok) {
@@ -577,7 +577,7 @@ search.addEventListener('input', () => {
 
 async function load() {
   try {
-    const r = await fetch(`/capability_capsules??tenant=${encodeURIComponent(TENANT)}`);
+    const r = await fetch(`/capability_capsules?tenant=${encodeURIComponent(TENANT)}`);
     if (!r.ok) {
       const t = await r.text();
       throw new Error(`HTTP ${r.status}: ${t.slice(0, 160)}`);
