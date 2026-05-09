@@ -1016,8 +1016,6 @@ impl LanceStore {
             .next())
     }
 
-    // insert_episode lives in `super::episodes`
-
     pub async fn list_memory_ids_for_tenant(
         &self,
         tenant: &str,
@@ -1029,9 +1027,6 @@ impl LanceStore {
             .map(|m| m.memory_id)
             .collect())
     }
-
-    // session methods are implemented in `super::sessions`
-    // episode methods are implemented in `super::episodes`
 
     pub async fn list_embedding_jobs(
         &self,
