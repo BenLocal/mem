@@ -163,10 +163,56 @@ impl LanceStore {
         // provider-dependent and unknown here without provider).
         // TODO: ensure_episodes_table, ensure_sessions_table.
 
+        // FTS indexes for the BM25 read paths. Built once at open
+        // time on empty tables — building the index is cheap when
+        // the table has no rows, and creating it up front lets the
+        // DuckDB query layer (`storage::duckdb_query`) call
+        // `lance_fts(...)` directly without first probing for an
+        // index. After this, every subsequent open is a no-op:
+        // `ensure_fts_index` checks `Table::list_indices` and skips
+        // creation when the column is already indexed.
+        ensure_fts_index(&conn, "memories", "content").await?;
+        ensure_fts_index(&conn, "conversation_messages", "content").await?;
+
         Ok(Self {
             conn: Arc::new(conn),
         })
     }
+}
+
+/// Idempotently ensure an FTS (BM25 inverted) index exists on
+/// `(table_name, column)`. The lance extension's `lance_fts(...)` SQL
+/// table function returns empty results — without erroring — when no
+/// FTS index is present on the queried column, which is a real-world
+/// trap: a typo'd column name silently turns into "no matches". Pinning
+/// the indexes at open() time means the DuckDB query side can call
+/// `lance_fts` and trust empty results to mean "no matching rows."
+async fn ensure_fts_index(
+    conn: &Connection,
+    table_name: &str,
+    column: &str,
+) -> Result<(), StorageError> {
+    let table = conn
+        .open_table(table_name)
+        .execute()
+        .await
+        .map_err(lancedb_err)?;
+    let indices = table.list_indices().await.map_err(lancedb_err)?;
+    let already = indices
+        .iter()
+        .any(|c| c.columns.iter().any(|col| col == column));
+    if already {
+        return Ok(());
+    }
+    table
+        .create_index(
+            &[column],
+            lancedb::index::Index::FTS(lancedb::index::scalar::FtsIndexBuilder::default()),
+        )
+        .execute()
+        .await
+        .map_err(lancedb_err)?;
+    Ok(())
 }
 
 /// Map a `lancedb::Error` into our generic [`StorageError`]. We lose the
@@ -1871,27 +1917,8 @@ impl MemoryRepository for LanceStore {
             .await
             .map_err(lancedb_err)?;
 
-        // Lazy-create FTS index on `content` if not already there. We
-        // keep this lazy (rather than at open()) for the same reason
-        // memory_embeddings is lazy: indexing an empty table is wasted
-        // work, and any test/dev path that never calls bm25_candidates
-        // doesn't pay the build cost. Once present, `replace(false)` +
-        // the existence check makes subsequent calls cheap.
-        let indices = table.list_indices().await.map_err(lancedb_err)?;
-        let has_fts = indices
-            .iter()
-            .any(|c| c.columns.iter().any(|col| col == "content"));
-        if !has_fts {
-            table
-                .create_index(
-                    &["content"],
-                    lancedb::index::Index::FTS(lancedb::index::scalar::FtsIndexBuilder::default()),
-                )
-                .execute()
-                .await
-                .map_err(lancedb_err)?;
-        }
-
+        // FTS index is built once at `LanceStore::open` time on the
+        // `content` column (see `ensure_fts_index`); no per-call check.
         let fts_query = lancedb::index::scalar::FullTextSearchQuery::new(query.to_string());
         let stream = table
             .query()
@@ -2736,23 +2763,7 @@ impl TranscriptRepository for LanceStore {
             .execute()
             .await
             .map_err(lancedb_err)?;
-        // Lazy-create FTS index on `content` (same pattern as
-        // bm25_candidates on the memories table).
-        let indices = table.list_indices().await.map_err(lancedb_err)?;
-        let has_fts = indices
-            .iter()
-            .any(|c| c.columns.iter().any(|col| col == "content"));
-        if !has_fts {
-            table
-                .create_index(
-                    &["content"],
-                    lancedb::index::Index::FTS(lancedb::index::scalar::FtsIndexBuilder::default()),
-                )
-                .execute()
-                .await
-                .map_err(lancedb_err)?;
-        }
-
+        // FTS index built at open() time (see `ensure_fts_index`).
         // Oversample so the embed_eligible drop doesn't immediately
         // starve the result (mirrors DuckDB tantivy oversample).
         let oversample = k.saturating_mul(2).max(k);

@@ -34,11 +34,12 @@
 //!   - `fetch_memories_by_ids`
 //!   - `list_memory_ids_for_tenant`
 //!   - `list_memory_versions_for_tenant`
+//!   - `bm25_candidates` (via `lance_fts`)
+//!   - `semantic_search_memories` (via `lance_vector_search`)
 //!
-//! Subsequent commits add `bm25_candidates` (via `lance_fts`),
-//! `semantic_search_memories` (via `lance_vector_search`), the
-//! transcript reads, the graph reads, and the entity-registry reads
-//! — one cluster per commit so each addition is reviewable.
+//! Subsequent commits add the transcript reads, the graph reads, and
+//! the entity-registry reads — one cluster per commit so each
+//! addition is reviewable.
 
 use std::path::Path;
 use std::sync::{Arc, Mutex};
@@ -368,6 +369,165 @@ impl DuckDbQuery {
                  WHERE tenant = ?1 ORDER BY updated_at DESC",
             )?;
             let rows = stmt.query_map(params![tenant], |row| row.get::<_, String>(0))?;
+            let mut out = Vec::new();
+            for r in rows {
+                out.push(r.map_err(StorageError::DuckDb)?);
+            }
+            Ok(out)
+        })
+        .await
+    }
+
+    /// Lexical recall via BM25 over the `memories.content` column.
+    /// Routes through the lance extension's `lance_fts(...)` SQL table
+    /// function — the FTS index itself is built once at
+    /// [`LanceStore::open`] time on `(memories, content)`.
+    ///
+    /// Status filter (`NOT IN ('rejected', 'archived')`) and tenant
+    /// scope are pushed to the outer `WHERE`. Oversampling: the
+    /// table function is asked for `k * 2` BM25 hits (mirrors the
+    /// legacy tantivy oversample) so the status filter has slack
+    /// before the final `LIMIT k`. `_score` from the function drives
+    /// the ORDER BY.
+    ///
+    /// Empty / whitespace query or `k == 0` short-circuits without
+    /// touching DuckDB.
+    pub async fn bm25_candidates(
+        &self,
+        tenant: &str,
+        query: &str,
+        k: usize,
+    ) -> Result<Vec<MemoryRecord>, StorageError> {
+        if query.trim().is_empty() || k == 0 {
+            return Ok(Vec::new());
+        }
+        let conn = self.conn.clone();
+        let tenant = tenant.to_string();
+        let query = query.to_string();
+        let k_i = i64::try_from(k).unwrap_or(64).clamp(1, 1024);
+        let oversample = k_i.saturating_mul(2);
+        let rejected = enum_to_text(&MemoryStatus::Rejected)?;
+        let archived = enum_to_text(&MemoryStatus::Archived)?;
+        spawn_blocking_storage(move || {
+            let conn = conn.lock().expect("duckdb_query mutex poisoned");
+            let sql = format!(
+                "SELECT {MEMORY_COLS} \
+                 FROM lance_fts('ns.main.memories', 'content', ?1, k => ?2) \
+                 WHERE tenant = ?3 AND status NOT IN (?4, ?5) \
+                 ORDER BY _score DESC \
+                 LIMIT ?6",
+                MEMORY_COLS = MEMORY_COLS,
+            );
+            let mut stmt = conn.prepare(&sql)?;
+            let rows = stmt.query_map(
+                params![query, oversample, tenant, archived, rejected, k_i],
+                row_to_memory_record,
+            )?;
+            collect_memories(rows)
+        })
+        .await
+    }
+
+    /// Semantic recall via ANN over the `memory_embeddings` table's
+    /// `embedding` column. Routes through the lance extension's
+    /// `lance_vector_search(...)` SQL table function; joins back to
+    /// `ns.main.memories` to hydrate the full `MemoryRecord`. Returns
+    /// `(record, similarity)` pairs ordered by similarity DESC.
+    ///
+    /// **Score**: cosine similarity ∈ `[0, 1]` for normalized
+    /// embeddings, derived from L2² as `1 - L2²/2` (see the
+    /// [implementation comment][impl-comment] for why we can't ask
+    /// the lance extension for cosine directly). EmbeddingProvider
+    /// implementations are required to produce L2-normalized vectors,
+    /// so this is the same score shape as the legacy backend's
+    /// `cosine_similarity`.
+    ///
+    /// [impl-comment]: see the SQL building site below.
+    ///
+    /// **Query vector encoding**: inlined as a `FLOAT[]` literal —
+    /// duckdb-rs 1.x has no `ToSql for &[f32]`, and query embeddings
+    /// come from the trusted embedding provider stack (always finite,
+    /// no NaN/Inf), so `Display`-formatting through the SQL string is
+    /// safe and lossless via Rust's f32 round-trippable formatter.
+    ///
+    /// Empty `query_embedding` or `limit == 0` short-circuits.
+    pub async fn semantic_search_memories(
+        &self,
+        tenant: &str,
+        query_embedding: &[f32],
+        limit: usize,
+    ) -> Result<Vec<(MemoryRecord, f32)>, StorageError> {
+        if query_embedding.is_empty() || limit == 0 {
+            return Ok(Vec::new());
+        }
+        let vector_lit = format!(
+            "[{}]::FLOAT[]",
+            query_embedding
+                .iter()
+                .map(|x| x.to_string())
+                .collect::<Vec<_>>()
+                .join(", "),
+        );
+        let conn = self.conn.clone();
+        let tenant = tenant.to_string();
+        let lim = i64::try_from(limit).unwrap_or(64).clamp(1, 1024);
+        let oversample = lim.saturating_mul(2);
+        let rejected = enum_to_text(&MemoryStatus::Rejected)?;
+        let archived = enum_to_text(&MemoryStatus::Archived)?;
+        spawn_blocking_storage(move || {
+            let conn = conn.lock().expect("duckdb_query mutex poisoned");
+            // SELECT both the 27 memory cols (m.<col>) and _distance.
+            // Done explicitly rather than via `m.*` so column ordering
+            // stays in lock-step with `row_to_memory_record`'s indices.
+            let m_cols = MEMORY_COLS
+                .split(',')
+                .map(|c| format!("m.{}", c.trim()))
+                .collect::<Vec<_>>()
+                .join(", ");
+            // The lance_duckdb extension's `lance_vector_search`
+            // accepts these named params only: `k`, `nprobs`,
+            // `refine_factor`, `prefilter`, `use_index`,
+            // `explain_verbose`. There is **no** `distance_type` kwarg
+            // — the function uses L2² (squared euclidean) by default
+            // when no vector index is attached, and otherwise inherits
+            // the index's distance type. We need cosine similarity to
+            // match the service-layer ranker's score contract.
+            //
+            // Workaround: for **L2-normalized** embeddings (the
+            // EmbeddingProvider trait's invariant — every provider mem
+            // ships with returns unit vectors),
+            //
+            //     cos_sim = 1 - L2² / 2
+            //
+            // because |a - b|² = |a|² + |b|² - 2·a·b
+            //                  = 2 - 2·cos_sim  (when |a|=|b|=1).
+            //
+            // So `1.0 - _distance / 2.0` lands in `[0, 1]` for
+            // typical normalized embeddings — same range and ordering
+            // as the legacy DuckDB backend's cosine_similarity.
+            // (If a non-normalized vector slips in, scores degrade
+            // gracefully — same failure mode as the legacy backend.)
+            let sql = format!(
+                "SELECT {m_cols}, e._distance \
+                 FROM lance_vector_search( \
+                        'ns.main.memory_embeddings', 'embedding', {vector_lit}, k => ?1 \
+                      ) AS e \
+                 JOIN ns.main.memories AS m ON m.memory_id = e.memory_id \
+                 WHERE m.tenant = ?2 AND m.status NOT IN (?3, ?4) \
+                 ORDER BY e._distance ASC \
+                 LIMIT ?5",
+            );
+            let mut stmt = conn.prepare(&sql)?;
+            let rows = stmt.query_map(
+                params![oversample, tenant, archived, rejected, lim],
+                |row| {
+                    let mem = row_to_memory_record(row)?;
+                    let l2_squared: f32 = row.get(27)?;
+                    // cos_sim = 1 - L2²/2 for normalized vectors (see
+                    // SQL comment above for the derivation).
+                    Ok((mem, 1.0_f32 - l2_squared / 2.0_f32))
+                },
+            )?;
             let mut out = Vec::new();
             for r in rows {
                 out.push(r.map_err(StorageError::DuckDb)?);
@@ -884,5 +1044,159 @@ mod tests {
             .find(|l| l.memory_id == "m_b")
             .expect("m_b in chain");
         assert!(b_link.supersedes_memory_id.is_none());
+    }
+
+    /// `bm25_candidates` over the lance extension's `lance_fts(...)`
+    /// SQL function, with the FTS index built at LanceStore::open.
+    /// Verifies:
+    ///   - Empty / k=0 → empty Vec.
+    ///   - Lexical match returns the right rows.
+    ///   - Tenant filter scopes correctly.
+    ///   - Archived/rejected rows are excluded by the outer WHERE.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn duckdb_query_bm25_candidates() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("store");
+        let lance = LanceStore::open(&path).await.unwrap();
+
+        // 4 memories with distinct content — 3 in tenant-a (one
+        // archived), 1 in tenant-b.
+        let mut a = fixture("m_duck", "tenant-a");
+        a.content = "DuckDB single mutex serializes writes".into();
+        let mut b = fixture("m_lance", "tenant-a");
+        b.content = "LanceDB native vector search uses ANN".into();
+        let mut c = fixture("m_arc", "tenant-a");
+        c.status = MemoryStatus::Archived;
+        c.content = "Tantivy provides BM25 in DuckDB build".into();
+        let mut d = fixture("m_other", "tenant-b");
+        d.content = "DuckDB connection pool tenant-b".into();
+        for m in [&a, &b, &c, &d] {
+            lance.insert_memory(m.clone()).await.unwrap();
+        }
+
+        let q = DuckDbQuery::open(&path).await.unwrap();
+
+        // empty query / k=0 short-circuits.
+        let none1 = q.bm25_candidates("tenant-a", "", 5).await.unwrap();
+        assert!(none1.is_empty());
+        let none2 = q.bm25_candidates("tenant-a", "DuckDB", 0).await.unwrap();
+        assert!(none2.is_empty());
+
+        // 'DuckDB' matches m_duck (tenant-a, active) and m_arc
+        // (tenant-a, archived). Archived must be filtered out.
+        let hits = q.bm25_candidates("tenant-a", "DuckDB", 10).await.unwrap();
+        let ids: Vec<&str> = hits.iter().map(|m| m.memory_id.as_str()).collect();
+        assert!(ids.contains(&"m_duck"), "got {ids:?}");
+        assert!(
+            !ids.contains(&"m_arc"),
+            "archived row must be filtered out by status NOT IN clause; got {ids:?}",
+        );
+        assert!(
+            !ids.contains(&"m_other"),
+            "tenant-b row must not appear in tenant-a query; got {ids:?}",
+        );
+
+        // tenant-b sees its own row.
+        let b_hits = q.bm25_candidates("tenant-b", "DuckDB", 10).await.unwrap();
+        let b_ids: Vec<&str> = b_hits.iter().map(|m| m.memory_id.as_str()).collect();
+        assert!(b_ids.contains(&"m_other"));
+
+        // Different query word.
+        let lance_hits = q.bm25_candidates("tenant-a", "LanceDB", 10).await.unwrap();
+        let lance_ids: Vec<&str> = lance_hits.iter().map(|m| m.memory_id.as_str()).collect();
+        assert!(lance_ids.contains(&"m_lance"), "got {lance_ids:?}");
+    }
+
+    /// `semantic_search_memories` over `lance_vector_search(...)` with
+    /// JOIN to memories. Inserts 3 memories with hand-rolled 4-d unit
+    /// vectors via `upsert_memory_embedding`, then queries with a
+    /// vector close to one of them and asserts ordering / score
+    /// shape / tenant scope / archived exclusion.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn duckdb_query_semantic_search_memories() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("store");
+        let lance = LanceStore::open(&path).await.unwrap();
+
+        let m1 = fixture("m_v1", "tenant-a");
+        let m2 = fixture("m_v2", "tenant-a");
+        let mut m3 = fixture("m_v3", "tenant-a");
+        m3.status = MemoryStatus::Archived;
+        let m4 = fixture("m_v4", "tenant-b");
+        for m in [&m1, &m2, &m3, &m4] {
+            lance.insert_memory(m.clone()).await.unwrap();
+        }
+
+        // 4-d unit vectors. v1 ≈ [1,0,0,0]; v2 distant; v3 in tenant-a
+        // but archived; v4 in tenant-b.
+        fn to_blob(v: &[f32]) -> Vec<u8> {
+            let mut out = Vec::with_capacity(v.len() * 4);
+            for f in v {
+                out.extend_from_slice(&f.to_ne_bytes());
+            }
+            out
+        }
+        let v1 = vec![1.0_f32, 0.0, 0.0, 0.0];
+        let v2 = vec![0.0_f32, 1.0, 0.0, 0.0];
+        let v3 = vec![0.0_f32, 0.0, 1.0, 0.0];
+        let v4 = vec![0.0_f32, 0.0, 0.0, 1.0];
+        let now = "00000001778000000000";
+        for (id, tenant, vec, hash) in [
+            ("m_v1", "tenant-a", &v1, "h1"),
+            ("m_v2", "tenant-a", &v2, "h2"),
+            ("m_v3", "tenant-a", &v3, "h3"),
+            ("m_v4", "tenant-b", &v4, "h4"),
+        ] {
+            lance
+                .upsert_memory_embedding(id, tenant, "fake-test", 4, &to_blob(vec), hash, now, now)
+                .await
+                .unwrap();
+        }
+
+        let q = DuckDbQuery::open(&path).await.unwrap();
+
+        // Query close to v1: m_v1 ranks first; m_v2 also returns;
+        // m_v3 archived → excluded; m_v4 cross-tenant → excluded.
+        let query = vec![0.99_f32, 0.14, 0.0, 0.0];
+        let hits = q
+            .semantic_search_memories("tenant-a", &query, 10)
+            .await
+            .unwrap();
+        assert_eq!(
+            hits.len(),
+            2,
+            "tenant-a active memories with embeddings → 2 (m_v1, m_v2); got {hits:?}"
+        );
+        assert_eq!(hits[0].0.memory_id, "m_v1", "v1 ranks first (closest)");
+        assert_eq!(hits[1].0.memory_id, "m_v2");
+        assert!(
+            hits[0].1 > hits[1].1,
+            "similarity is descending: {} > {}",
+            hits[0].1,
+            hits[1].1,
+        );
+        // Sanity: similarity ∈ (0, 1] for normalized vectors close to
+        // v1; the closer hit (≈cos(0.14)) should be > 0.99.
+        assert!(hits[0].1 > 0.99);
+
+        // Empty / 0-limit short-circuits.
+        let empty1 = q
+            .semantic_search_memories("tenant-a", &[], 10)
+            .await
+            .unwrap();
+        assert!(empty1.is_empty());
+        let empty2 = q
+            .semantic_search_memories("tenant-a", &query, 0)
+            .await
+            .unwrap();
+        assert!(empty2.is_empty());
+
+        // tenant-b sees its own row.
+        let b_hits = q
+            .semantic_search_memories("tenant-b", &query, 10)
+            .await
+            .unwrap();
+        assert_eq!(b_hits.len(), 1);
+        assert_eq!(b_hits[0].0.memory_id, "m_v4");
     }
 }
