@@ -63,3 +63,10 @@ rand = "0.8"
 # Requires network at first run (community extension download).
 [[example]]
 name = "lance_duckdb_poc"
+
+# PoC: cross-table hybrid search (lance_fts + lance_vector_search joined
+# on capability_capsule_id, with RRF computed in DuckDB SQL). Validates
+# the no-schema-change route to native hybrid retrieval. Run with:
+#   cargo run --example hybrid_sql_poc
+[[example]]
+name = "hybrid_sql_poc"
