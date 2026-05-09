@@ -476,6 +476,21 @@ impl Store {
             .semantic_search_capability_capsules(tenant, query_embedding, limit)
             .await
     }
+
+    /// Cross-table BM25 + vector + RRF, fused inline in DuckDB SQL.
+    /// See `DuckDbQuery::hybrid_candidates` for the full contract;
+    /// validated by `examples/hybrid_sql_poc.rs`.
+    pub async fn hybrid_candidates(
+        &self,
+        tenant: &str,
+        query_text: &str,
+        query_embedding: &[f32],
+        k: usize,
+    ) -> Result<Vec<(CapabilityCapsuleRecord, f32)>, StorageError> {
+        self.query
+            .hybrid_candidates(tenant, query_text, query_embedding, k)
+            .await
+    }
 }
 
 // ── Memory reads with no DuckDbQuery counterpart yet (LanceStore) ──

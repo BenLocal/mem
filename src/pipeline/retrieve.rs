@@ -7,7 +7,7 @@ use crate::{
         },
         query::SearchCapabilityCapsuleRequest,
     },
-    pipeline::ranking::{freshness_score, timestamp_score, RRF_K, RRF_SCALE},
+    pipeline::ranking::{freshness_score, timestamp_score, RRF_SCALE},
     storage::Store,
 };
 
@@ -54,161 +54,83 @@ fn finalize(scored: Vec<ScoredMemory>) -> Vec<CapabilityCapsuleRecord> {
         .collect()
 }
 
-pub fn rank_candidates(
-    candidates: Vec<CapabilityCapsuleRecord>,
+/// Top-level hybrid entry: take the lifecycle pool (e.g. all active
+/// capsules for tenant) plus the SQL-side hybrid hits with their RRF
+/// scores, and produce the user-visible ranked result.
+///
+/// `pool` carries the always-applicable Preference / Workflow rows
+/// regardless of whether they hit the query — they pass `finalize`'s
+/// floor exemption. `hybrid_hits` carries the relevance signal: an
+/// (id → rrf_score) map driven by `lance_fts` + `lance_vector_search`
+/// joined and RRF-fused inline in DuckDB SQL. Items in both inputs
+/// score with rrf_score + lifecycle signals; items only in the pool
+/// score from lifecycle alone.
+///
+/// Graph expansion follows the same two-pass shape as the pre-hybrid
+/// path: derive anchors from the unfiltered top-N, fetch related
+/// capsule ids, rescore with `graph_boost = 12` on matching items.
+pub async fn rank_with_hybrid_and_graph(
+    pool: Vec<CapabilityCapsuleRecord>,
+    hybrid_hits: Vec<(CapabilityCapsuleRecord, f32)>,
     query: &SearchCapabilityCapsuleRequest,
-) -> Vec<CapabilityCapsuleRecord> {
-    finalize(score_candidates(candidates, query, &HashSet::new(), 0))
-}
-
-pub fn merge_and_rank_hybrid(
-    lexical: Vec<CapabilityCapsuleRecord>,
-    semantic: Vec<(CapabilityCapsuleRecord, f32)>,
-    query: &SearchCapabilityCapsuleRequest,
-    related_capability_capsule_ids: &HashSet<String>,
-    graph_boost: i64,
-) -> Vec<CapabilityCapsuleRecord> {
-    finalize(merge_and_rank_hybrid_scored(
-        lexical,
-        semantic,
-        query,
-        related_capability_capsule_ids,
-        graph_boost,
-    ))
-}
-
-/// Internal: hybrid scoring without the relevance-floor filter. Used by
-/// graph-expansion paths that need the unfiltered top-N to derive anchors.
-fn merge_and_rank_hybrid_scored(
-    lexical: Vec<CapabilityCapsuleRecord>,
-    semantic: Vec<(CapabilityCapsuleRecord, f32)>,
-    query: &SearchCapabilityCapsuleRequest,
-    related_capability_capsule_ids: &HashSet<String>,
-    graph_boost: i64,
-) -> Vec<ScoredMemory> {
-    let lexical_ranks: HashMap<String, usize> = lexical
+    graph: &Store,
+) -> Result<Vec<CapabilityCapsuleRecord>, crate::storage::GraphError> {
+    let hybrid_scores: HashMap<String, f32> = hybrid_hits
         .iter()
-        .enumerate()
-        .map(|(i, m)| (m.capability_capsule_id.clone(), i + 1))
-        .collect();
-    let semantic_ranks: HashMap<String, usize> = semantic
-        .iter()
-        .enumerate()
-        .map(|(i, (m, _sim))| (m.capability_capsule_id.clone(), i + 1))
+        .map(|(m, s)| (m.capability_capsule_id.clone(), *s))
         .collect();
 
+    // Merge: pool acts as the lifecycle-applicable cohort; any
+    // hybrid hits not already in pool (rare — pool is the full active
+    // tenant set) are folded in so they can be scored.
     let mut by_id: HashMap<String, CapabilityCapsuleRecord> = HashMap::new();
-    for m in lexical {
+    for m in pool {
         by_id.insert(m.capability_capsule_id.clone(), m);
     }
-    for (m, _sim) in semantic {
+    for (m, _) in hybrid_hits {
         by_id.entry(m.capability_capsule_id.clone()).or_insert(m);
     }
     let candidates: Vec<CapabilityCapsuleRecord> = by_id.into_values().collect();
 
-    score_candidates_hybrid(
-        candidates,
-        query,
-        related_capability_capsule_ids,
-        graph_boost,
-        &lexical_ranks,
-        &semantic_ranks,
-    )
-}
-
-pub async fn rank_with_graph_hybrid(
-    lexical: Vec<CapabilityCapsuleRecord>,
-    semantic: Vec<(CapabilityCapsuleRecord, f32)>,
-    query: &SearchCapabilityCapsuleRequest,
-    graph: &Store,
-) -> Result<Vec<CapabilityCapsuleRecord>, crate::storage::GraphError> {
-    if semantic.is_empty() {
-        return rank_with_graph(lexical, query, graph).await;
-    }
-
     if !query.expand_graph {
-        return Ok(merge_and_rank_hybrid(
-            lexical,
-            semantic,
+        return Ok(finalize(score_with_hybrid(
+            candidates,
             query,
+            &hybrid_scores,
             &HashSet::new(),
             0,
-        ));
+        )));
     }
 
-    // Use the unfiltered scored output to derive graph anchors — anchor
-    // selection should consider the full top-N regardless of the relevance
-    // floor; the floor only gates the *user-visible* result.
-    let preliminary_scored =
-        merge_and_rank_hybrid_scored(lexical.clone(), semantic.clone(), query, &HashSet::new(), 0);
+    // Graph anchor derivation uses unfiltered top-N (floor is for the
+    // user-visible result, not anchor selection).
+    let preliminary_scored = score_with_hybrid(
+        candidates.clone(),
+        query,
+        &hybrid_scores,
+        &HashSet::new(),
+        0,
+    );
     let anchors = graph_anchor_nodes(&preliminary_scored);
     if anchors.is_empty() {
         return Ok(finalize(preliminary_scored));
     }
 
-    let related_capability_capsule_ids = graph.related_capability_capsule_ids(&anchors).await?;
-    let related_lookup = related_capability_capsule_ids
-        .into_iter()
-        .collect::<HashSet<_>>();
-    Ok(merge_and_rank_hybrid(
-        lexical,
-        semantic,
+    let related = graph.related_capability_capsule_ids(&anchors).await?;
+    let related_lookup: HashSet<String> = related.into_iter().collect();
+    Ok(finalize(score_with_hybrid(
+        candidates,
         query,
+        &hybrid_scores,
         &related_lookup,
         12,
-    ))
+    )))
 }
 
-pub async fn rank_with_graph(
-    candidates: Vec<CapabilityCapsuleRecord>,
-    query: &SearchCapabilityCapsuleRequest,
-    graph: &Store,
-) -> Result<Vec<CapabilityCapsuleRecord>, crate::storage::GraphError> {
-    if !query.expand_graph {
-        return Ok(rank_candidates(candidates, query));
-    }
-
-    let base = score_candidates(candidates, query, &HashSet::new(), 0);
-    let anchor_nodes = graph_anchor_nodes(&base);
-    if anchor_nodes.is_empty() {
-        return Ok(finalize(base));
-    }
-
-    let related_capability_capsule_ids =
-        graph.related_capability_capsule_ids(&anchor_nodes).await?;
-    let related_lookup = related_capability_capsule_ids
-        .into_iter()
-        .collect::<HashSet<_>>();
-    let rescored = score_candidates(
-        base.into_iter().map(|entry| entry.memory).collect(),
-        query,
-        &related_lookup,
-        12,
-    );
-    Ok(finalize(rescored))
-}
-
-pub async fn candidate_memory_ids(
-    graph: &Store,
-    candidates: &[CapabilityCapsuleRecord],
-) -> Result<Vec<String>, crate::storage::GraphError> {
-    let mut nodes = graph_anchor_nodes(
-        &candidates
-            .iter()
-            .cloned()
-            .map(|memory| ScoredMemory { memory, score: 0 })
-            .collect::<Vec<_>>(),
-    );
-    nodes.sort();
-    nodes.dedup();
-    graph.related_capability_capsule_ids(&nodes).await
-}
-
-/// Computes the additive non-recall portion of a memory's score, covering
-/// the 9 signals shared by both scorers (`score_candidates_hybrid`,
-/// `score_candidates`). The evidence bonus (`+2 when !evidence.is_empty()`)
-/// applies only to the hybrid scorer; the caller adds it inline before
-/// invoking this helper. Recall computation differs per scorer; this helper
+/// Computes the additive non-recall portion of a memory's score (the
+/// "lifecycle" stack: scope, intent, confidence, validation, freshness,
+/// staleness, graph boost, status penalty). Used by `score_with_hybrid`
+/// after the SQL-side RRF score has been added.
 /// handles the common rest.
 #[allow(dead_code)] // callers are wired in subsequent Tasks 3-5
 fn apply_lifecycle_score(
@@ -244,13 +166,18 @@ fn apply_lifecycle_score(
     score
 }
 
-fn score_candidates_hybrid(
+/// Score each candidate with the SQL-side RRF (already-fused
+/// lex+sem signal as a Float32) plus the lifecycle / scope / intent
+/// / freshness / decay / graph stack. Items not in `hybrid_scores`
+/// score zero on relevance — they survive only via the lifecycle
+/// stack and the always-applicable `Preference` / `Workflow` floor
+/// exemption in `finalize`.
+fn score_with_hybrid(
     candidates: Vec<CapabilityCapsuleRecord>,
     query: &SearchCapabilityCapsuleRequest,
+    hybrid_scores: &HashMap<String, f32>,
     related_capability_capsule_ids: &HashSet<String>,
     graph_boost: i64,
-    lexical_ranks: &HashMap<String, usize>,
-    semantic_ranks: &HashMap<String, usize>,
 ) -> Vec<ScoredMemory> {
     let newest = candidates
         .iter()
@@ -266,18 +193,15 @@ fn score_candidates_hybrid(
         .map(|memory| {
             let mut score = 0i64;
 
-            let rrf_lex = lexical_ranks
-                .get(&memory.capability_capsule_id)
-                .map(|&r| 1.0_f64 / (RRF_K as f64 + r as f64))
-                .unwrap_or(0.0);
-            let rrf_sem = semantic_ranks
-                .get(&memory.capability_capsule_id)
-                .map(|&r| 1.0_f64 / (RRF_K as f64 + r as f64))
-                .unwrap_or(0.0);
-            score += ((rrf_lex + rrf_sem) * RRF_SCALE).round() as i64;
+            // SQL-side RRF score is already (1/(60+lex_rank))
+            // + (1/(60+sem_rank)) ∈ ~[0, 0.033]. Scale it into the
+            // i64 score domain via `RRF_SCALE` so a rank-1 dual hit
+            // contributes about the same as the legacy manual RRF
+            // path (~32 score points).
+            if let Some(rrf) = hybrid_scores.get(&memory.capability_capsule_id) {
+                score += ((*rrf as f64) * RRF_SCALE).round() as i64;
+            }
 
-            // Lifecycle additive layer — extracted to apply_lifecycle_score for shared math.
-            // Evidence bonus stays inline because score_candidates (non-hybrid) doesn't have it.
             if !memory.evidence.is_empty() {
                 score += 2;
             }
@@ -291,56 +215,6 @@ fn score_candidates_hybrid(
                 graph_boost,
             );
 
-            ScoredMemory { memory, score }
-        })
-        .collect::<Vec<_>>();
-
-    scored.sort_by(|left, right| {
-        right
-            .score
-            .cmp(&left.score)
-            .then_with(|| {
-                timestamp_score(&right.memory.updated_at)
-                    .cmp(&timestamp_score(&left.memory.updated_at))
-            })
-            .then_with(|| right.memory.version.cmp(&left.memory.version))
-            .then_with(|| {
-                left.memory
-                    .capability_capsule_id
-                    .cmp(&right.memory.capability_capsule_id)
-            })
-    });
-
-    scored
-}
-
-fn score_candidates(
-    candidates: Vec<CapabilityCapsuleRecord>,
-    query: &SearchCapabilityCapsuleRequest,
-    related_capability_capsule_ids: &HashSet<String>,
-    graph_boost: i64,
-) -> Vec<ScoredMemory> {
-    let newest = candidates
-        .iter()
-        .map(|memory| timestamp_score(&memory.updated_at))
-        .max()
-        .unwrap_or(0);
-
-    let query_terms = tokenize(&query.query);
-    let scope_filters = parse_scope_filters(&query.scope_filters);
-
-    let mut scored = candidates
-        .into_iter()
-        .map(|memory| {
-            let score = apply_lifecycle_score(
-                &memory,
-                query,
-                &query_terms,
-                &scope_filters,
-                newest,
-                related_capability_capsule_ids,
-                graph_boost,
-            );
             ScoredMemory { memory, score }
         })
         .collect::<Vec<_>>();
@@ -664,6 +538,15 @@ mod tests {
             - staleness_penalty(memory.decay_score)
     }
 
+    /// RRF score equivalent to `lance_fts`/`lance_vector_search`'s SQL
+    /// output: sum of `1.0/(60+rank)` per source. Used in tests to
+    /// build the same Float32 score the SQL hybrid produces.
+    fn sql_rrf(lex_rank: Option<usize>, sem_rank: Option<usize>) -> f32 {
+        let lex = lex_rank.map(|r| 1.0 / (60.0 + r as f32)).unwrap_or(0.0);
+        let sem = sem_rank.map(|r| 1.0 / (60.0 + r as f32)).unwrap_or(0.0);
+        lex + sem
+    }
+
     #[test]
     fn rrf_recall_only_lexical() {
         let memory = fixture_memory("mem_a");
@@ -671,20 +554,12 @@ mod tests {
 
         let lifecycle_baseline = lifecycle_baseline_for(&memory, &query);
 
-        let mut lex_ranks = HashMap::new();
-        lex_ranks.insert("mem_a".into(), 1usize);
-        let sem_ranks: HashMap<String, usize> = HashMap::new();
+        let mut hybrid = HashMap::new();
+        hybrid.insert("mem_a".into(), sql_rrf(Some(1), None));
 
-        let scored = score_candidates_hybrid(
-            vec![memory],
-            &query,
-            &HashSet::new(),
-            0,
-            &lex_ranks,
-            &sem_ranks,
-        );
+        let scored = score_with_hybrid(vec![memory], &query, &hybrid, &HashSet::new(), 0);
 
-        // RRF contribution: 1000/(60+1) = 16.39 → round → 16.
+        // RRF contribution: 1000 * 1/(60+1) = 16.39 → round → 16.
         assert_eq!(scored[0].score - lifecycle_baseline, 16);
     }
 
@@ -697,19 +572,10 @@ mod tests {
 
         let lifecycle_baseline = lifecycle_baseline_for(&memory, &query);
 
-        let mut lex_ranks = HashMap::new();
-        let mut sem_ranks = HashMap::new();
-        lex_ranks.insert("mem_top".into(), 1usize);
-        sem_ranks.insert("mem_top".into(), 1usize);
+        let mut hybrid = HashMap::new();
+        hybrid.insert("mem_top".into(), sql_rrf(Some(1), Some(1)));
 
-        let scored = score_candidates_hybrid(
-            vec![memory],
-            &query,
-            &HashSet::new(),
-            0,
-            &lex_ranks,
-            &sem_ranks,
-        );
+        let scored = score_with_hybrid(vec![memory], &query, &hybrid, &HashSet::new(), 0);
 
         assert_eq!(scored[0].score - lifecycle_baseline, 33);
     }
@@ -724,20 +590,12 @@ mod tests {
         let m100 = fixture_memory("rank_100");
         let query = fixture_query();
 
-        let mut sem_ranks = HashMap::new();
-        sem_ranks.insert("rank_1".into(), 1usize);
-        sem_ranks.insert("rank_50".into(), 50usize);
-        sem_ranks.insert("rank_100".into(), 100usize);
-        let lex_ranks: HashMap<String, usize> = HashMap::new();
+        let mut hybrid = HashMap::new();
+        hybrid.insert("rank_1".into(), sql_rrf(None, Some(1)));
+        hybrid.insert("rank_50".into(), sql_rrf(None, Some(50)));
+        hybrid.insert("rank_100".into(), sql_rrf(None, Some(100)));
 
-        let scored = score_candidates_hybrid(
-            vec![m1, m50, m100],
-            &query,
-            &HashSet::new(),
-            0,
-            &lex_ranks,
-            &sem_ranks,
-        );
+        let scored = score_with_hybrid(vec![m1, m50, m100], &query, &hybrid, &HashSet::new(), 0);
 
         // After sort: rank_1 (highest RRF), rank_50, rank_100.
         // All share the same lifecycle baseline → ordering is determined by RRF alone.
@@ -759,18 +617,10 @@ mod tests {
 
         let lifecycle_baseline = lifecycle_baseline_for(&memory, &query);
 
-        let mut lex_ranks = HashMap::new();
-        lex_ranks.insert("lex_only".into(), 1usize);
-        let sem_ranks: HashMap<String, usize> = HashMap::new();
+        let mut hybrid = HashMap::new();
+        hybrid.insert("lex_only".into(), sql_rrf(Some(1), None));
 
-        let scored = score_candidates_hybrid(
-            vec![memory],
-            &query,
-            &HashSet::new(),
-            0,
-            &lex_ranks,
-            &sem_ranks,
-        );
+        let scored = score_with_hybrid(vec![memory], &query, &hybrid, &HashSet::new(), 0);
 
         assert!(
             scored[0].score > lifecycle_baseline,

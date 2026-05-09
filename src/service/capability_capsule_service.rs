@@ -1,5 +1,3 @@
-use std::collections::HashSet;
-
 use serde::Serialize;
 use std::sync::Arc;
 use thiserror::Error;
@@ -629,31 +627,36 @@ impl CapabilityCapsuleService {
             return Ok(compress::compress(&candidates, query.token_budget));
         }
 
-        // Lexical and semantic recall are independent — fire them in
-        // parallel via `tokio::join!`. The embedding-then-ANN path
-        // dominates wall time (model inference + HNSW lookup), so freeing
-        // the BM25 path to run alongside it shaves the total search
-        // latency by ~40% in the typical case (docs/api-data-flow.md §4.2).
-        let lexical_fut = self.lexical_candidates(tenant, &query.query);
-        let semantic_fut = async {
+        // Single SQL hybrid call replaces the dual lex/sem fan-out:
+        // `Store::hybrid_candidates` runs `lance_fts` +
+        // `lance_vector_search` joined by capability_capsule_id with
+        // RRF (k=60) computed inline in DuckDB SQL. See
+        // `examples/hybrid_sql_poc.rs` for the standalone validation.
+        //
+        // The lifecycle pool (`search_candidates`) still pulls the full
+        // active tenant set in parallel — Preference / Workflow rows
+        // that don't hit the query still surface via the floor
+        // exemption in `retrieve::finalize`, and lifecycle / scope /
+        // intent signals score against the broader pool.
+        const HYBRID_K: usize = 48;
+        let pool_fut = self.store.search_candidates(tenant);
+        let query_vec_fut = async {
             let Some(provider) = self.embedding_search_provider.as_ref() else {
                 return Vec::new();
             };
-            let q = match provider.embed_text(&query.query).await {
-                Ok(v) => v,
-                Err(_) => return Vec::new(),
-            };
-            self.store
-                .semantic_search_capability_capsules(tenant, &q, 48)
-                .await
-                .unwrap_or_default()
+            provider.embed_text(&query.query).await.unwrap_or_default()
         };
-        let (lexical, semantic) = tokio::join!(lexical_fut, semantic_fut);
-        let lexical = lexical?;
+        let (pool_res, query_vec) = tokio::join!(pool_fut, query_vec_fut);
+        let pool = pool_res.map_err(ServiceError::Storage)?;
+        let hybrid_hits = self
+            .store
+            .hybrid_candidates(tenant, &query.query, &query_vec, HYBRID_K)
+            .await
+            .map_err(ServiceError::Storage)?;
 
-        let ranked = match retrieve::rank_with_graph_hybrid(
-            lexical,
-            semantic.clone(),
+        let ranked = match retrieve::rank_with_hybrid_and_graph(
+            pool.clone(),
+            hybrid_hits.clone(),
             &query,
             self.store.as_ref(),
         )
@@ -661,69 +664,19 @@ impl CapabilityCapsuleService {
         {
             Ok(ranked) => ranked,
             Err(e) => {
-                tracing::warn!(error = %e, "graph backend error during rank_with_graph_hybrid; falling back to no graph boost");
-                let lex2 = self.lexical_candidates(tenant, &query.query).await?;
-                if semantic.is_empty() {
-                    retrieve::rank_candidates(lex2, &query)
-                } else {
-                    retrieve::merge_and_rank_hybrid(lex2, semantic, &query, &HashSet::new(), 0)
-                }
+                tracing::warn!(error = %e, "graph backend error during rank_with_hybrid_and_graph; falling back to no graph boost");
+                // Force-ungrafted retry: build a request with
+                // expand_graph=false so the graph anchor lookup is
+                // skipped and the call cannot return a graph error.
+                let mut q2 = query.clone();
+                q2.expand_graph = false;
+                retrieve::rank_with_hybrid_and_graph(pool, hybrid_hits, &q2, self.store.as_ref())
+                    .await
+                    .unwrap_or_default()
             }
         };
 
         Ok(compress::compress(&ranked, query.token_budget))
-    }
-
-    /// Lexical candidate selection.
-    ///
-    /// Returns the full live set for the tenant, but with BM25-matching rows
-    /// **moved to the front** so they get the highest RRF lexical rank in
-    /// `retrieve::merge_and_rank_hybrid`. Non-matching rows still enter the
-    /// pipeline so semantic / scope / freshness signals can score them; the
-    /// relevance floor in `retrieve::finalize` drops anything that fails to
-    /// accumulate enough signal.
-    ///
-    /// This keeps BM25 a ranking signal rather than a hard filter — relevant
-    /// rows bubble up, irrelevant rows get filtered by the threshold instead
-    /// of being pre-excluded from scoring.
-    async fn lexical_candidates(
-        &self,
-        tenant: &str,
-        query: &str,
-    ) -> Result<Vec<CapabilityCapsuleRecord>, ServiceError> {
-        const BM25_TOP_K: usize = 48;
-
-        let all = self
-            .store
-            .search_candidates(tenant)
-            .await
-            .map_err(ServiceError::Storage)?;
-
-        if query.trim().is_empty() || all.is_empty() {
-            return Ok(all);
-        }
-
-        let bm25 = self
-            .store
-            .bm25_candidates(tenant, query, BM25_TOP_K)
-            .await
-            .map_err(ServiceError::Storage)?;
-
-        if bm25.is_empty() {
-            return Ok(all);
-        }
-
-        let bm25_ids: HashSet<String> = bm25
-            .iter()
-            .map(|m| m.capability_capsule_id.clone())
-            .collect();
-        let mut combined = bm25;
-        for memory in all {
-            if !bm25_ids.contains(&memory.capability_capsule_id) {
-                combined.push(memory);
-            }
-        }
-        Ok(combined)
     }
 
     async fn enqueue_embedding_job_for_memory(
