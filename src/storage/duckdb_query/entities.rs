@@ -149,7 +149,7 @@ mod tests {
     ///     canonical_name, created_at DESC ordering, limit
     #[tokio::test(flavor = "multi_thread")]
     async fn duckdb_query_graph_and_entity_reads() {
-        use crate::domain::memory::GraphEdge;
+        use crate::domain::capability_capsule::GraphEdge;
 
         let dir = tempdir().unwrap();
         let path = dir.path().join("store");
@@ -160,21 +160,21 @@ mod tests {
         // discusses ent:e2. All active.
         let edges = vec![
             GraphEdge {
-                from_node_id: "memory:m1".into(),
+                from_node_id: "capability_capsule:m1".into(),
                 to_node_id: "entity:e1".into(),
                 relation: "mentions".into(),
                 valid_from: "00000001778000000000".into(),
                 valid_to: None,
             },
             GraphEdge {
-                from_node_id: "memory:m2".into(),
+                from_node_id: "capability_capsule:m2".into(),
                 to_node_id: "entity:e1".into(),
                 relation: "mentions".into(),
                 valid_from: "00000001778000000000".into(),
                 valid_to: None,
             },
             GraphEdge {
-                from_node_id: "memory:m1".into(),
+                from_node_id: "capability_capsule:m1".into(),
                 to_node_id: "entity:e2".into(),
                 relation: "discusses".into(),
                 valid_from: "00000001778000000000".into(),
@@ -186,11 +186,11 @@ mod tests {
             .await
             .unwrap();
         // Add a closed edge — must NOT surface from neighbors /
-        // related_memory_ids. Easiest way: add then close.
+        // related_capability_capsule_ids. Easiest way: add then close.
         lance
             .sync_memory_edges(
                 &[GraphEdge {
-                    from_node_id: "memory:m_closed".into(),
+                    from_node_id: "capability_capsule:m_closed".into(),
                     to_node_id: "entity:e1".into(),
                     relation: "mentions".into(),
                     valid_from: "00000001778000000000".into(),
@@ -200,7 +200,10 @@ mod tests {
             )
             .await
             .unwrap();
-        lance.close_edges_for_memory("m_closed").await.unwrap();
+        lance
+            .close_edges_for_capability_capsule("m_closed")
+            .await
+            .unwrap();
 
         // ── seed entities + aliases via the writer ──────────────
         let id_rust = lance
@@ -244,26 +247,26 @@ mod tests {
         // from, to → 'mentions'/m1, 'mentions'/m2.
         let n_e1 = q.neighbors("entity:e1").await.unwrap();
         assert_eq!(n_e1.len(), 2);
-        assert_eq!(n_e1[0].from_node_id, "memory:m1");
-        assert_eq!(n_e1[1].from_node_id, "memory:m2");
+        assert_eq!(n_e1[0].from_node_id, "capability_capsule:m1");
+        assert_eq!(n_e1[1].from_node_id, "capability_capsule:m2");
 
-        // memory:m1 has 2 active outgoing edges.
-        let n_m1 = q.neighbors("memory:m1").await.unwrap();
+        // capability_capsule:m1 has 2 active outgoing edges.
+        let n_m1 = q.neighbors("capability_capsule:m1").await.unwrap();
         assert_eq!(n_m1.len(), 2);
 
         // No-neighbor node returns empty (not error).
         let n_none = q.neighbors("entity:nonexistent").await.unwrap();
         assert!(n_none.is_empty());
 
-        // ── graph: related_memory_ids ───────────────────────────
+        // ── graph: related_capability_capsule_ids ───────────────────────────
         // Empty input → empty Vec.
-        let r_empty = q.related_memory_ids(&[]).await.unwrap();
+        let r_empty = q.related_capability_capsule_ids(&[]).await.unwrap();
         assert!(r_empty.is_empty());
 
         // Seeds [e1, e2] → reachable memories: m1 (via e1+e2), m2
         // (via e1). Output sorted; dedupe by HashSet.
         let r = q
-            .related_memory_ids(&["entity:e1".into(), "entity:e2".into()])
+            .related_capability_capsule_ids(&["entity:e1".into(), "entity:e2".into()])
             .await
             .unwrap();
         assert_eq!(r, vec!["m1".to_string(), "m2".to_string()]);

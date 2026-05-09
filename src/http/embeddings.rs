@@ -27,7 +27,7 @@ struct ListJobsQuery {
     #[serde(default = "default_tenant")]
     tenant: String,
     status: Option<String>,
-    memory_id: Option<String>,
+    capability_capsule_id: Option<String>,
     #[serde(default = "default_jobs_limit")]
     limit: usize,
 }
@@ -46,11 +46,11 @@ async fn list_jobs(
 ) -> Result<Json<Vec<crate::domain::embeddings::EmbeddingJobInfo>>, AppError> {
     let limit = q.limit.clamp(1, 10_000);
     let jobs = app
-        .memory_service
+        .capability_capsule_service
         .list_embedding_jobs(
             &q.tenant,
             q.status.as_deref(),
-            q.memory_id.as_deref(),
+            q.capability_capsule_id.as_deref(),
             limit,
         )
         .await?;
@@ -62,8 +62,8 @@ async fn rebuild(
     Json(body): Json<EmbeddingsRebuildRequest>,
 ) -> Result<Json<EmbeddingsRebuildResponse>, AppError> {
     let res = app
-        .memory_service
-        .rebuild_embeddings(&body.tenant, &body.memory_ids, body.force)
+        .capability_capsule_service
+        .rebuild_embeddings(&body.tenant, &body.capability_capsule_ids, body.force)
         .await?;
     Ok(Json(res))
 }

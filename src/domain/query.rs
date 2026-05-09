@@ -8,7 +8,7 @@ fn skip_none<T>(value: &Option<T>) -> bool {
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
-pub struct SearchMemoryRequest {
+pub struct SearchCapabilityCapsuleRequest {
     pub query: String,
     pub intent: String,
     pub scope_filters: Vec<String>,
@@ -22,7 +22,7 @@ pub struct SearchMemoryRequest {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub struct DirectiveItem {
-    pub memory_id: String,
+    pub capability_capsule_id: String,
     pub text: String,
     pub source_summary: String,
 }
@@ -30,7 +30,7 @@ pub struct DirectiveItem {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub struct FactItem {
-    pub memory_id: String,
+    pub capability_capsule_id: String,
     pub text: String,
     pub code_refs: Vec<String>,
     pub source_summary: String,
@@ -39,7 +39,7 @@ pub struct FactItem {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub struct PatternItem {
-    pub memory_id: String,
+    pub capability_capsule_id: String,
     pub text: String,
     #[serde(skip_serializing_if = "skip_none")]
     pub applicability: Option<String>,
@@ -48,7 +48,7 @@ pub struct PatternItem {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
 #[serde(rename_all = "snake_case")]
-pub struct SearchMemoryResponse {
+pub struct SearchCapabilityCapsuleResponse {
     pub directives: Vec<DirectiveItem>,
     pub relevant_facts: Vec<FactItem>,
     pub reusable_patterns: Vec<PatternItem>,

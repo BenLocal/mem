@@ -41,7 +41,7 @@ impl DuckDbQuery {
         spawn_blocking_storage(move || {
             let conn = conn.lock().expect("duckdb_query mutex poisoned");
             conn.execute(
-                "UPDATE ns.main.memories \
+                "UPDATE ns.main.capability_capsules \
                  SET decay_score = least(1.0, decay_score + ?1 * ((?2 - updated_at::double) / ?3)), \
                      updated_at = ?4 \
                  WHERE status = 'active' AND decay_score < 1.0",

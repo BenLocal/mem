@@ -20,7 +20,7 @@ use crate::storage::types::{
 };
 
 /// `query_transcript_embedding_jobs` was a helper inside the
-/// `update_status / query_memories / query_embedding_jobs` impl block
+/// `update_status / query_capability_capsules / query_embedding_jobs` impl block
 /// in mod.rs; pulled here next to its callers.
 impl LanceStore {
     pub(crate) async fn query_transcript_embedding_jobs(
@@ -52,7 +52,7 @@ impl LanceStore {
 }
 
 /// Transcript embedding queue methods. Mirror the memories-side
-/// queue (`try_enqueue_embedding_job` etc.) with `memory_id` →
+/// queue (`try_enqueue_embedding_job` etc.) with `capability_capsule_id` →
 /// `message_block_id` and `target_content_hash` dropped (transcript
 /// blocks are immutable). All inherent on `LanceStore` — they're
 /// not part of the trait surface (which never abstracted the
@@ -265,8 +265,8 @@ impl LanceStore {
 
     /// Upsert a transcript-block embedding into
     /// `conversation_message_embeddings`. Mirrors
-    /// `MemoryRepository::upsert_memory_embedding` 1:1 with
-    /// `memory_id` → `message_block_id`. Lazy-creates the table on
+    /// `MemoryRepository::upsert_capability_capsule_embedding` 1:1 with
+    /// `capability_capsule_id` → `message_block_id`. Lazy-creates the table on
     /// first call (dim is provider-dependent and not known at
     /// `LanceStore::open` time without a provider).
     #[allow(clippy::too_many_arguments)]

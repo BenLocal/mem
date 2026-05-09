@@ -24,18 +24,18 @@
 //! layer).
 //!
 //! **Coverage so far** (memories table):
-//!   - `list_memories_for_tenant`
-//!   - `get_memory_for_tenant`
+//!   - `list_capability_capsules_for_tenant`
+//!   - `get_capability_capsule_for_tenant`
 //!   - `get_pending`
 //!   - `find_by_idempotency_or_hash`
 //!   - `list_pending_review`
-//!   - `recent_active_memories`
+//!   - `recent_active_capability_capsules`
 //!   - `search_candidates`
-//!   - `fetch_memories_by_ids`
-//!   - `list_memory_ids_for_tenant`
-//!   - `list_memory_versions_for_tenant`
+//!   - `fetch_capability_capsules_by_ids`
+//!   - `list_capability_capsule_ids_for_tenant`
+//!   - `list_capability_capsule_versions_for_tenant`
 //!   - `bm25_candidates` (via `lance_fts`)
-//!   - `semantic_search_memories` (via `lance_vector_search`)
+//!   - `semantic_search_capability_capsules` (via `lance_vector_search`)
 //!
 //! **Coverage so far** (conversation_messages table — transcript reads):
 //!   - `get_conversation_messages_by_session`
@@ -51,7 +51,7 @@
 //!
 //! **Coverage so far** (graph_edges table — graph reads):
 //!   - `neighbors`
-//!   - `related_memory_ids`
+//!   - `related_capability_capsule_ids`
 //!
 //! **Coverage so far** (entities + entity_aliases — entity-registry reads):
 //!   - `get_entity`
@@ -71,14 +71,14 @@ use serde::de::DeserializeOwned;
 use serde::Serialize;
 
 use super::{GraphError, StorageError};
-use crate::domain::memory::GraphEdge;
+use crate::domain::capability_capsule::GraphEdge;
 use crate::domain::{Entity, EntityKind};
 
+mod capability_capsules;
 mod decay;
 mod embedding_jobs;
 mod entities;
 mod graph;
-mod memories;
 mod transcripts;
 
 /// Read-only DuckDB SQL client backed by lance datasets ATTACHed at

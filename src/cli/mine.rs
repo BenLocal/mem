@@ -16,7 +16,7 @@ use std::path::{Path, PathBuf};
 // `重要：` 等显式 cue" matched its own meta-mention and saved the trailing
 // text as a memory (`mem_019e061e-...`, archived). Agents that want to
 // persist a fact must use `<mem-save>...</mem-save>` (or call
-// `memory_ingest` directly via MCP).
+// `capability_capsule_ingest` directly via MCP).
 static TAG_RE: Lazy<Regex> = Lazy::new(|| Regex::new(r"<mem-save>(.*?)</mem-save>").unwrap());
 
 #[derive(Debug, Args)]
@@ -48,7 +48,7 @@ pub struct ExtractedMemory {
 ///
 /// Field semantics mirror `http::transcripts::IngestRequest`. The CLI
 /// produces these from a single linear pass over the JSONL transcript so
-/// the "memories" extract pipeline and the "transcript archive" pipeline
+/// the "capability_capsules" extract pipeline and the "transcript archive" pipeline
 /// share a single I/O cost.
 pub struct ArchivedBlock {
     pub session_id: String,
@@ -294,7 +294,7 @@ pub async fn run(args: MineArgs) -> i32 {
 
         let payload = serde_json::json!({
             "tenant": args.tenant,
-            "memory_type": "experience",
+            "capability_capsule_type": "experience",
             "content": memory.content,
             "scope": "global",
             "source_agent": args.agent,

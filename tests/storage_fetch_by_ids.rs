@@ -1,7 +1,9 @@
 use std::sync::Arc;
 
-use mem::domain::memory::{IngestMemoryRequest, MemoryType, Scope, Visibility, WriteMode};
-use mem::service::MemoryService;
+use mem::domain::capability_capsule::{
+    CapabilityCapsuleType, IngestCapabilityCapsuleRequest, Scope, Visibility, WriteMode,
+};
+use mem::service::CapabilityCapsuleService;
 use mem::storage::Store;
 use tempfile::tempdir;
 
@@ -10,11 +12,11 @@ async fn fetch_by_ids_filters_tenant_and_status() {
     let dir = tempdir().unwrap();
     let db = dir.path().join("fetch.lance");
     let store = Arc::new(Store::open(&db).await.unwrap());
-    let svc = MemoryService::new(store.clone());
+    let svc = CapabilityCapsuleService::new(store.clone());
 
-    let make = |tenant: &str, content: &str| IngestMemoryRequest {
+    let make = |tenant: &str, content: &str| IngestCapabilityCapsuleRequest {
         tenant: tenant.into(),
-        memory_type: MemoryType::Implementation,
+        capability_capsule_type: CapabilityCapsuleType::Implementation,
         content: content.into(),
         summary: None,
         evidence: vec![],
@@ -36,15 +38,20 @@ async fn fetch_by_ids_filters_tenant_and_status() {
     let c = svc.ingest(make("ten-a", "gamma")).await.unwrap();
 
     let ids = vec![
-        a.memory_id.as_str(),
-        b.memory_id.as_str(),
-        c.memory_id.as_str(),
+        a.capability_capsule_id.as_str(),
+        b.capability_capsule_id.as_str(),
+        c.capability_capsule_id.as_str(),
     ];
-    let rows = store.fetch_memories_by_ids("ten-a", &ids).await.unwrap();
+    let rows = store
+        .fetch_capability_capsules_by_ids("ten-a", &ids)
+        .await
+        .unwrap();
 
-    let returned: std::collections::HashSet<_> =
-        rows.iter().map(|m| m.memory_id.as_str()).collect();
-    assert!(returned.contains(a.memory_id.as_str()));
-    assert!(returned.contains(c.memory_id.as_str()));
-    assert!(!returned.contains(b.memory_id.as_str())); // wrong tenant
+    let returned: std::collections::HashSet<_> = rows
+        .iter()
+        .map(|m| m.capability_capsule_id.as_str())
+        .collect();
+    assert!(returned.contains(a.capability_capsule_id.as_str()));
+    assert!(returned.contains(c.capability_capsule_id.as_str()));
+    assert!(!returned.contains(b.capability_capsule_id.as_str())); // wrong tenant
 }

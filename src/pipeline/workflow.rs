@@ -1,8 +1,8 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use crate::domain::{
+    capability_capsule::{CapabilityCapsuleType, IngestCapabilityCapsuleRequest, WriteMode},
     episode::EpisodeRecord,
-    memory::{IngestMemoryRequest, MemoryType, WriteMode},
     workflow::WorkflowCandidate,
 };
 
@@ -10,7 +10,7 @@ use crate::domain::{
 struct WorkflowGroup {
     representative_goal: String,
     representative_steps: Vec<String>,
-    scope: crate::domain::memory::Scope,
+    scope: crate::domain::capability_capsule::Scope,
     evidence: BTreeSet<String>,
     count: usize,
 }
@@ -39,7 +39,7 @@ pub fn maybe_extract_workflow(episodes: &[EpisodeRecord]) -> Option<WorkflowCand
 
     groups.into_values().find_map(|group| {
         (group.count >= 2).then(|| WorkflowCandidate {
-            memory_id: None,
+            capability_capsule_id: None,
             goal: group.representative_goal,
             preconditions: Vec::new(),
             steps: group.representative_steps,
@@ -55,15 +55,15 @@ pub fn maybe_extract_workflow(episodes: &[EpisodeRecord]) -> Option<WorkflowCand
 pub fn workflow_memory_request(
     episode: &EpisodeRecord,
     candidate: &WorkflowCandidate,
-) -> IngestMemoryRequest {
+) -> IngestCapabilityCapsuleRequest {
     let mut tags = episode.tags.clone();
     if !tags.iter().any(|tag| tag == "workflow_candidate") {
         tags.push("workflow_candidate".to_string());
     }
 
-    IngestMemoryRequest {
+    IngestCapabilityCapsuleRequest {
         tenant: episode.tenant.clone(),
-        memory_type: MemoryType::Workflow,
+        capability_capsule_type: CapabilityCapsuleType::Workflow,
         content: workflow_content(candidate),
         summary: None,
         evidence: candidate.evidence.clone(),

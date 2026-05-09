@@ -1,6 +1,6 @@
 //! Memory CRUD + filter + lookup + embedding-job + episode/session +
 //! feedback methods. All inherent on LanceStore. Helpers
-//! (`query_memories`, `update_status`, `query_embedding_jobs`) used
+//! (`query_capability_capsules`, `update_status`, `query_embedding_jobs`) used
 //! across these methods live with their domain rather than in
 //! `mod.rs`.
 
@@ -10,35 +10,38 @@ use lancedb::query::{ExecutableQuery, QueryBase};
 use lancedb::DistanceType;
 
 use super::{
-    decode_embedding_blob, embedding_job_row_to_record_batch, ensure_memory_embeddings_table,
-    enum_to_str, feedback_adjustments, feedback_events_to_record_batch, lancedb_err,
-    memories_to_record_batch, memory_embedding_to_record_batch, record_batch_to_embedding_job_rows,
-    record_batch_to_feedback_events, record_batch_to_memories, sql_quote, EmbeddingJobRow,
-    LanceStore,
+    capability_capsule_embedding_to_record_batch, capability_capsules_to_record_batch,
+    decode_embedding_blob, embedding_job_row_to_record_batch,
+    ensure_capability_capsule_embeddings_table, enum_to_str, feedback_adjustments,
+    feedback_events_to_record_batch, lancedb_err, record_batch_to_capability_capsules,
+    record_batch_to_embedding_job_rows, record_batch_to_feedback_events, sql_quote,
+    EmbeddingJobRow, LanceStore,
+};
+use crate::domain::capability_capsule::{
+    CapabilityCapsuleRecord, CapabilityCapsuleVersionLink, FeedbackSummary,
 };
 use crate::domain::embeddings::EmbeddingJobInfo;
-use crate::domain::memory::{FeedbackSummary, MemoryRecord, MemoryVersionLink};
 use crate::storage::types::{ClaimedEmbeddingJob, EmbeddingJobInsert, FeedbackEvent, StorageError};
 
 impl LanceStore {
-    /// Apply a status transition to `(tenant, memory_id)` and return the
+    /// Apply a status transition to `(tenant, capability_capsule_id)` and return the
     /// updated row. Shared by `accept_pending` / `reject_pending` (and a
     /// future `archive_pending` if needed). Mirrors the DuckDB backend's
     /// `update_status` private helper.
     ///
     /// **Not yet implemented:** the embedding-references cleanup that the
-    /// DuckDB version does (delete `embedding_jobs` + `memory_embeddings`
+    /// DuckDB version does (delete `embedding_jobs` + `capability_capsule_embeddings`
     /// rows for this memory) — those tables don't exist on the LanceDB
     /// side yet. Add when those tables land.
     pub async fn update_status(
         &self,
         tenant: &str,
-        memory_id: &str,
+        capability_capsule_id: &str,
         status_str: &str,
-    ) -> Result<MemoryRecord, StorageError> {
+    ) -> Result<CapabilityCapsuleRecord, StorageError> {
         let table = self
             .conn
-            .open_table("memories")
+            .open_table("capability_capsules")
             .execute()
             .await
             .map_err(lancedb_err)?;
@@ -46,9 +49,9 @@ impl LanceStore {
         let result = table
             .update()
             .only_if(format!(
-                "tenant = {} AND memory_id = {}",
+                "tenant = {} AND capability_capsule_id = {}",
                 sql_quote(tenant),
-                sql_quote(memory_id),
+                sql_quote(capability_capsule_id),
             ))
             .column("status", sql_quote(status_str))
             .column("updated_at", sql_quote(&now))
@@ -58,7 +61,7 @@ impl LanceStore {
         if result.rows_updated == 0 {
             return Err(StorageError::InvalidData("memory not found"));
         }
-        self.get_memory_for_tenant(tenant, memory_id)
+        self.get_capability_capsule_for_tenant(tenant, capability_capsule_id)
             .await?
             .ok_or(StorageError::InvalidData(
                 "memory missing after status update",
@@ -66,16 +69,16 @@ impl LanceStore {
     }
 
     /// Run a filter query against the `memories` table and parse all
-    /// returned batches into [`MemoryRecord`]s. Shared by every read
+    /// returned batches into [`CapabilityCapsuleRecord`]s. Shared by every read
     /// method that just needs a `WHERE`-clause + optional `LIMIT`.
-    pub async fn query_memories(
+    pub async fn query_capability_capsules(
         &self,
         filter: String,
         limit: Option<usize>,
-    ) -> Result<Vec<MemoryRecord>, StorageError> {
+    ) -> Result<Vec<CapabilityCapsuleRecord>, StorageError> {
         let table = self
             .conn
-            .open_table("memories")
+            .open_table("capability_capsules")
             .execute()
             .await
             .map_err(lancedb_err)?;
@@ -90,14 +93,14 @@ impl LanceStore {
             .map_err(|e| StorageError::InvalidInput(format!("lancedb stream: {e}")))?;
         let mut out = Vec::new();
         for b in &batches {
-            out.extend(record_batch_to_memories(b)?);
+            out.extend(record_batch_to_capability_capsules(b)?);
         }
         Ok(out)
     }
 
     /// Read all `embedding_jobs` rows matching `filter`, parsed into
     /// [`EmbeddingJobRow`]s. Shared by every queue read path: the claim
-    /// flow, `first_embedding_job_id_for_memory`, `list_embedding_jobs`,
+    /// flow, `first_embedding_job_id_for_capability_capsule`, `list_embedding_jobs`,
     /// and the duplicate-detection in `try_enqueue_embedding_job`.
     pub(crate) async fn query_embedding_jobs(
         &self,
@@ -132,14 +135,17 @@ impl LanceStore {
 /// inherent. Methods kept as `pub async fn`; signatures unchanged.
 #[allow(clippy::too_many_arguments)]
 impl LanceStore {
-    pub async fn insert_memory(&self, memory: MemoryRecord) -> Result<MemoryRecord, StorageError> {
+    pub async fn insert_capability_capsule(
+        &self,
+        memory: CapabilityCapsuleRecord,
+    ) -> Result<CapabilityCapsuleRecord, StorageError> {
         let table = self
             .conn
-            .open_table("memories")
+            .open_table("capability_capsules")
             .execute()
             .await
             .map_err(lancedb_err)?;
-        let batch = memories_to_record_batch(std::slice::from_ref(&memory))?;
+        let batch = capability_capsules_to_record_batch(std::slice::from_ref(&memory))?;
         // `RecordBatch` impls `Scannable` directly — no need to wrap in an
         // iterator. (Re-checking lancedb-0.27.2/src/data/scannable.rs L70.)
         table.add(batch).execute().await.map_err(lancedb_err)?;
@@ -151,7 +157,7 @@ impl LanceStore {
         insert: EmbeddingJobInsert,
     ) -> Result<bool, StorageError> {
         // Idempotency check: if any live (pending/processing) row already
-        // covers this (tenant, memory_id, target_content_hash, provider)
+        // covers this (tenant, capability_capsule_id, target_content_hash, provider)
         // tuple, decline the enqueue. LanceDB has no transactions so the
         // count → insert window is racy under concurrent writers, but mem
         // serve runs one writer per DB so the race is single-instance safe.
@@ -163,10 +169,10 @@ impl LanceStore {
             .map_err(lancedb_err)?;
         let live = table
             .count_rows(Some(format!(
-                "tenant = {} AND memory_id = {} AND target_content_hash = {} \
+                "tenant = {} AND capability_capsule_id = {} AND target_content_hash = {} \
                  AND provider = {} AND (status = 'pending' OR status = 'processing')",
                 sql_quote(&insert.tenant),
-                sql_quote(&insert.memory_id),
+                sql_quote(&insert.capability_capsule_id),
                 sql_quote(&insert.target_content_hash),
                 sql_quote(&insert.provider),
             )))
@@ -178,7 +184,7 @@ impl LanceStore {
         let row = EmbeddingJobRow {
             job_id: insert.job_id,
             tenant: insert.tenant,
-            memory_id: insert.memory_id,
+            capability_capsule_id: insert.capability_capsule_id,
             target_content_hash: insert.target_content_hash,
             provider: insert.provider,
             status: "pending".to_string(),
@@ -193,12 +199,15 @@ impl LanceStore {
         Ok(true)
     }
 
-    pub async fn first_embedding_job_id_for_memory(
+    pub async fn first_embedding_job_id_for_capability_capsule(
         &self,
-        memory_id: &str,
+        capability_capsule_id: &str,
     ) -> Result<Option<String>, StorageError> {
         let mut rows = self
-            .query_embedding_jobs(format!("memory_id = {}", sql_quote(memory_id)))
+            .query_embedding_jobs(format!(
+                "capability_capsule_id = {}",
+                sql_quote(capability_capsule_id)
+            ))
             .await?;
         // LanceDB has no ORDER BY — sort in memory by created_at ASC
         // (same shape as the DuckDB SQL).
@@ -274,7 +283,7 @@ impl LanceStore {
             claimed.push(ClaimedEmbeddingJob {
                 job_id: r.job_id,
                 tenant: r.tenant,
-                memory_id: r.memory_id,
+                capability_capsule_id: r.capability_capsule_id,
                 target_content_hash: r.target_content_hash,
                 provider: r.provider,
                 attempt_count: r.attempt_count,
@@ -283,9 +292,9 @@ impl LanceStore {
         Ok(claimed)
     }
 
-    pub async fn upsert_memory_embedding(
+    pub async fn upsert_capability_capsule_embedding(
         &self,
-        memory_id: &str,
+        capability_capsule_id: &str,
         tenant: &str,
         embedding_model: &str,
         embedding_dim: i64,
@@ -298,22 +307,25 @@ impl LanceStore {
             .map_err(|_| StorageError::InvalidData("embedding_dim does not fit in i32"))?;
         let vector = decode_embedding_blob(embedding_blob, embedding_dim as usize)?;
 
-        ensure_memory_embeddings_table(&self.conn, dim_i32).await?;
+        ensure_capability_capsule_embeddings_table(&self.conn, dim_i32).await?;
 
         let table = self
             .conn
-            .open_table("memory_embeddings")
+            .open_table("capability_capsule_embeddings")
             .execute()
             .await
             .map_err(lancedb_err)?;
         // upsert = delete-then-insert. LanceDB has no PK enforcement so
-        // we sweep any existing row for this memory_id first.
+        // we sweep any existing row for this capability_capsule_id first.
         table
-            .delete(&format!("memory_id = {}", sql_quote(memory_id)))
+            .delete(&format!(
+                "capability_capsule_id = {}",
+                sql_quote(capability_capsule_id)
+            ))
             .await
             .map_err(lancedb_err)?;
-        let batch = memory_embedding_to_record_batch(
-            memory_id,
+        let batch = capability_capsule_embedding_to_record_batch(
+            capability_capsule_id,
             tenant,
             embedding_model,
             embedding_dim,
@@ -326,7 +338,10 @@ impl LanceStore {
         Ok(())
     }
 
-    pub async fn delete_memory_embedding(&self, memory_id: &str) -> Result<(), StorageError> {
+    pub async fn delete_capability_capsule_embedding(
+        &self,
+        capability_capsule_id: &str,
+    ) -> Result<(), StorageError> {
         // No-op if the table doesn't exist yet (semantic search hasn't
         // been used; nothing to delete).
         let names = self
@@ -335,53 +350,56 @@ impl LanceStore {
             .execute()
             .await
             .map_err(lancedb_err)?;
-        if !names.iter().any(|n| n == "memory_embeddings") {
+        if !names.iter().any(|n| n == "capability_capsule_embeddings") {
             return Ok(());
         }
         let table = self
             .conn
-            .open_table("memory_embeddings")
+            .open_table("capability_capsule_embeddings")
             .execute()
             .await
             .map_err(lancedb_err)?;
         table
-            .delete(&format!("memory_id = {}", sql_quote(memory_id)))
+            .delete(&format!(
+                "capability_capsule_id = {}",
+                sql_quote(capability_capsule_id)
+            ))
             .await
             .map_err(lancedb_err)?;
         Ok(())
     }
 
-    pub async fn list_memories_for_tenant(
+    pub async fn list_capability_capsules_for_tenant(
         &self,
         tenant: &str,
-    ) -> Result<Vec<MemoryRecord>, StorageError> {
-        self.query_memories(format!("tenant = {}", sql_quote(tenant)), None)
+    ) -> Result<Vec<CapabilityCapsuleRecord>, StorageError> {
+        self.query_capability_capsules(format!("tenant = {}", sql_quote(tenant)), None)
             .await
     }
 
-    pub async fn semantic_search_memories(
+    pub async fn semantic_search_capability_capsules(
         &self,
         tenant: &str,
         query_embedding: &[f32],
         limit: usize,
-    ) -> Result<Vec<(MemoryRecord, f32)>, StorageError> {
+    ) -> Result<Vec<(CapabilityCapsuleRecord, f32)>, StorageError> {
         if query_embedding.is_empty() || limit == 0 {
             return Ok(vec![]);
         }
         // No embeddings written yet → empty result (matches DuckDB
-        // legacy linear-scan behavior on an empty memory_embeddings).
+        // legacy linear-scan behavior on an empty capability_capsule_embeddings).
         let names = self
             .conn
             .table_names()
             .execute()
             .await
             .map_err(lancedb_err)?;
-        if !names.iter().any(|n| n == "memory_embeddings") {
+        if !names.iter().any(|n| n == "capability_capsule_embeddings") {
             return Ok(vec![]);
         }
         let table = self
             .conn
-            .open_table("memory_embeddings")
+            .open_table("capability_capsule_embeddings")
             .execute()
             .await
             .map_err(lancedb_err)?;
@@ -403,17 +421,21 @@ impl LanceStore {
             .await
             .map_err(|e| StorageError::InvalidInput(format!("lancedb stream: {e}")))?;
 
-        // Collect (memory_id, score) pairs in distance-ascending order.
+        // Collect (capability_capsule_id, score) pairs in distance-ascending order.
         // LanceDB returns rows already sorted by `_distance`; preserve
         // that order across batches by extending sequentially.
         let mut hits: Vec<(String, f32)> = Vec::new();
         for b in &batches {
-            let memory_ids = b
-                .column_by_name("memory_id")
-                .ok_or(StorageError::InvalidData("missing memory_id column"))?
+            let capability_capsule_ids = b
+                .column_by_name("capability_capsule_id")
+                .ok_or(StorageError::InvalidData(
+                    "missing capability_capsule_id column",
+                ))?
                 .as_any()
                 .downcast_ref::<StringArray>()
-                .ok_or(StorageError::InvalidData("memory_id column type mismatch"))?;
+                .ok_or(StorageError::InvalidData(
+                    "capability_capsule_id column type mismatch",
+                ))?;
             let distances = b
                 .column_by_name("_distance")
                 .ok_or(StorageError::InvalidData(
@@ -427,19 +449,21 @@ impl LanceStore {
                 // matches DuckDB backend's cosine_similarity score
                 // shape (higher = better, normalized vectors → [0, 1]).
                 let score = 1.0 - distances.value(i);
-                hits.push((memory_ids.value(i).to_string(), score));
+                hits.push((capability_capsule_ids.value(i).to_string(), score));
             }
         }
 
-        // Hydrate full MemoryRecord rows. fetch_memories_by_ids returns
+        // Hydrate full CapabilityCapsuleRecord rows. fetch_capability_capsules_by_ids returns
         // out of input order, so we rebuild the score-ordered list
         // afterwards via a hashmap lookup.
         let ids: Vec<String> = hits.iter().map(|(id, _)| id.clone()).collect();
         let id_refs: Vec<&str> = ids.iter().map(|s| s.as_str()).collect();
-        let records = self.fetch_memories_by_ids(tenant, &id_refs).await?;
-        let by_id: std::collections::HashMap<String, MemoryRecord> = records
+        let records = self
+            .fetch_capability_capsules_by_ids(tenant, &id_refs)
+            .await?;
+        let by_id: std::collections::HashMap<String, CapabilityCapsuleRecord> = records
             .into_iter()
-            .map(|m| (m.memory_id.clone(), m))
+            .map(|m| (m.capability_capsule_id.clone(), m))
             .collect();
         let mut out = Vec::with_capacity(hits.len());
         for (id, score) in hits {
@@ -561,9 +585,9 @@ impl LanceStore {
         Ok(())
     }
 
-    pub async fn delete_embedding_jobs_by_memory_id(
+    pub async fn delete_embedding_jobs_by_capability_capsule_id(
         &self,
-        memory_id: &str,
+        capability_capsule_id: &str,
     ) -> Result<usize, StorageError> {
         // Pre-count to return how many rows we delete (LanceDB's
         // DeleteResult only carries num_deleted_rows, but we want this
@@ -576,14 +600,20 @@ impl LanceStore {
             .await
             .map_err(lancedb_err)?;
         let count = table
-            .count_rows(Some(format!("memory_id = {}", sql_quote(memory_id))))
+            .count_rows(Some(format!(
+                "capability_capsule_id = {}",
+                sql_quote(capability_capsule_id)
+            )))
             .await
             .map_err(lancedb_err)?;
         if count == 0 {
             return Ok(0);
         }
         let result = table
-            .delete(&format!("memory_id = {}", sql_quote(memory_id)))
+            .delete(&format!(
+                "capability_capsule_id = {}",
+                sql_quote(capability_capsule_id)
+            ))
             .await
             .map_err(lancedb_err)?;
         // Lance servers older than this codebase may report 0 here even
@@ -596,21 +626,21 @@ impl LanceStore {
         }
     }
 
-    pub async fn get_memory_for_tenant(
+    pub async fn get_capability_capsule_for_tenant(
         &self,
         tenant: &str,
-        memory_id: &str,
-    ) -> Result<Option<MemoryRecord>, StorageError> {
+        capability_capsule_id: &str,
+    ) -> Result<Option<CapabilityCapsuleRecord>, StorageError> {
         let table = self
             .conn
-            .open_table("memories")
+            .open_table("capability_capsules")
             .execute()
             .await
             .map_err(lancedb_err)?;
         let filter = format!(
-            "tenant = {} AND memory_id = {}",
+            "tenant = {} AND capability_capsule_id = {}",
             sql_quote(tenant),
-            sql_quote(memory_id),
+            sql_quote(capability_capsule_id),
         );
         let stream = table
             .query()
@@ -624,7 +654,7 @@ impl LanceStore {
             .await
             .map_err(|e| StorageError::InvalidInput(format!("lancedb stream: {e}")))?;
         for batch in &batches {
-            let mems = record_batch_to_memories(batch)?;
+            let mems = record_batch_to_capability_capsules(batch)?;
             if let Some(m) = mems.into_iter().next() {
                 return Ok(Some(m));
             }
@@ -635,15 +665,15 @@ impl LanceStore {
     pub async fn get_pending(
         &self,
         tenant: &str,
-        memory_id: &str,
-    ) -> Result<Option<MemoryRecord>, StorageError> {
+        capability_capsule_id: &str,
+    ) -> Result<Option<CapabilityCapsuleRecord>, StorageError> {
         let filter = format!(
-            "tenant = {} AND memory_id = {} AND status = 'pending_confirmation'",
+            "tenant = {} AND capability_capsule_id = {} AND status = 'pending_confirmation'",
             sql_quote(tenant),
-            sql_quote(memory_id),
+            sql_quote(capability_capsule_id),
         );
         Ok(self
-            .query_memories(filter, Some(1))
+            .query_capability_capsules(filter, Some(1))
             .await?
             .into_iter()
             .next())
@@ -654,7 +684,7 @@ impl LanceStore {
         tenant: &str,
         idempotency_key: &Option<String>,
         content_hash: &str,
-    ) -> Result<Option<MemoryRecord>, StorageError> {
+    ) -> Result<Option<CapabilityCapsuleRecord>, StorageError> {
         // Match either `idempotency_key` (when caller provided one) OR
         // `content_hash` — same precedence as DuckDB's variant.
         let filter = match idempotency_key.as_deref() {
@@ -671,7 +701,7 @@ impl LanceStore {
             ),
         };
         Ok(self
-            .query_memories(filter, Some(1))
+            .query_capability_capsules(filter, Some(1))
             .await?
             .into_iter()
             .next())
@@ -680,29 +710,32 @@ impl LanceStore {
     pub async fn list_pending_review(
         &self,
         tenant: &str,
-    ) -> Result<Vec<MemoryRecord>, StorageError> {
+    ) -> Result<Vec<CapabilityCapsuleRecord>, StorageError> {
         let filter = format!(
             "tenant = {} AND status = 'pending_confirmation'",
             sql_quote(tenant),
         );
-        self.query_memories(filter, None).await
+        self.query_capability_capsules(filter, None).await
     }
 
-    pub async fn search_candidates(&self, tenant: &str) -> Result<Vec<MemoryRecord>, StorageError> {
+    pub async fn search_candidates(
+        &self,
+        tenant: &str,
+    ) -> Result<Vec<CapabilityCapsuleRecord>, StorageError> {
         // Same live-status filter the DuckDB backend uses
         // (`pipeline::retrieve` post-filters this set anyway).
         let filter = format!(
             "tenant = {} AND status NOT IN ('rejected', 'archived')",
             sql_quote(tenant),
         );
-        self.query_memories(filter, None).await
+        self.query_capability_capsules(filter, None).await
     }
 
-    pub async fn recent_active_memories(
+    pub async fn recent_active_capability_capsules(
         &self,
         tenant: &str,
         limit: usize,
-    ) -> Result<Vec<MemoryRecord>, StorageError> {
+    ) -> Result<Vec<CapabilityCapsuleRecord>, StorageError> {
         // NOTE: LanceDB's `Query::limit` doesn't guarantee any ordering
         // without a `Table::create_index` on `updated_at`. For now this
         // returns _some_ N rows; switching to ordered results requires
@@ -712,7 +745,7 @@ impl LanceStore {
             "tenant = {} AND status NOT IN ('rejected', 'archived')",
             sql_quote(tenant),
         );
-        self.query_memories(filter, Some(limit)).await
+        self.query_capability_capsules(filter, Some(limit)).await
     }
 
     pub async fn bm25_candidates(
@@ -720,13 +753,13 @@ impl LanceStore {
         tenant: &str,
         query: &str,
         k: usize,
-    ) -> Result<Vec<MemoryRecord>, StorageError> {
+    ) -> Result<Vec<CapabilityCapsuleRecord>, StorageError> {
         if query.trim().is_empty() || k == 0 {
             return Ok(vec![]);
         }
         let table = self
             .conn
-            .open_table("memories")
+            .open_table("capability_capsules")
             .execute()
             .await
             .map_err(lancedb_err)?;
@@ -748,50 +781,52 @@ impl LanceStore {
             .map_err(|e| StorageError::InvalidInput(format!("lancedb stream: {e}")))?;
         let mut out = Vec::new();
         for b in &batches {
-            out.extend(record_batch_to_memories(b)?);
+            out.extend(record_batch_to_capability_capsules(b)?);
         }
         Ok(out)
     }
 
-    pub async fn fetch_memories_by_ids(
+    pub async fn fetch_capability_capsules_by_ids(
         &self,
         tenant: &str,
         ids: &[&str],
-    ) -> Result<Vec<MemoryRecord>, StorageError> {
+    ) -> Result<Vec<CapabilityCapsuleRecord>, StorageError> {
         if ids.is_empty() {
             return Ok(vec![]);
         }
         let id_list: Vec<String> = ids.iter().map(|i| sql_quote(i)).collect();
         let filter = format!(
-            "tenant = {} AND status NOT IN ('rejected', 'archived') AND memory_id IN ({})",
+            "tenant = {} AND status NOT IN ('rejected', 'archived') AND capability_capsule_id IN ({})",
             sql_quote(tenant),
             id_list.join(", "),
         );
-        self.query_memories(filter, None).await
+        self.query_capability_capsules(filter, None).await
     }
 
     pub async fn accept_pending(
         &self,
         tenant: &str,
-        memory_id: &str,
-    ) -> Result<MemoryRecord, StorageError> {
-        self.update_status(tenant, memory_id, "active").await
+        capability_capsule_id: &str,
+    ) -> Result<CapabilityCapsuleRecord, StorageError> {
+        self.update_status(tenant, capability_capsule_id, "active")
+            .await
     }
 
     pub async fn reject_pending(
         &self,
         tenant: &str,
-        memory_id: &str,
-    ) -> Result<MemoryRecord, StorageError> {
-        self.update_status(tenant, memory_id, "rejected").await
+        capability_capsule_id: &str,
+    ) -> Result<CapabilityCapsuleRecord, StorageError> {
+        self.update_status(tenant, capability_capsule_id, "rejected")
+            .await
     }
 
     pub async fn replace_pending_with_successor(
         &self,
         tenant: &str,
         original_memory_id: &str,
-        successor: MemoryRecord,
-    ) -> Result<MemoryRecord, StorageError> {
+        successor: CapabilityCapsuleRecord,
+    ) -> Result<CapabilityCapsuleRecord, StorageError> {
         // Two-step supersede: archive the old row, then insert the new
         // one. LanceDB has no transaction semantics across these calls,
         // so a crash between them leaves the old archived without a
@@ -800,7 +835,7 @@ impl LanceStore {
         // duckdb/mod.rs).
         let table = self
             .conn
-            .open_table("memories")
+            .open_table("capability_capsules")
             .execute()
             .await
             .map_err(lancedb_err)?;
@@ -808,7 +843,7 @@ impl LanceStore {
         table
             .update()
             .only_if(format!(
-                "tenant = {} AND memory_id = {}",
+                "tenant = {} AND capability_capsule_id = {}",
                 sql_quote(tenant),
                 sql_quote(original_memory_id),
             ))
@@ -817,16 +852,16 @@ impl LanceStore {
             .execute()
             .await
             .map_err(lancedb_err)?;
-        let batch = memories_to_record_batch(std::slice::from_ref(&successor))?;
+        let batch = capability_capsules_to_record_batch(std::slice::from_ref(&successor))?;
         table.add(batch).execute().await.map_err(lancedb_err)?;
         Ok(successor)
     }
 
     pub async fn apply_feedback(
         &self,
-        memory: &MemoryRecord,
+        memory: &CapabilityCapsuleRecord,
         feedback: FeedbackEvent,
-    ) -> Result<MemoryRecord, StorageError> {
+    ) -> Result<CapabilityCapsuleRecord, StorageError> {
         let (conf_delta, decay_delta, status_after, mark_validated) =
             feedback_adjustments(&feedback.feedback_kind)
                 .ok_or(StorageError::InvalidData("invalid feedback kind"))?;
@@ -858,13 +893,16 @@ impl LanceStore {
         // optionally set; confidence + decay + updated_at always.
         let mem_table = self
             .conn
-            .open_table("memories")
+            .open_table("capability_capsules")
             .execute()
             .await
             .map_err(lancedb_err)?;
         let mut update = mem_table
             .update()
-            .only_if(format!("memory_id = {}", sql_quote(&updated.memory_id)))
+            .only_if(format!(
+                "capability_capsule_id = {}",
+                sql_quote(&updated.capability_capsule_id)
+            ))
             .column("confidence", format!("{}", updated.confidence))
             .column("decay_score", format!("{}", updated.decay_score))
             .column("updated_at", sql_quote(&updated.updated_at));
@@ -880,7 +918,7 @@ impl LanceStore {
 
     pub async fn list_feedback_for_memory(
         &self,
-        memory_id: &str,
+        capability_capsule_id: &str,
     ) -> Result<Vec<FeedbackEvent>, StorageError> {
         let table = self
             .conn
@@ -890,7 +928,10 @@ impl LanceStore {
             .map_err(lancedb_err)?;
         let stream = table
             .query()
-            .only_if(format!("memory_id = {}", sql_quote(memory_id)))
+            .only_if(format!(
+                "capability_capsule_id = {}",
+                sql_quote(capability_capsule_id)
+            ))
             .execute()
             .await
             .map_err(lancedb_err)?;
@@ -909,24 +950,24 @@ impl LanceStore {
         Ok(out)
     }
 
-    pub async fn list_memory_versions_for_tenant(
+    pub async fn list_capability_capsule_versions_for_tenant(
         &self,
         tenant: &str,
-        memory_id: &str,
-    ) -> Result<Vec<MemoryVersionLink>, StorageError> {
-        // Walk the supersedes chain backwards: start from `memory_id`,
-        // follow `supersedes_memory_id` to predecessors, and append each
+        capability_capsule_id: &str,
+    ) -> Result<Vec<CapabilityCapsuleVersionLink>, StorageError> {
+        // Walk the supersedes chain backwards: start from `capability_capsule_id`,
+        // follow `supersedes_capability_capsule_id` to predecessors, and append each
         // record. Output ordered newest → oldest by version DESC.
-        let mut chain: Vec<MemoryRecord> = Vec::new();
-        let mut cursor = Some(memory_id.to_string());
+        let mut chain: Vec<CapabilityCapsuleRecord> = Vec::new();
+        let mut cursor = Some(capability_capsule_id.to_string());
         // Cap depth — the chain should be short (typically 1–3) and a
         // cycle would loop forever otherwise.
         for _ in 0..32 {
             let Some(id) = cursor.take() else { break };
             let rec = self
-                .query_memories(
+                .query_capability_capsules(
                     format!(
-                        "tenant = {} AND memory_id = {}",
+                        "tenant = {} AND capability_capsule_id = {}",
                         sql_quote(tenant),
                         sql_quote(&id)
                     ),
@@ -936,28 +977,31 @@ impl LanceStore {
                 .into_iter()
                 .next();
             let Some(r) = rec else { break };
-            cursor = r.supersedes_memory_id.clone();
+            cursor = r.supersedes_capability_capsule_id.clone();
             chain.push(r);
         }
         chain.sort_by(|a, b| b.version.cmp(&a.version));
         Ok(chain
             .into_iter()
-            .map(|r| MemoryVersionLink {
-                memory_id: r.memory_id,
+            .map(|r| CapabilityCapsuleVersionLink {
+                capability_capsule_id: r.capability_capsule_id,
                 version: r.version,
                 status: r.status,
                 updated_at: r.updated_at,
-                supersedes_memory_id: r.supersedes_memory_id,
+                supersedes_capability_capsule_id: r.supersedes_capability_capsule_id,
             })
             .collect())
     }
 
-    pub async fn feedback_summary(&self, memory_id: &str) -> Result<FeedbackSummary, StorageError> {
+    pub async fn feedback_summary(
+        &self,
+        capability_capsule_id: &str,
+    ) -> Result<FeedbackSummary, StorageError> {
         // Fetch all events for this memory and aggregate client-side.
         // Counts are tiny (events per memory typically < 10), so the
         // network/parse cost is negligible compared to running a
         // GROUP BY query through LanceDB's filter API.
-        let events = self.list_feedback_for_memory(memory_id).await?;
+        let events = self.list_feedback_for_memory(capability_capsule_id).await?;
         let mut summary = FeedbackSummary::default();
         for e in events {
             summary.total += 1;
@@ -973,58 +1017,61 @@ impl LanceStore {
         Ok(summary)
     }
 
-    pub async fn delete_memory_hard(
+    pub async fn delete_capability_capsule_hard(
         &self,
         tenant: &str,
-        memory_id: &str,
+        capability_capsule_id: &str,
     ) -> Result<(), StorageError> {
         let table = self
             .conn
-            .open_table("memories")
+            .open_table("capability_capsules")
             .execute()
             .await
             .map_err(lancedb_err)?;
         let result = table
             .delete(&format!(
-                "tenant = {} AND memory_id = {}",
+                "tenant = {} AND capability_capsule_id = {}",
                 sql_quote(tenant),
-                sql_quote(memory_id),
+                sql_quote(capability_capsule_id),
             ))
             .await
             .map_err(lancedb_err)?;
         if result.num_deleted_rows == 0 {
             return Err(StorageError::InvalidData("memory not found"));
         }
-        // TODO: cascade-delete from embedding_jobs / memory_embeddings /
+        // TODO: cascade-delete from embedding_jobs / capability_capsule_embeddings /
         // feedback_events / graph_edges once those tables exist on the
         // LanceDB side. The DuckDB backend handles this in
-        // `DuckDbRepository::delete_memory_hard` (see ./duckdb/mod.rs).
+        // `DuckDbRepository::delete_capability_capsule_hard` (see ./duckdb/mod.rs).
         Ok(())
     }
 
-    pub async fn get_memory(
+    pub async fn get_capability_capsule(
         &self,
-        memory_id: String,
-    ) -> Result<Option<MemoryRecord>, StorageError> {
+        capability_capsule_id: String,
+    ) -> Result<Option<CapabilityCapsuleRecord>, StorageError> {
         // Cross-tenant lookup (admin / version-chain path). DuckDB does the
-        // same — filters only on memory_id.
-        let filter = format!("memory_id = {}", sql_quote(&memory_id));
+        // same — filters only on capability_capsule_id.
+        let filter = format!(
+            "capability_capsule_id = {}",
+            sql_quote(&capability_capsule_id)
+        );
         Ok(self
-            .query_memories(filter, Some(1))
+            .query_capability_capsules(filter, Some(1))
             .await?
             .into_iter()
             .next())
     }
 
-    pub async fn list_memory_ids_for_tenant(
+    pub async fn list_capability_capsule_ids_for_tenant(
         &self,
         tenant: &str,
     ) -> Result<Vec<String>, StorageError> {
         Ok(self
-            .query_memories(format!("tenant = {}", sql_quote(tenant)), None)
+            .query_capability_capsules(format!("tenant = {}", sql_quote(tenant)), None)
             .await?
             .into_iter()
-            .map(|m| m.memory_id)
+            .map(|m| m.capability_capsule_id)
             .collect())
     }
 
@@ -1040,7 +1087,7 @@ impl LanceStore {
             filter.push_str(&format!(" AND status = {}", sql_quote(s)));
         }
         if let Some(m) = memory_id_filter {
-            filter.push_str(&format!(" AND memory_id = {}", sql_quote(m)));
+            filter.push_str(&format!(" AND capability_capsule_id = {}", sql_quote(m)));
         }
         let mut rows = self.query_embedding_jobs(filter).await?;
         // ORDER BY updated_at DESC LIMIT n — sort then truncate.
@@ -1052,7 +1099,7 @@ impl LanceStore {
             .map(|r| EmbeddingJobInfo {
                 job_id: r.job_id,
                 tenant: r.tenant,
-                memory_id: r.memory_id,
+                capability_capsule_id: r.capability_capsule_id,
                 target_content_hash: r.target_content_hash,
                 provider: r.provider,
                 status: r.status,
@@ -1066,10 +1113,10 @@ impl LanceStore {
         Ok(out)
     }
 
-    pub async fn stale_live_embedding_jobs_for_memory(
+    pub async fn stale_live_embedding_jobs_for_capability_capsule(
         &self,
         tenant: &str,
-        memory_id: &str,
+        capability_capsule_id: &str,
         provider: &str,
         now: &str,
     ) -> Result<usize, StorageError> {
@@ -1085,10 +1132,10 @@ impl LanceStore {
             .await
             .map_err(lancedb_err)?;
         let filter = format!(
-            "tenant = {} AND memory_id = {} AND provider = {} \
+            "tenant = {} AND capability_capsule_id = {} AND provider = {} \
              AND (status = 'pending' OR status = 'processing')",
             sql_quote(tenant),
-            sql_quote(memory_id),
+            sql_quote(capability_capsule_id),
             sql_quote(provider),
         );
         let count = table
@@ -1113,29 +1160,32 @@ impl LanceStore {
         }
     }
 
-    pub async fn get_memory_embedding_row(
+    pub async fn get_capability_capsule_embedding_row(
         &self,
-        memory_id: &str,
+        capability_capsule_id: &str,
     ) -> Result<Option<(String, String, String)>, StorageError> {
-        // No memory_embeddings table yet → no row by definition.
+        // No capability_capsule_embeddings table yet → no row by definition.
         let names = self
             .conn
             .table_names()
             .execute()
             .await
             .map_err(lancedb_err)?;
-        if !names.iter().any(|n| n == "memory_embeddings") {
+        if !names.iter().any(|n| n == "capability_capsule_embeddings") {
             return Ok(None);
         }
         let table = self
             .conn
-            .open_table("memory_embeddings")
+            .open_table("capability_capsule_embeddings")
             .execute()
             .await
             .map_err(lancedb_err)?;
         let stream = table
             .query()
-            .only_if(format!("memory_id = {}", sql_quote(memory_id)))
+            .only_if(format!(
+                "capability_capsule_id = {}",
+                sql_quote(capability_capsule_id)
+            ))
             .limit(1)
             .execute()
             .await
@@ -1174,14 +1224,14 @@ impl LanceStore {
     pub async fn latest_embedding_job_status_for_hash(
         &self,
         tenant: &str,
-        memory_id: &str,
+        capability_capsule_id: &str,
         target_content_hash: &str,
     ) -> Result<Option<String>, StorageError> {
         let mut rows = self
             .query_embedding_jobs(format!(
-                "tenant = {} AND memory_id = {} AND target_content_hash = {}",
+                "tenant = {} AND capability_capsule_id = {} AND target_content_hash = {}",
                 sql_quote(tenant),
-                sql_quote(memory_id),
+                sql_quote(capability_capsule_id),
                 sql_quote(target_content_hash),
             ))
             .await?;
@@ -1194,16 +1244,18 @@ impl LanceStore {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::domain::memory::{MemoryStatus, MemoryType, Scope, Visibility};
+    use crate::domain::capability_capsule::{
+        CapabilityCapsuleStatus, CapabilityCapsuleType, Scope, Visibility,
+    };
     use crate::storage::types::EmbeddingJobInsert;
     use tempfile::tempdir;
 
-    fn fixture(memory_id: &str, tenant: &str) -> MemoryRecord {
-        MemoryRecord {
-            memory_id: memory_id.into(),
+    fn fixture(capability_capsule_id: &str, tenant: &str) -> CapabilityCapsuleRecord {
+        CapabilityCapsuleRecord {
+            capability_capsule_id: capability_capsule_id.into(),
             tenant: tenant.into(),
-            memory_type: MemoryType::Implementation,
-            status: MemoryStatus::Active,
+            capability_capsule_type: CapabilityCapsuleType::Implementation,
+            status: CapabilityCapsuleStatus::Active,
             scope: Scope::Project,
             visibility: Visibility::Shared,
             version: 1,
@@ -1222,7 +1274,7 @@ mod tests {
             content_hash: "h".repeat(64),
             idempotency_key: Some("idemp-1".into()),
             session_id: None,
-            supersedes_memory_id: None,
+            supersedes_capability_capsule_id: None,
             source_agent: "test".into(),
             created_at: "00000001778000000000".into(),
             updated_at: "00000001778000000000".into(),
@@ -1237,19 +1289,19 @@ mod tests {
         let repo = LanceStore::open(&path).await.expect("open lancedb store");
 
         let memory = fixture("mem_lance_001", "tenant-a");
-        repo.insert_memory(memory.clone())
+        repo.insert_capability_capsule(memory.clone())
             .await
-            .expect("insert_memory");
+            .expect("insert_capability_capsule");
 
         let got = repo
-            .get_memory_for_tenant("tenant-a", "mem_lance_001")
+            .get_capability_capsule_for_tenant("tenant-a", "mem_lance_001")
             .await
-            .expect("get_memory_for_tenant")
+            .expect("get_capability_capsule_for_tenant")
             .expect("memory should exist");
 
-        assert_eq!(got.memory_id, memory.memory_id);
+        assert_eq!(got.capability_capsule_id, memory.capability_capsule_id);
         assert_eq!(got.tenant, memory.tenant);
-        assert_eq!(got.memory_type, memory.memory_type);
+        assert_eq!(got.capability_capsule_type, memory.capability_capsule_type);
         assert_eq!(got.status, memory.status);
         assert_eq!(got.summary, memory.summary);
         assert_eq!(got.content, memory.content);
@@ -1267,24 +1319,24 @@ mod tests {
         assert_eq!(got.last_validated_at, memory.last_validated_at);
 
         let missing = repo
-            .get_memory_for_tenant("tenant-a", "does-not-exist")
+            .get_capability_capsule_for_tenant("tenant-a", "does-not-exist")
             .await
             .expect("missing query");
         assert!(missing.is_none());
 
         // Cross-tenant filter must not leak.
         let wrong_tenant = repo
-            .get_memory_for_tenant("tenant-b", "mem_lance_001")
+            .get_capability_capsule_for_tenant("tenant-b", "mem_lance_001")
             .await
             .expect("cross-tenant query");
         assert!(wrong_tenant.is_none());
     }
 
-    /// Exercises the batch-impl filter methods (`list_memories_for_tenant`,
-    /// `list_memory_ids_for_tenant`, `find_by_idempotency_or_hash`,
-    /// `search_candidates`, `recent_active_memories`,
-    /// `fetch_memories_by_ids`, `list_pending_review`, `get_pending`,
-    /// `get_memory`).
+    /// Exercises the batch-impl filter methods (`list_capability_capsules_for_tenant`,
+    /// `list_capability_capsule_ids_for_tenant`, `find_by_idempotency_or_hash`,
+    /// `search_candidates`, `recent_active_capability_capsules`,
+    /// `fetch_capability_capsules_by_ids`, `list_pending_review`, `get_pending`,
+    /// `get_capability_capsule`).
     #[tokio::test]
     pub async fn lancedb_filter_methods_round_trip() {
         let dir = tempdir().unwrap();
@@ -1294,24 +1346,33 @@ mod tests {
         let mut a1 = fixture("mem_a_001", "tenant-a");
         a1.idempotency_key = Some("idem-a-1".into());
         let mut a2 = fixture("mem_a_002", "tenant-a");
-        a2.status = MemoryStatus::PendingConfirmation;
+        a2.status = CapabilityCapsuleStatus::PendingConfirmation;
         a2.content_hash = "h2".repeat(32);
         let mut a3 = fixture("mem_a_003", "tenant-a");
-        a3.status = MemoryStatus::Archived;
+        a3.status = CapabilityCapsuleStatus::Archived;
         let b1 = fixture("mem_b_001", "tenant-b");
 
         for m in [&a1, &a2, &a3, &b1] {
-            repo.insert_memory(m.clone()).await.unwrap();
+            repo.insert_capability_capsule(m.clone()).await.unwrap();
         }
 
-        // list_memories_for_tenant
-        let a_all = repo.list_memories_for_tenant("tenant-a").await.unwrap();
+        // list_capability_capsules_for_tenant
+        let a_all = repo
+            .list_capability_capsules_for_tenant("tenant-a")
+            .await
+            .unwrap();
         assert_eq!(a_all.len(), 3);
-        let b_all = repo.list_memories_for_tenant("tenant-b").await.unwrap();
+        let b_all = repo
+            .list_capability_capsules_for_tenant("tenant-b")
+            .await
+            .unwrap();
         assert_eq!(b_all.len(), 1);
 
-        // list_memory_ids_for_tenant
-        let mut ids_a = repo.list_memory_ids_for_tenant("tenant-a").await.unwrap();
+        // list_capability_capsule_ids_for_tenant
+        let mut ids_a = repo
+            .list_capability_capsule_ids_for_tenant("tenant-a")
+            .await
+            .unwrap();
         ids_a.sort();
         assert_eq!(ids_a, vec!["mem_a_001", "mem_a_002", "mem_a_003"]);
 
@@ -1320,34 +1381,40 @@ mod tests {
             .find_by_idempotency_or_hash("tenant-a", &Some("idem-a-1".into()), "no-such-hash")
             .await
             .unwrap();
-        assert_eq!(by_idem.unwrap().memory_id, "mem_a_001");
+        assert_eq!(by_idem.unwrap().capability_capsule_id, "mem_a_001");
 
         // ... match via content_hash when no idempotency_key supplied
         let by_hash = repo
             .find_by_idempotency_or_hash("tenant-a", &None, &a2.content_hash)
             .await
             .unwrap();
-        assert_eq!(by_hash.unwrap().memory_id, "mem_a_002");
+        assert_eq!(by_hash.unwrap().capability_capsule_id, "mem_a_002");
 
         // search_candidates — drops `archived`
         let cands = repo.search_candidates("tenant-a").await.unwrap();
-        let mut cand_ids: Vec<_> = cands.iter().map(|m| m.memory_id.clone()).collect();
+        let mut cand_ids: Vec<_> = cands
+            .iter()
+            .map(|m| m.capability_capsule_id.clone())
+            .collect();
         cand_ids.sort();
         assert_eq!(cand_ids, vec!["mem_a_001", "mem_a_002"]);
 
-        // recent_active_memories — same filter, with limit
-        let recent = repo.recent_active_memories("tenant-a", 1).await.unwrap();
+        // recent_active_capability_capsules — same filter, with limit
+        let recent = repo
+            .recent_active_capability_capsules("tenant-a", 1)
+            .await
+            .unwrap();
         assert_eq!(recent.len(), 1);
 
-        // fetch_memories_by_ids — IN clause
+        // fetch_capability_capsules_by_ids — IN clause
         let by_ids = repo
-            .fetch_memories_by_ids("tenant-a", &["mem_a_001", "mem_a_002"])
+            .fetch_capability_capsules_by_ids("tenant-a", &["mem_a_001", "mem_a_002"])
             .await
             .unwrap();
         assert_eq!(by_ids.len(), 2);
         // Empty input — short-circuit, no query.
         assert!(repo
-            .fetch_memories_by_ids("tenant-a", &[])
+            .fetch_capability_capsules_by_ids("tenant-a", &[])
             .await
             .unwrap()
             .is_empty());
@@ -1355,22 +1422,25 @@ mod tests {
         // list_pending_review
         let pending = repo.list_pending_review("tenant-a").await.unwrap();
         assert_eq!(pending.len(), 1);
-        assert_eq!(pending[0].memory_id, "mem_a_002");
+        assert_eq!(pending[0].capability_capsule_id, "mem_a_002");
 
         // get_pending — exact one
         let p = repo.get_pending("tenant-a", "mem_a_002").await.unwrap();
-        assert_eq!(p.unwrap().memory_id, "mem_a_002");
+        assert_eq!(p.unwrap().capability_capsule_id, "mem_a_002");
         // get_pending — wrong status returns None
         let np = repo.get_pending("tenant-a", "mem_a_001").await.unwrap();
         assert!(np.is_none());
 
-        // get_memory — cross-tenant (no tenant filter)
-        let cross = repo.get_memory("mem_b_001".into()).await.unwrap();
+        // get_capability_capsule — cross-tenant (no tenant filter)
+        let cross = repo
+            .get_capability_capsule("mem_b_001".into())
+            .await
+            .unwrap();
         assert_eq!(cross.unwrap().tenant, "tenant-b");
     }
 
     /// Mutating-method round-trip: accept_pending, reject_pending,
-    /// replace_pending_with_successor, delete_memory_hard.
+    /// replace_pending_with_successor, delete_capability_capsule_hard.
     #[tokio::test]
     pub async fn lancedb_mutating_methods_round_trip() {
         let dir = tempdir().unwrap();
@@ -1378,23 +1448,23 @@ mod tests {
         let repo = LanceStore::open(&path).await.unwrap();
 
         let mut p = fixture("mem_p", "tenant");
-        p.status = MemoryStatus::PendingConfirmation;
+        p.status = CapabilityCapsuleStatus::PendingConfirmation;
         let mut q = fixture("mem_q", "tenant");
-        q.status = MemoryStatus::PendingConfirmation;
+        q.status = CapabilityCapsuleStatus::PendingConfirmation;
         let r = fixture("mem_r", "tenant");
         let s = fixture("mem_s", "tenant");
         for m in [&p, &q, &r, &s] {
-            repo.insert_memory(m.clone()).await.unwrap();
+            repo.insert_capability_capsule(m.clone()).await.unwrap();
         }
 
         // accept_pending → status active
         let accepted = repo.accept_pending("tenant", "mem_p").await.unwrap();
-        assert_eq!(accepted.status, MemoryStatus::Active);
-        assert_eq!(accepted.memory_id, "mem_p");
+        assert_eq!(accepted.status, CapabilityCapsuleStatus::Active);
+        assert_eq!(accepted.capability_capsule_id, "mem_p");
 
         // reject_pending → status rejected
         let rejected = repo.reject_pending("tenant", "mem_q").await.unwrap();
-        assert_eq!(rejected.status, MemoryStatus::Rejected);
+        assert_eq!(rejected.status, CapabilityCapsuleStatus::Rejected);
 
         // After accept/reject, list_pending_review is empty
         let pending = repo.list_pending_review("tenant").await.unwrap();
@@ -1402,35 +1472,43 @@ mod tests {
 
         // replace_pending_with_successor: archive r, insert successor
         let mut succ = fixture("mem_r_v2", "tenant");
-        succ.supersedes_memory_id = Some("mem_r".into());
+        succ.supersedes_capability_capsule_id = Some("mem_r".into());
         succ.version = 2;
         let returned = repo
             .replace_pending_with_successor("tenant", "mem_r", succ.clone())
             .await
             .unwrap();
-        assert_eq!(returned.memory_id, "mem_r_v2");
+        assert_eq!(returned.capability_capsule_id, "mem_r_v2");
         let archived = repo
-            .get_memory_for_tenant("tenant", "mem_r")
+            .get_capability_capsule_for_tenant("tenant", "mem_r")
             .await
             .unwrap()
             .unwrap();
-        assert_eq!(archived.status, MemoryStatus::Rejected);
+        assert_eq!(archived.status, CapabilityCapsuleStatus::Rejected);
         let successor_row = repo
-            .get_memory_for_tenant("tenant", "mem_r_v2")
+            .get_capability_capsule_for_tenant("tenant", "mem_r_v2")
             .await
             .unwrap()
             .unwrap();
-        assert_eq!(successor_row.supersedes_memory_id, Some("mem_r".into()));
+        assert_eq!(
+            successor_row.supersedes_capability_capsule_id,
+            Some("mem_r".into())
+        );
         assert_eq!(successor_row.version, 2);
 
-        // delete_memory_hard
-        repo.delete_memory_hard("tenant", "mem_s").await.unwrap();
-        let gone = repo.get_memory_for_tenant("tenant", "mem_s").await.unwrap();
+        // delete_capability_capsule_hard
+        repo.delete_capability_capsule_hard("tenant", "mem_s")
+            .await
+            .unwrap();
+        let gone = repo
+            .get_capability_capsule_for_tenant("tenant", "mem_s")
+            .await
+            .unwrap();
         assert!(gone.is_none());
 
         // delete on non-existent → NotFound-equivalent error
         let err = repo
-            .delete_memory_hard("tenant", "does-not-exist")
+            .delete_capability_capsule_hard("tenant", "does-not-exist")
             .await
             .unwrap_err();
         assert!(
@@ -1446,12 +1524,14 @@ mod tests {
         let repo = LanceStore::open(&path).await.unwrap();
 
         let memory = fixture("mem_fb", "tenant");
-        repo.insert_memory(memory.clone()).await.unwrap();
+        repo.insert_capability_capsule(memory.clone())
+            .await
+            .unwrap();
 
         // Apply 3 feedbacks of different kinds
         let make = |kind: &str, ts: &str, suffix: &str| FeedbackEvent {
             feedback_id: format!("fb_{suffix}"),
-            memory_id: memory.memory_id.clone(),
+            capability_capsule_id: memory.capability_capsule_id.clone(),
             feedback_kind: kind.into(),
             created_at: ts.into(),
         };
@@ -1460,7 +1540,7 @@ mod tests {
             .await
             .unwrap();
         let after_useful = repo
-            .get_memory_for_tenant("tenant", "mem_fb")
+            .get_capability_capsule_for_tenant("tenant", "mem_fb")
             .await
             .unwrap()
             .unwrap();
@@ -1477,7 +1557,7 @@ mod tests {
             .await
             .unwrap();
         let after_outdated = repo
-            .get_memory_for_tenant("tenant", "mem_fb")
+            .get_capability_capsule_for_tenant("tenant", "mem_fb")
             .await
             .unwrap()
             .unwrap();
@@ -1494,13 +1574,13 @@ mod tests {
             .await
             .unwrap();
         let after_incorrect = repo
-            .get_memory_for_tenant("tenant", "mem_fb")
+            .get_capability_capsule_for_tenant("tenant", "mem_fb")
             .await
             .unwrap()
             .unwrap();
         assert_eq!(
             after_incorrect.status,
-            MemoryStatus::Archived,
+            CapabilityCapsuleStatus::Archived,
             "incorrect must archive",
         );
 
@@ -1523,11 +1603,11 @@ mod tests {
         assert_eq!(summary_none.total, 0);
     }
 
-    /// `upsert_memory_embedding` + `semantic_search_memories` round-trip:
+    /// `upsert_capability_capsule_embedding` + `semantic_search_capability_capsules` round-trip:
     /// insert two memories, write their embeddings, search by a query
     /// vector, expect both back in cosine-distance order with the closer
     /// vector ranked first. Also exercises tenant prefilter and
-    /// `delete_memory_embedding`.
+    /// `delete_capability_capsule_embedding`.
     #[tokio::test(flavor = "multi_thread")]
     pub async fn lancedb_embedding_round_trip() {
         let dir = tempdir().unwrap();
@@ -1540,7 +1620,7 @@ mod tests {
         let a2 = fixture("mem_emb_2", "tenant-a");
         let b1 = fixture("mem_emb_3", "tenant-b");
         for m in [&a1, &a2, &b1] {
-            repo.insert_memory(m.clone()).await.unwrap();
+            repo.insert_capability_capsule(m.clone()).await.unwrap();
         }
 
         // Hand-rolled 4-d unit vectors. q ≈ v1 (close), v2 different,
@@ -1555,7 +1635,7 @@ mod tests {
         let v1 = vec![1.0_f32, 0.0, 0.0, 0.0];
         let v2 = vec![0.0_f32, 1.0, 0.0, 0.0];
         let v3 = vec![0.0_f32, 0.0, 1.0, 0.0];
-        repo.upsert_memory_embedding(
+        repo.upsert_capability_capsule_embedding(
             "mem_emb_1",
             "tenant-a",
             "fake-test",
@@ -1567,7 +1647,7 @@ mod tests {
         )
         .await
         .unwrap();
-        repo.upsert_memory_embedding(
+        repo.upsert_capability_capsule_embedding(
             "mem_emb_2",
             "tenant-a",
             "fake-test",
@@ -1579,7 +1659,7 @@ mod tests {
         )
         .await
         .unwrap();
-        repo.upsert_memory_embedding(
+        repo.upsert_capability_capsule_embedding(
             "mem_emb_3",
             "tenant-b",
             "fake-test",
@@ -1596,12 +1676,15 @@ mod tests {
         // (tenant-b) must be filtered out.
         let q = vec![0.99_f32, 0.14, 0.0, 0.0]; // ≈ unit, close to v1
         let hits = repo
-            .semantic_search_memories("tenant-a", &q, 10)
+            .semantic_search_capability_capsules("tenant-a", &q, 10)
             .await
             .unwrap();
         assert_eq!(hits.len(), 2, "tenant-a should have 2 hits, got {hits:?}");
-        assert_eq!(hits[0].0.memory_id, "mem_emb_1", "v1 should rank first");
-        assert_eq!(hits[1].0.memory_id, "mem_emb_2");
+        assert_eq!(
+            hits[0].0.capability_capsule_id, "mem_emb_1",
+            "v1 should rank first"
+        );
+        assert_eq!(hits[1].0.capability_capsule_id, "mem_emb_2");
         // similarity ∈ (0, 1] for close-but-not-identical normalized vecs;
         // strictly greater than the v2 score.
         assert!(hits[0].1 > hits[1].1);
@@ -1610,7 +1693,7 @@ mod tests {
         // to v1 should rank mem_emb_2 first (because both rows now have
         // v2-like vectors, but mem_emb_1 will be slightly off due to
         // float roundtrip, so we just check the row count stays at 2).
-        repo.upsert_memory_embedding(
+        repo.upsert_capability_capsule_embedding(
             "mem_emb_1",
             "tenant-a",
             "fake-test",
@@ -1623,38 +1706,40 @@ mod tests {
         .await
         .unwrap();
         let after_overwrite = repo
-            .semantic_search_memories("tenant-a", &q, 10)
+            .semantic_search_capability_capsules("tenant-a", &q, 10)
             .await
             .unwrap();
         assert_eq!(after_overwrite.len(), 2);
 
-        // delete_memory_embedding removes the row from the search corpus.
-        repo.delete_memory_embedding("mem_emb_2").await.unwrap();
+        // delete_capability_capsule_embedding removes the row from the search corpus.
+        repo.delete_capability_capsule_embedding("mem_emb_2")
+            .await
+            .unwrap();
         let after_delete = repo
-            .semantic_search_memories("tenant-a", &q, 10)
+            .semantic_search_capability_capsules("tenant-a", &q, 10)
             .await
             .unwrap();
         assert_eq!(after_delete.len(), 1);
-        assert_eq!(after_delete[0].0.memory_id, "mem_emb_1");
+        assert_eq!(after_delete[0].0.capability_capsule_id, "mem_emb_1");
 
         // delete on no-row is a no-op (table exists but no matching row).
-        repo.delete_memory_embedding("does-not-exist")
+        repo.delete_capability_capsule_embedding("does-not-exist")
             .await
             .unwrap();
 
-        // Search before any upsert (fresh repo, no memory_embeddings
+        // Search before any upsert (fresh repo, no capability_capsule_embeddings
         // table) returns empty without error.
         let dir2 = tempdir().unwrap();
         let path2 = dir2.path().join("empty.store");
         let empty_repo = LanceStore::open(&path2).await.unwrap();
         let empty_hits = empty_repo
-            .semantic_search_memories("tenant-a", &q, 10)
+            .semantic_search_capability_capsules("tenant-a", &q, 10)
             .await
             .unwrap();
         assert!(empty_hits.is_empty());
         // And delete on a missing table is a no-op.
         empty_repo
-            .delete_memory_embedding("anything")
+            .delete_capability_capsule_embedding("anything")
             .await
             .unwrap();
     }
@@ -1672,14 +1757,14 @@ mod tests {
         let m1 = fixture("mem_q1", "tenant-a");
         let m2 = fixture("mem_q2", "tenant-a");
         for m in [&m1, &m2] {
-            repo.insert_memory(m.clone()).await.unwrap();
+            repo.insert_capability_capsule(m.clone()).await.unwrap();
         }
 
         // Enqueue: first call creates, second is idempotent (dup detected).
         let insert1 = EmbeddingJobInsert {
             job_id: "job_1".into(),
             tenant: "tenant-a".into(),
-            memory_id: "mem_q1".into(),
+            capability_capsule_id: "mem_q1".into(),
             target_content_hash: "hash_q1".into(),
             provider: "fake-test".into(),
             available_at: "00000001778000000000".into(),
@@ -1695,12 +1780,12 @@ mod tests {
         assert!(!enq1b, "duplicate enqueue must return false");
 
         let first = repo
-            .first_embedding_job_id_for_memory("mem_q1")
+            .first_embedding_job_id_for_capability_capsule("mem_q1")
             .await
             .unwrap();
         assert_eq!(first, Some("job_1".into()));
         let none = repo
-            .first_embedding_job_id_for_memory("does-not-exist")
+            .first_embedding_job_id_for_capability_capsule("does-not-exist")
             .await
             .unwrap();
         assert!(none.is_none());
@@ -1715,7 +1800,7 @@ mod tests {
         let insert2 = EmbeddingJobInsert {
             job_id: "job_2".into(),
             tenant: "tenant-a".into(),
-            memory_id: "mem_q2".into(),
+            capability_capsule_id: "mem_q2".into(),
             target_content_hash: "hash_q2".into(),
             provider: "fake-test".into(),
             available_at: "00000001778000000001".into(),
@@ -1809,19 +1894,19 @@ mod tests {
         assert_eq!(only_failed[0].job_id, "job_2");
         assert_eq!(only_failed[0].attempt_count, 5);
 
-        // memory_id filter.
+        // capability_capsule_id filter.
         let only_q1 = repo
             .list_embedding_jobs("tenant-a", None, Some("mem_q1"), 50)
             .await
             .unwrap();
         assert_eq!(only_q1.len(), 1);
-        assert_eq!(only_q1[0].memory_id, "mem_q1");
+        assert_eq!(only_q1[0].capability_capsule_id, "mem_q1");
 
         // stale_live: enqueue a fresh pending row, then sweep it stale.
         let insert3 = EmbeddingJobInsert {
             job_id: "job_3".into(),
             tenant: "tenant-a".into(),
-            memory_id: "mem_q1".into(),
+            capability_capsule_id: "mem_q1".into(),
             target_content_hash: "hash_q1_v2".into(),
             provider: "fake-test".into(),
             available_at: "00000001778000080000".into(),
@@ -1830,7 +1915,7 @@ mod tests {
         };
         repo.try_enqueue_embedding_job(insert3).await.unwrap();
         let staled = repo
-            .stale_live_embedding_jobs_for_memory(
+            .stale_live_embedding_jobs_for_capability_capsule(
                 "tenant-a",
                 "mem_q1",
                 "fake-test",
@@ -1841,7 +1926,7 @@ mod tests {
         assert_eq!(staled, 1);
 
         let deleted = repo
-            .delete_embedding_jobs_by_memory_id("mem_q1")
+            .delete_embedding_jobs_by_capability_capsule_id("mem_q1")
             .await
             .unwrap();
         assert_eq!(deleted, 2);
@@ -1850,11 +1935,11 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(remaining.len(), 1);
-        assert_eq!(remaining[0].memory_id, "mem_q2");
+        assert_eq!(remaining[0].capability_capsule_id, "mem_q2");
 
         // delete on no-row → 0.
         let zero = repo
-            .delete_embedding_jobs_by_memory_id("nope")
+            .delete_embedding_jobs_by_capability_capsule_id("nope")
             .await
             .unwrap();
         assert_eq!(zero, 0);
@@ -1862,7 +1947,7 @@ mod tests {
 
     /// `bm25_candidates` lazy-creates the FTS index on `memories.content`
     /// the first time it's called, then BM25-ranks rows matching the
-    /// query — distinct from semantic_search_memories (vector ANN).
+    /// query — distinct from semantic_search_capability_capsules (vector ANN).
     /// Tenant filter must be honored; empty query / k == 0 returns [].
     #[tokio::test]
     pub async fn lancedb_bm25_candidates_round_trip() {
@@ -1879,7 +1964,7 @@ mod tests {
         let mut d = fixture("mem_b4", "tenant-b");
         d.content = "DuckDB connection pool tenant-b".into();
         for m in [&a, &b, &c, &d] {
-            repo.insert_memory(m.clone()).await.unwrap();
+            repo.insert_capability_capsule(m.clone()).await.unwrap();
         }
 
         // Empty query → []; k=0 → [].
@@ -1894,7 +1979,10 @@ mod tests {
             .bm25_candidates("tenant-a", "DuckDB", 10)
             .await
             .unwrap();
-        let ids: Vec<&str> = hits.iter().map(|m| m.memory_id.as_str()).collect();
+        let ids: Vec<&str> = hits
+            .iter()
+            .map(|m| m.capability_capsule_id.as_str())
+            .collect();
         assert!(ids.contains(&"mem_b1"), "got {ids:?}");
         assert!(ids.contains(&"mem_b3"), "got {ids:?}");
         assert!(!ids.contains(&"mem_b2"));
@@ -1904,7 +1992,12 @@ mod tests {
         );
 
         // Index now exists — second call should reuse, not rebuild.
-        let table = repo.conn.open_table("memories").execute().await.unwrap();
+        let table = repo
+            .conn
+            .open_table("capability_capsules")
+            .execute()
+            .await
+            .unwrap();
         let indices = table.list_indices().await.unwrap();
         assert!(
             indices
@@ -1918,7 +2011,10 @@ mod tests {
             .bm25_candidates("tenant-a", "LanceDB", 10)
             .await
             .unwrap();
-        let lance_ids: Vec<&str> = lance_hits.iter().map(|m| m.memory_id.as_str()).collect();
+        let lance_ids: Vec<&str> = lance_hits
+            .iter()
+            .map(|m| m.capability_capsule_id.as_str())
+            .collect();
         assert!(lance_ids.contains(&"mem_b2"));
     }
 }

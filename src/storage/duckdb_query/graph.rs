@@ -5,7 +5,7 @@
 use duckdb::params;
 
 use super::{row_to_graph_edge, spawn_blocking_graph, DuckDbQuery};
-use crate::domain::memory::GraphEdge;
+use crate::domain::capability_capsule::GraphEdge;
 use crate::storage::types::GraphError;
 
 impl DuckDbQuery {
@@ -49,7 +49,10 @@ impl DuckDbQuery {
     /// is NOT in (...)" expression.
     ///
     /// Empty input short-circuits.
-    pub async fn related_memory_ids(&self, node_ids: &[String]) -> Result<Vec<String>, GraphError> {
+    pub async fn related_capability_capsule_ids(
+        &self,
+        node_ids: &[String],
+    ) -> Result<Vec<String>, GraphError> {
         if node_ids.is_empty() {
             return Ok(Vec::new());
         }
@@ -81,18 +84,18 @@ impl DuckDbQuery {
 
             let node_set: std::collections::HashSet<&str> =
                 node_ids.iter().map(|s| s.as_str()).collect();
-            let mut memory_ids = std::collections::HashSet::new();
+            let mut capability_capsule_ids = std::collections::HashSet::new();
             for r in rows {
                 let (from, to) = r?;
                 for endpoint in [&from, &to] {
                     if !node_set.contains(endpoint.as_str()) {
-                        if let Some(mid) = endpoint.strip_prefix("memory:") {
-                            memory_ids.insert(mid.to_string());
+                        if let Some(mid) = endpoint.strip_prefix("capability_capsule:") {
+                            capability_capsule_ids.insert(mid.to_string());
                         }
                     }
                 }
             }
-            let mut out: Vec<String> = memory_ids.into_iter().collect();
+            let mut out: Vec<String> = capability_capsule_ids.into_iter().collect();
             out.sort();
             Ok(out)
         })

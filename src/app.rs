@@ -8,13 +8,13 @@ use tracing::info;
 
 use crate::{
     http,
-    service::{EntityService, MemoryService, TranscriptService},
+    service::{CapabilityCapsuleService, EntityService, TranscriptService},
     storage::Store,
 };
 
 #[derive(Clone)]
 pub struct AppState {
-    pub memory_service: MemoryService,
+    pub capability_capsule_service: CapabilityCapsuleService,
     pub config: crate::config::Config,
     /// Service façade backing the `/transcripts/*` HTTP routes.
     pub transcript_service: TranscriptService,
@@ -85,11 +85,11 @@ impl AppState {
         let embedding_provider_id = config.embedding.job_provider_id().to_string();
         let transcript_service = TranscriptService::new(store.clone(), Some(provider.clone()));
         let entity_service = EntityService::new(store.clone());
-        let memory_service =
-            MemoryService::with_providers(store, embedding_provider_id, Some(provider));
+        let capability_capsule_service =
+            CapabilityCapsuleService::with_providers(store, embedding_provider_id, Some(provider));
 
         Ok(Self {
-            memory_service,
+            capability_capsule_service,
             config,
             transcript_service,
             entity_service,

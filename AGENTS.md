@@ -30,7 +30,7 @@ cross build --release                          # cross-compile (reads ./Cross.to
 
 - **Rust edition 2021** (see `Cargo.toml`). `cargo fmt` + `cargo clippy --all-targets -- -D warnings` clean is non-negotiable. snake_case for modules / files / functions.
 - **Tests:** integration tests live in `tests/` at the repo root (e.g. `tests/search_api.rs`, `tests/vector_index.rs`). Unit tests sit inline as `#[cfg(test)] mod tests` at the bottom of source files. **Must** colocated `*_test.rs` convention in this codebase.
-- **Schema migrations:** `db/schema/*.sql` files are append-only; never edit historical files in-place. Add a new numbered file for new tables / columns.
+- **Schema:** LanceDB tables are defined inline as `Schema::new(vec![Field::new(...)])` in `src/storage/lance_store/{mod,sessions,episodes}.rs`. No external migration files. Adding/changing a table means updating the schema fn + record_batch builders + parsers in lockstep.
 - **Commit scope tags:** `feat(area)`, `fix(area)`, `docs(area)`, `test(area)`, `refactor(area)`, `chore`. When closing a roadmap item: `… (closes mempalace-diff §8 #N)`.
 - **Pre-commit CI check (mandatory):** Before EVERY commit, run BOTH:
   1. `cargo fmt --check`

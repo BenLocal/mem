@@ -56,9 +56,11 @@ use super::{
     ClaimedEmbeddingJob, ClaimedTranscriptEmbeddingJob, ContextWindow, EmbeddingJobInsert,
     FeedbackEvent, GraphError, StorageError, TranscriptSessionSummary,
 };
+use crate::domain::capability_capsule::{
+    CapabilityCapsuleRecord, CapabilityCapsuleVersionLink, FeedbackSummary, GraphEdge,
+};
 use crate::domain::embeddings::EmbeddingJobInfo;
 use crate::domain::episode::EpisodeRecord;
-use crate::domain::memory::{FeedbackSummary, GraphEdge, MemoryRecord, MemoryVersionLink};
 use crate::domain::session::Session;
 use crate::domain::{AddAliasOutcome, ConversationMessage, Entity, EntityKind, EntityWithAliases};
 
@@ -141,8 +143,11 @@ macro_rules! lance_write_then_refresh {
 
 // ── Memory writes (LanceStore + DuckDbQuery refresh) ────────────────
 impl Store {
-    pub async fn insert_memory(&self, m: MemoryRecord) -> Result<MemoryRecord, StorageError> {
-        lance_write_then_refresh!(self, self.lance.insert_memory(m).await)
+    pub async fn insert_capability_capsule(
+        &self,
+        m: CapabilityCapsuleRecord,
+    ) -> Result<CapabilityCapsuleRecord, StorageError> {
+        lance_write_then_refresh!(self, self.lance.insert_capability_capsule(m).await)
     }
 
     pub async fn try_enqueue_embedding_job(
@@ -167,9 +172,9 @@ impl Store {
     }
 
     #[allow(clippy::too_many_arguments)]
-    pub async fn upsert_memory_embedding(
+    pub async fn upsert_capability_capsule_embedding(
         &self,
-        memory_id: &str,
+        capability_capsule_id: &str,
         tenant: &str,
         embedding_model: &str,
         embedding_dim: i64,
@@ -181,8 +186,8 @@ impl Store {
         lance_write_then_refresh!(
             self,
             self.lance
-                .upsert_memory_embedding(
-                    memory_id,
+                .upsert_capability_capsule_embedding(
+                    capability_capsule_id,
                     tenant,
                     embedding_model,
                     embedding_dim,
@@ -195,8 +200,16 @@ impl Store {
         )
     }
 
-    pub async fn delete_memory_embedding(&self, memory_id: &str) -> Result<(), StorageError> {
-        lance_write_then_refresh!(self, self.lance.delete_memory_embedding(memory_id).await)
+    pub async fn delete_capability_capsule_embedding(
+        &self,
+        capability_capsule_id: &str,
+    ) -> Result<(), StorageError> {
+        lance_write_then_refresh!(
+            self,
+            self.lance
+                .delete_capability_capsule_embedding(capability_capsule_id)
+                .await
+        )
     }
 
     pub async fn complete_embedding_job(
@@ -252,14 +265,14 @@ impl Store {
         )
     }
 
-    pub async fn delete_embedding_jobs_by_memory_id(
+    pub async fn delete_embedding_jobs_by_capability_capsule_id(
         &self,
-        memory_id: &str,
+        capability_capsule_id: &str,
     ) -> Result<usize, StorageError> {
         lance_write_then_refresh!(
             self,
             self.lance
-                .delete_embedding_jobs_by_memory_id(memory_id)
+                .delete_embedding_jobs_by_capability_capsule_id(capability_capsule_id)
                 .await
         )
     }
@@ -267,25 +280,35 @@ impl Store {
     pub async fn accept_pending(
         &self,
         tenant: &str,
-        memory_id: &str,
-    ) -> Result<MemoryRecord, StorageError> {
-        lance_write_then_refresh!(self, self.lance.accept_pending(tenant, memory_id).await)
+        capability_capsule_id: &str,
+    ) -> Result<CapabilityCapsuleRecord, StorageError> {
+        lance_write_then_refresh!(
+            self,
+            self.lance
+                .accept_pending(tenant, capability_capsule_id)
+                .await
+        )
     }
 
     pub async fn reject_pending(
         &self,
         tenant: &str,
-        memory_id: &str,
-    ) -> Result<MemoryRecord, StorageError> {
-        lance_write_then_refresh!(self, self.lance.reject_pending(tenant, memory_id).await)
+        capability_capsule_id: &str,
+    ) -> Result<CapabilityCapsuleRecord, StorageError> {
+        lance_write_then_refresh!(
+            self,
+            self.lance
+                .reject_pending(tenant, capability_capsule_id)
+                .await
+        )
     }
 
     pub async fn replace_pending_with_successor(
         &self,
         tenant: &str,
         original_memory_id: &str,
-        successor: MemoryRecord,
-    ) -> Result<MemoryRecord, StorageError> {
+        successor: CapabilityCapsuleRecord,
+    ) -> Result<CapabilityCapsuleRecord, StorageError> {
         lance_write_then_refresh!(
             self,
             self.lance
@@ -296,18 +319,23 @@ impl Store {
 
     pub async fn apply_feedback(
         &self,
-        memory: &MemoryRecord,
+        memory: &CapabilityCapsuleRecord,
         feedback: FeedbackEvent,
-    ) -> Result<MemoryRecord, StorageError> {
+    ) -> Result<CapabilityCapsuleRecord, StorageError> {
         lance_write_then_refresh!(self, self.lance.apply_feedback(memory, feedback).await)
     }
 
-    pub async fn delete_memory_hard(
+    pub async fn delete_capability_capsule_hard(
         &self,
         tenant: &str,
-        memory_id: &str,
+        capability_capsule_id: &str,
     ) -> Result<(), StorageError> {
-        lance_write_then_refresh!(self, self.lance.delete_memory_hard(tenant, memory_id).await)
+        lance_write_then_refresh!(
+            self,
+            self.lance
+                .delete_capability_capsule_hard(tenant, capability_capsule_id)
+                .await
+        )
     }
 
     pub async fn insert_episode(
@@ -317,17 +345,22 @@ impl Store {
         lance_write_then_refresh!(self, self.lance.insert_episode(episode).await)
     }
 
-    pub async fn stale_live_embedding_jobs_for_memory(
+    pub async fn stale_live_embedding_jobs_for_capability_capsule(
         &self,
         tenant: &str,
-        memory_id: &str,
+        capability_capsule_id: &str,
         provider: &str,
         now: &str,
     ) -> Result<usize, StorageError> {
         lance_write_then_refresh!(
             self,
             self.lance
-                .stale_live_embedding_jobs_for_memory(tenant, memory_id, provider, now)
+                .stale_live_embedding_jobs_for_capability_capsule(
+                    tenant,
+                    capability_capsule_id,
+                    provider,
+                    now
+                )
                 .await
         )
     }
@@ -335,27 +368,29 @@ impl Store {
 
 // ── Memory reads (DuckDbQuery) ──────────────────────────────────────
 impl Store {
-    pub async fn list_memories_for_tenant(
+    pub async fn list_capability_capsules_for_tenant(
         &self,
         tenant: &str,
-    ) -> Result<Vec<MemoryRecord>, StorageError> {
-        self.query.list_memories_for_tenant(tenant).await
+    ) -> Result<Vec<CapabilityCapsuleRecord>, StorageError> {
+        self.query.list_capability_capsules_for_tenant(tenant).await
     }
 
-    pub async fn get_memory_for_tenant(
+    pub async fn get_capability_capsule_for_tenant(
         &self,
         tenant: &str,
-        memory_id: &str,
-    ) -> Result<Option<MemoryRecord>, StorageError> {
-        self.query.get_memory_for_tenant(tenant, memory_id).await
+        capability_capsule_id: &str,
+    ) -> Result<Option<CapabilityCapsuleRecord>, StorageError> {
+        self.query
+            .get_capability_capsule_for_tenant(tenant, capability_capsule_id)
+            .await
     }
 
     pub async fn get_pending(
         &self,
         tenant: &str,
-        memory_id: &str,
-    ) -> Result<Option<MemoryRecord>, StorageError> {
-        self.query.get_pending(tenant, memory_id).await
+        capability_capsule_id: &str,
+    ) -> Result<Option<CapabilityCapsuleRecord>, StorageError> {
+        self.query.get_pending(tenant, capability_capsule_id).await
     }
 
     pub async fn find_by_idempotency_or_hash(
@@ -363,7 +398,7 @@ impl Store {
         tenant: &str,
         idempotency_key: &Option<String>,
         content_hash: &str,
-    ) -> Result<Option<MemoryRecord>, StorageError> {
+    ) -> Result<Option<CapabilityCapsuleRecord>, StorageError> {
         self.query
             .find_by_idempotency_or_hash(tenant, idempotency_key, content_hash)
             .await
@@ -372,20 +407,25 @@ impl Store {
     pub async fn list_pending_review(
         &self,
         tenant: &str,
-    ) -> Result<Vec<MemoryRecord>, StorageError> {
+    ) -> Result<Vec<CapabilityCapsuleRecord>, StorageError> {
         self.query.list_pending_review(tenant).await
     }
 
-    pub async fn search_candidates(&self, tenant: &str) -> Result<Vec<MemoryRecord>, StorageError> {
+    pub async fn search_candidates(
+        &self,
+        tenant: &str,
+    ) -> Result<Vec<CapabilityCapsuleRecord>, StorageError> {
         self.query.search_candidates(tenant).await
     }
 
-    pub async fn recent_active_memories(
+    pub async fn recent_active_capability_capsules(
         &self,
         tenant: &str,
         limit: usize,
-    ) -> Result<Vec<MemoryRecord>, StorageError> {
-        self.query.recent_active_memories(tenant, limit).await
+    ) -> Result<Vec<CapabilityCapsuleRecord>, StorageError> {
+        self.query
+            .recent_active_capability_capsules(tenant, limit)
+            .await
     }
 
     pub async fn bm25_candidates(
@@ -393,43 +433,47 @@ impl Store {
         tenant: &str,
         query: &str,
         k: usize,
-    ) -> Result<Vec<MemoryRecord>, StorageError> {
+    ) -> Result<Vec<CapabilityCapsuleRecord>, StorageError> {
         self.query.bm25_candidates(tenant, query, k).await
     }
 
-    pub async fn fetch_memories_by_ids(
+    pub async fn fetch_capability_capsules_by_ids(
         &self,
         tenant: &str,
         ids: &[&str],
-    ) -> Result<Vec<MemoryRecord>, StorageError> {
-        self.query.fetch_memories_by_ids(tenant, ids).await
-    }
-
-    pub async fn list_memory_ids_for_tenant(
-        &self,
-        tenant: &str,
-    ) -> Result<Vec<String>, StorageError> {
-        self.query.list_memory_ids_for_tenant(tenant).await
-    }
-
-    pub async fn list_memory_versions_for_tenant(
-        &self,
-        tenant: &str,
-        memory_id: &str,
-    ) -> Result<Vec<MemoryVersionLink>, StorageError> {
+    ) -> Result<Vec<CapabilityCapsuleRecord>, StorageError> {
         self.query
-            .list_memory_versions_for_tenant(tenant, memory_id)
+            .fetch_capability_capsules_by_ids(tenant, ids)
             .await
     }
 
-    pub async fn semantic_search_memories(
+    pub async fn list_capability_capsule_ids_for_tenant(
+        &self,
+        tenant: &str,
+    ) -> Result<Vec<String>, StorageError> {
+        self.query
+            .list_capability_capsule_ids_for_tenant(tenant)
+            .await
+    }
+
+    pub async fn list_capability_capsule_versions_for_tenant(
+        &self,
+        tenant: &str,
+        capability_capsule_id: &str,
+    ) -> Result<Vec<CapabilityCapsuleVersionLink>, StorageError> {
+        self.query
+            .list_capability_capsule_versions_for_tenant(tenant, capability_capsule_id)
+            .await
+    }
+
+    pub async fn semantic_search_capability_capsules(
         &self,
         tenant: &str,
         query_embedding: &[f32],
         limit: usize,
-    ) -> Result<Vec<(MemoryRecord, f32)>, StorageError> {
+    ) -> Result<Vec<(CapabilityCapsuleRecord, f32)>, StorageError> {
         self.query
-            .semantic_search_memories(tenant, query_embedding, limit)
+            .semantic_search_capability_capsules(tenant, query_embedding, limit)
             .await
     }
 }
@@ -443,34 +487,41 @@ impl Store {
 // Marked individually with `// TODO: route to DuckDbQuery once added`.
 impl Store {
     /// TODO: route to DuckDbQuery once added.
-    pub async fn first_embedding_job_id_for_memory(
+    pub async fn first_embedding_job_id_for_capability_capsule(
         &self,
-        memory_id: &str,
+        capability_capsule_id: &str,
     ) -> Result<Option<String>, StorageError> {
         self.lance
-            .first_embedding_job_id_for_memory(memory_id)
+            .first_embedding_job_id_for_capability_capsule(capability_capsule_id)
             .await
     }
 
     /// TODO: route to DuckDbQuery once added.
     pub async fn list_feedback_for_memory(
         &self,
-        memory_id: &str,
+        capability_capsule_id: &str,
     ) -> Result<Vec<FeedbackEvent>, StorageError> {
-        self.lance.list_feedback_for_memory(memory_id).await
+        self.lance
+            .list_feedback_for_memory(capability_capsule_id)
+            .await
     }
 
     /// TODO: route to DuckDbQuery once added.
-    pub async fn feedback_summary(&self, memory_id: &str) -> Result<FeedbackSummary, StorageError> {
-        self.lance.feedback_summary(memory_id).await
-    }
-
-    /// TODO: route to DuckDbQuery once added.
-    pub async fn get_memory(
+    pub async fn feedback_summary(
         &self,
-        memory_id: String,
-    ) -> Result<Option<MemoryRecord>, StorageError> {
-        self.lance.get_memory(memory_id).await
+        capability_capsule_id: &str,
+    ) -> Result<FeedbackSummary, StorageError> {
+        self.lance.feedback_summary(capability_capsule_id).await
+    }
+
+    /// TODO: route to DuckDbQuery once added.
+    pub async fn get_capability_capsule(
+        &self,
+        capability_capsule_id: String,
+    ) -> Result<Option<CapabilityCapsuleRecord>, StorageError> {
+        self.lance
+            .get_capability_capsule(capability_capsule_id)
+            .await
     }
 
     /// TODO: route to DuckDbQuery once added.
@@ -504,22 +555,28 @@ impl Store {
     }
 
     /// TODO: route to DuckDbQuery once added.
-    pub async fn get_memory_embedding_row(
+    pub async fn get_capability_capsule_embedding_row(
         &self,
-        memory_id: &str,
+        capability_capsule_id: &str,
     ) -> Result<Option<(String, String, String)>, StorageError> {
-        self.lance.get_memory_embedding_row(memory_id).await
+        self.lance
+            .get_capability_capsule_embedding_row(capability_capsule_id)
+            .await
     }
 
     /// TODO: route to DuckDbQuery once added.
     pub async fn latest_embedding_job_status_for_hash(
         &self,
         tenant: &str,
-        memory_id: &str,
+        capability_capsule_id: &str,
         target_content_hash: &str,
     ) -> Result<Option<String>, StorageError> {
         self.lance
-            .latest_embedding_job_status_for_hash(tenant, memory_id, target_content_hash)
+            .latest_embedding_job_status_for_hash(
+                tenant,
+                capability_capsule_id,
+                target_content_hash,
+            )
             .await
     }
 
@@ -851,8 +908,11 @@ impl Store {
         self.query.neighbors(node_id).await
     }
 
-    pub async fn related_memory_ids(&self, node_ids: &[String]) -> Result<Vec<String>, GraphError> {
-        self.query.related_memory_ids(node_ids).await
+    pub async fn related_capability_capsule_ids(
+        &self,
+        node_ids: &[String],
+    ) -> Result<Vec<String>, GraphError> {
+        self.query.related_capability_capsule_ids(node_ids).await
     }
 
     pub async fn sync_memory_edges(
@@ -870,8 +930,14 @@ impl Store {
         result
     }
 
-    pub async fn close_edges_for_memory(&self, memory_id: &str) -> Result<usize, GraphError> {
-        let result = self.lance.close_edges_for_memory(memory_id).await;
+    pub async fn close_edges_for_capability_capsule(
+        &self,
+        capability_capsule_id: &str,
+    ) -> Result<usize, GraphError> {
+        let result = self
+            .lance
+            .close_edges_for_capability_capsule(capability_capsule_id)
+            .await;
         if let Err(e) = self.query.refresh().await {
             return match result {
                 Ok(_) => Err(GraphError::Backend(e.to_string())),
@@ -942,15 +1008,17 @@ impl Store {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::domain::memory::{MemoryStatus, MemoryType, Scope, Visibility};
+    use crate::domain::capability_capsule::{
+        CapabilityCapsuleStatus, CapabilityCapsuleType, Scope, Visibility,
+    };
     use tempfile::tempdir;
 
-    fn fixture(memory_id: &str, tenant: &str) -> MemoryRecord {
-        MemoryRecord {
-            memory_id: memory_id.into(),
+    fn fixture(capability_capsule_id: &str, tenant: &str) -> CapabilityCapsuleRecord {
+        CapabilityCapsuleRecord {
+            capability_capsule_id: capability_capsule_id.into(),
             tenant: tenant.into(),
-            memory_type: MemoryType::Implementation,
-            status: MemoryStatus::Active,
+            capability_capsule_type: CapabilityCapsuleType::Implementation,
+            status: CapabilityCapsuleStatus::Active,
             scope: Scope::Project,
             visibility: Visibility::Shared,
             version: 1,
@@ -969,7 +1037,7 @@ mod tests {
             content_hash: "h".repeat(64),
             idempotency_key: None,
             session_id: None,
-            supersedes_memory_id: None,
+            supersedes_capability_capsule_id: None,
             source_agent: "test".into(),
             created_at: "00000001778000000000".into(),
             updated_at: "00000001778000000000".into(),
@@ -992,49 +1060,55 @@ mod tests {
 
         // First write → first read: m_a visible.
         let m = fixture("m_a", "tenant-a");
-        store.insert_memory(m.clone()).await.unwrap();
+        store.insert_capability_capsule(m.clone()).await.unwrap();
         let got = store
-            .get_memory_for_tenant("tenant-a", "m_a")
+            .get_capability_capsule_for_tenant("tenant-a", "m_a")
             .await
             .unwrap()
             .expect("m_a visible after insert");
-        assert_eq!(got.memory_id, "m_a");
+        assert_eq!(got.capability_capsule_id, "m_a");
         assert_eq!(got.evidence, vec!["src/main.rs:42".to_string()]);
         // Cross-tenant scope.
         let none = store
-            .list_memories_for_tenant("does-not-exist")
+            .list_capability_capsules_for_tenant("does-not-exist")
             .await
             .unwrap();
         assert!(none.is_empty());
-        let all = store.list_memories_for_tenant("tenant-a").await.unwrap();
+        let all = store
+            .list_capability_capsules_for_tenant("tenant-a")
+            .await
+            .unwrap();
         assert_eq!(all.len(), 1);
 
         // Second write: previously hidden by the snapshot cache; now
         // refresh is wired so it shows up.
         let mut p = fixture("m_pending", "tenant-a");
-        p.status = MemoryStatus::PendingConfirmation;
-        store.insert_memory(p).await.unwrap();
-        let after = store.list_memories_for_tenant("tenant-a").await.unwrap();
+        p.status = CapabilityCapsuleStatus::PendingConfirmation;
+        store.insert_capability_capsule(p).await.unwrap();
+        let after = store
+            .list_capability_capsules_for_tenant("tenant-a")
+            .await
+            .unwrap();
         assert_eq!(after.len(), 2, "second write must be visible");
 
         let pre = store
-            .get_memory_for_tenant("tenant-a", "m_pending")
+            .get_capability_capsule_for_tenant("tenant-a", "m_pending")
             .await
             .unwrap()
             .expect("pending row visible after second insert + refresh");
-        assert_eq!(pre.status, MemoryStatus::PendingConfirmation);
+        assert_eq!(pre.status, CapabilityCapsuleStatus::PendingConfirmation);
 
         // UPDATE via accept_pending (lance Table::update) — the
         // hardest case: lance UPDATE wasn't visible at all without
         // refresh.
         let accepted = store.accept_pending("tenant-a", "m_pending").await.unwrap();
-        assert_eq!(accepted.status, MemoryStatus::Active);
+        assert_eq!(accepted.status, CapabilityCapsuleStatus::Active);
         let post = store
-            .get_memory_for_tenant("tenant-a", "m_pending")
+            .get_capability_capsule_for_tenant("tenant-a", "m_pending")
             .await
             .unwrap()
             .expect("row visible to SQL after lance UPDATE + refresh");
-        assert_eq!(post.status, MemoryStatus::Active);
+        assert_eq!(post.status, CapabilityCapsuleStatus::Active);
     }
 
     /// `get_embedding_job_status`: enqueue a job via the lance side,
@@ -1046,7 +1120,7 @@ mod tests {
         let store = Store::open(&path).await.unwrap();
 
         store
-            .insert_memory(fixture("m_e", "tenant-a"))
+            .insert_capability_capsule(fixture("m_e", "tenant-a"))
             .await
             .unwrap();
 
@@ -1060,7 +1134,7 @@ mod tests {
             .try_enqueue_embedding_job(EmbeddingJobInsert {
                 job_id: "job_e1".into(),
                 tenant: "tenant-a".into(),
-                memory_id: "m_e".into(),
+                capability_capsule_id: "m_e".into(),
                 target_content_hash: "h".into(),
                 provider: "fake-test".into(),
                 available_at: "00000001778000000000".into(),
@@ -1094,22 +1168,22 @@ mod tests {
         active.created_at = ten_days_ago_str.clone();
         active.updated_at = ten_days_ago_str.clone();
         active.decay_score = 0.0;
-        store.insert_memory(active).await.unwrap();
+        store.insert_capability_capsule(active).await.unwrap();
 
         // Saturated row should not move (`decay_score < 1.0` filter).
         let mut sat = fixture("m_sat", "tenant-a");
         sat.created_at = ten_days_ago_str.clone();
         sat.updated_at = ten_days_ago_str.clone();
         sat.decay_score = 1.0;
-        store.insert_memory(sat).await.unwrap();
+        store.insert_capability_capsule(sat).await.unwrap();
 
         // Non-active row should not move (status='active' filter).
         let mut prov = fixture("m_prov", "tenant-a");
-        prov.status = MemoryStatus::PendingConfirmation;
+        prov.status = CapabilityCapsuleStatus::PendingConfirmation;
         prov.created_at = ten_days_ago_str.clone();
         prov.updated_at = ten_days_ago_str.clone();
         prov.decay_score = 0.0;
-        store.insert_memory(prov).await.unwrap();
+        store.insert_capability_capsule(prov).await.unwrap();
 
         store
             .apply_time_decay(RATE, now_ms as f64, MS_PER_DAY, &now_str)
@@ -1122,7 +1196,7 @@ mod tests {
         // reads through Store still go through DuckDbQuery, so they
         // see the new state.
         let active_after = store
-            .get_memory_for_tenant("tenant-a", "m_decay")
+            .get_capability_capsule_for_tenant("tenant-a", "m_decay")
             .await
             .unwrap()
             .unwrap();
@@ -1134,14 +1208,14 @@ mod tests {
         );
 
         let sat_after = store
-            .get_memory_for_tenant("tenant-a", "m_sat")
+            .get_capability_capsule_for_tenant("tenant-a", "m_sat")
             .await
             .unwrap()
             .unwrap();
         assert!((sat_after.decay_score - 1.0).abs() < 1e-6);
 
         let prov_after = store
-            .get_memory_for_tenant("tenant-a", "m_prov")
+            .get_capability_capsule_for_tenant("tenant-a", "m_prov")
             .await
             .unwrap()
             .unwrap();

@@ -5,8 +5,8 @@
 //! - `GET /web/{path}`         → any asset under `src/web/`
 //!
 //! All data flows through the existing JSON HTTP API
-//! (`GET /memories?tenant=…`, `POST /memories/feedback`,
-//! `POST /memories/search`). No bespoke admin endpoints.
+//! (`GET /memories?tenant=…`, `POST /capability_capsules/feedback`,
+//! `POST /capability_capsules/search`). No bespoke admin endpoints.
 //!
 //! "Delete" semantics: the page POSTs `feedback_kind: "incorrect"`, which
 //! transitions the memory's status to `Archived`. mem has no hard delete by

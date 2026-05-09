@@ -6,11 +6,11 @@
 //! layers (services, HTTP handlers) work against it interchangeably.
 //!
 //! **Status:** the read path on the `memories` table is fully working —
-//! `open` creates the table, `insert_memory` writes a row, and 11
-//! filter/lookup methods read back (`get_memory`, `get_memory_for_tenant`,
-//! `get_pending`, `find_by_idempotency_or_hash`, `list_memories_for_tenant`,
-//! `list_memory_ids_for_tenant`, `list_pending_review`, `search_candidates`,
-//! `recent_active_memories`, `fetch_memories_by_ids`). Round-trip is
+//! `open` creates the table, `insert_capability_capsule` writes a row, and 11
+//! filter/lookup methods read back (`get_capability_capsule`, `get_capability_capsule_for_tenant`,
+//! `get_pending`, `find_by_idempotency_or_hash`, `list_capability_capsules_for_tenant`,
+//! `list_capability_capsule_ids_for_tenant`, `list_pending_review`, `search_candidates`,
+//! `recent_active_capability_capsules`, `fetch_capability_capsules_by_ids`). Round-trip is
 //! end-to-end verified by two tests in this module's `#[cfg(test)] mod
 //! tests`. Mutating methods (accept/reject/supersede/apply_feedback) and
 //! all non-`memories`-table methods are still `unimplemented!()` —
@@ -23,7 +23,7 @@
 //!      `Table::query().only_if(...)` / `Table::vector_search(...)`
 //!   4. add a parity test against DuckDB
 //!
-//! Helpers `memories_to_record_batch` / `record_batch_to_memories` /
+//! Helpers `capability_capsules_to_record_batch` / `record_batch_to_capability_capsules` /
 //! `enum_to_str` / `enum_from_str` / `sql_quote` are reusable across
 //! upcoming methods.
 //!
@@ -33,7 +33,7 @@
 //! |------------------------------------|--------------------------------|
 //! | memories                           | `memories`                     |
 //! | embedding_jobs                     | `embedding_jobs`               |
-//! | memory_embeddings                  | `memory_embeddings` (vector col)|
+//! | capability_capsule_embeddings                  | `capability_capsule_embeddings` (vector col)|
 //! | conversation_messages              | `conversation_messages`        |
 //! | conversation_message_embeddings    | `conversation_message_embeddings` (vector col) |
 //! | transcript_embedding_jobs          | `transcript_embedding_jobs`    |
@@ -65,15 +65,15 @@ use lancedb::embeddings::{EmbeddingFunction, EmbeddingRegistry, MemoryRegistry};
 use lancedb::Connection;
 use serde::{de::DeserializeOwned, Serialize};
 
+mod capability_capsules;
 mod embedding;
 mod entities;
 mod episodes;
 mod graph;
-mod memories;
 mod sessions;
 mod transcripts;
 
-use crate::domain::memory::{GraphEdge, MemoryRecord};
+use crate::domain::capability_capsule::{CapabilityCapsuleRecord, GraphEdge};
 use crate::domain::{BlockType, ConversationMessage, MessageRole};
 use crate::domain::{Entity, EntityKind};
 use crate::storage::{FeedbackEvent, StorageError};
@@ -153,7 +153,7 @@ impl LanceStore {
         }
         let conn = builder.execute().await.map_err(lancedb_err)?;
 
-        ensure_memories_table(&conn).await?;
+        ensure_capability_capsules_table(&conn).await?;
         ensure_feedback_events_table(&conn).await?;
         ensure_embedding_jobs_table(&conn).await?;
         ensure_graph_edges_table(&conn).await?;
@@ -163,7 +163,7 @@ impl LanceStore {
         ensure_transcript_embedding_jobs_table(&conn).await?;
         ensure_sessions_table(&conn).await?;
         ensure_episodes_table(&conn).await?;
-        // memory_embeddings is lazy-created on first upsert (dim is
+        // capability_capsule_embeddings is lazy-created on first upsert (dim is
         // provider-dependent and unknown here without provider).
 
         // FTS indexes for the BM25 read paths. Built once at open
@@ -174,7 +174,7 @@ impl LanceStore {
         // index. After this, every subsequent open is a no-op:
         // `ensure_fts_index` checks `Table::list_indices` and skips
         // creation when the column is already indexed.
-        ensure_fts_index(&conn, "memories", "content").await?;
+        ensure_fts_index(&conn, "capability_capsules", "content").await?;
         ensure_fts_index(&conn, "conversation_messages", "content").await?;
 
         Ok(Self {
@@ -251,16 +251,16 @@ pub(super) fn lancedb_err(e: lancedb::Error) -> StorageError {
 }
 
 /// Arrow schema for the `memories` LanceDB table. One column per
-/// [`MemoryRecord`] field; enums (`memory_type`, `status`, `scope`,
+/// [`CapabilityCapsuleRecord`] field; enums (`capability_capsule_type`, `status`, `scope`,
 /// `visibility`) are stored as their `serde` snake_case representation
 /// for symmetry with the JSON-string encoding the DuckDB backend uses
 /// in its `text` columns.
-fn memories_schema() -> Schema {
+fn capability_capsules_schema() -> Schema {
     let str_list = DataType::List(Arc::new(Field::new("item", DataType::Utf8, true)));
     Schema::new(vec![
-        Field::new("memory_id", DataType::Utf8, false),
+        Field::new("capability_capsule_id", DataType::Utf8, false),
         Field::new("tenant", DataType::Utf8, false),
-        Field::new("memory_type", DataType::Utf8, false),
+        Field::new("capability_capsule_type", DataType::Utf8, false),
         Field::new("status", DataType::Utf8, false),
         Field::new("scope", DataType::Utf8, false),
         Field::new("visibility", DataType::Utf8, false),
@@ -280,7 +280,7 @@ fn memories_schema() -> Schema {
         Field::new("content_hash", DataType::Utf8, false),
         Field::new("idempotency_key", DataType::Utf8, true),
         Field::new("session_id", DataType::Utf8, true),
-        Field::new("supersedes_memory_id", DataType::Utf8, true),
+        Field::new("supersedes_capability_capsule_id", DataType::Utf8, true),
         Field::new("source_agent", DataType::Utf8, false),
         Field::new("created_at", DataType::Utf8, false),
         Field::new("updated_at", DataType::Utf8, false),
@@ -288,29 +288,37 @@ fn memories_schema() -> Schema {
     ])
 }
 
-async fn ensure_memories_table(conn: &Connection) -> Result<(), StorageError> {
-    ensure_table(conn, "memories", memories_schema()).await
+async fn ensure_capability_capsules_table(conn: &Connection) -> Result<(), StorageError> {
+    ensure_table(conn, "capability_capsules", capability_capsules_schema()).await
 }
 
 async fn ensure_feedback_events_table(conn: &Connection) -> Result<(), StorageError> {
     ensure_table(conn, "feedback_events", feedback_events_schema()).await
 }
 
-/// Idempotently create the `memory_embeddings` table with `dim`-sized
-/// vectors. Lazy-created on first `upsert_memory_embedding` because dim
+/// Idempotently create the `capability_capsule_embeddings` table with `dim`-sized
+/// vectors. Lazy-created on first `upsert_capability_capsule_embedding` because dim
 /// is provider-dependent and not known at `LanceStore::open()`
 /// time. If the table already exists with a different dim, subsequent
 /// `Table::add` calls fail with a schema mismatch error — that's
 /// surfaced as the original `lancedb::Error` and is the right behavior
 /// (mixing dims would break vector search regardless).
-async fn ensure_memory_embeddings_table(conn: &Connection, dim: i32) -> Result<(), StorageError> {
-    ensure_table(conn, "memory_embeddings", memory_embeddings_schema(dim)).await
+async fn ensure_capability_capsule_embeddings_table(
+    conn: &Connection,
+    dim: i32,
+) -> Result<(), StorageError> {
+    ensure_table(
+        conn,
+        "capability_capsule_embeddings",
+        capability_capsule_embeddings_schema(dim),
+    )
+    .await
 }
 
-/// Counterpart of [`ensure_memory_embeddings_table`] for the
+/// Counterpart of [`ensure_capability_capsule_embeddings_table`] for the
 /// transcript-side embeddings. Lazy-created on first
 /// `upsert_conversation_message_embedding` for the same reason
-/// memory_embeddings is lazy: dim is provider-dependent.
+/// capability_capsule_embeddings is lazy: dim is provider-dependent.
 async fn ensure_conversation_message_embeddings_table(
     conn: &Connection,
     dim: i32,
@@ -425,11 +433,11 @@ async fn ensure_table(conn: &Connection, name: &str, schema: Schema) -> Result<(
 
 /// Arrow schema for the `feedback_events` LanceDB table. Mirrors the
 /// `feedback_events` DuckDB schema (4 columns: feedback_id PK,
-/// memory_id, feedback_kind, created_at).
+/// capability_capsule_id, feedback_kind, created_at).
 fn feedback_events_schema() -> Schema {
     Schema::new(vec![
         Field::new("feedback_id", DataType::Utf8, false),
-        Field::new("memory_id", DataType::Utf8, false),
+        Field::new("capability_capsule_id", DataType::Utf8, false),
         Field::new("feedback_kind", DataType::Utf8, false),
         Field::new("created_at", DataType::Utf8, false),
     ])
@@ -439,19 +447,19 @@ pub(super) fn feedback_events_to_record_batch(
     events: &[FeedbackEvent],
 ) -> Result<RecordBatch, StorageError> {
     let mut feedback_id = StringBuilder::new();
-    let mut memory_id = StringBuilder::new();
+    let mut capability_capsule_id = StringBuilder::new();
     let mut feedback_kind = StringBuilder::new();
     let mut created_at = StringBuilder::new();
     for e in events {
         feedback_id.append_value(&e.feedback_id);
-        memory_id.append_value(&e.memory_id);
+        capability_capsule_id.append_value(&e.capability_capsule_id);
         feedback_kind.append_value(&e.feedback_kind);
         created_at.append_value(&e.created_at);
     }
     let schema = Arc::new(feedback_events_schema());
     let columns: Vec<Arc<dyn Array>> = vec![
         Arc::new(feedback_id.finish()),
-        Arc::new(memory_id.finish()),
+        Arc::new(capability_capsule_id.finish()),
         Arc::new(feedback_kind.finish()),
         Arc::new(created_at.finish()),
     ];
@@ -474,14 +482,14 @@ pub(super) fn record_batch_to_feedback_events(
             .ok_or(StorageError::InvalidData("column type mismatch"))
     }
     let feedback_id = col::<StringArray>(batch, "feedback_id")?;
-    let memory_id = col::<StringArray>(batch, "memory_id")?;
+    let capability_capsule_id = col::<StringArray>(batch, "capability_capsule_id")?;
     let feedback_kind = col::<StringArray>(batch, "feedback_kind")?;
     let created_at = col::<StringArray>(batch, "created_at")?;
     let mut out = Vec::with_capacity(batch.num_rows());
     for i in 0..batch.num_rows() {
         out.push(FeedbackEvent {
             feedback_id: feedback_id.value(i).to_string(),
-            memory_id: memory_id.value(i).to_string(),
+            capability_capsule_id: capability_capsule_id.value(i).to_string(),
             feedback_kind: feedback_kind.value(i).to_string(),
             created_at: created_at.value(i).to_string(),
         });
@@ -489,13 +497,13 @@ pub(super) fn record_batch_to_feedback_events(
     Ok(out)
 }
 
-/// Arrow schema for the `memory_embeddings` LanceDB table. The vector
+/// Arrow schema for the `capability_capsule_embeddings` LanceDB table. The vector
 /// column is `FixedSizeList<Float32, dim>` because LanceDB's ANN index
 /// requires a known fixed dimension; `dim` comes from the upserting
 /// caller (which knows the embedding model's output size).
-fn memory_embeddings_schema(dim: i32) -> Schema {
+fn capability_capsule_embeddings_schema(dim: i32) -> Schema {
     Schema::new(vec![
-        Field::new("memory_id", DataType::Utf8, false),
+        Field::new("capability_capsule_id", DataType::Utf8, false),
         Field::new("tenant", DataType::Utf8, false),
         Field::new("embedding_model", DataType::Utf8, false),
         Field::new("embedding_dim", DataType::Int64, false),
@@ -532,11 +540,11 @@ pub(super) fn decode_embedding_blob(
     Ok(out)
 }
 
-/// Build a one-row `RecordBatch` for `memory_embeddings`. `embedding`
+/// Build a one-row `RecordBatch` for `capability_capsule_embeddings`. `embedding`
 /// must already be the decoded `Vec<f32>` of length `dim`.
 #[allow(clippy::too_many_arguments)]
-pub(super) fn memory_embedding_to_record_batch(
-    memory_id: &str,
+pub(super) fn capability_capsule_embedding_to_record_batch(
+    capability_capsule_id: &str,
     tenant: &str,
     embedding_model: &str,
     embedding_dim: i64,
@@ -557,7 +565,7 @@ pub(super) fn memory_embedding_to_record_batch(
     let mut src_ts_b = StringBuilder::new();
     let mut created_b = StringBuilder::new();
     let mut updated_b = StringBuilder::new();
-    memory_id_b.append_value(memory_id);
+    memory_id_b.append_value(capability_capsule_id);
     tenant_b.append_value(tenant);
     model_b.append_value(embedding_model);
     dim_b.append_value(embedding_dim);
@@ -572,7 +580,7 @@ pub(super) fn memory_embedding_to_record_batch(
     }
     emb_b.append(true);
 
-    let schema = Arc::new(memory_embeddings_schema(dim));
+    let schema = Arc::new(capability_capsule_embeddings_schema(dim));
     let columns: Vec<Arc<dyn Array>> = vec![
         Arc::new(memory_id_b.finish()),
         Arc::new(tenant_b.finish()),
@@ -584,12 +592,13 @@ pub(super) fn memory_embedding_to_record_batch(
         Arc::new(created_b.finish()),
         Arc::new(updated_b.finish()),
     ];
-    RecordBatch::try_new(schema, columns)
-        .map_err(|e| StorageError::InvalidInput(format!("memory_embedding record batch: {e}")))
+    RecordBatch::try_new(schema, columns).map_err(|e| {
+        StorageError::InvalidInput(format!("capability_capsule_embedding record batch: {e}"))
+    })
 }
 
 /// Arrow schema for `conversation_message_embeddings`. Mirrors
-/// `memory_embeddings` 1:1 with `memory_id` → `message_block_id`.
+/// `capability_capsule_embeddings` 1:1 with `capability_capsule_id` → `message_block_id`.
 fn conversation_message_embeddings_schema(dim: i32) -> Schema {
     Schema::new(vec![
         Field::new("message_block_id", DataType::Utf8, false),
@@ -673,7 +682,7 @@ pub(super) fn conversation_message_embedding_to_record_batch(
 pub(crate) struct EmbeddingJobRow {
     job_id: String,
     tenant: String,
-    memory_id: String,
+    capability_capsule_id: String,
     target_content_hash: String,
     provider: String,
     status: String,
@@ -690,7 +699,7 @@ fn embedding_jobs_schema() -> Schema {
     Schema::new(vec![
         Field::new("job_id", DataType::Utf8, false),
         Field::new("tenant", DataType::Utf8, false),
-        Field::new("memory_id", DataType::Utf8, false),
+        Field::new("capability_capsule_id", DataType::Utf8, false),
         Field::new("target_content_hash", DataType::Utf8, false),
         Field::new("provider", DataType::Utf8, false),
         Field::new("status", DataType::Utf8, false),
@@ -707,7 +716,7 @@ pub(super) fn embedding_job_row_to_record_batch(
 ) -> Result<RecordBatch, StorageError> {
     let mut job_id = StringBuilder::new();
     let mut tenant = StringBuilder::new();
-    let mut memory_id = StringBuilder::new();
+    let mut capability_capsule_id = StringBuilder::new();
     let mut target_content_hash = StringBuilder::new();
     let mut provider = StringBuilder::new();
     let mut status = StringBuilder::new();
@@ -718,7 +727,7 @@ pub(super) fn embedding_job_row_to_record_batch(
     let mut updated_at = StringBuilder::new();
     job_id.append_value(&row.job_id);
     tenant.append_value(&row.tenant);
-    memory_id.append_value(&row.memory_id);
+    capability_capsule_id.append_value(&row.capability_capsule_id);
     target_content_hash.append_value(&row.target_content_hash);
     provider.append_value(&row.provider);
     status.append_value(&row.status);
@@ -733,7 +742,7 @@ pub(super) fn embedding_job_row_to_record_batch(
     let columns: Vec<Arc<dyn Array>> = vec![
         Arc::new(job_id.finish()),
         Arc::new(tenant.finish()),
-        Arc::new(memory_id.finish()),
+        Arc::new(capability_capsule_id.finish()),
         Arc::new(target_content_hash.finish()),
         Arc::new(provider.finish()),
         Arc::new(status.finish()),
@@ -764,7 +773,7 @@ pub(super) fn record_batch_to_embedding_job_rows(
     use arrow_array::Int64Array;
     let job_id = col::<StringArray>(batch, "job_id")?;
     let tenant = col::<StringArray>(batch, "tenant")?;
-    let memory_id = col::<StringArray>(batch, "memory_id")?;
+    let capability_capsule_id = col::<StringArray>(batch, "capability_capsule_id")?;
     let target_content_hash = col::<StringArray>(batch, "target_content_hash")?;
     let provider = col::<StringArray>(batch, "provider")?;
     let status = col::<StringArray>(batch, "status")?;
@@ -778,7 +787,7 @@ pub(super) fn record_batch_to_embedding_job_rows(
         out.push(EmbeddingJobRow {
             job_id: job_id.value(i).to_string(),
             tenant: tenant.value(i).to_string(),
-            memory_id: memory_id.value(i).to_string(),
+            capability_capsule_id: capability_capsule_id.value(i).to_string(),
             target_content_hash: target_content_hash.value(i).to_string(),
             provider: provider.value(i).to_string(),
             status: status.value(i).to_string(),
@@ -797,7 +806,7 @@ pub(super) fn record_batch_to_embedding_job_rows(
 }
 
 /// Internal row representation for `transcript_embedding_jobs`.
-/// Mirrors `EmbeddingJobRow` (memories side) with `memory_id` →
+/// Mirrors `EmbeddingJobRow` (memories side) with `capability_capsule_id` →
 /// `message_block_id` and `target_content_hash` dropped (transcript
 /// blocks are immutable, so the row id IS the hash).
 #[derive(Debug, Clone)]
@@ -1264,8 +1273,13 @@ pub(super) fn record_batch_to_conversation_messages(
 /// apply to the parent memory's confidence / decay / status fields.
 pub(super) fn feedback_adjustments(
     feedback_kind: &str,
-) -> Option<(f32, f32, Option<crate::domain::memory::MemoryStatus>, bool)> {
-    use crate::domain::memory::FeedbackKind;
+) -> Option<(
+    f32,
+    f32,
+    Option<crate::domain::capability_capsule::CapabilityCapsuleStatus>,
+    bool,
+)> {
+    use crate::domain::capability_capsule::FeedbackKind;
     let kind = match feedback_kind {
         "useful" => FeedbackKind::Useful,
         "outdated" => FeedbackKind::Outdated,
@@ -1278,13 +1292,13 @@ pub(super) fn feedback_adjustments(
     Some((
         kind.confidence_delta(),
         kind.decay_delta(),
-        archive.then_some(crate::domain::memory::MemoryStatus::Archived),
+        archive.then_some(crate::domain::capability_capsule::CapabilityCapsuleStatus::Archived),
         kind.marks_validated(),
     ))
 }
 
 /// Mirror of the DuckDB `encode_text` helper: serialize a snake_case-encoded
-/// enum (e.g. `MemoryType`, `MemoryStatus`) to its plain JSON string token.
+/// enum (e.g. `CapabilityCapsuleType`, `CapabilityCapsuleStatus`) to its plain JSON string token.
 pub(super) fn enum_to_str<T: Serialize>(v: &T) -> Result<String, StorageError> {
     serde_json::to_value(v)
         .map_err(StorageError::Serde)?
@@ -1295,21 +1309,21 @@ pub(super) fn enum_to_str<T: Serialize>(v: &T) -> Result<String, StorageError> {
         ))
 }
 
-/// Inverse of `enum_to_str`. Used when materializing a `MemoryRecord` from
+/// Inverse of `enum_to_str`. Used when materializing a `CapabilityCapsuleRecord` from
 /// a `RecordBatch` row.
 pub(super) fn enum_from_str<T: DeserializeOwned>(s: &str) -> Result<T, StorageError> {
     serde_json::from_value(serde_json::Value::String(s.to_string())).map_err(StorageError::Serde)
 }
 
-/// Serialize one or more `MemoryRecord`s to an Arrow `RecordBatch` matching
-/// the [`memories_schema`] layout. Used by `insert_memory` to feed
+/// Serialize one or more `CapabilityCapsuleRecord`s to an Arrow `RecordBatch` matching
+/// the [`capability_capsules_schema`] layout. Used by `insert_capability_capsule` to feed
 /// `Table::add(...)`.
-pub(super) fn memories_to_record_batch(
-    memories: &[MemoryRecord],
+pub(super) fn capability_capsules_to_record_batch(
+    memories: &[CapabilityCapsuleRecord],
 ) -> Result<RecordBatch, StorageError> {
-    let mut memory_id = StringBuilder::new();
+    let mut capability_capsule_id = StringBuilder::new();
     let mut tenant = StringBuilder::new();
-    let mut memory_type = StringBuilder::new();
+    let mut capability_capsule_type = StringBuilder::new();
     let mut status = StringBuilder::new();
     let mut scope = StringBuilder::new();
     let mut visibility = StringBuilder::new();
@@ -1329,16 +1343,16 @@ pub(super) fn memories_to_record_batch(
     let mut content_hash = StringBuilder::new();
     let mut idempotency_key = StringBuilder::new();
     let mut session_id = StringBuilder::new();
-    let mut supersedes_memory_id = StringBuilder::new();
+    let mut supersedes_capability_capsule_id = StringBuilder::new();
     let mut source_agent = StringBuilder::new();
     let mut created_at = StringBuilder::new();
     let mut updated_at = StringBuilder::new();
     let mut last_validated_at = StringBuilder::new();
 
     for m in memories {
-        memory_id.append_value(&m.memory_id);
+        capability_capsule_id.append_value(&m.capability_capsule_id);
         tenant.append_value(&m.tenant);
-        memory_type.append_value(enum_to_str(&m.memory_type)?);
+        capability_capsule_type.append_value(enum_to_str(&m.capability_capsule_type)?);
         status.append_value(enum_to_str(&m.status)?);
         scope.append_value(enum_to_str(&m.scope)?);
         visibility.append_value(enum_to_str(&m.visibility)?);
@@ -1388,9 +1402,9 @@ pub(super) fn memories_to_record_batch(
             Some(s) => session_id.append_value(s),
             None => session_id.append_null(),
         }
-        match &m.supersedes_memory_id {
-            Some(s) => supersedes_memory_id.append_value(s),
-            None => supersedes_memory_id.append_null(),
+        match &m.supersedes_capability_capsule_id {
+            Some(s) => supersedes_capability_capsule_id.append_value(s),
+            None => supersedes_capability_capsule_id.append_null(),
         }
         source_agent.append_value(&m.source_agent);
         created_at.append_value(&m.created_at);
@@ -1401,11 +1415,11 @@ pub(super) fn memories_to_record_batch(
         }
     }
 
-    let schema = Arc::new(memories_schema());
+    let schema = Arc::new(capability_capsules_schema());
     let columns: Vec<Arc<dyn Array>> = vec![
-        Arc::new(memory_id.finish()),
+        Arc::new(capability_capsule_id.finish()),
         Arc::new(tenant.finish()),
-        Arc::new(memory_type.finish()),
+        Arc::new(capability_capsule_type.finish()),
         Arc::new(status.finish()),
         Arc::new(scope.finish()),
         Arc::new(visibility.finish()),
@@ -1425,7 +1439,7 @@ pub(super) fn memories_to_record_batch(
         Arc::new(content_hash.finish()),
         Arc::new(idempotency_key.finish()),
         Arc::new(session_id.finish()),
-        Arc::new(supersedes_memory_id.finish()),
+        Arc::new(supersedes_capability_capsule_id.finish()),
         Arc::new(source_agent.finish()),
         Arc::new(created_at.finish()),
         Arc::new(updated_at.finish()),
@@ -1435,11 +1449,11 @@ pub(super) fn memories_to_record_batch(
         .map_err(|e| StorageError::InvalidInput(format!("memories record batch: {e}")))
 }
 
-/// Inverse of `memories_to_record_batch`: parse a Lance query result into
-/// `MemoryRecord`s.
-pub(super) fn record_batch_to_memories(
+/// Inverse of `capability_capsules_to_record_batch`: parse a Lance query result into
+/// `CapabilityCapsuleRecord`s.
+pub(super) fn record_batch_to_capability_capsules(
     batch: &RecordBatch,
-) -> Result<Vec<MemoryRecord>, StorageError> {
+) -> Result<Vec<CapabilityCapsuleRecord>, StorageError> {
     fn col<'a, T: 'static>(
         batch: &'a RecordBatch,
         name: &'static str,
@@ -1451,9 +1465,9 @@ pub(super) fn record_batch_to_memories(
             .downcast_ref::<T>()
             .ok_or(StorageError::InvalidData("column type mismatch"))
     }
-    let memory_id = col::<StringArray>(batch, "memory_id")?;
+    let capability_capsule_id = col::<StringArray>(batch, "capability_capsule_id")?;
     let tenant = col::<StringArray>(batch, "tenant")?;
-    let memory_type = col::<StringArray>(batch, "memory_type")?;
+    let capability_capsule_type = col::<StringArray>(batch, "capability_capsule_type")?;
     let status = col::<StringArray>(batch, "status")?;
     let scope = col::<StringArray>(batch, "scope")?;
     let visibility = col::<StringArray>(batch, "visibility")?;
@@ -1473,7 +1487,8 @@ pub(super) fn record_batch_to_memories(
     let content_hash = col::<StringArray>(batch, "content_hash")?;
     let idempotency_key = col::<StringArray>(batch, "idempotency_key")?;
     let session_id = col::<StringArray>(batch, "session_id")?;
-    let supersedes_memory_id = col::<StringArray>(batch, "supersedes_memory_id")?;
+    let supersedes_capability_capsule_id =
+        col::<StringArray>(batch, "supersedes_capability_capsule_id")?;
     let source_agent = col::<StringArray>(batch, "source_agent")?;
     let created_at = col::<StringArray>(batch, "created_at")?;
     let updated_at = col::<StringArray>(batch, "updated_at")?;
@@ -1497,10 +1512,10 @@ pub(super) fn record_batch_to_memories(
 
     let mut out = Vec::with_capacity(batch.num_rows());
     for i in 0..batch.num_rows() {
-        out.push(MemoryRecord {
-            memory_id: memory_id.value(i).to_string(),
+        out.push(CapabilityCapsuleRecord {
+            capability_capsule_id: capability_capsule_id.value(i).to_string(),
             tenant: tenant.value(i).to_string(),
-            memory_type: enum_from_str(memory_type.value(i))?,
+            capability_capsule_type: enum_from_str(capability_capsule_type.value(i))?,
             status: enum_from_str(status.value(i))?,
             scope: enum_from_str(scope.value(i))?,
             visibility: enum_from_str(visibility.value(i))?,
@@ -1520,7 +1535,7 @@ pub(super) fn record_batch_to_memories(
             content_hash: content_hash.value(i).to_string(),
             idempotency_key: opt(idempotency_key, i),
             session_id: opt(session_id, i),
-            supersedes_memory_id: opt(supersedes_memory_id, i),
+            supersedes_capability_capsule_id: opt(supersedes_capability_capsule_id, i),
             source_agent: source_agent.value(i).to_string(),
             created_at: created_at.value(i).to_string(),
             updated_at: updated_at.value(i).to_string(),

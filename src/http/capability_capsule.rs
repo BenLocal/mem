@@ -8,46 +8,62 @@ use serde::Deserialize;
 
 use crate::{
     app::AppState,
+    domain::capability_capsule::{
+        CapabilityCapsuleType, FeedbackKind, IngestCapabilityCapsuleRequest, Scope, Visibility,
+        WriteMode,
+    },
     domain::episode::{EpisodeResponse, IngestEpisodeRequest},
-    domain::memory::{FeedbackKind, IngestMemoryRequest, MemoryType, Scope, Visibility, WriteMode},
-    domain::query::SearchMemoryRequest,
+    domain::query::SearchCapabilityCapsuleRequest,
     error::AppError,
-    service::IngestMemoryResponse,
+    service::IngestCapabilityCapsuleResponse,
 };
 
 pub fn router() -> Router<AppState> {
     Router::new()
-        .route("/memories", post(ingest_memory).get(list_memories))
+        .route(
+            "/capability_capsules",
+            post(ingest_capability_capsule).get(list_capability_capsules),
+        )
         .route("/episodes", post(ingest_episode))
-        .route("/memories/search", post(search_memory))
-        .route("/memories/feedback", post(submit_feedback))
-        .route("/memories/{id}", get(get_memory).delete(delete_memory))
+        .route(
+            "/capability_capsules/search",
+            post(search_capability_capsule),
+        )
+        .route("/capability_capsules/feedback", post(submit_feedback))
+        .route(
+            "/capability_capsules/{id}",
+            get(get_capability_capsule).delete(delete_capability_capsule),
+        )
 }
 
-async fn delete_memory(
+async fn delete_capability_capsule(
     State(app): State<AppState>,
-    Path(memory_id): Path<String>,
-    Query(query): Query<MemoryDetailQuery>,
+    Path(capability_capsule_id): Path<String>,
+    Query(query): Query<CapabilityCapsuleDetailQuery>,
 ) -> Result<StatusCode, AppError> {
     let tenant = query.tenant.as_deref().unwrap_or("local");
-    app.memory_service
-        .delete_memory_hard(tenant, &memory_id)
+    app.capability_capsule_service
+        .delete_capability_capsule_hard(tenant, &capability_capsule_id)
         .await?;
     Ok(StatusCode::NO_CONTENT)
 }
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "snake_case")]
-struct MemoryListQuery {
+struct CapabilityCapsuleListQuery {
     #[serde(default = "default_tenant")]
     tenant: String,
 }
 
-async fn list_memories(
+async fn list_capability_capsules(
     State(app): State<AppState>,
-    Query(query): Query<MemoryListQuery>,
-) -> Result<Json<Vec<crate::domain::memory::MemoryRecord>>, AppError> {
-    Ok(Json(app.memory_service.list_memories(&query.tenant).await?))
+    Query(query): Query<CapabilityCapsuleListQuery>,
+) -> Result<Json<Vec<crate::domain::capability_capsule::CapabilityCapsuleRecord>>, AppError> {
+    Ok(Json(
+        app.capability_capsule_service
+            .list_capability_capsules(&query.tenant)
+            .await?,
+    ))
 }
 
 #[derive(Debug, Deserialize)]
@@ -55,7 +71,7 @@ async fn list_memories(
 struct HttpIngestMemoryRequest {
     #[serde(default = "default_tenant")]
     tenant: String,
-    memory_type: MemoryType,
+    capability_capsule_type: CapabilityCapsuleType,
     content: String,
     #[serde(default)]
     summary: Option<String>,
@@ -86,11 +102,11 @@ struct HttpIngestMemoryRequest {
     write_mode: WriteMode,
 }
 
-impl From<HttpIngestMemoryRequest> for IngestMemoryRequest {
+impl From<HttpIngestMemoryRequest> for IngestCapabilityCapsuleRequest {
     fn from(request: HttpIngestMemoryRequest) -> Self {
         Self {
             tenant: request.tenant,
-            memory_type: request.memory_type,
+            capability_capsule_type: request.capability_capsule_type,
             content: request.content,
             summary: request.summary,
             evidence: request.evidence,
@@ -110,11 +126,14 @@ impl From<HttpIngestMemoryRequest> for IngestMemoryRequest {
     }
 }
 
-async fn ingest_memory(
+async fn ingest_capability_capsule(
     State(app): State<AppState>,
     Json(request): Json<HttpIngestMemoryRequest>,
-) -> Result<(StatusCode, Json<IngestMemoryResponse>), AppError> {
-    let response = app.memory_service.ingest(request.into()).await?;
+) -> Result<(StatusCode, Json<IngestCapabilityCapsuleResponse>), AppError> {
+    let response = app
+        .capability_capsule_service
+        .ingest(request.into())
+        .await?;
     Ok((StatusCode::CREATED, Json(response)))
 }
 
@@ -122,43 +141,50 @@ async fn ingest_episode(
     State(app): State<AppState>,
     Json(request): Json<IngestEpisodeRequest>,
 ) -> Result<(StatusCode, Json<EpisodeResponse>), AppError> {
-    let response = app.memory_service.ingest_episode(request).await?;
+    let response = app
+        .capability_capsule_service
+        .ingest_episode(request)
+        .await?;
     Ok((StatusCode::CREATED, Json(response)))
 }
 
-async fn get_memory(
+async fn get_capability_capsule(
     State(app): State<AppState>,
-    Path(memory_id): Path<String>,
-    Query(query): Query<MemoryDetailQuery>,
-) -> Result<Json<crate::domain::memory::MemoryDetailResponse>, AppError> {
+    Path(capability_capsule_id): Path<String>,
+    Query(query): Query<CapabilityCapsuleDetailQuery>,
+) -> Result<Json<crate::domain::capability_capsule::CapabilityCapsuleDetailResponse>, AppError> {
     Ok(Json(
-        app.memory_service
-            .get_memory(query.tenant.as_deref(), &memory_id)
+        app.capability_capsule_service
+            .get_capability_capsule(query.tenant.as_deref(), &capability_capsule_id)
             .await?,
     ))
 }
 
-async fn search_memory(
+async fn search_capability_capsule(
     State(app): State<AppState>,
-    Json(request): Json<SearchMemoryRequest>,
-) -> Result<Json<crate::domain::query::SearchMemoryResponse>, AppError> {
-    Ok(Json(app.memory_service.search(request).await?))
+    Json(request): Json<SearchCapabilityCapsuleRequest>,
+) -> Result<Json<crate::domain::query::SearchCapabilityCapsuleResponse>, AppError> {
+    Ok(Json(app.capability_capsule_service.search(request).await?))
 }
 
 async fn submit_feedback(
     State(app): State<AppState>,
     Json(request): Json<HttpFeedbackRequest>,
-) -> Result<Json<crate::domain::memory::MemoryRecord>, AppError> {
+) -> Result<Json<crate::domain::capability_capsule::CapabilityCapsuleRecord>, AppError> {
     Ok(Json(
-        app.memory_service
-            .submit_feedback(&request.tenant, &request.memory_id, request.feedback_kind)
+        app.capability_capsule_service
+            .submit_feedback(
+                &request.tenant,
+                &request.capability_capsule_id,
+                request.feedback_kind,
+            )
             .await?,
     ))
 }
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "snake_case")]
-struct MemoryDetailQuery {
+struct CapabilityCapsuleDetailQuery {
     #[serde(default)]
     tenant: Option<String>,
 }
@@ -176,6 +202,6 @@ fn default_source_agent() -> String {
 struct HttpFeedbackRequest {
     #[serde(default = "default_tenant")]
     tenant: String,
-    memory_id: String,
+    capability_capsule_id: String,
     feedback_kind: FeedbackKind,
 }

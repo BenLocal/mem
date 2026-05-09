@@ -42,7 +42,7 @@ pub async fn run(args: WakeUpArgs) -> Result<String> {
     });
 
     let resp = client
-        .post(format!("{}/memories/search", base_url))
+        .post(format!("{}/capability_capsules/search", base_url))
         .json(&payload)
         .send()
         .await?;

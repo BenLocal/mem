@@ -135,7 +135,7 @@ mod http_routes {
     use axum::body::{to_bytes, Body};
     use axum::http::{Request, StatusCode};
     use mem::http;
-    use mem::service::MemoryService;
+    use mem::service::CapabilityCapsuleService;
     use serde_json::{json, Value};
     use tower::ServiceExt;
 
@@ -144,7 +144,10 @@ mod http_routes {
         let db = dir.path().join("mem.duckdb");
         let repo = Arc::new(Store::open(&db).await.unwrap());
         repo.set_transcript_job_provider("embedanything");
-        let state = super::common::test_app_state(repo.clone(), MemoryService::new(repo.clone()));
+        let state = super::common::test_app_state(
+            repo.clone(),
+            CapabilityCapsuleService::new(repo.clone()),
+        );
         let router = http::router().with_state(state);
         (router, dir, repo)
     }

@@ -111,10 +111,10 @@ async fn memory_detail_includes_embedding_meta_after_ingest() {
     let app = TestApp::new().await;
     let ingest = app
         .post_json(
-            "/memories",
+            "/capability_capsules",
             json!({
                 "tenant": "local",
-                "memory_type": "implementation",
+                "capability_capsule_type": "implementation",
                 "content": "embedding meta api test",
                 "evidence": [],
                 "code_refs": [],
@@ -131,10 +131,15 @@ async fn memory_detail_includes_embedding_meta_after_ingest() {
         .await;
     assert_eq!(ingest.status, StatusCode::CREATED);
     let ingest_json = ingest.json();
-    let memory_id = ingest_json["memory_id"].as_str().unwrap().to_string();
+    let capability_capsule_id = ingest_json["capability_capsule_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
 
     let detail = app
-        .get(&format!("/memories/{memory_id}?tenant=local"))
+        .get(&format!(
+            "/capability_capsules/{capability_capsule_id}?tenant=local"
+        ))
         .await;
     assert_eq!(detail.status, StatusCode::OK);
     let j = detail.json();
@@ -152,8 +157,9 @@ async fn memory_detail_includes_embedding_meta_after_ingest() {
     let jobs_json = jobs.json();
     let arr = jobs_json.as_array().expect("jobs array");
     assert!(
-        arr.iter()
-            .any(|row| row["memory_id"].as_str() == Some(memory_id.as_str())),
+        arr.iter().any(
+            |row| row["capability_capsule_id"].as_str() == Some(capability_capsule_id.as_str())
+        ),
         "expected a job for ingested memory"
     );
 }
@@ -163,10 +169,10 @@ async fn embeddings_rebuild_enqueues_when_forced() {
     let app = TestApp::new().await;
     let ingest = app
         .post_json(
-            "/memories",
+            "/capability_capsules",
             json!({
                 "tenant": "local",
-                "memory_type": "implementation",
+                "capability_capsule_type": "implementation",
                 "content": "rebuild force test",
                 "evidence": [],
                 "code_refs": [],
@@ -183,14 +189,17 @@ async fn embeddings_rebuild_enqueues_when_forced() {
         .await;
     assert_eq!(ingest.status, StatusCode::CREATED);
     let ingest_json = ingest.json();
-    let memory_id = ingest_json["memory_id"].as_str().unwrap().to_string();
+    let capability_capsule_id = ingest_json["capability_capsule_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
 
     let rebuild = app
         .post_json(
             "/embeddings/rebuild",
             json!({
                 "tenant": "local",
-                "memory_ids": [&memory_id],
+                "capability_capsule_ids": [&capability_capsule_id],
                 "force": true
             }),
         )

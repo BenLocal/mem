@@ -152,7 +152,7 @@ impl TranscriptService {
         let limit = limit.clamp(1, 100);
         // Oversample factor (`k = limit * factor`) is read directly from env at
         // search time, mirroring the `MEM_VECTOR_INDEX_OVERSAMPLE` pattern in
-        // `DuckDbRepository::semantic_search_memories` (Option B): keeps the
+        // `DuckDbRepository::semantic_search_capability_capsules` (Option B): keeps the
         // override flexible without plumbing config through the service. The
         // parser in `config.rs` rejects 0 for `MEM_TRANSCRIPT_OVERSAMPLE`, but
         // since this read bypasses the parser we apply the same `> 0` filter

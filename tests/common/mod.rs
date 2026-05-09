@@ -2,8 +2,8 @@
 //!
 //! The single point of truth for assembling an [`AppState`] in tests.
 //! Each test file calls `common::test_app_state(store, memory_service)`
-//! with a `MemoryService` flavor it wants (typically
-//! `MemoryService::new(store.clone())`); this helper assembles the
+//! with a `CapabilityCapsuleService` flavor it wants (typically
+//! `CapabilityCapsuleService::new(store.clone())`); this helper assembles the
 //! `EntityService` + `TranscriptService` + `Config` plumbing.
 //!
 //! Centralising the boilerplate here means future `AppState` field
@@ -22,7 +22,7 @@ use std::sync::Arc;
 
 use mem::{
     app::AppState,
-    service::{EntityService, MemoryService, TranscriptService},
+    service::{CapabilityCapsuleService, EntityService, TranscriptService},
     storage::Store,
 };
 use tempfile::TempDir;
@@ -44,14 +44,17 @@ pub async fn test_store() -> (TempDir, Arc<Store>) {
 /// Builds an [`AppState`] suitable for integration tests.
 ///
 /// The caller passes the open [`Store`] handle and the
-/// [`MemoryService`] flavor under test. The helper assembles the
+/// [`CapabilityCapsuleService`] flavor under test. The helper assembles the
 /// transcript-side and entity-side service façades and the default
 /// `Config::local()` so request handlers have a complete state.
-pub fn test_app_state(store: Arc<Store>, memory_service: MemoryService) -> AppState {
+pub fn test_app_state(
+    store: Arc<Store>,
+    capability_capsule_service: CapabilityCapsuleService,
+) -> AppState {
     let transcript_service = TranscriptService::new(store.clone(), None);
     let entity_service = EntityService::new(store);
     AppState {
-        memory_service,
+        capability_capsule_service,
         config: mem::config::Config::local(),
         transcript_service,
         entity_service,

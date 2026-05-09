@@ -31,16 +31,21 @@ async fn apply_time_decay(store: &Store) -> Result<(), Box<dyn std::error::Error
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::domain::memory::{MemoryRecord, MemoryStatus};
+    use crate::domain::capability_capsule::{CapabilityCapsuleRecord, CapabilityCapsuleStatus};
     use tempfile::tempdir;
 
     fn ms_string(ms: u128) -> String {
         format!("{ms:020}")
     }
 
-    fn fixture(id: &str, status: MemoryStatus, decay: f32, updated_at: &str) -> MemoryRecord {
-        MemoryRecord {
-            memory_id: id.into(),
+    fn fixture(
+        id: &str,
+        status: CapabilityCapsuleStatus,
+        decay: f32,
+        updated_at: &str,
+    ) -> CapabilityCapsuleRecord {
+        CapabilityCapsuleRecord {
+            capability_capsule_id: id.into(),
             tenant: "t".into(),
             status,
             decay_score: decay,
@@ -65,25 +70,30 @@ mod tests {
         let ten_days_ago = ms_string(now_ms - 10 * MS_PER_DAY as u128);
 
         store
-            .insert_memory(fixture(
+            .insert_capability_capsule(fixture(
                 "m-active",
-                MemoryStatus::Active,
+                CapabilityCapsuleStatus::Active,
                 0.0,
                 &ten_days_ago,
             ))
             .await
             .unwrap();
         store
-            .insert_memory(fixture(
+            .insert_capability_capsule(fixture(
                 "m-prov",
-                MemoryStatus::Provisional,
+                CapabilityCapsuleStatus::Provisional,
                 0.0,
                 &ten_days_ago,
             ))
             .await
             .unwrap();
         store
-            .insert_memory(fixture("m-sat", MemoryStatus::Active, 1.0, &ten_days_ago))
+            .insert_capability_capsule(fixture(
+                "m-sat",
+                CapabilityCapsuleStatus::Active,
+                1.0,
+                &ten_days_ago,
+            ))
             .await
             .unwrap();
 
@@ -94,7 +104,7 @@ mod tests {
             let id = id.to_string();
             async move {
                 store
-                    .get_memory_for_tenant("t", &id)
+                    .get_capability_capsule_for_tenant("t", &id)
                     .await
                     .unwrap()
                     .unwrap()

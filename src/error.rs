@@ -5,7 +5,7 @@ use axum::{
 };
 use serde_json::json;
 
-use crate::{service::memory_service::ServiceError, storage::StorageError};
+use crate::{service::capability_capsule_service::ServiceError, storage::StorageError};
 
 pub type Result<T> = std::result::Result<T, anyhow::Error>;
 

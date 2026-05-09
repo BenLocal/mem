@@ -1,6 +1,6 @@
 //! `mem feedback-from-transcript` — scan a Claude Code transcript for
 //! `mcp__mem__memory_search` calls, decide which retrieved memories were
-//! actually consumed by the agent, and POST `/memories/feedback` for each.
+//! actually consumed by the agent, and POST `/capability_capsules/feedback` for each.
 //!
 //! Heuristic for "consumed": the memory's `text` (returned in the
 //! `directives` / `relevant_facts` / `reusable_patterns` sections of the
@@ -24,7 +24,7 @@ use std::io::{BufRead, BufReader};
 use std::path::PathBuf;
 
 /// Memory-search MCP tool names we care about. Both share the same
-/// response shape (`domain::query::SearchMemoryResponse`).
+/// response shape (`domain::query::SearchCapabilityCapsuleResponse`).
 const SEARCH_TOOL_NAMES: &[&str] = &[
     "mcp__mem__memory_search",
     "mcp__mem__memory_search_contextual",
@@ -41,7 +41,7 @@ pub struct FeedbackFromTranscriptArgs {
     /// Path to the Claude Code transcript JSONL file.
     pub transcript_path: PathBuf,
 
-    /// Tenant identifier (passed through to `/memories/feedback`).
+    /// Tenant identifier (passed through to `/capability_capsules/feedback`).
     #[arg(long, default_value = "local")]
     pub tenant: String,
 
@@ -79,11 +79,11 @@ pub async fn run(args: FeedbackFromTranscriptArgs) -> i32 {
     for mid in &consumed {
         let body = serde_json::json!({
             "tenant": args.tenant,
-            "memory_id": mid,
+            "capability_capsule_id": mid,
             "feedback_kind": args.kind,
         });
         match client
-            .post(format!("{}/memories/feedback", args.base_url))
+            .post(format!("{}/capability_capsules/feedback", args.base_url))
             .json(&body)
             .send()
             .await
@@ -113,14 +113,14 @@ pub async fn run(args: FeedbackFromTranscriptArgs) -> i32 {
     }
 }
 
-/// One pass over the JSONL transcript; returns the set of memory_ids that
+/// One pass over the JSONL transcript; returns the set of capability_capsule_ids that
 /// were both retrieved by an `mcp__mem__memory_search*` call AND whose
 /// `text` reappears in a subsequent assistant `text`/`thinking` block.
 fn scan_transcript(args: &FeedbackFromTranscriptArgs) -> Result<HashSet<String>> {
     let file = File::open(&args.transcript_path)?;
     let reader = BufReader::new(file);
 
-    // (memory_id, text-prefix snippet, line index where retrieval happened)
+    // (capability_capsule_id, text-prefix snippet, line index where retrieval happened)
     let mut retrieved: Vec<(String, String, usize)> = Vec::new();
     // (line index, lower-cased assistant block text) — query corpus.
     let mut assistant_corpus: Vec<(usize, String)> = Vec::new();
@@ -172,7 +172,7 @@ fn scan_transcript(args: &FeedbackFromTranscriptArgs) -> Result<HashSet<String>>
                     // Result content is either a string (older) or an
                     // array of `{type, text}` chunks. The MCP wrapper
                     // emits a single text chunk holding the JSON-encoded
-                    // SearchMemoryResponse — extract that string before
+                    // SearchCapabilityCapsuleResponse — extract that string before
                     // re-parsing.
                     let inner = extract_tool_result_text(&item["content"]);
                     let Ok(resp) = serde_json::from_str::<Value>(&inner) else {
@@ -181,7 +181,7 @@ fn scan_transcript(args: &FeedbackFromTranscriptArgs) -> Result<HashSet<String>>
                     for section in ["directives", "relevant_facts", "reusable_patterns"] {
                         if let Some(arr) = resp[section].as_array() {
                             for entry in arr {
-                                let mid = entry["memory_id"].as_str().unwrap_or("");
+                                let mid = entry["capability_capsule_id"].as_str().unwrap_or("");
                                 let text = entry["text"].as_str().unwrap_or("");
                                 if mid.is_empty() {
                                     continue;

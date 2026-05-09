@@ -11,7 +11,7 @@ use crate::domain::ConversationMessage;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FeedbackEvent {
     pub feedback_id: String,
-    pub memory_id: String,
+    pub capability_capsule_id: String,
     pub feedback_kind: String,
     pub created_at: String,
 }
@@ -21,7 +21,7 @@ pub struct FeedbackEvent {
 pub struct ClaimedEmbeddingJob {
     pub job_id: String,
     pub tenant: String,
-    pub memory_id: String,
+    pub capability_capsule_id: String,
     pub target_content_hash: String,
     pub provider: String,
     pub attempt_count: i64,
@@ -33,7 +33,7 @@ pub struct ClaimedEmbeddingJob {
 pub struct EmbeddingJobInsert {
     pub job_id: String,
     pub tenant: String,
-    pub memory_id: String,
+    pub capability_capsule_id: String,
     pub target_content_hash: String,
     pub provider: String,
     pub available_at: String,
@@ -57,7 +57,7 @@ pub struct TranscriptSessionSummary {
 
 /// Row claimed by the transcript embedding worker
 /// (`status = processing`). Mirrors `ClaimedEmbeddingJob` for the
-/// memories side, with `memory_id` renamed to `message_block_id` and
+/// memories side, with `capability_capsule_id` renamed to `message_block_id` and
 /// `target_content_hash` dropped (transcript blocks are immutable on
 /// insert, so the hash is implicit in the row id).
 #[derive(Debug, Clone)]

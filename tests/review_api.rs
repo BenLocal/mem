@@ -5,7 +5,10 @@ use axum::{
     http::{Request, StatusCode},
 };
 use mem::{
-    domain::memory::{FeedbackSummary, MemoryRecord, MemoryStatus, MemoryType, Scope, Visibility},
+    domain::capability_capsule::{
+        CapabilityCapsuleRecord, CapabilityCapsuleStatus, CapabilityCapsuleType, FeedbackSummary,
+        Scope, Visibility,
+    },
     http,
     storage::{EmbeddingJobInsert, Store},
 };
@@ -15,16 +18,19 @@ use tower::util::ServiceExt;
 
 mod common;
 
-fn sample_memory(memory_id: &str, status: MemoryStatus) -> MemoryRecord {
-    MemoryRecord {
-        memory_id: memory_id.into(),
+fn sample_memory(
+    capability_capsule_id: &str,
+    status: CapabilityCapsuleStatus,
+) -> CapabilityCapsuleRecord {
+    CapabilityCapsuleRecord {
+        capability_capsule_id: capability_capsule_id.into(),
         tenant: "local".into(),
-        memory_type: MemoryType::Preference,
+        capability_capsule_type: CapabilityCapsuleType::Preference,
         status,
         scope: Scope::Repo,
         visibility: Visibility::Shared,
         version: 1,
-        summary: format!("summary-{memory_id}"),
+        summary: format!("summary-{capability_capsule_id}"),
         content: "stored content".into(),
         evidence: vec!["docs/review.md".into()],
         code_refs: vec!["src/review.rs".into()],
@@ -36,21 +42,25 @@ fn sample_memory(memory_id: &str, status: MemoryStatus) -> MemoryRecord {
         topics: vec![],
         confidence: 0.7,
         decay_score: 0.2,
-        content_hash: format!("hash-{memory_id}"),
+        content_hash: format!("hash-{capability_capsule_id}"),
         idempotency_key: None,
         session_id: None,
-        supersedes_memory_id: None,
+        supersedes_capability_capsule_id: None,
         source_agent: "codex-worker".into(),
-        created_at: format!("2026-03-21T00:00:{memory_id}Z"),
-        updated_at: format!("2026-03-21T00:05:{memory_id}Z"),
+        created_at: format!("2026-03-21T00:00:{capability_capsule_id}Z"),
+        updated_at: format!("2026-03-21T00:05:{capability_capsule_id}Z"),
         last_validated_at: None,
     }
 }
 
-fn sample_memory_for_tenant(memory_id: &str, tenant: &str, status: MemoryStatus) -> MemoryRecord {
-    MemoryRecord {
+fn sample_memory_for_tenant(
+    capability_capsule_id: &str,
+    tenant: &str,
+    status: CapabilityCapsuleStatus,
+) -> CapabilityCapsuleRecord {
+    CapabilityCapsuleRecord {
         tenant: tenant.into(),
-        ..sample_memory(memory_id, status)
+        ..sample_memory(capability_capsule_id, status)
     }
 }
 
@@ -133,12 +143,17 @@ async fn seeded_app_with_pending_preference() -> TestApp {
     let temp_dir = tempdir().unwrap();
     let db_path = temp_dir.path().join("review-api.duckdb");
     let repo = Arc::new(Store::open(&db_path).await.unwrap());
-    repo.insert_memory(sample_memory("mem_123", MemoryStatus::PendingConfirmation))
-        .await
-        .unwrap();
+    repo.insert_capability_capsule(sample_memory(
+        "mem_123",
+        CapabilityCapsuleStatus::PendingConfirmation,
+    ))
+    .await
+    .unwrap();
 
-    let state =
-        common::test_app_state(repo.clone(), mem::service::MemoryService::new(repo.clone()));
+    let state = common::test_app_state(
+        repo.clone(),
+        mem::service::CapabilityCapsuleService::new(repo.clone()),
+    );
 
     TestApp {
         _temp_dir: temp_dir,
@@ -151,12 +166,14 @@ async fn seeded_app_with_active_preference() -> TestApp {
     let temp_dir = tempdir().unwrap();
     let db_path = temp_dir.path().join("review-api-active.duckdb");
     let repo = Arc::new(Store::open(&db_path).await.unwrap());
-    repo.insert_memory(sample_memory("mem_123", MemoryStatus::Active))
+    repo.insert_capability_capsule(sample_memory("mem_123", CapabilityCapsuleStatus::Active))
         .await
         .unwrap();
 
-    let state =
-        common::test_app_state(repo.clone(), mem::service::MemoryService::new(repo.clone()));
+    let state = common::test_app_state(
+        repo.clone(),
+        mem::service::CapabilityCapsuleService::new(repo.clone()),
+    );
 
     TestApp {
         _temp_dir: temp_dir,
@@ -168,18 +185,24 @@ async fn seeded_app_with_active_preference() -> TestApp {
 #[tokio::test]
 async fn duckdb_repository_lists_pending_review_rows() {
     let (_dir, repo) = test_duckdb_repo().await;
-    repo.insert_memory(sample_memory("001", MemoryStatus::PendingConfirmation))
-        .await
-        .unwrap();
-    repo.insert_memory(sample_memory("002", MemoryStatus::Active))
+    repo.insert_capability_capsule(sample_memory(
+        "001",
+        CapabilityCapsuleStatus::PendingConfirmation,
+    ))
+    .await
+    .unwrap();
+    repo.insert_capability_capsule(sample_memory("002", CapabilityCapsuleStatus::Active))
         .await
         .unwrap();
 
     let pending = repo.list_pending_review("local").await.unwrap();
 
     assert_eq!(pending.len(), 1);
-    assert_eq!(pending[0].memory_id, "001");
-    assert_eq!(pending[0].status, MemoryStatus::PendingConfirmation);
+    assert_eq!(pending[0].capability_capsule_id, "001");
+    assert_eq!(
+        pending[0].status,
+        CapabilityCapsuleStatus::PendingConfirmation
+    );
 }
 
 // duckdb_repository_summarizes_feedback_by_kind: removed during the
@@ -206,7 +229,7 @@ async fn listing_pending_memories_returns_pending_rows() {
     let response = app.get("/reviews/pending?tenant=local").await;
 
     assert_eq!(response.status(), 200, "response body: {}", response.body);
-    assert_eq!(response.json()[0]["memory_id"], "mem_123");
+    assert_eq!(response.json()[0]["capability_capsule_id"], "mem_123");
     assert_eq!(response.json()[0]["status"], "pending_confirmation");
 }
 
@@ -219,7 +242,7 @@ async fn accepting_pending_memory_marks_it_active() {
             "/reviews/pending/accept",
             json!({
                 "tenant": "local",
-                "memory_id": "mem_123"
+                "capability_capsule_id": "mem_123"
             }),
         )
         .await;
@@ -237,7 +260,7 @@ async fn accepting_pending_memory_with_embedding_job_marks_it_active() {
         .try_enqueue_embedding_job(EmbeddingJobInsert {
             job_id: "ej_00000000000000000001".into(),
             tenant: "local".into(),
-            memory_id: "mem_123".into(),
+            capability_capsule_id: "mem_123".into(),
             target_content_hash: "hash-mem_123".into(),
             provider: "fake".into(),
             available_at: now.clone(),
@@ -253,7 +276,7 @@ async fn accepting_pending_memory_with_embedding_job_marks_it_active() {
             "/reviews/pending/accept",
             json!({
                 "tenant": "local",
-                "memory_id": "mem_123"
+                "capability_capsule_id": "mem_123"
             }),
         )
         .await;
@@ -271,7 +294,7 @@ async fn rejecting_pending_memory_marks_it_rejected() {
             "/reviews/pending/reject",
             json!({
                 "tenant": "local",
-                "memory_id": "mem_123"
+                "capability_capsule_id": "mem_123"
             }),
         )
         .await;
@@ -289,7 +312,7 @@ async fn editing_pending_memory_rejects_original_and_creates_active_successor() 
             "/reviews/pending/edit_accept",
             json!({
                 "tenant": "local",
-                "memory_id": "mem_123",
+                "capability_capsule_id": "mem_123",
                 "summary": "updated summary",
                 "content": "updated content",
                 "evidence": ["docs/updated.md"],
@@ -302,24 +325,30 @@ async fn editing_pending_memory_rejects_original_and_creates_active_successor() 
     assert_eq!(response.status(), 200);
     assert_eq!(response.json()["original_memory_id"], "mem_123");
     assert_eq!(response.json()["memory"]["status"], "active");
-    assert_eq!(response.json()["memory"]["supersedes_memory_id"], "mem_123");
-    assert_ne!(response.json()["memory"]["memory_id"], "mem_123");
+    assert_eq!(
+        response.json()["memory"]["supersedes_capability_capsule_id"],
+        "mem_123"
+    );
+    assert_ne!(
+        response.json()["memory"]["capability_capsule_id"],
+        "mem_123"
+    );
 
     let original = app
         .repo
-        .get_memory("mem_123".into())
+        .get_capability_capsule("mem_123".into())
         .await
         .unwrap()
         .expect("original memory should exist");
-    assert_eq!(original.status, MemoryStatus::Rejected);
+    assert_eq!(original.status, CapabilityCapsuleStatus::Rejected);
 
-    let successor_id = response.json()["memory"]["memory_id"]
+    let successor_id = response.json()["memory"]["capability_capsule_id"]
         .as_str()
         .expect("successor memory id should be present")
         .to_string();
     let successor = app
         .repo
-        .get_memory(successor_id)
+        .get_capability_capsule(successor_id)
         .await
         .unwrap()
         .expect("successor memory should exist");
@@ -338,23 +367,23 @@ async fn submitting_feedback_updates_summary_and_lifecycle_fields() {
 
     let response = app
         .post_json(
-            "/memories/feedback",
+            "/capability_capsules/feedback",
             json!({
                 "tenant": "local",
-                "memory_id": "mem_123",
+                "capability_capsule_id": "mem_123",
                 "feedback_kind": "useful"
             }),
         )
         .await;
 
     assert_eq!(response.status(), 200);
-    assert_eq!(response.json()["memory_id"], "mem_123");
+    assert_eq!(response.json()["capability_capsule_id"], "mem_123");
     let confidence = response.json()["confidence"].as_f64().unwrap();
     let decay_score = response.json()["decay_score"].as_f64().unwrap();
     assert!((confidence - 0.8).abs() < 1e-6);
     assert!((decay_score - 0.2).abs() < 1e-6);
 
-    let detail = app.get("/memories/mem_123?tenant=local").await;
+    let detail = app.get("/capability_capsules/mem_123?tenant=local").await;
     assert_eq!(detail.status(), 200);
     assert_eq!(detail.json()["feedback_summary"]["total"], 1);
     assert_eq!(detail.json()["feedback_summary"]["useful"], 1);
@@ -369,23 +398,25 @@ async fn listing_pending_memories_respects_tenant_scope() {
     let temp_dir = tempdir().unwrap();
     let db_path = temp_dir.path().join("review-api-tenants.duckdb");
     let repo = Arc::new(Store::open(&db_path).await.unwrap());
-    repo.insert_memory(sample_memory_for_tenant(
+    repo.insert_capability_capsule(sample_memory_for_tenant(
         "mem_local",
         "tenant-a",
-        MemoryStatus::PendingConfirmation,
+        CapabilityCapsuleStatus::PendingConfirmation,
     ))
     .await
     .unwrap();
-    repo.insert_memory(sample_memory_for_tenant(
+    repo.insert_capability_capsule(sample_memory_for_tenant(
         "mem_other",
         "tenant-b",
-        MemoryStatus::PendingConfirmation,
+        CapabilityCapsuleStatus::PendingConfirmation,
     ))
     .await
     .unwrap();
 
-    let state =
-        common::test_app_state(repo.clone(), mem::service::MemoryService::new(repo.clone()));
+    let state = common::test_app_state(
+        repo.clone(),
+        mem::service::CapabilityCapsuleService::new(repo.clone()),
+    );
     let app = TestApp {
         _temp_dir: temp_dir,
         router: http::router().with_state(state),
@@ -396,7 +427,7 @@ async fn listing_pending_memories_respects_tenant_scope() {
 
     assert_eq!(response.status(), 200);
     assert_eq!(response.json().as_array().unwrap().len(), 1);
-    assert_eq!(response.json()[0]["memory_id"], "mem_local");
+    assert_eq!(response.json()[0]["capability_capsule_id"], "mem_local");
 }
 
 #[tokio::test]
@@ -408,7 +439,7 @@ async fn accepting_pending_memory_from_wrong_tenant_returns_not_found() {
             "/reviews/pending/accept",
             json!({
                 "tenant": "other-tenant",
-                "memory_id": "mem_123"
+                "capability_capsule_id": "mem_123"
             }),
         )
         .await;
@@ -426,7 +457,7 @@ async fn accepting_unknown_pending_memory_returns_not_found() {
             "/reviews/pending/accept",
             json!({
                 "tenant": "local",
-                "memory_id": "missing"
+                "capability_capsule_id": "missing"
             }),
         )
         .await;
@@ -444,7 +475,7 @@ async fn rejecting_unknown_pending_memory_returns_not_found() {
             "/reviews/pending/reject",
             json!({
                 "tenant": "local",
-                "memory_id": "missing"
+                "capability_capsule_id": "missing"
             }),
         )
         .await;
@@ -462,7 +493,7 @@ async fn editing_unknown_pending_memory_returns_not_found() {
             "/reviews/pending/edit_accept",
             json!({
                 "tenant": "local",
-                "memory_id": "missing",
+                "capability_capsule_id": "missing",
                 "summary": "updated summary",
                 "content": "updated content",
                 "evidence": ["docs/updated.md"],

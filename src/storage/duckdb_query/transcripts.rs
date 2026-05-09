@@ -529,8 +529,8 @@ impl DuckDbQuery {
     }
 
     /// Semantic recall over `conversation_message_embeddings`.
-    /// Mirrors `semantic_search_memories` 1:1 with `memories` →
-    /// `conversation_messages` and `memory_id` → `message_block_id`.
+    /// Mirrors `semantic_search_capability_capsules` 1:1 with `memories` →
+    /// `conversation_messages` and `capability_capsule_id` → `message_block_id`.
     /// Routes through the lance extension's `lance_vector_search`
     /// SQL function; joins back to `ns.main.conversation_messages`
     /// for the full row. Returns `(message, similarity)` pairs in
@@ -538,7 +538,7 @@ impl DuckDbQuery {
     ///
     /// **Score**: cosine similarity ∈ `[0, 1]` for normalized
     /// embeddings, derived from the L2² distance lance returns as
-    /// `1 - L2²/2` — see `semantic_search_memories` for the
+    /// `1 - L2²/2` — see `semantic_search_capability_capsules` for the
     /// derivation. Same workaround applies (lance extension's
     /// `lance_vector_search` doesn't accept a `distance_type`
     /// kwarg, so we transform the L2² return value).

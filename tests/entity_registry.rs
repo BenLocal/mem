@@ -62,17 +62,19 @@ async fn schema_bootstrap_is_idempotent() {
     // No panic: re-opening must not fail on duplicate ALTER.
 }
 
-use mem::domain::memory::{MemoryRecord, MemoryStatus, MemoryType, Scope, Visibility};
+use mem::domain::capability_capsule::{
+    CapabilityCapsuleRecord, CapabilityCapsuleStatus, CapabilityCapsuleType, Scope, Visibility,
+};
 use mem::domain::{AddAliasOutcome, EntityKind};
 
 const NOW: &str = "00000000020260502000";
 
-fn baseline_memory(id: &str) -> MemoryRecord {
-    MemoryRecord {
-        memory_id: id.to_string(),
+fn baseline_memory(id: &str) -> CapabilityCapsuleRecord {
+    CapabilityCapsuleRecord {
+        capability_capsule_id: id.to_string(),
         tenant: "local".to_string(),
-        memory_type: MemoryType::Implementation,
-        status: MemoryStatus::Active,
+        capability_capsule_type: CapabilityCapsuleType::Implementation,
+        status: CapabilityCapsuleStatus::Active,
         scope: Scope::Global,
         visibility: Visibility::Private,
         version: 1,
@@ -91,7 +93,7 @@ fn baseline_memory(id: &str) -> MemoryRecord {
         content_hash: "00".repeat(32),
         idempotency_key: None,
         session_id: None,
-        supersedes_memory_id: None,
+        supersedes_capability_capsule_id: None,
         source_agent: "test".to_string(),
         created_at: NOW.to_string(),
         updated_at: NOW.to_string(),
@@ -105,18 +107,18 @@ async fn memory_record_topics_round_trip() {
     let db = tmp.path().join("mem.duckdb");
     let repo = Arc::new(Store::open(&db).await.unwrap());
 
-    let memory = MemoryRecord {
-        memory_id: "mem-test".to_string(),
+    let memory = CapabilityCapsuleRecord {
+        capability_capsule_id: "mem-test".to_string(),
         topics: vec!["Rust".into(), "ownership".into()],
         content_hash: "deadbeef".repeat(8), // 64 chars
         content: "discussion of language ownership".to_string(),
         summary: "ownership notes".to_string(),
         ..baseline_memory("mem-test")
     };
-    repo.insert_memory(memory).await.unwrap();
+    repo.insert_capability_capsule(memory).await.unwrap();
 
     let fetched = repo
-        .get_memory_for_tenant("local", "mem-test")
+        .get_capability_capsule_for_tenant("local", "mem-test")
         .await
         .unwrap()
         .unwrap();
@@ -132,15 +134,15 @@ async fn memory_record_empty_topics_round_trips_as_empty_vec() {
     let db = tmp.path().join("mem.duckdb");
     let repo = Arc::new(Store::open(&db).await.unwrap());
 
-    let memory = MemoryRecord {
-        memory_id: "mem-empty".to_string(),
+    let memory = CapabilityCapsuleRecord {
+        capability_capsule_id: "mem-empty".to_string(),
         topics: vec![],
         ..baseline_memory("mem-empty")
     };
-    repo.insert_memory(memory).await.unwrap();
+    repo.insert_capability_capsule(memory).await.unwrap();
 
     let fetched = repo
-        .get_memory_for_tenant("local", "mem-empty")
+        .get_capability_capsule_for_tenant("local", "mem-empty")
         .await
         .unwrap()
         .unwrap();
@@ -305,7 +307,7 @@ async fn get_entity_returns_canonical_with_aliases_in_creation_order() {
 // Ingest → resolve → graph_edges integration (Task 8 + Task 9).
 //
 // `resolve_drafts_to_edges` is defined in `service::memory_service` (Task 8)
-// and wired into `MemoryService::ingest` by Task 9. These exercise the full
+// and wired into `CapabilityCapsuleService::ingest` by Task 9. These exercise the full
 // HTTP flow and assert that `graph_edges.to_node_id` carries `entity:<uuid>`
 // (resolved via EntityRegistry), not the legacy `topic:<alias>` literal.
 // ---------------------------------------------------------------------------

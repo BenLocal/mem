@@ -6,12 +6,12 @@ use futures::TryStreamExt;
 use lancedb::query::{ExecutableQuery, QueryBase};
 
 use super::{graph_edge_to_record_batch, record_batch_to_graph_edges, sql_quote, LanceStore};
-use crate::domain::memory::GraphEdge;
+use crate::domain::capability_capsule::GraphEdge;
 use crate::storage::types::GraphError;
 
 impl LanceStore {
     /// Read all `graph_edges` rows matching `filter`, parsed into
-    /// [`GraphEdge`]s. Helper shared by `neighbors`, `related_memory_ids`,
+    /// [`GraphEdge`]s. Helper shared by `neighbors`, `related_capability_capsule_ids`,
     /// and the existence check in `sync_memory_edges`.
     pub async fn query_graph_edges(&self, filter: String) -> Result<Vec<GraphEdge>, GraphError> {
         let table = self
@@ -111,8 +111,11 @@ impl LanceStore {
         Ok(())
     }
 
-    pub async fn close_edges_for_memory(&self, memory_id: &str) -> Result<usize, GraphError> {
-        let from = format!("memory:{memory_id}");
+    pub async fn close_edges_for_capability_capsule(
+        &self,
+        capability_capsule_id: &str,
+    ) -> Result<usize, GraphError> {
+        let from = format!("capability_capsule:{capability_capsule_id}");
         let now = crate::storage::current_timestamp();
         let table = self
             .conn
@@ -142,7 +145,10 @@ impl LanceStore {
         }
     }
 
-    pub async fn related_memory_ids(&self, node_ids: &[String]) -> Result<Vec<String>, GraphError> {
+    pub async fn related_capability_capsule_ids(
+        &self,
+        node_ids: &[String],
+    ) -> Result<Vec<String>, GraphError> {
         if node_ids.is_empty() {
             return Ok(vec![]);
         }
@@ -161,7 +167,7 @@ impl LanceStore {
         let edges = self.query_graph_edges(filter).await?;
         let node_set: std::collections::HashSet<&str> =
             node_ids.iter().map(|s| s.as_str()).collect();
-        let mut memory_ids = std::collections::HashSet::new();
+        let mut capability_capsule_ids = std::collections::HashSet::new();
         for e in edges {
             // Adjacency: pick the endpoint that's NOT in node_ids; if
             // both sides are in node_ids, both are recorded (matches
@@ -169,13 +175,15 @@ impl LanceStore {
             // semantics — the SELECT DISTINCT collapses the duplicate).
             for endpoint in [&e.from_node_id, &e.to_node_id] {
                 if !node_set.contains(endpoint.as_str()) {
-                    if let Some(memory_id) = endpoint.strip_prefix("memory:") {
-                        memory_ids.insert(memory_id.to_string());
+                    if let Some(capability_capsule_id) =
+                        endpoint.strip_prefix("capability_capsule:")
+                    {
+                        capability_capsule_ids.insert(capability_capsule_id.to_string());
                     }
                 }
             }
         }
-        let mut out: Vec<String> = memory_ids.into_iter().collect();
+        let mut out: Vec<String> = capability_capsule_ids.into_iter().collect();
         out.sort();
         Ok(out)
     }
@@ -184,10 +192,10 @@ impl LanceStore {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::domain::memory::GraphEdge;
+    use crate::domain::capability_capsule::GraphEdge;
     use tempfile::tempdir;
 
-    /// neighbors → close_edges_for_memory → related_memory_ids.
+    /// neighbors → close_edges_for_capability_capsule → related_capability_capsule_ids.
     #[tokio::test]
     pub async fn lancedb_graph_store_round_trip() {
         let dir = tempdir().unwrap();
@@ -196,21 +204,21 @@ mod tests {
 
         let edges = vec![
             GraphEdge {
-                from_node_id: "memory:m1".into(),
+                from_node_id: "capability_capsule:m1".into(),
                 to_node_id: "entity:e1".into(),
                 relation: "mentions".into(),
                 valid_from: "00000001778000000000".into(),
                 valid_to: None,
             },
             GraphEdge {
-                from_node_id: "memory:m2".into(),
+                from_node_id: "capability_capsule:m2".into(),
                 to_node_id: "entity:e1".into(),
                 relation: "mentions".into(),
                 valid_from: "00000001778000000000".into(),
                 valid_to: None,
             },
             GraphEdge {
-                from_node_id: "memory:m1".into(),
+                from_node_id: "capability_capsule:m1".into(),
                 to_node_id: "entity:e2".into(),
                 relation: "discusses".into(),
                 valid_from: "00000001778000000000".into(),
@@ -235,34 +243,37 @@ mod tests {
         let n_e1 = repo.neighbors("entity:e1").await.unwrap();
         assert_eq!(n_e1.len(), 2);
         // ordered by relation,from,to — mentions/m1, mentions/m2
-        assert_eq!(n_e1[0].from_node_id, "memory:m1");
-        assert_eq!(n_e1[1].from_node_id, "memory:m2");
+        assert_eq!(n_e1[0].from_node_id, "capability_capsule:m1");
+        assert_eq!(n_e1[1].from_node_id, "capability_capsule:m2");
 
-        // related_memory_ids for [e1, e2]: should give {m1, m2}.
+        // related_capability_capsule_ids for [e1, e2]: should give {m1, m2}.
         let related = repo
-            .related_memory_ids(&["entity:e1".into(), "entity:e2".into()])
+            .related_capability_capsule_ids(&["entity:e1".into(), "entity:e2".into()])
             .await
             .unwrap();
         assert_eq!(related, vec!["m1".to_string(), "m2".to_string()]);
 
         // Close all edges from m1 (mentions e1 + discusses e2).
-        let closed = repo.close_edges_for_memory("m1").await.unwrap();
+        let closed = repo.close_edges_for_capability_capsule("m1").await.unwrap();
         assert_eq!(closed, 2);
 
         // After close, neighbors(e1) drops to just m2's edge.
         let n_after = repo.neighbors("entity:e1").await.unwrap();
         assert_eq!(n_after.len(), 1);
-        assert_eq!(n_after[0].from_node_id, "memory:m2");
+        assert_eq!(n_after[0].from_node_id, "capability_capsule:m2");
 
-        // related_memory_ids reflects the close — m1 is gone.
+        // related_capability_capsule_ids reflects the close — m1 is gone.
         let related2 = repo
-            .related_memory_ids(&["entity:e1".into(), "entity:e2".into()])
+            .related_capability_capsule_ids(&["entity:e1".into(), "entity:e2".into()])
             .await
             .unwrap();
         assert_eq!(related2, vec!["m2".to_string()]);
 
         // close on a memory with no active edges → 0.
-        let zero = repo.close_edges_for_memory("nope").await.unwrap();
+        let zero = repo
+            .close_edges_for_capability_capsule("nope")
+            .await
+            .unwrap();
         assert_eq!(zero, 0);
 
         // Empty input edge list → no-op (no errors).
@@ -271,7 +282,7 @@ mod tests {
             .unwrap();
 
         // Empty input node_ids → empty Vec.
-        let empty = repo.related_memory_ids(&[]).await.unwrap();
+        let empty = repo.related_capability_capsule_ids(&[]).await.unwrap();
         assert!(empty.is_empty());
     }
 }

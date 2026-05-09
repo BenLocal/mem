@@ -9,7 +9,7 @@
 //!   (active rows only, capped at 1.0). Goes through
 //!   `Store::apply_time_decay` (DuckDB SQL via the lance extension).
 //! - `embedding_worker` — drains `embedding_jobs`, calls
-//!   `embed_batch`, upserts to `memory_embeddings`. Lance handles
+//!   `embed_batch`, upserts to `capability_capsule_embeddings`. Lance handles
 //!   vector indexing internally — no separate HNSW sidecar to
 //!   update.
 //! - `transcript_embedding_worker` — same shape for

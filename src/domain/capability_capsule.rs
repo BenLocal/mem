@@ -6,7 +6,7 @@ fn skip_none<T>(value: &Option<T>) -> bool {
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
-pub enum MemoryStatus {
+pub enum CapabilityCapsuleStatus {
     #[default]
     PendingConfirmation,
     Provisional,
@@ -17,7 +17,7 @@ pub enum MemoryStatus {
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
-pub enum MemoryType {
+pub enum CapabilityCapsuleType {
     #[default]
     Implementation,
     Experience,
@@ -102,9 +102,9 @@ impl FeedbackKind {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
 #[serde(rename_all = "snake_case")]
-pub struct IngestMemoryRequest {
+pub struct IngestCapabilityCapsuleRequest {
     pub tenant: String,
-    pub memory_type: MemoryType,
+    pub capability_capsule_type: CapabilityCapsuleType,
     pub content: String,
     #[serde(skip_serializing_if = "skip_none")]
     pub summary: Option<String>,
@@ -131,11 +131,11 @@ pub struct IngestMemoryRequest {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "snake_case")]
-pub struct MemoryRecord {
-    pub memory_id: String,
+pub struct CapabilityCapsuleRecord {
+    pub capability_capsule_id: String,
     pub tenant: String,
-    pub memory_type: MemoryType,
-    pub status: MemoryStatus,
+    pub capability_capsule_type: CapabilityCapsuleType,
+    pub status: CapabilityCapsuleStatus,
     pub scope: Scope,
     pub visibility: Visibility,
     pub version: u64,
@@ -161,7 +161,7 @@ pub struct MemoryRecord {
     #[serde(skip_serializing_if = "skip_none")]
     pub session_id: Option<String>,
     #[serde(skip_serializing_if = "skip_none")]
-    pub supersedes_memory_id: Option<String>,
+    pub supersedes_capability_capsule_id: Option<String>,
     pub source_agent: String,
     pub created_at: String,
     pub updated_at: String,
@@ -169,13 +169,13 @@ pub struct MemoryRecord {
     pub last_validated_at: Option<String>,
 }
 
-impl Default for MemoryRecord {
+impl Default for CapabilityCapsuleRecord {
     fn default() -> Self {
         Self {
-            memory_id: String::new(),
+            capability_capsule_id: String::new(),
             tenant: String::new(),
-            memory_type: MemoryType::default(),
-            status: MemoryStatus::default(),
+            capability_capsule_type: CapabilityCapsuleType::default(),
+            status: CapabilityCapsuleStatus::default(),
             scope: Scope::default(),
             visibility: Visibility::default(),
             version: 0,
@@ -194,7 +194,7 @@ impl Default for MemoryRecord {
             content_hash: String::new(),
             idempotency_key: None,
             session_id: None,
-            supersedes_memory_id: None,
+            supersedes_capability_capsule_id: None,
             source_agent: String::new(),
             created_at: String::new(),
             updated_at: String::new(),
@@ -206,7 +206,7 @@ impl Default for MemoryRecord {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub struct EditPendingRequest {
-    pub memory_id: String,
+    pub capability_capsule_id: String,
     pub summary: String,
     pub content: String,
     pub evidence: Vec<String>,
@@ -218,18 +218,18 @@ pub struct EditPendingRequest {
 #[serde(rename_all = "snake_case")]
 pub struct EditPendingResponse {
     pub original_memory_id: String,
-    pub memory: MemoryRecord,
+    pub memory: CapabilityCapsuleRecord,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
-pub struct MemoryVersionLink {
-    pub memory_id: String,
+pub struct CapabilityCapsuleVersionLink {
+    pub capability_capsule_id: String,
     pub version: u64,
-    pub status: MemoryStatus,
+    pub status: CapabilityCapsuleStatus,
     pub updated_at: String,
     #[serde(skip_serializing_if = "skip_none")]
-    pub supersedes_memory_id: Option<String>,
+    pub supersedes_capability_capsule_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -255,11 +255,11 @@ pub struct FeedbackSummary {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "snake_case")]
-pub struct MemoryDetailResponse {
-    pub memory: MemoryRecord,
-    pub version_chain: Vec<MemoryVersionLink>,
+pub struct CapabilityCapsuleDetailResponse {
+    pub memory: CapabilityCapsuleRecord,
+    pub version_chain: Vec<CapabilityCapsuleVersionLink>,
     pub graph_links: Vec<GraphEdge>,
     pub feedback_summary: FeedbackSummary,
     #[serde(default)]
-    pub embedding: super::embeddings::MemoryEmbeddingMeta,
+    pub embedding: super::embeddings::CapabilityCapsuleEmbeddingMeta,
 }

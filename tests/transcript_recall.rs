@@ -312,13 +312,13 @@ use tower::ServiceExt;
 
 async fn build_recall_app(db_dir: &TempDir) -> axum::Router {
     use mem::config::Config;
-    use mem::service::MemoryService;
+    use mem::service::CapabilityCapsuleService;
     let mut cfg = Config::local();
     cfg.db_path = db_dir.path().join("mem.duckdb");
     let repo = Arc::new(Store::open(&cfg.db_path).await.unwrap());
     repo.set_transcript_job_provider("embedanything");
-    let memory_service = MemoryService::new(repo.clone());
-    let state = common::test_app_state(repo, memory_service);
+    let capability_capsule_service = CapabilityCapsuleService::new(repo.clone());
+    let state = common::test_app_state(repo, capability_capsule_service);
     mem::http::router().with_state(state)
 }
 

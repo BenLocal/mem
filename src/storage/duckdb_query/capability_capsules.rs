@@ -5,18 +5,21 @@
 use duckdb::{params, OptionalExt};
 
 use super::{enum_to_text, get_string_list, parse_enum, spawn_blocking_storage, DuckDbQuery};
-use crate::domain::memory::{MemoryRecord, MemoryStatus, MemoryVersionLink};
+use crate::domain::capability_capsule::{
+    CapabilityCapsuleRecord, CapabilityCapsuleStatus, CapabilityCapsuleVersionLink,
+};
 use crate::storage::types::StorageError;
 
 /// 27-column projection shared by every memory-row read method.
-/// Order must match `row_to_memory_record` below — keep in sync.
-const MEMORY_COLS: &str = "memory_id, tenant, memory_type, status, scope, visibility, version, \
+/// Order must match `row_to_capability_capsule_record` below — keep in sync.
+const CAPABILITY_CAPSULE_COLS: &str =
+    "capability_capsule_id, tenant, capability_capsule_type, status, scope, visibility, version, \
     summary, content, evidence, code_refs, project, repo, module, task_type, \
     tags, topics, confidence, decay_score, content_hash, idempotency_key, \
-    session_id, supersedes_memory_id, source_agent, created_at, updated_at, \
+    session_id, supersedes_capability_capsule_id, source_agent, created_at, updated_at, \
     last_validated_at";
 
-/// Parse one row of the 27-column SELECT above into a [`MemoryRecord`].
+/// Parse one row of the 27-column SELECT above into a [`CapabilityCapsuleRecord`].
 ///
 /// Type expectations (Lance Arrow → DuckDB SQL via the lance extension):
 ///   - `Utf8` → `VARCHAR` → `String` / `Option<String>`
@@ -24,16 +27,18 @@ const MEMORY_COLS: &str = "memory_id, tenant, memory_type, status, scope, visibi
 ///   - `UInt64` → `UBIGINT` → `u64`
 ///   - `Float32` → `FLOAT` (a.k.a. `REAL`) → `f32`
 ///
-/// Enum fields (`memory_type`, `status`, `scope`, `visibility`) live as
+/// Enum fields (`capability_capsule_type`, `status`, `scope`, `visibility`) live as
 /// snake_case Utf8 strings on the Lance side per LanceStore's schema;
 /// here we round-trip them through `serde_json::Value::String` so
 /// `#[serde(rename_all = "snake_case")]` on the enum lookups them
 /// without needing a hand-written from-str table.
-fn row_to_memory_record(row: &duckdb::Row<'_>) -> duckdb::Result<MemoryRecord> {
-    Ok(MemoryRecord {
-        memory_id: row.get(0)?,
+fn row_to_capability_capsule_record(
+    row: &duckdb::Row<'_>,
+) -> duckdb::Result<CapabilityCapsuleRecord> {
+    Ok(CapabilityCapsuleRecord {
+        capability_capsule_id: row.get(0)?,
         tenant: row.get(1)?,
-        memory_type: parse_enum(&row.get::<_, String>(2)?)?,
+        capability_capsule_type: parse_enum(&row.get::<_, String>(2)?)?,
         status: parse_enum(&row.get::<_, String>(3)?)?,
         scope: parse_enum(&row.get::<_, String>(4)?)?,
         visibility: parse_enum(&row.get::<_, String>(5)?)?,
@@ -53,7 +58,7 @@ fn row_to_memory_record(row: &duckdb::Row<'_>) -> duckdb::Result<MemoryRecord> {
         content_hash: row.get(19)?,
         idempotency_key: row.get(20)?,
         session_id: row.get(21)?,
-        supersedes_memory_id: row.get(22)?,
+        supersedes_capability_capsule_id: row.get(22)?,
         source_agent: row.get(23)?,
         created_at: row.get(24)?,
         updated_at: row.get(25)?,
@@ -61,11 +66,11 @@ fn row_to_memory_record(row: &duckdb::Row<'_>) -> duckdb::Result<MemoryRecord> {
     })
 }
 
-/// Collect rows from a `query_map` iterator into a `Vec<MemoryRecord>`,
+/// Collect rows from a `query_map` iterator into a `Vec<CapabilityCapsuleRecord>`,
 /// converting the per-row `duckdb::Error` to `StorageError`.
-fn collect_memories<I>(rows: I) -> Result<Vec<MemoryRecord>, StorageError>
+fn collect_capability_capsules<I>(rows: I) -> Result<Vec<CapabilityCapsuleRecord>, StorageError>
 where
-    I: Iterator<Item = duckdb::Result<MemoryRecord>>,
+    I: Iterator<Item = duckdb::Result<CapabilityCapsuleRecord>>,
 {
     let mut out = Vec::new();
     for r in rows {
@@ -75,74 +80,47 @@ where
 }
 
 impl DuckDbQuery {
-    pub async fn list_memories_for_tenant(
+    pub async fn list_capability_capsules_for_tenant(
         &self,
         tenant: &str,
-    ) -> Result<Vec<MemoryRecord>, StorageError> {
+    ) -> Result<Vec<CapabilityCapsuleRecord>, StorageError> {
         let conn = self.conn.clone();
         let tenant = tenant.to_string();
         spawn_blocking_storage(move || {
             let conn = conn.lock().expect("duckdb_query mutex poisoned");
             let sql = format!(
-                "SELECT {MEMORY_COLS} FROM ns.main.memories WHERE tenant = ?1",
-                MEMORY_COLS = MEMORY_COLS,
+                "SELECT {CAPABILITY_CAPSULE_COLS} FROM ns.main.capability_capsules WHERE tenant = ?1",
+                CAPABILITY_CAPSULE_COLS = CAPABILITY_CAPSULE_COLS,
             );
             let mut stmt = conn.prepare(&sql)?;
-            let rows = stmt.query_map(params![tenant], row_to_memory_record)?;
-            collect_memories(rows)
+            let rows = stmt.query_map(params![tenant], row_to_capability_capsule_record)?;
+            collect_capability_capsules(rows)
         })
         .await
     }
 
-    /// Single memory by `(tenant, memory_id)`. Returns `Ok(None)` when
+    /// Single memory by `(tenant, capability_capsule_id)`. Returns `Ok(None)` when
     /// no row matches (the canonical "not found" path — distinct from
     /// errors).
-    pub async fn get_memory_for_tenant(
+    pub async fn get_capability_capsule_for_tenant(
         &self,
         tenant: &str,
-        memory_id: &str,
-    ) -> Result<Option<MemoryRecord>, StorageError> {
+        capability_capsule_id: &str,
+    ) -> Result<Option<CapabilityCapsuleRecord>, StorageError> {
         let conn = self.conn.clone();
         let tenant = tenant.to_string();
-        let memory_id = memory_id.to_string();
+        let capability_capsule_id = capability_capsule_id.to_string();
         spawn_blocking_storage(move || {
             let conn = conn.lock().expect("duckdb_query mutex poisoned");
             let sql = format!(
-                "SELECT {MEMORY_COLS} FROM ns.main.memories \
-                 WHERE tenant = ?1 AND memory_id = ?2",
-                MEMORY_COLS = MEMORY_COLS,
-            );
-            conn.query_row(&sql, params![tenant, memory_id], row_to_memory_record)
-                .optional()
-                .map_err(StorageError::DuckDb)
-        })
-        .await
-    }
-
-    /// Single pending-confirmation memory by `(tenant, memory_id)`.
-    /// Used by the review-queue UI's edit/inspect flow — surfaces
-    /// `Ok(None)` if the row is gone or has already been
-    /// accepted/rejected (status moved off `pending_confirmation`).
-    pub async fn get_pending(
-        &self,
-        tenant: &str,
-        memory_id: &str,
-    ) -> Result<Option<MemoryRecord>, StorageError> {
-        let conn = self.conn.clone();
-        let tenant = tenant.to_string();
-        let memory_id = memory_id.to_string();
-        let status = enum_to_text(&MemoryStatus::PendingConfirmation)?;
-        spawn_blocking_storage(move || {
-            let conn = conn.lock().expect("duckdb_query mutex poisoned");
-            let sql = format!(
-                "SELECT {MEMORY_COLS} FROM ns.main.memories \
-                 WHERE tenant = ?1 AND memory_id = ?2 AND status = ?3",
-                MEMORY_COLS = MEMORY_COLS,
+                "SELECT {CAPABILITY_CAPSULE_COLS} FROM ns.main.capability_capsules \
+                 WHERE tenant = ?1 AND capability_capsule_id = ?2",
+                CAPABILITY_CAPSULE_COLS = CAPABILITY_CAPSULE_COLS,
             );
             conn.query_row(
                 &sql,
-                params![tenant, memory_id, status],
-                row_to_memory_record,
+                params![tenant, capability_capsule_id],
+                row_to_capability_capsule_record,
             )
             .optional()
             .map_err(StorageError::DuckDb)
@@ -150,7 +128,38 @@ impl DuckDbQuery {
         .await
     }
 
-    /// Idempotency check used by `MemoryService::ingest`. Matches on
+    /// Single pending-confirmation memory by `(tenant, capability_capsule_id)`.
+    /// Used by the review-queue UI's edit/inspect flow — surfaces
+    /// `Ok(None)` if the row is gone or has already been
+    /// accepted/rejected (status moved off `pending_confirmation`).
+    pub async fn get_pending(
+        &self,
+        tenant: &str,
+        capability_capsule_id: &str,
+    ) -> Result<Option<CapabilityCapsuleRecord>, StorageError> {
+        let conn = self.conn.clone();
+        let tenant = tenant.to_string();
+        let capability_capsule_id = capability_capsule_id.to_string();
+        let status = enum_to_text(&CapabilityCapsuleStatus::PendingConfirmation)?;
+        spawn_blocking_storage(move || {
+            let conn = conn.lock().expect("duckdb_query mutex poisoned");
+            let sql = format!(
+                "SELECT {CAPABILITY_CAPSULE_COLS} FROM ns.main.capability_capsules \
+                 WHERE tenant = ?1 AND capability_capsule_id = ?2 AND status = ?3",
+                CAPABILITY_CAPSULE_COLS = CAPABILITY_CAPSULE_COLS,
+            );
+            conn.query_row(
+                &sql,
+                params![tenant, capability_capsule_id, status],
+                row_to_capability_capsule_record,
+            )
+            .optional()
+            .map_err(StorageError::DuckDb)
+        })
+        .await
+    }
+
+    /// Idempotency check used by `CapabilityCapsuleService::ingest`. Matches on
     /// either an `idempotency_key` (when caller supplied one) or the
     /// `content_hash` (always; functions as the natural-key duplicate
     /// check). Idempotency-key matches rank first (priority 0) so a
@@ -161,7 +170,7 @@ impl DuckDbQuery {
         tenant: &str,
         idempotency_key: &Option<String>,
         content_hash: &str,
-    ) -> Result<Option<MemoryRecord>, StorageError> {
+    ) -> Result<Option<CapabilityCapsuleRecord>, StorageError> {
         let conn = self.conn.clone();
         let tenant = tenant.to_string();
         let idempotency_key = idempotency_key.clone();
@@ -169,19 +178,19 @@ impl DuckDbQuery {
         spawn_blocking_storage(move || {
             let conn = conn.lock().expect("duckdb_query mutex poisoned");
             let sql = format!(
-                "SELECT {MEMORY_COLS} FROM ns.main.memories
+                "SELECT {CAPABILITY_CAPSULE_COLS} FROM ns.main.capability_capsules
                  WHERE tenant = ?1
                    AND ((?2 IS NOT NULL AND idempotency_key = ?2) OR content_hash = ?3)
                  ORDER BY
                     CASE WHEN ?2 IS NOT NULL AND idempotency_key = ?2 THEN 0 ELSE 1 END,
                     updated_at DESC
                  LIMIT 1",
-                MEMORY_COLS = MEMORY_COLS,
+                CAPABILITY_CAPSULE_COLS = CAPABILITY_CAPSULE_COLS,
             );
             conn.query_row(
                 &sql,
                 params![tenant, idempotency_key.as_deref(), content_hash],
-                row_to_memory_record,
+                row_to_capability_capsule_record,
             )
             .optional()
             .map_err(StorageError::DuckDb)
@@ -196,97 +205,103 @@ impl DuckDbQuery {
     pub async fn list_pending_review(
         &self,
         tenant: &str,
-    ) -> Result<Vec<MemoryRecord>, StorageError> {
+    ) -> Result<Vec<CapabilityCapsuleRecord>, StorageError> {
         let conn = self.conn.clone();
         let tenant = tenant.to_string();
-        let status = enum_to_text(&MemoryStatus::PendingConfirmation)?;
+        let status = enum_to_text(&CapabilityCapsuleStatus::PendingConfirmation)?;
         spawn_blocking_storage(move || {
             let conn = conn.lock().expect("duckdb_query mutex poisoned");
             let sql = format!(
-                "SELECT {MEMORY_COLS} FROM ns.main.memories \
+                "SELECT {CAPABILITY_CAPSULE_COLS} FROM ns.main.capability_capsules \
                  WHERE tenant = ?1 AND status = ?2 \
                  ORDER BY created_at DESC",
-                MEMORY_COLS = MEMORY_COLS,
+                CAPABILITY_CAPSULE_COLS = CAPABILITY_CAPSULE_COLS,
             );
             let mut stmt = conn.prepare(&sql)?;
-            let rows = stmt.query_map(params![tenant, status], row_to_memory_record)?;
-            collect_memories(rows)
+            let rows = stmt.query_map(params![tenant, status], row_to_capability_capsule_record)?;
+            collect_capability_capsules(rows)
         })
         .await
     }
 
     /// Most-recent non-rejected, non-archived memories under `tenant`
     /// — the empty-query fallback for `mem wake-up`. Ordered
-    /// `(updated_at DESC, version DESC, memory_id ASC)` to keep ties
+    /// `(updated_at DESC, version DESC, capability_capsule_id ASC)` to keep ties
     /// deterministic when a batch of rows shares an `updated_at`
     /// timestamp.
     ///
     /// `limit` is clamped to `[1, 1024]` (mirrors the legacy bound).
-    pub async fn recent_active_memories(
+    pub async fn recent_active_capability_capsules(
         &self,
         tenant: &str,
         limit: usize,
-    ) -> Result<Vec<MemoryRecord>, StorageError> {
+    ) -> Result<Vec<CapabilityCapsuleRecord>, StorageError> {
         let conn = self.conn.clone();
         let tenant = tenant.to_string();
         let lim = i64::try_from(limit).unwrap_or(64).clamp(1, 1024);
-        let rejected = enum_to_text(&MemoryStatus::Rejected)?;
-        let archived = enum_to_text(&MemoryStatus::Archived)?;
+        let rejected = enum_to_text(&CapabilityCapsuleStatus::Rejected)?;
+        let archived = enum_to_text(&CapabilityCapsuleStatus::Archived)?;
         spawn_blocking_storage(move || {
             let conn = conn.lock().expect("duckdb_query mutex poisoned");
             let sql = format!(
-                "SELECT {MEMORY_COLS} FROM ns.main.memories \
+                "SELECT {CAPABILITY_CAPSULE_COLS} FROM ns.main.capability_capsules \
                  WHERE tenant = ?1 AND status NOT IN (?2, ?3) \
-                 ORDER BY updated_at DESC, version DESC, memory_id ASC \
+                 ORDER BY updated_at DESC, version DESC, capability_capsule_id ASC \
                  LIMIT ?4",
-                MEMORY_COLS = MEMORY_COLS,
+                CAPABILITY_CAPSULE_COLS = CAPABILITY_CAPSULE_COLS,
             );
             let mut stmt = conn.prepare(&sql)?;
             let rows = stmt.query_map(
                 params![tenant, rejected, archived, lim],
-                row_to_memory_record,
+                row_to_capability_capsule_record,
             )?;
-            collect_memories(rows)
+            collect_capability_capsules(rows)
         })
         .await
     }
 
     /// Candidate pool for the ranking pipeline. Same row shape /
-    /// ordering as `recent_active_memories` but **unbounded** — pulls
+    /// ordering as `recent_active_capability_capsules` but **unbounded** — pulls
     /// the entire live (non-rejected, non-archived) set for `tenant`
     /// and returns it. Used by `pipeline::retrieve` to score every
     /// candidate; service code is expected to top-N afterward.
     ///
     /// For tenants with thousands of memories the wake-up fast path
-    /// uses `recent_active_memories` instead — same filter, push the
+    /// uses `recent_active_capability_capsules` instead — same filter, push the
     /// LIMIT to SQL.
     ///
     /// We do the status filter in SQL (rather than the legacy "fetch
     /// all then filter in Rust") because pushing predicates is the
     /// whole point of having DuckDB on top — every byte of an archived
     /// row that doesn't make it into Rust is a win.
-    pub async fn search_candidates(&self, tenant: &str) -> Result<Vec<MemoryRecord>, StorageError> {
+    pub async fn search_candidates(
+        &self,
+        tenant: &str,
+    ) -> Result<Vec<CapabilityCapsuleRecord>, StorageError> {
         let conn = self.conn.clone();
         let tenant = tenant.to_string();
-        let rejected = enum_to_text(&MemoryStatus::Rejected)?;
-        let archived = enum_to_text(&MemoryStatus::Archived)?;
+        let rejected = enum_to_text(&CapabilityCapsuleStatus::Rejected)?;
+        let archived = enum_to_text(&CapabilityCapsuleStatus::Archived)?;
         spawn_blocking_storage(move || {
             let conn = conn.lock().expect("duckdb_query mutex poisoned");
             let sql = format!(
-                "SELECT {MEMORY_COLS} FROM ns.main.memories \
+                "SELECT {CAPABILITY_CAPSULE_COLS} FROM ns.main.capability_capsules \
                  WHERE tenant = ?1 AND status NOT IN (?2, ?3) \
-                 ORDER BY updated_at DESC, version DESC, memory_id ASC",
-                MEMORY_COLS = MEMORY_COLS,
+                 ORDER BY updated_at DESC, version DESC, capability_capsule_id ASC",
+                CAPABILITY_CAPSULE_COLS = CAPABILITY_CAPSULE_COLS,
             );
             let mut stmt = conn.prepare(&sql)?;
-            let rows = stmt.query_map(params![tenant, rejected, archived], row_to_memory_record)?;
-            collect_memories(rows)
+            let rows = stmt.query_map(
+                params![tenant, rejected, archived],
+                row_to_capability_capsule_record,
+            )?;
+            collect_capability_capsules(rows)
         })
         .await
     }
 
-    /// Bulk fetch by memory_id list, scoped to `tenant`. Uses
-    /// `WHERE memory_id IN (?, ?, ...)` with N parameter binders.
+    /// Bulk fetch by capability_capsule_id list, scoped to `tenant`. Uses
+    /// `WHERE capability_capsule_id IN (?, ?, ...)` with N parameter binders.
     /// Returns rows in DB-natural order, **not** in input slice order;
     /// callers that need to preserve `ids` ordering reshape via a
     /// HashMap (the legacy hybrid-search path does this).
@@ -295,12 +310,12 @@ impl DuckDbQuery {
     /// connection.
     ///
     /// Used by post-search hydration in `pipeline::retrieve`: ANN /
-    /// BM25 returns memory_ids only; this fills the row data.
-    pub async fn fetch_memories_by_ids(
+    /// BM25 returns capability_capsule_ids only; this fills the row data.
+    pub async fn fetch_capability_capsules_by_ids(
         &self,
         tenant: &str,
         ids: &[&str],
-    ) -> Result<Vec<MemoryRecord>, StorageError> {
+    ) -> Result<Vec<CapabilityCapsuleRecord>, StorageError> {
         if ids.is_empty() {
             return Ok(Vec::new());
         }
@@ -316,9 +331,9 @@ impl DuckDbQuery {
                 .collect::<Vec<_>>()
                 .join(", ");
             let sql = format!(
-                "SELECT {MEMORY_COLS} FROM ns.main.memories \
-                 WHERE tenant = ?1 AND memory_id IN ({placeholders})",
-                MEMORY_COLS = MEMORY_COLS,
+                "SELECT {CAPABILITY_CAPSULE_COLS} FROM ns.main.capability_capsules \
+                 WHERE tenant = ?1 AND capability_capsule_id IN ({placeholders})",
+                CAPABILITY_CAPSULE_COLS = CAPABILITY_CAPSULE_COLS,
             );
             let mut stmt = conn.prepare(&sql)?;
             let mut params_vec: Vec<Box<dyn duckdb::ToSql>> = vec![Box::new(tenant)];
@@ -327,16 +342,16 @@ impl DuckDbQuery {
             }
             let params_refs: Vec<&dyn duckdb::ToSql> =
                 params_vec.iter().map(|b| b.as_ref()).collect();
-            let rows = stmt.query_map(params_refs.as_slice(), row_to_memory_record)?;
-            collect_memories(rows)
+            let rows = stmt.query_map(params_refs.as_slice(), row_to_capability_capsule_record)?;
+            collect_capability_capsules(rows)
         })
         .await
     }
 
-    /// Project just `memory_id` column for `tenant`, ordered
+    /// Project just `capability_capsule_id` column for `tenant`, ordered
     /// `updated_at DESC`. Cheap admin / repair operation that doesn't
     /// need to hydrate the full row.
-    pub async fn list_memory_ids_for_tenant(
+    pub async fn list_capability_capsule_ids_for_tenant(
         &self,
         tenant: &str,
     ) -> Result<Vec<String>, StorageError> {
@@ -345,7 +360,7 @@ impl DuckDbQuery {
         spawn_blocking_storage(move || {
             let conn = conn.lock().expect("duckdb_query mutex poisoned");
             let mut stmt = conn.prepare(
-                "SELECT memory_id FROM ns.main.memories \
+                "SELECT capability_capsule_id FROM ns.main.capability_capsules \
                  WHERE tenant = ?1 ORDER BY updated_at DESC",
             )?;
             let rows = stmt.query_map(params![tenant], |row| row.get::<_, String>(0))?;
@@ -377,7 +392,7 @@ impl DuckDbQuery {
         tenant: &str,
         query: &str,
         k: usize,
-    ) -> Result<Vec<MemoryRecord>, StorageError> {
+    ) -> Result<Vec<CapabilityCapsuleRecord>, StorageError> {
         if query.trim().is_empty() || k == 0 {
             return Ok(Vec::new());
         }
@@ -386,32 +401,32 @@ impl DuckDbQuery {
         let query = query.to_string();
         let k_i = i64::try_from(k).unwrap_or(64).clamp(1, 1024);
         let oversample = k_i.saturating_mul(2);
-        let rejected = enum_to_text(&MemoryStatus::Rejected)?;
-        let archived = enum_to_text(&MemoryStatus::Archived)?;
+        let rejected = enum_to_text(&CapabilityCapsuleStatus::Rejected)?;
+        let archived = enum_to_text(&CapabilityCapsuleStatus::Archived)?;
         spawn_blocking_storage(move || {
             let conn = conn.lock().expect("duckdb_query mutex poisoned");
             let sql = format!(
-                "SELECT {MEMORY_COLS} \
-                 FROM lance_fts('ns.main.memories', 'content', ?1, k => ?2) \
+                "SELECT {CAPABILITY_CAPSULE_COLS} \
+                 FROM lance_fts('ns.main.capability_capsules', 'content', ?1, k => ?2) \
                  WHERE tenant = ?3 AND status NOT IN (?4, ?5) \
                  ORDER BY _score DESC \
                  LIMIT ?6",
-                MEMORY_COLS = MEMORY_COLS,
+                CAPABILITY_CAPSULE_COLS = CAPABILITY_CAPSULE_COLS,
             );
             let mut stmt = conn.prepare(&sql)?;
             let rows = stmt.query_map(
                 params![query, oversample, tenant, archived, rejected, k_i],
-                row_to_memory_record,
+                row_to_capability_capsule_record,
             )?;
-            collect_memories(rows)
+            collect_capability_capsules(rows)
         })
         .await
     }
 
-    /// Semantic recall via ANN over the `memory_embeddings` table's
+    /// Semantic recall via ANN over the `capability_capsule_embeddings` table's
     /// `embedding` column. Routes through the lance extension's
     /// `lance_vector_search(...)` SQL table function; joins back to
-    /// `ns.main.memories` to hydrate the full `MemoryRecord`. Returns
+    /// `ns.main.capability_capsules` to hydrate the full `CapabilityCapsuleRecord`. Returns
     /// `(record, similarity)` pairs ordered by similarity DESC.
     ///
     /// **Score**: cosine similarity ∈ `[0, 1]` for normalized
@@ -431,12 +446,12 @@ impl DuckDbQuery {
     /// safe and lossless via Rust's f32 round-trippable formatter.
     ///
     /// Empty `query_embedding` or `limit == 0` short-circuits.
-    pub async fn semantic_search_memories(
+    pub async fn semantic_search_capability_capsules(
         &self,
         tenant: &str,
         query_embedding: &[f32],
         limit: usize,
-    ) -> Result<Vec<(MemoryRecord, f32)>, StorageError> {
+    ) -> Result<Vec<(CapabilityCapsuleRecord, f32)>, StorageError> {
         if query_embedding.is_empty() || limit == 0 {
             return Ok(Vec::new());
         }
@@ -452,14 +467,14 @@ impl DuckDbQuery {
         let tenant = tenant.to_string();
         let lim = i64::try_from(limit).unwrap_or(64).clamp(1, 1024);
         let oversample = lim.saturating_mul(2);
-        let rejected = enum_to_text(&MemoryStatus::Rejected)?;
-        let archived = enum_to_text(&MemoryStatus::Archived)?;
+        let rejected = enum_to_text(&CapabilityCapsuleStatus::Rejected)?;
+        let archived = enum_to_text(&CapabilityCapsuleStatus::Archived)?;
         spawn_blocking_storage(move || {
             let conn = conn.lock().expect("duckdb_query mutex poisoned");
             // SELECT both the 27 memory cols (m.<col>) and _distance.
             // Done explicitly rather than via `m.*` so column ordering
-            // stays in lock-step with `row_to_memory_record`'s indices.
-            let m_cols = MEMORY_COLS
+            // stays in lock-step with `row_to_capability_capsule_record`'s indices.
+            let m_cols = CAPABILITY_CAPSULE_COLS
                 .split(',')
                 .map(|c| format!("m.{}", c.trim()))
                 .collect::<Vec<_>>()
@@ -490,9 +505,9 @@ impl DuckDbQuery {
             let sql = format!(
                 "SELECT {m_cols}, e._distance \
                  FROM lance_vector_search( \
-                        'ns.main.memory_embeddings', 'embedding', {vector_lit}, k => ?1 \
+                        'ns.main.capability_capsule_embeddings', 'embedding', {vector_lit}, k => ?1 \
                       ) AS e \
-                 JOIN ns.main.memories AS m ON m.memory_id = e.memory_id \
+                 JOIN ns.main.capability_capsules AS m ON m.capability_capsule_id = e.capability_capsule_id \
                  WHERE m.tenant = ?2 AND m.status NOT IN (?3, ?4) \
                  ORDER BY e._distance ASC \
                  LIMIT ?5",
@@ -501,7 +516,7 @@ impl DuckDbQuery {
             let rows = stmt.query_map(
                 params![oversample, tenant, archived, rejected, lim],
                 |row| {
-                    let mem = row_to_memory_record(row)?;
+                    let mem = row_to_capability_capsule_record(row)?;
                     let l2_squared: f32 = row.get(27)?;
                     // cos_sim = 1 - L2²/2 for normalized vectors (see
                     // SQL comment above for the derivation).
@@ -521,36 +536,36 @@ impl DuckDbQuery {
     /// link, ordered `version DESC, updated_at DESC`).
     ///
     /// **TODO:** the legacy DuckDB-as-storage signature accepts a
-    /// `memory_id` parameter but ignores it — the SQL only filters by
+    /// `capability_capsule_id` parameter but ignores it — the SQL only filters by
     /// tenant. Service-layer callers (`get_memory_detail`) expect the
     /// returned chain to be tenant-scoped *and* memory-scoped, so
     /// they're getting a too-broad answer today. Mirroring the broken
     /// behavior here for cutover parity; will fix with a proper
-    /// version-chain walk (`WHERE memory_id = ?2 OR
-    /// supersedes_memory_id = ?2`, recursive) in a follow-up.
-    pub async fn list_memory_versions_for_tenant(
+    /// version-chain walk (`WHERE capability_capsule_id = ?2 OR
+    /// supersedes_capability_capsule_id = ?2`, recursive) in a follow-up.
+    pub async fn list_capability_capsule_versions_for_tenant(
         &self,
         tenant: &str,
-        memory_id: &str,
-    ) -> Result<Vec<MemoryVersionLink>, StorageError> {
-        let _ = memory_id;
+        capability_capsule_id: &str,
+    ) -> Result<Vec<CapabilityCapsuleVersionLink>, StorageError> {
+        let _ = capability_capsule_id;
         let conn = self.conn.clone();
         let tenant = tenant.to_string();
         spawn_blocking_storage(move || {
             let conn = conn.lock().expect("duckdb_query mutex poisoned");
             let mut stmt = conn.prepare(
-                "SELECT memory_id, version, status, updated_at, supersedes_memory_id \
-                 FROM ns.main.memories \
+                "SELECT capability_capsule_id, version, status, updated_at, supersedes_capability_capsule_id \
+                 FROM ns.main.capability_capsules \
                  WHERE tenant = ?1 \
                  ORDER BY version DESC, updated_at DESC",
             )?;
             let rows = stmt.query_map(params![tenant], |row| {
-                Ok(MemoryVersionLink {
-                    memory_id: row.get(0)?,
+                Ok(CapabilityCapsuleVersionLink {
+                    capability_capsule_id: row.get(0)?,
                     version: row.get::<_, u64>(1)?,
                     status: parse_enum(&row.get::<_, String>(2)?)?,
                     updated_at: row.get(3)?,
-                    supersedes_memory_id: row.get(4)?,
+                    supersedes_capability_capsule_id: row.get(4)?,
                 })
             })?;
             let mut out = Vec::new();
@@ -566,16 +581,18 @@ impl DuckDbQuery {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::domain::memory::{MemoryStatus, MemoryType, Scope, Visibility};
+    use crate::domain::capability_capsule::{
+        CapabilityCapsuleStatus, CapabilityCapsuleType, Scope, Visibility,
+    };
     use crate::storage::lance_store::LanceStore;
     use tempfile::tempdir;
 
-    fn fixture(memory_id: &str, tenant: &str) -> MemoryRecord {
-        MemoryRecord {
-            memory_id: memory_id.into(),
+    fn fixture(capability_capsule_id: &str, tenant: &str) -> CapabilityCapsuleRecord {
+        CapabilityCapsuleRecord {
+            capability_capsule_id: capability_capsule_id.into(),
             tenant: tenant.into(),
-            memory_type: MemoryType::Implementation,
-            status: MemoryStatus::Active,
+            capability_capsule_type: CapabilityCapsuleType::Implementation,
+            status: CapabilityCapsuleStatus::Active,
             scope: Scope::Project,
             visibility: Visibility::Shared,
             version: 1,
@@ -594,7 +611,7 @@ mod tests {
             content_hash: "h".repeat(64),
             idempotency_key: Some("idemp-1".into()),
             session_id: None,
-            supersedes_memory_id: None,
+            supersedes_capability_capsule_id: None,
             source_agent: "test".into(),
             created_at: "00000001778000000000".into(),
             updated_at: "00000001778000000000".into(),
@@ -611,15 +628,15 @@ mod tests {
         // 1. Create + populate Lance dataset via the writer.
         let lance = LanceStore::open(&path).await.expect("LanceStore::open");
         lance
-            .insert_memory(fixture("m1", "tenant-a"))
+            .insert_capability_capsule(fixture("m1", "tenant-a"))
             .await
             .expect("insert m1");
         lance
-            .insert_memory(fixture("m2", "tenant-a"))
+            .insert_capability_capsule(fixture("m2", "tenant-a"))
             .await
             .expect("insert m2");
         lance
-            .insert_memory(fixture("m3", "tenant-b"))
+            .insert_capability_capsule(fixture("m3", "tenant-b"))
             .await
             .expect("insert m3");
 
@@ -628,13 +645,13 @@ mod tests {
 
         // 3. Read back through SQL. tenant-a → 2 rows; tenant-b → 1 row.
         let mut a = q
-            .list_memories_for_tenant("tenant-a")
+            .list_capability_capsules_for_tenant("tenant-a")
             .await
             .expect("list tenant-a");
-        a.sort_by(|x, y| x.memory_id.cmp(&y.memory_id));
+        a.sort_by(|x, y| x.capability_capsule_id.cmp(&y.capability_capsule_id));
         assert_eq!(a.len(), 2);
-        assert_eq!(a[0].memory_id, "m1");
-        assert_eq!(a[1].memory_id, "m2");
+        assert_eq!(a[0].capability_capsule_id, "m1");
+        assert_eq!(a[1].capability_capsule_id, "m2");
         // Spot-check rich types preserved through the SQL boundary.
         assert_eq!(a[0].evidence, vec!["src/main.rs:42", "Cargo.toml:11"]);
         assert_eq!(a[0].code_refs, vec!["foo::bar()"]);
@@ -644,29 +661,32 @@ mod tests {
         assert!((a[0].confidence - 0.7).abs() < 1e-6);
         assert_eq!(a[0].project.as_deref(), Some("mem"));
         assert!(a[0].module.is_none());
-        assert_eq!(a[0].status, MemoryStatus::Active);
-        assert_eq!(a[0].memory_type, MemoryType::Implementation);
+        assert_eq!(a[0].status, CapabilityCapsuleStatus::Active);
+        assert_eq!(
+            a[0].capability_capsule_type,
+            CapabilityCapsuleType::Implementation
+        );
 
         let b = q
-            .list_memories_for_tenant("tenant-b")
+            .list_capability_capsules_for_tenant("tenant-b")
             .await
             .expect("list tenant-b");
         assert_eq!(b.len(), 1);
-        assert_eq!(b[0].memory_id, "m3");
+        assert_eq!(b[0].capability_capsule_id, "m3");
 
         // Tenant that has no rows returns empty (not an error).
         let none = q
-            .list_memories_for_tenant("does-not-exist")
+            .list_capability_capsules_for_tenant("does-not-exist")
             .await
             .expect("list missing tenant");
         assert!(none.is_empty());
     }
 
     /// Exercises the 4 single-row / filtered-list methods that build
-    /// on the same SELECT prefix as `list_memories_for_tenant`:
-    /// `get_memory_for_tenant`, `get_pending`,
+    /// on the same SELECT prefix as `list_capability_capsules_for_tenant`:
+    /// `get_capability_capsule_for_tenant`, `get_pending`,
     /// `find_by_idempotency_or_hash`, `list_pending_review`,
-    /// `recent_active_memories`.
+    /// `recent_active_capability_capsules`.
     #[tokio::test(flavor = "multi_thread")]
     async fn duckdb_query_memory_filters() {
         let dir = tempdir().unwrap();
@@ -674,46 +694,46 @@ mod tests {
         let lance = LanceStore::open(&path).await.unwrap();
 
         // Seed: 1 active, 1 pending, 1 archived (excluded from
-        // recent_active_memories), 1 rejected (also excluded), 1 in
+        // recent_active_capability_capsules), 1 rejected (also excluded), 1 in
         // tenant-b (cross-tenant exclusion).
         let mut active = fixture("m_active", "tenant-a");
         active.idempotency_key = Some("idemp-active".into());
         active.content_hash = "hash-active".into();
         active.updated_at = "00000001778000000020".into();
         let mut pending = fixture("m_pending", "tenant-a");
-        pending.status = MemoryStatus::PendingConfirmation;
+        pending.status = CapabilityCapsuleStatus::PendingConfirmation;
         pending.idempotency_key = Some("idemp-pending".into());
         pending.content_hash = "hash-pending".into();
         pending.updated_at = "00000001778000000010".into();
         let mut archived = fixture("m_archived", "tenant-a");
-        archived.status = MemoryStatus::Archived;
+        archived.status = CapabilityCapsuleStatus::Archived;
         archived.updated_at = "00000001778000000005".into();
         let mut rejected = fixture("m_rejected", "tenant-a");
-        rejected.status = MemoryStatus::Rejected;
+        rejected.status = CapabilityCapsuleStatus::Rejected;
         rejected.updated_at = "00000001778000000006".into();
         let other_tenant = fixture("m_other", "tenant-b");
 
         for m in [&active, &pending, &archived, &rejected, &other_tenant] {
-            lance.insert_memory(m.clone()).await.unwrap();
+            lance.insert_capability_capsule(m.clone()).await.unwrap();
         }
 
         let q = DuckDbQuery::open(&path).await.unwrap();
 
-        // get_memory_for_tenant — hit + miss + cross-tenant.
+        // get_capability_capsule_for_tenant — hit + miss + cross-tenant.
         let hit = q
-            .get_memory_for_tenant("tenant-a", "m_active")
+            .get_capability_capsule_for_tenant("tenant-a", "m_active")
             .await
             .unwrap()
             .expect("active memory should exist");
-        assert_eq!(hit.memory_id, "m_active");
-        assert_eq!(hit.status, MemoryStatus::Active);
+        assert_eq!(hit.capability_capsule_id, "m_active");
+        assert_eq!(hit.status, CapabilityCapsuleStatus::Active);
         let miss = q
-            .get_memory_for_tenant("tenant-a", "does-not-exist")
+            .get_capability_capsule_for_tenant("tenant-a", "does-not-exist")
             .await
             .unwrap();
         assert!(miss.is_none());
         let cross = q
-            .get_memory_for_tenant("tenant-b", "m_active")
+            .get_capability_capsule_for_tenant("tenant-b", "m_active")
             .await
             .unwrap();
         assert!(cross.is_none(), "tenant filter must scope cross-tenant");
@@ -724,7 +744,7 @@ mod tests {
             .await
             .unwrap()
             .expect("pending row");
-        assert_eq!(pend.memory_id, "m_pending");
+        assert_eq!(pend.capability_capsule_id, "m_pending");
         let pend_active = q.get_pending("tenant-a", "m_active").await.unwrap();
         assert!(
             pend_active.is_none(),
@@ -744,13 +764,13 @@ mod tests {
             .await
             .unwrap()
             .expect("idempotency-key match should win");
-        assert_eq!(by_idemp.memory_id, "m_active");
+        assert_eq!(by_idemp.capability_capsule_id, "m_active");
         let by_hash_only = q
             .find_by_idempotency_or_hash("tenant-a", &None, "hash-pending")
             .await
             .unwrap()
             .expect("hash match");
-        assert_eq!(by_hash_only.memory_id, "m_pending");
+        assert_eq!(by_hash_only.capability_capsule_id, "m_pending");
         let by_miss = q
             .find_by_idempotency_or_hash("tenant-a", &None, "no-such-hash")
             .await
@@ -760,32 +780,44 @@ mod tests {
         // list_pending_review — only pending_confirmation.
         let pending_list = q.list_pending_review("tenant-a").await.unwrap();
         assert_eq!(pending_list.len(), 1);
-        assert_eq!(pending_list[0].memory_id, "m_pending");
+        assert_eq!(pending_list[0].capability_capsule_id, "m_pending");
         let other = q.list_pending_review("tenant-b").await.unwrap();
         assert!(other.is_empty(), "no pending in tenant-b");
 
-        // recent_active_memories — pending + active stay; archived +
+        // recent_active_capability_capsules — pending + active stay; archived +
         // rejected drop. Cross-tenant excluded.
-        let recent = q.recent_active_memories("tenant-a", 50).await.unwrap();
-        let recent_ids: Vec<&str> = recent.iter().map(|m| m.memory_id.as_str()).collect();
+        let recent = q
+            .recent_active_capability_capsules("tenant-a", 50)
+            .await
+            .unwrap();
+        let recent_ids: Vec<&str> = recent
+            .iter()
+            .map(|m| m.capability_capsule_id.as_str())
+            .collect();
         assert_eq!(
             recent_ids,
             vec!["m_active", "m_pending"],
             "ordered by updated_at DESC; archived/rejected excluded"
         );
-        let recent_b = q.recent_active_memories("tenant-b", 50).await.unwrap();
+        let recent_b = q
+            .recent_active_capability_capsules("tenant-b", 50)
+            .await
+            .unwrap();
         assert_eq!(recent_b.len(), 1);
-        assert_eq!(recent_b[0].memory_id, "m_other");
+        assert_eq!(recent_b[0].capability_capsule_id, "m_other");
 
         // limit clamps to >=1 even when caller passes 0 (mirrors the
         // legacy DuckDB-as-storage clamp).
-        let recent_clamped = q.recent_active_memories("tenant-a", 0).await.unwrap();
+        let recent_clamped = q
+            .recent_active_capability_capsules("tenant-a", 0)
+            .await
+            .unwrap();
         assert_eq!(recent_clamped.len(), 1);
     }
 
     /// Cluster A round-trip: `search_candidates`,
-    /// `fetch_memories_by_ids`, `list_memory_ids_for_tenant`,
-    /// `list_memory_versions_for_tenant`. All four operate on the
+    /// `fetch_capability_capsules_by_ids`, `list_capability_capsule_ids_for_tenant`,
+    /// `list_capability_capsule_versions_for_tenant`. All four operate on the
     /// memories table only; share the same fixture seeding.
     #[tokio::test(flavor = "multi_thread")]
     async fn duckdb_query_memory_collections() {
@@ -803,24 +835,27 @@ mod tests {
         b.updated_at = "00000001778000000040".into();
         b.version = 1;
         let mut arc = fixture("m_arc", "tenant-a");
-        arc.status = MemoryStatus::Archived;
+        arc.status = CapabilityCapsuleStatus::Archived;
         arc.updated_at = "00000001778000000030".into();
         let mut bv2 = fixture("m_b_v2", "tenant-a");
-        bv2.supersedes_memory_id = Some("m_b".into());
+        bv2.supersedes_capability_capsule_id = Some("m_b".into());
         bv2.version = 2;
         bv2.updated_at = "00000001778000000060".into();
         let mut other = fixture("m_other", "tenant-b");
         other.updated_at = "00000001778000000020".into();
         for m in [&a, &b, &arc, &bv2, &other] {
-            lance.insert_memory(m.clone()).await.unwrap();
+            lance.insert_capability_capsule(m.clone()).await.unwrap();
         }
 
         let q = DuckDbQuery::open(&path).await.unwrap();
 
         // search_candidates: archived/rejected excluded; tenant-scoped;
-        // ordered (updated_at DESC, version DESC, memory_id ASC).
+        // ordered (updated_at DESC, version DESC, capability_capsule_id ASC).
         let cands = q.search_candidates("tenant-a").await.unwrap();
-        let cand_ids: Vec<&str> = cands.iter().map(|m| m.memory_id.as_str()).collect();
+        let cand_ids: Vec<&str> = cands
+            .iter()
+            .map(|m| m.capability_capsule_id.as_str())
+            .collect();
         assert_eq!(
             cand_ids,
             vec!["m_b_v2", "m_a", "m_b"],
@@ -829,48 +864,59 @@ mod tests {
         let cands_b = q.search_candidates("tenant-b").await.unwrap();
         assert_eq!(cands_b.len(), 1);
 
-        // fetch_memories_by_ids: in-clause batch lookup. Empty → empty.
-        let empty = q.fetch_memories_by_ids("tenant-a", &[]).await.unwrap();
+        // fetch_capability_capsules_by_ids: in-clause batch lookup. Empty → empty.
+        let empty = q
+            .fetch_capability_capsules_by_ids("tenant-a", &[])
+            .await
+            .unwrap();
         assert!(empty.is_empty());
 
         let some = q
-            .fetch_memories_by_ids("tenant-a", &["m_a", "m_b", "does-not-exist"])
+            .fetch_capability_capsules_by_ids("tenant-a", &["m_a", "m_b", "does-not-exist"])
             .await
             .unwrap();
-        let some_ids: std::collections::HashSet<&str> =
-            some.iter().map(|m| m.memory_id.as_str()).collect();
+        let some_ids: std::collections::HashSet<&str> = some
+            .iter()
+            .map(|m| m.capability_capsule_id.as_str())
+            .collect();
         assert_eq!(some.len(), 2);
         assert!(some_ids.contains("m_a"));
         assert!(some_ids.contains("m_b"));
 
         // tenant filter scopes the IN-clause: same id under different
         // tenant returns nothing.
-        let cross = q.fetch_memories_by_ids("tenant-b", &["m_a"]).await.unwrap();
+        let cross = q
+            .fetch_capability_capsules_by_ids("tenant-b", &["m_a"])
+            .await
+            .unwrap();
         assert!(
             cross.is_empty(),
             "tenant-a id must not appear in tenant-b lookup"
         );
 
-        // list_memory_ids_for_tenant: just IDs, ordered updated_at DESC.
-        let ids_a = q.list_memory_ids_for_tenant("tenant-a").await.unwrap();
+        // list_capability_capsule_ids_for_tenant: just IDs, ordered updated_at DESC.
+        let ids_a = q
+            .list_capability_capsule_ids_for_tenant("tenant-a")
+            .await
+            .unwrap();
         assert_eq!(
             ids_a,
             vec!["m_b_v2", "m_a", "m_b", "m_arc"],
             "all 4 tenant-a rows incl. archived; updated_at DESC"
         );
         let ids_empty = q
-            .list_memory_ids_for_tenant("does-not-exist")
+            .list_capability_capsule_ids_for_tenant("does-not-exist")
             .await
             .unwrap();
         assert!(ids_empty.is_empty());
 
-        // list_memory_versions_for_tenant: ordered (version DESC,
-        // updated_at DESC). NOTE: passes memory_id but the legacy
+        // list_capability_capsule_versions_for_tenant: ordered (version DESC,
+        // updated_at DESC). NOTE: passes capability_capsule_id but the legacy
         // implementation ignores it; we mirror that here so behavior
         // stays parity until a follow-up fixes the version-chain
         // walk.
         let chain = q
-            .list_memory_versions_for_tenant("tenant-a", "m_b")
+            .list_capability_capsule_versions_for_tenant("tenant-a", "m_b")
             .await
             .unwrap();
         // Returns ALL tenant-a rows' version links — m_b_v2 (v=2) +
@@ -879,14 +925,17 @@ mod tests {
         // The supersedes link is preserved.
         let bv2_link = chain
             .iter()
-            .find(|l| l.memory_id == "m_b_v2")
+            .find(|l| l.capability_capsule_id == "m_b_v2")
             .expect("m_b_v2 in chain");
-        assert_eq!(bv2_link.supersedes_memory_id.as_deref(), Some("m_b"));
+        assert_eq!(
+            bv2_link.supersedes_capability_capsule_id.as_deref(),
+            Some("m_b")
+        );
         let b_link = chain
             .iter()
-            .find(|l| l.memory_id == "m_b")
+            .find(|l| l.capability_capsule_id == "m_b")
             .expect("m_b in chain");
-        assert!(b_link.supersedes_memory_id.is_none());
+        assert!(b_link.supersedes_capability_capsule_id.is_none());
     }
 
     /// `bm25_candidates` over the lance extension's `lance_fts(...)`
@@ -909,12 +958,12 @@ mod tests {
         let mut b = fixture("m_lance", "tenant-a");
         b.content = "LanceDB native vector search uses ANN".into();
         let mut c = fixture("m_arc", "tenant-a");
-        c.status = MemoryStatus::Archived;
+        c.status = CapabilityCapsuleStatus::Archived;
         c.content = "Tantivy provides BM25 in DuckDB build".into();
         let mut d = fixture("m_other", "tenant-b");
         d.content = "DuckDB connection pool tenant-b".into();
         for m in [&a, &b, &c, &d] {
-            lance.insert_memory(m.clone()).await.unwrap();
+            lance.insert_capability_capsule(m.clone()).await.unwrap();
         }
 
         let q = DuckDbQuery::open(&path).await.unwrap();
@@ -928,7 +977,10 @@ mod tests {
         // 'DuckDB' matches m_duck (tenant-a, active) and m_arc
         // (tenant-a, archived). Archived must be filtered out.
         let hits = q.bm25_candidates("tenant-a", "DuckDB", 10).await.unwrap();
-        let ids: Vec<&str> = hits.iter().map(|m| m.memory_id.as_str()).collect();
+        let ids: Vec<&str> = hits
+            .iter()
+            .map(|m| m.capability_capsule_id.as_str())
+            .collect();
         assert!(ids.contains(&"m_duck"), "got {ids:?}");
         assert!(
             !ids.contains(&"m_arc"),
@@ -941,18 +993,24 @@ mod tests {
 
         // tenant-b sees its own row.
         let b_hits = q.bm25_candidates("tenant-b", "DuckDB", 10).await.unwrap();
-        let b_ids: Vec<&str> = b_hits.iter().map(|m| m.memory_id.as_str()).collect();
+        let b_ids: Vec<&str> = b_hits
+            .iter()
+            .map(|m| m.capability_capsule_id.as_str())
+            .collect();
         assert!(b_ids.contains(&"m_other"));
 
         // Different query word.
         let lance_hits = q.bm25_candidates("tenant-a", "LanceDB", 10).await.unwrap();
-        let lance_ids: Vec<&str> = lance_hits.iter().map(|m| m.memory_id.as_str()).collect();
+        let lance_ids: Vec<&str> = lance_hits
+            .iter()
+            .map(|m| m.capability_capsule_id.as_str())
+            .collect();
         assert!(lance_ids.contains(&"m_lance"), "got {lance_ids:?}");
     }
 
-    /// `semantic_search_memories` over `lance_vector_search(...)` with
+    /// `semantic_search_capability_capsules` over `lance_vector_search(...)` with
     /// JOIN to memories. Inserts 3 memories with hand-rolled 4-d unit
-    /// vectors via `upsert_memory_embedding`, then queries with a
+    /// vectors via `upsert_capability_capsule_embedding`, then queries with a
     /// vector close to one of them and asserts ordering / score
     /// shape / tenant scope / archived exclusion.
     #[tokio::test(flavor = "multi_thread")]
@@ -964,10 +1022,10 @@ mod tests {
         let m1 = fixture("m_v1", "tenant-a");
         let m2 = fixture("m_v2", "tenant-a");
         let mut m3 = fixture("m_v3", "tenant-a");
-        m3.status = MemoryStatus::Archived;
+        m3.status = CapabilityCapsuleStatus::Archived;
         let m4 = fixture("m_v4", "tenant-b");
         for m in [&m1, &m2, &m3, &m4] {
-            lance.insert_memory(m.clone()).await.unwrap();
+            lance.insert_capability_capsule(m.clone()).await.unwrap();
         }
 
         // 4-d unit vectors. v1 ≈ [1,0,0,0]; v2 distant; v3 in tenant-a
@@ -991,7 +1049,16 @@ mod tests {
             ("m_v4", "tenant-b", &v4, "h4"),
         ] {
             lance
-                .upsert_memory_embedding(id, tenant, "fake-test", 4, &to_blob(vec), hash, now, now)
+                .upsert_capability_capsule_embedding(
+                    id,
+                    tenant,
+                    "fake-test",
+                    4,
+                    &to_blob(vec),
+                    hash,
+                    now,
+                    now,
+                )
                 .await
                 .unwrap();
         }
@@ -1002,7 +1069,7 @@ mod tests {
         // m_v3 archived → excluded; m_v4 cross-tenant → excluded.
         let query = vec![0.99_f32, 0.14, 0.0, 0.0];
         let hits = q
-            .semantic_search_memories("tenant-a", &query, 10)
+            .semantic_search_capability_capsules("tenant-a", &query, 10)
             .await
             .unwrap();
         assert_eq!(
@@ -1010,8 +1077,11 @@ mod tests {
             2,
             "tenant-a active memories with embeddings → 2 (m_v1, m_v2); got {hits:?}"
         );
-        assert_eq!(hits[0].0.memory_id, "m_v1", "v1 ranks first (closest)");
-        assert_eq!(hits[1].0.memory_id, "m_v2");
+        assert_eq!(
+            hits[0].0.capability_capsule_id, "m_v1",
+            "v1 ranks first (closest)"
+        );
+        assert_eq!(hits[1].0.capability_capsule_id, "m_v2");
         assert!(
             hits[0].1 > hits[1].1,
             "similarity is descending: {} > {}",
@@ -1024,22 +1094,22 @@ mod tests {
 
         // Empty / 0-limit short-circuits.
         let empty1 = q
-            .semantic_search_memories("tenant-a", &[], 10)
+            .semantic_search_capability_capsules("tenant-a", &[], 10)
             .await
             .unwrap();
         assert!(empty1.is_empty());
         let empty2 = q
-            .semantic_search_memories("tenant-a", &query, 0)
+            .semantic_search_capability_capsules("tenant-a", &query, 0)
             .await
             .unwrap();
         assert!(empty2.is_empty());
 
         // tenant-b sees its own row.
         let b_hits = q
-            .semantic_search_memories("tenant-b", &query, 10)
+            .semantic_search_capability_capsules("tenant-b", &query, 10)
             .await
             .unwrap();
         assert_eq!(b_hits.len(), 1);
-        assert_eq!(b_hits[0].0.memory_id, "m_v4");
+        assert_eq!(b_hits[0].0.capability_capsule_id, "m_v4");
     }
 }

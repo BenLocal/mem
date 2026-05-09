@@ -6,8 +6,9 @@ use axum::{
 };
 use mem::{
     app,
-    domain::memory::{
-        IngestMemoryRequest, MemoryRecord, MemoryStatus, MemoryType, Scope, Visibility, WriteMode,
+    domain::capability_capsule::{
+        CapabilityCapsuleRecord, CapabilityCapsuleStatus, CapabilityCapsuleType,
+        IngestCapabilityCapsuleRequest, Scope, Visibility, WriteMode,
     },
     http,
     pipeline::ingest::{compute_content_hash, initial_status},
@@ -100,35 +101,35 @@ async fn test_app() -> TestApp {
 }
 
 fn sample_memory(
-    memory_id: &str,
+    capability_capsule_id: &str,
     tenant: &str,
     version: u64,
-    supersedes_memory_id: Option<&str>,
-) -> MemoryRecord {
-    MemoryRecord {
-        memory_id: memory_id.into(),
+    supersedes_capability_capsule_id: Option<&str>,
+) -> CapabilityCapsuleRecord {
+    CapabilityCapsuleRecord {
+        capability_capsule_id: capability_capsule_id.into(),
         tenant: tenant.into(),
-        memory_type: MemoryType::Implementation,
-        status: MemoryStatus::Active,
+        capability_capsule_type: CapabilityCapsuleType::Implementation,
+        status: CapabilityCapsuleStatus::Active,
         scope: Scope::Repo,
         visibility: Visibility::Shared,
         version,
-        summary: format!("summary-{memory_id}"),
-        content: format!("content-{memory_id}"),
-        evidence: vec![format!("evidence-{memory_id}")],
-        code_refs: vec![format!("src/{memory_id}.rs")],
+        summary: format!("summary-{capability_capsule_id}"),
+        content: format!("content-{capability_capsule_id}"),
+        evidence: vec![format!("evidence-{capability_capsule_id}")],
+        code_refs: vec![format!("src/{capability_capsule_id}.rs")],
         project: Some("memory-service".into()),
         repo: Some("mem".into()),
         module: Some("memory".into()),
         task_type: Some("implementation".into()),
-        tags: vec![format!("tag-{memory_id}")],
+        tags: vec![format!("tag-{capability_capsule_id}")],
         topics: vec![],
         confidence: 0.9,
         decay_score: 0.0,
-        content_hash: format!("hash-{memory_id}"),
+        content_hash: format!("hash-{capability_capsule_id}"),
         idempotency_key: None,
         session_id: None,
-        supersedes_memory_id: supersedes_memory_id.map(str::to_string),
+        supersedes_capability_capsule_id: supersedes_capability_capsule_id.map(str::to_string),
         source_agent: "api".into(),
         created_at: format!("2026-03-21T00:00:0{version}Z"),
         updated_at: format!("2026-03-21T00:05:0{version}Z"),
@@ -136,15 +137,18 @@ fn sample_memory(
     }
 }
 
-async fn seeded_app(memories: Vec<MemoryRecord>) -> TestApp {
+async fn seeded_app(memories: Vec<CapabilityCapsuleRecord>) -> TestApp {
     let temp_dir = tempdir().unwrap();
     let db_path = temp_dir.path().join("ingest-api.duckdb");
     let repo = Arc::new(Store::open(&db_path).await.unwrap());
     for memory in memories {
-        repo.insert_memory(memory).await.unwrap();
+        repo.insert_capability_capsule(memory).await.unwrap();
     }
 
-    let state = common::test_app_state(repo.clone(), mem::service::MemoryService::new(repo));
+    let state = common::test_app_state(
+        repo.clone(),
+        mem::service::CapabilityCapsuleService::new(repo),
+    );
 
     TestApp {
         _temp_dir: Some(temp_dir),
@@ -155,24 +159,24 @@ async fn seeded_app(memories: Vec<MemoryRecord>) -> TestApp {
 #[test]
 fn initial_status_routes_memory_types_as_expected() {
     assert_eq!(
-        initial_status(&MemoryType::Preference, &WriteMode::Propose),
-        MemoryStatus::PendingConfirmation
+        initial_status(&CapabilityCapsuleType::Preference, &WriteMode::Propose),
+        CapabilityCapsuleStatus::PendingConfirmation
     );
     assert_eq!(
-        initial_status(&MemoryType::Workflow, &WriteMode::Auto),
-        MemoryStatus::PendingConfirmation
+        initial_status(&CapabilityCapsuleType::Workflow, &WriteMode::Auto),
+        CapabilityCapsuleStatus::PendingConfirmation
     );
     assert_eq!(
-        initial_status(&MemoryType::Implementation, &WriteMode::Auto),
-        MemoryStatus::Active
+        initial_status(&CapabilityCapsuleType::Implementation, &WriteMode::Auto),
+        CapabilityCapsuleStatus::Active
     );
 }
 
 #[test]
 fn content_hash_is_deterministic_for_same_request() {
-    let request = IngestMemoryRequest {
+    let request = IngestCapabilityCapsuleRequest {
         tenant: "tenant-a".into(),
-        memory_type: MemoryType::Implementation,
+        capability_capsule_type: CapabilityCapsuleType::Implementation,
         content: "invalidate cache when schema changes".into(),
         summary: None,
         evidence: vec!["notes".into()],
@@ -209,40 +213,42 @@ async fn repository_dedupe_lookup_prefers_same_tenant_memory() {
     let db_path = temp_dir.path().join("ingest-dedupe.duckdb");
     let repo = Arc::new(Store::open(&db_path).await.unwrap());
 
-    let make_memory = |tenant: &str, memory_id: &str| mem::domain::memory::MemoryRecord {
-        memory_id: memory_id.into(),
-        tenant: tenant.into(),
-        memory_type: MemoryType::Implementation,
-        status: MemoryStatus::Active,
-        scope: Scope::Repo,
-        visibility: Visibility::Shared,
-        version: 1,
-        summary: "same content".into(),
-        content: "same content".into(),
-        evidence: vec![],
-        code_refs: vec![],
-        project: None,
-        repo: None,
-        module: None,
-        task_type: None,
-        tags: vec![],
-        topics: vec![],
-        confidence: 0.9,
-        decay_score: 0.0,
-        content_hash: "hash-123".into(),
-        idempotency_key: Some("idem-123".into()),
-        session_id: None,
-        supersedes_memory_id: None,
-        source_agent: "api".into(),
-        created_at: "1".into(),
-        updated_at: "1".into(),
-        last_validated_at: None,
+    let make_memory = |tenant: &str, capability_capsule_id: &str| {
+        mem::domain::capability_capsule::CapabilityCapsuleRecord {
+            capability_capsule_id: capability_capsule_id.into(),
+            tenant: tenant.into(),
+            capability_capsule_type: CapabilityCapsuleType::Implementation,
+            status: CapabilityCapsuleStatus::Active,
+            scope: Scope::Repo,
+            visibility: Visibility::Shared,
+            version: 1,
+            summary: "same content".into(),
+            content: "same content".into(),
+            evidence: vec![],
+            code_refs: vec![],
+            project: None,
+            repo: None,
+            module: None,
+            task_type: None,
+            tags: vec![],
+            topics: vec![],
+            confidence: 0.9,
+            decay_score: 0.0,
+            content_hash: "hash-123".into(),
+            idempotency_key: Some("idem-123".into()),
+            session_id: None,
+            supersedes_capability_capsule_id: None,
+            source_agent: "api".into(),
+            created_at: "1".into(),
+            updated_at: "1".into(),
+            last_validated_at: None,
+        }
     };
 
-    repo.insert_memory(make_memory("tenant-a", "mem-a"))
+    repo.insert_capability_capsule(make_memory("tenant-a", "mem-a"))
         .await
         .unwrap();
-    repo.insert_memory(make_memory("tenant-b", "mem-b"))
+    repo.insert_capability_capsule(make_memory("tenant-b", "mem-b"))
         .await
         .unwrap();
 
@@ -252,7 +258,7 @@ async fn repository_dedupe_lookup_prefers_same_tenant_memory() {
         .unwrap()
         .unwrap();
 
-    assert_eq!(found.memory_id, "mem-b");
+    assert_eq!(found.capability_capsule_id, "mem-b");
 }
 
 #[tokio::test]
@@ -260,9 +266,9 @@ async fn preference_memory_stays_pending_confirmation() {
     let app = test_app().await;
     let response = app
         .post_json(
-            "/memories",
+            "/capability_capsules",
             json!({
-                "memory_type": "preference",
+                "capability_capsule_type": "preference",
                 "content": "prefer concise answers",
                 "scope": "global",
                 "write_mode": "propose"
@@ -279,9 +285,9 @@ async fn implementation_memory_auto_activates() {
     let app = test_app().await;
     let response = app
         .post_json(
-            "/memories",
+            "/capability_capsules",
             json!({
-                "memory_type": "implementation",
+                "capability_capsule_type": "implementation",
                 "content": "invalidate cache when schema changes",
                 "scope": "repo",
                 "write_mode": "auto"
@@ -297,19 +303,22 @@ async fn implementation_memory_auto_activates() {
 async fn repeated_ingest_with_same_idempotency_key_returns_existing_memory() {
     let app = test_app().await;
     let request = json!({
-        "memory_type": "implementation",
+        "capability_capsule_type": "implementation",
         "content": "invalidate cache when schema changes",
         "scope": "repo",
         "write_mode": "auto",
         "idempotency_key": "idem-123"
     });
 
-    let first = app.post_json("/memories", request.clone()).await;
-    let second = app.post_json("/memories", request).await;
+    let first = app.post_json("/capability_capsules", request.clone()).await;
+    let second = app.post_json("/capability_capsules", request).await;
 
     assert_eq!(first.status(), 201);
     assert_eq!(second.status(), 201);
-    assert_eq!(first.json()["memory_id"], second.json()["memory_id"]);
+    assert_eq!(
+        first.json()["capability_capsule_id"],
+        second.json()["capability_capsule_id"]
+    );
     assert_eq!(second.json()["status"], "active");
 }
 
@@ -319,10 +328,10 @@ async fn same_idempotency_key_in_different_tenants_creates_distinct_memories() {
 
     let first = app
         .post_json(
-            "/memories",
+            "/capability_capsules",
             json!({
                 "tenant": "tenant-a",
-                "memory_type": "implementation",
+                "capability_capsule_type": "implementation",
                 "content": "invalidate cache when schema changes",
                 "scope": "repo",
                 "write_mode": "auto",
@@ -333,10 +342,10 @@ async fn same_idempotency_key_in_different_tenants_creates_distinct_memories() {
 
     let second = app
         .post_json(
-            "/memories",
+            "/capability_capsules",
             json!({
                 "tenant": "tenant-b",
-                "memory_type": "implementation",
+                "capability_capsule_type": "implementation",
                 "content": "invalidate cache when schema changes",
                 "scope": "repo",
                 "write_mode": "auto",
@@ -347,7 +356,10 @@ async fn same_idempotency_key_in_different_tenants_creates_distinct_memories() {
 
     assert_eq!(first.status(), 201);
     assert_eq!(second.status(), 201);
-    assert_ne!(first.json()["memory_id"], second.json()["memory_id"]);
+    assert_ne!(
+        first.json()["capability_capsule_id"],
+        second.json()["capability_capsule_id"]
+    );
 }
 
 #[tokio::test]
@@ -355,9 +367,9 @@ async fn get_memory_returns_full_record() {
     let app = test_app().await;
     let created = app
         .post_json(
-            "/memories",
+            "/capability_capsules",
             json!({
-                "memory_type": "implementation",
+                "capability_capsule_type": "implementation",
                 "content": "invalidate cache when schema changes",
                 "scope": "repo",
                 "write_mode": "auto",
@@ -367,15 +379,20 @@ async fn get_memory_returns_full_record() {
         .await;
 
     assert_eq!(created.status(), 201);
-    let memory_id = created.json()["memory_id"]
+    let capability_capsule_id = created.json()["capability_capsule_id"]
         .as_str()
         .expect("memory id should be present")
         .to_string();
 
-    let response = app.get(&format!("/memories/{memory_id}")).await;
+    let response = app
+        .get(&format!("/capability_capsules/{capability_capsule_id}"))
+        .await;
 
     assert_eq!(response.status(), 200);
-    assert_eq!(response.json()["memory"]["memory_id"], memory_id);
+    assert_eq!(
+        response.json()["memory"]["capability_capsule_id"],
+        capability_capsule_id
+    );
     assert_eq!(
         response.json()["memory"]["content"],
         "invalidate cache when schema changes"
@@ -390,7 +407,7 @@ async fn get_memory_returns_full_record() {
 async fn get_memory_returns_not_found_for_missing_memory() {
     let app = test_app().await;
 
-    let response = app.get("/memories/missing").await;
+    let response = app.get("/capability_capsules/missing").await;
 
     assert_eq!(response.status(), 404);
     assert_eq!(response.json()["error"], "memory not found");
@@ -400,7 +417,9 @@ async fn get_memory_returns_not_found_for_missing_memory() {
 async fn get_memory_returns_not_found_for_wrong_tenant() {
     let app = seeded_app(vec![sample_memory("mem_123", "tenant-a", 1, None)]).await;
 
-    let response = app.get("/memories/mem_123?tenant=tenant-b").await;
+    let response = app
+        .get("/capability_capsules/mem_123?tenant=tenant-b")
+        .await;
 
     assert_eq!(response.status(), 404);
     assert_eq!(response.json()["error"], "memory not found");
@@ -410,10 +429,13 @@ async fn get_memory_returns_not_found_for_wrong_tenant() {
 async fn get_memory_defaults_tenant_to_local() {
     let app = seeded_app(vec![sample_memory("mem_123", "tenant-a", 1, None)]).await;
 
-    let response = app.get("/memories/mem_123").await;
+    let response = app.get("/capability_capsules/mem_123").await;
 
     assert_eq!(response.status(), 200);
-    assert_eq!(response.json()["memory"]["memory_id"], "mem_123");
+    assert_eq!(
+        response.json()["memory"]["capability_capsule_id"],
+        "mem_123"
+    );
     assert_eq!(response.json()["memory"]["tenant"], "tenant-a");
 }
 
@@ -426,29 +448,29 @@ async fn get_memory_returns_full_version_chain_for_successor_ids() {
     ])
     .await;
 
-    let response = app.get("/memories/mem_v2?tenant=local").await;
+    let response = app.get("/capability_capsules/mem_v2?tenant=local").await;
 
     assert_eq!(response.status(), 200);
-    assert_eq!(response.json()["memory"]["memory_id"], "mem_v2");
+    assert_eq!(response.json()["memory"]["capability_capsule_id"], "mem_v2");
     assert_eq!(
         response.json()["version_chain"],
         json!([
             {
-                "memory_id": "mem_v3",
+                "capability_capsule_id": "mem_v3",
                 "version": 3,
                 "status": "active",
                 "updated_at": "2026-03-21T00:05:03Z",
-                "supersedes_memory_id": "mem_v2"
+                "supersedes_capability_capsule_id": "mem_v2"
             },
             {
-                "memory_id": "mem_v2",
+                "capability_capsule_id": "mem_v2",
                 "version": 2,
                 "status": "active",
                 "updated_at": "2026-03-21T00:05:02Z",
-                "supersedes_memory_id": "mem_v1"
+                "supersedes_capability_capsule_id": "mem_v1"
             },
             {
-                "memory_id": "mem_v1",
+                "capability_capsule_id": "mem_v1",
                 "version": 1,
                 "status": "active",
                 "updated_at": "2026-03-21T00:05:01Z"
@@ -464,9 +486,9 @@ async fn ingest_rejects_summary_equals_content() {
         "verbatim guard: content and summary are identical, which violates the rule";
     let response = app
         .post_json(
-            "/memories",
+            "/capability_capsules",
             json!({
-                "memory_type": "implementation",
+                "capability_capsule_type": "implementation",
                 "content": verbatim_text,
                 "summary": verbatim_text,
                 "scope": "repo",
@@ -494,9 +516,9 @@ async fn ingest_accepts_caller_summary_and_stores_it() {
 
     let created = app
         .post_json(
-            "/memories",
+            "/capability_capsules",
             json!({
-                "memory_type": "implementation",
+                "capability_capsule_type": "implementation",
                 "content": content,
                 "summary": caller_summary,
                 "scope": "repo",
@@ -506,12 +528,14 @@ async fn ingest_accepts_caller_summary_and_stores_it() {
         .await;
 
     assert_eq!(created.status(), 201);
-    let memory_id = created.json()["memory_id"]
+    let capability_capsule_id = created.json()["capability_capsule_id"]
         .as_str()
-        .expect("memory_id should be present")
+        .expect("capability_capsule_id should be present")
         .to_string();
 
-    let detail = app.get(&format!("/memories/{memory_id}")).await;
+    let detail = app
+        .get(&format!("/capability_capsules/{capability_capsule_id}"))
+        .await;
     assert_eq!(detail.status(), 200);
     assert_eq!(
         detail.json()["memory"]["summary"],

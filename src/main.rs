@@ -26,7 +26,7 @@ enum Command {
     /// Scan a transcript and POST `applies_here` feedback for memories
     /// whose retrieved text was referenced in subsequent assistant
     /// blocks. Wired into the Stop / PreCompact hooks so the lifecycle
-    /// signals close even when the agent forgets to call `memory_feedback`.
+    /// signals close even when the agent forgets to call `capability_capsule_feedback`.
     FeedbackFromTranscript(mem::cli::feedback::FeedbackFromTranscriptArgs),
 }
 

@@ -12,8 +12,8 @@ use futures::TryStreamExt;
 use lancedb::query::{ExecutableQuery, QueryBase};
 
 use super::{enum_from_str, enum_to_str, episodes_schema, lancedb_err, sql_quote, LanceStore};
+use crate::domain::capability_capsule::{Scope, Visibility};
 use crate::domain::episode::EpisodeRecord;
-use crate::domain::memory::{Scope, Visibility};
 use crate::domain::workflow::WorkflowCandidate;
 use crate::storage::types::StorageError;
 

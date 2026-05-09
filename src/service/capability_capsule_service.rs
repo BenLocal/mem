@@ -5,19 +5,19 @@ use std::sync::Arc;
 use thiserror::Error;
 
 use crate::domain::{
-    embeddings::{EmbeddingJobInfo, EmbeddingsRebuildResponse, MemoryEmbeddingMeta},
+    capability_capsule::CapabilityCapsuleDetailResponse,
+    embeddings::{CapabilityCapsuleEmbeddingMeta, EmbeddingJobInfo, EmbeddingsRebuildResponse},
     episode::EpisodeResponse,
-    memory::MemoryDetailResponse,
 };
 use crate::embedding::EmbeddingProvider;
 use crate::{
     domain::{
-        episode::{EpisodeRecord, IngestEpisodeRequest},
-        memory::{
-            EditPendingRequest, EditPendingResponse, FeedbackKind, GraphEdge, IngestMemoryRequest,
-            MemoryRecord, MemoryStatus,
+        capability_capsule::{
+            CapabilityCapsuleRecord, CapabilityCapsuleStatus, EditPendingRequest,
+            EditPendingResponse, FeedbackKind, GraphEdge, IngestCapabilityCapsuleRequest,
         },
-        query::{SearchMemoryRequest, SearchMemoryResponse},
+        episode::{EpisodeRecord, IngestEpisodeRequest},
+        query::{SearchCapabilityCapsuleRequest, SearchCapabilityCapsuleResponse},
     },
     pipeline::ingest::{
         compute_content_hash, initial_status, memory_node_id, GraphEdgeDraft, ToNodeKind,
@@ -29,9 +29,9 @@ use crate::{
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
-pub struct IngestMemoryResponse {
-    pub memory_id: String,
-    pub status: MemoryStatus,
+pub struct IngestCapabilityCapsuleResponse {
+    pub capability_capsule_id: String,
+    pub status: CapabilityCapsuleStatus,
 }
 
 #[derive(Debug, Error)]
@@ -44,17 +44,17 @@ pub enum ServiceError {
     Graph(#[from] GraphError),
 }
 
-impl From<MemoryRecord> for IngestMemoryResponse {
-    fn from(memory: MemoryRecord) -> Self {
+impl From<CapabilityCapsuleRecord> for IngestCapabilityCapsuleResponse {
+    fn from(memory: CapabilityCapsuleRecord) -> Self {
         Self {
-            memory_id: memory.memory_id,
+            capability_capsule_id: memory.capability_capsule_id,
             status: memory.status,
         }
     }
 }
 
 #[derive(Clone)]
-pub struct MemoryService {
+pub struct CapabilityCapsuleService {
     /// Shared storage handle. Writes flow to LanceStore; reads
     /// (incl. graph reads via `pipeline::retrieve::rank_with_graph_*`)
     /// flow to DuckDbQuery. The graph surface lives on `Store`'s
@@ -67,7 +67,7 @@ pub struct MemoryService {
     embedding_search_provider: Option<Arc<dyn EmbeddingProvider>>,
 }
 
-impl MemoryService {
+impl CapabilityCapsuleService {
     /// Primary constructor. `embedding_job_provider` defaults to
     /// `"fake"` (legacy compat); search provider is `None` (BM25-only
     /// recall). Use [`Self::with_providers`] to override.
@@ -111,8 +111,8 @@ impl MemoryService {
 
     pub async fn ingest(
         &self,
-        request: IngestMemoryRequest,
-    ) -> Result<IngestMemoryResponse, ServiceError> {
+        request: IngestCapabilityCapsuleRequest,
+    ) -> Result<IngestCapabilityCapsuleResponse, ServiceError> {
         let content_hash = compute_content_hash(&request);
 
         if let Some(existing) = self
@@ -123,7 +123,7 @@ impl MemoryService {
             return Ok(existing.into());
         }
 
-        let status = initial_status(&request.memory_type, &request.write_mode);
+        let status = initial_status(&request.capability_capsule_type, &request.write_mode);
         let now = current_timestamp();
 
         crate::pipeline::ingest::validate_verbatim(&request.content, request.summary.as_deref())
@@ -146,10 +146,10 @@ impl MemoryService {
         .await
         .map_err(ServiceError::Storage)?;
 
-        let memory = MemoryRecord {
-            memory_id: next_memory_id(),
+        let memory = CapabilityCapsuleRecord {
+            capability_capsule_id: next_memory_id(),
             tenant: request.tenant,
-            memory_type: request.memory_type,
+            capability_capsule_type: request.capability_capsule_type,
             status: status.clone(),
             scope: request.scope,
             visibility: request.visibility,
@@ -169,14 +169,14 @@ impl MemoryService {
             content_hash,
             idempotency_key: request.idempotency_key,
             session_id: Some(session_id.clone()),
-            supersedes_memory_id: None,
+            supersedes_capability_capsule_id: None,
             source_agent: request.source_agent,
             created_at: now.clone(),
             updated_at: now.clone(),
             last_validated_at: None,
         };
 
-        let stored = self.store.insert_memory(memory).await?;
+        let stored = self.store.insert_capability_capsule(memory).await?;
         let drafts = crate::pipeline::ingest::extract_graph_edge_drafts(&stored);
         let edges = resolve_drafts_to_edges(drafts, &self.store, &stored.tenant, &now).await?;
         self.store.sync_memory_edges(&edges, &now).await?;
@@ -227,7 +227,7 @@ impl MemoryService {
             let workflow_memory = self
                 .ingest(workflow::workflow_memory_request(&episode, candidate))
                 .await?;
-            candidate.memory_id = Some(workflow_memory.memory_id);
+            candidate.capability_capsule_id = Some(workflow_memory.capability_capsule_id);
             episode.workflow_candidate = Some(candidate.clone());
         }
 
@@ -243,51 +243,67 @@ impl MemoryService {
     pub async fn list_pending_review(
         &self,
         tenant: &str,
-    ) -> Result<Vec<MemoryRecord>, ServiceError> {
+    ) -> Result<Vec<CapabilityCapsuleRecord>, ServiceError> {
         Ok(self.store.list_pending_review(tenant).await?)
     }
 
     /// All memories for a tenant, regardless of status, ordered by created_at
     /// ascending. Backs the admin web page (`GET /memories?tenant=…`).
-    pub async fn list_memories(&self, tenant: &str) -> Result<Vec<MemoryRecord>, ServiceError> {
-        Ok(self.store.list_memories_for_tenant(tenant).await?)
+    pub async fn list_capability_capsules(
+        &self,
+        tenant: &str,
+    ) -> Result<Vec<CapabilityCapsuleRecord>, ServiceError> {
+        Ok(self
+            .store
+            .list_capability_capsules_for_tenant(tenant)
+            .await?)
     }
 
     /// Hard-delete a memory and all its references. **Irreversible.**
-    /// Backs `DELETE /memories/{id}` from the admin web page.
+    /// Backs `DELETE /capability_capsules/{id}` from the admin web page.
     ///
     /// Order:
     ///   1. Verify the row exists for this tenant (clean 404 if not).
     ///   2. Transactional DuckDB cascade
-    ///      (`repository::delete_memory_hard`).
+    ///      (`repository::delete_capability_capsule_hard`).
     ///   3. Best-effort HNSW sidecar removal — if the sidecar is missing or
     ///      the remove fails, the DB delete still wins; an orphan vector
     ///      gets cleaned by the next `mem repair --rebuild`.
-    pub async fn delete_memory_hard(
+    pub async fn delete_capability_capsule_hard(
         &self,
         tenant: &str,
-        memory_id: &str,
+        capability_capsule_id: &str,
     ) -> Result<(), ServiceError> {
         self.store
-            .get_memory_for_tenant(tenant, memory_id)
+            .get_capability_capsule_for_tenant(tenant, capability_capsule_id)
             .await?
             .ok_or(ServiceError::NotFound)?;
 
-        self.store.delete_memory_hard(tenant, memory_id).await?;
+        self.store
+            .delete_capability_capsule_hard(tenant, capability_capsule_id)
+            .await?;
         // Vector-index sidecar removal happens inside
-        // `DuckDbRepository::delete_memory_hard` itself; service code no
+        // `DuckDbRepository::delete_capability_capsule_hard` itself; service code no
         // longer needs to know the backend uses HNSW.
         Ok(())
     }
 
-    pub async fn get_memory(
+    pub async fn get_capability_capsule(
         &self,
         tenant: Option<&str>,
-        memory_id: &str,
-    ) -> Result<MemoryDetailResponse, ServiceError> {
+        capability_capsule_id: &str,
+    ) -> Result<CapabilityCapsuleDetailResponse, ServiceError> {
         let memory = match tenant {
-            Some(tenant) => self.store.get_memory_for_tenant(tenant, memory_id).await?,
-            None => self.store.get_memory(memory_id.to_string()).await?,
+            Some(tenant) => {
+                self.store
+                    .get_capability_capsule_for_tenant(tenant, capability_capsule_id)
+                    .await?
+            }
+            None => {
+                self.store
+                    .get_capability_capsule(capability_capsule_id.to_string())
+                    .await?
+            }
         }
         .ok_or(ServiceError::NotFound)?;
 
@@ -295,17 +311,17 @@ impl MemoryService {
 
         let graph_links = self
             .store
-            .neighbors(&memory_node_id(memory_id))
+            .neighbors(&memory_node_id(capability_capsule_id))
             .await
             .unwrap_or_default();
 
-        Ok(MemoryDetailResponse {
+        Ok(CapabilityCapsuleDetailResponse {
             version_chain: self
                 .store
-                .list_memory_versions_for_tenant(&memory.tenant, memory_id)
+                .list_capability_capsule_versions_for_tenant(&memory.tenant, capability_capsule_id)
                 .await?,
             graph_links,
-            feedback_summary: self.store.feedback_summary(memory_id).await?,
+            feedback_summary: self.store.feedback_summary(capability_capsule_id).await?,
             memory,
             embedding,
         })
@@ -315,40 +331,42 @@ impl MemoryService {
         &self,
         tenant: &str,
         status: Option<&str>,
-        memory_id: Option<&str>,
+        capability_capsule_id: Option<&str>,
         limit: usize,
     ) -> Result<Vec<EmbeddingJobInfo>, ServiceError> {
         Ok(self
             .store
-            .list_embedding_jobs(tenant, status, memory_id, limit)
+            .list_embedding_jobs(tenant, status, capability_capsule_id, limit)
             .await?)
     }
 
     pub async fn rebuild_embeddings(
         &self,
         tenant: &str,
-        memory_ids: &[String],
+        capability_capsule_ids: &[String],
         force: bool,
     ) -> Result<EmbeddingsRebuildResponse, ServiceError> {
-        let ids: Vec<String> = if memory_ids.is_empty() {
-            self.store.list_memory_ids_for_tenant(tenant).await?
+        let ids: Vec<String> = if capability_capsule_ids.is_empty() {
+            self.store
+                .list_capability_capsule_ids_for_tenant(tenant)
+                .await?
         } else {
-            memory_ids.to_vec()
+            capability_capsule_ids.to_vec()
         };
 
         let mut enqueued: u32 = 0;
         for mid in ids {
             let memory = self
                 .store
-                .get_memory_for_tenant(tenant, &mid)
+                .get_capability_capsule_for_tenant(tenant, &mid)
                 .await?
                 .ok_or(ServiceError::NotFound)?;
 
             let now = current_timestamp();
             if force {
-                self.store.delete_memory_embedding(&mid).await?;
+                self.store.delete_capability_capsule_embedding(&mid).await?;
                 self.store
-                    .stale_live_embedding_jobs_for_memory(
+                    .stale_live_embedding_jobs_for_capability_capsule(
                         tenant,
                         &mid,
                         &self.embedding_job_provider,
@@ -360,7 +378,7 @@ impl MemoryService {
             let insert = EmbeddingJobInsert {
                 job_id: next_embedding_job_id(),
                 tenant: memory.tenant.clone(),
-                memory_id: memory.memory_id.clone(),
+                capability_capsule_id: memory.capability_capsule_id.clone(),
                 target_content_hash: memory.content_hash.clone(),
                 provider: self.embedding_job_provider.clone(),
                 available_at: now.clone(),
@@ -377,22 +395,22 @@ impl MemoryService {
 
     async fn embedding_meta_for_memory(
         &self,
-        memory: &MemoryRecord,
-    ) -> Result<MemoryEmbeddingMeta, ServiceError> {
+        memory: &CapabilityCapsuleRecord,
+    ) -> Result<CapabilityCapsuleEmbeddingMeta, ServiceError> {
         if let Some((model, hash, updated_at)) = self
             .store
-            .get_memory_embedding_row(&memory.memory_id)
+            .get_capability_capsule_embedding_row(&memory.capability_capsule_id)
             .await?
         {
             if hash == memory.content_hash {
-                return Ok(MemoryEmbeddingMeta {
+                return Ok(CapabilityCapsuleEmbeddingMeta {
                     status: "indexed".to_string(),
                     model: Some(model),
                     updated_at: Some(updated_at),
                     content_hash: Some(hash),
                 });
             }
-            return Ok(MemoryEmbeddingMeta {
+            return Ok(CapabilityCapsuleEmbeddingMeta {
                 status: "stale".to_string(),
                 model: Some(model),
                 updated_at: Some(updated_at),
@@ -404,7 +422,7 @@ impl MemoryService {
             .store
             .latest_embedding_job_status_for_hash(
                 &memory.tenant,
-                &memory.memory_id,
+                &memory.capability_capsule_id,
                 &memory.content_hash,
             )
             .await?;
@@ -418,7 +436,7 @@ impl MemoryService {
             Some(_) => "none",
         };
 
-        Ok(MemoryEmbeddingMeta {
+        Ok(CapabilityCapsuleEmbeddingMeta {
             status: status_label.to_string(),
             ..Default::default()
         })
@@ -427,38 +445,44 @@ impl MemoryService {
     pub async fn accept_pending(
         &self,
         tenant: &str,
-        memory_id: &str,
-    ) -> Result<MemoryRecord, ServiceError> {
+        capability_capsule_id: &str,
+    ) -> Result<CapabilityCapsuleRecord, ServiceError> {
         self.store
-            .get_pending(tenant, memory_id)
+            .get_pending(tenant, capability_capsule_id)
             .await?
             .ok_or(ServiceError::NotFound)?;
-        Ok(self.store.accept_pending(tenant, memory_id).await?)
+        Ok(self
+            .store
+            .accept_pending(tenant, capability_capsule_id)
+            .await?)
     }
 
     pub async fn reject_pending(
         &self,
         tenant: &str,
-        memory_id: &str,
-    ) -> Result<MemoryRecord, ServiceError> {
+        capability_capsule_id: &str,
+    ) -> Result<CapabilityCapsuleRecord, ServiceError> {
         self.store
-            .get_pending(tenant, memory_id)
+            .get_pending(tenant, capability_capsule_id)
             .await?
             .ok_or(ServiceError::NotFound)?;
-        Ok(self.store.reject_pending(tenant, memory_id).await?)
+        Ok(self
+            .store
+            .reject_pending(tenant, capability_capsule_id)
+            .await?)
     }
 
     /// Supersede flow: accept a pending memory by replacing it with an edited active version.
     ///
     /// After storage is updated, the graph is kept consistent:
-    /// 1. v1's edges are closed (`close_edges_for_memory`)
+    /// 1. v1's edges are closed (`close_edges_for_capability_capsule`)
     /// 2. v2's edges are opened via the new draft + registry-resolve + `sync_memory_edges` path
     pub async fn edit_and_accept_pending(
         &self,
         tenant: &str,
         patch: EditPendingRequest,
     ) -> Result<EditPendingResponse, ServiceError> {
-        let original_memory_id = patch.memory_id.clone();
+        let original_memory_id = patch.capability_capsule_id.clone();
         let original = self
             .store
             .get_pending(tenant, &original_memory_id)
@@ -476,7 +500,7 @@ impl MemoryService {
 
         // Close v1's graph edges, then open v2's — order matters.
         self.store
-            .close_edges_for_memory(&original.memory_id)
+            .close_edges_for_capability_capsule(&original.capability_capsule_id)
             .await?;
         let now = current_timestamp();
         let drafts = crate::pipeline::ingest::extract_graph_edge_drafts(&superseding);
@@ -486,7 +510,7 @@ impl MemoryService {
         self.enqueue_embedding_job_for_memory(&superseding).await?;
 
         Ok(EditPendingResponse {
-            original_memory_id: original.memory_id,
+            original_memory_id: original.capability_capsule_id,
             memory: superseding,
         })
     }
@@ -494,18 +518,18 @@ impl MemoryService {
     pub async fn submit_feedback(
         &self,
         tenant: &str,
-        memory_id: &str,
+        capability_capsule_id: &str,
         feedback_kind: FeedbackKind,
-    ) -> Result<MemoryRecord, ServiceError> {
+    ) -> Result<CapabilityCapsuleRecord, ServiceError> {
         let memory = self
             .store
-            .get_memory_for_tenant(tenant, memory_id)
+            .get_capability_capsule_for_tenant(tenant, capability_capsule_id)
             .await?
             .ok_or(ServiceError::NotFound)?;
 
         let feedback = crate::storage::FeedbackEvent {
             feedback_id: next_feedback_id(),
-            memory_id: memory.memory_id.clone(),
+            capability_capsule_id: memory.capability_capsule_id.clone(),
             feedback_kind: feedback_kind.as_str().to_string(),
             created_at: current_timestamp(),
         };
@@ -515,12 +539,12 @@ impl MemoryService {
 
     fn superseding_active_version(
         &self,
-        original: &MemoryRecord,
+        original: &CapabilityCapsuleRecord,
         patch: EditPendingRequest,
-    ) -> MemoryRecord {
-        let request = IngestMemoryRequest {
+    ) -> CapabilityCapsuleRecord {
+        let request = IngestCapabilityCapsuleRequest {
             tenant: original.tenant.clone(),
-            memory_type: original.memory_type.clone(),
+            capability_capsule_type: original.capability_capsule_type.clone(),
             content: patch.content.clone(),
             summary: None,
             evidence: patch.evidence.clone(),
@@ -535,15 +559,15 @@ impl MemoryService {
             topics: original.topics.clone(),
             source_agent: original.source_agent.clone(),
             idempotency_key: None,
-            write_mode: crate::domain::memory::WriteMode::Auto,
+            write_mode: crate::domain::capability_capsule::WriteMode::Auto,
         };
         let now = current_timestamp();
 
-        MemoryRecord {
-            memory_id: next_memory_id(),
+        CapabilityCapsuleRecord {
+            capability_capsule_id: next_memory_id(),
             tenant: original.tenant.clone(),
-            memory_type: original.memory_type.clone(),
-            status: MemoryStatus::Active,
+            capability_capsule_type: original.capability_capsule_type.clone(),
+            status: CapabilityCapsuleStatus::Active,
             scope: original.scope.clone(),
             visibility: original.visibility.clone(),
             version: original.version + 1,
@@ -557,12 +581,12 @@ impl MemoryService {
             task_type: original.task_type.clone(),
             tags: patch.tags,
             topics: original.topics.clone(),
-            confidence: default_confidence(&MemoryStatus::Active),
+            confidence: default_confidence(&CapabilityCapsuleStatus::Active),
             decay_score: 0.0,
             content_hash: compute_content_hash(&request),
             idempotency_key: None,
             session_id: None,
-            supersedes_memory_id: Some(original.memory_id.clone()),
+            supersedes_capability_capsule_id: Some(original.capability_capsule_id.clone()),
             source_agent: original.source_agent.clone(),
             created_at: now.clone(),
             updated_at: now,
@@ -576,8 +600,8 @@ impl MemoryService {
 
     pub async fn search(
         &self,
-        query: SearchMemoryRequest,
-    ) -> Result<SearchMemoryResponse, ServiceError> {
+        query: SearchCapabilityCapsuleRequest,
+    ) -> Result<SearchCapabilityCapsuleResponse, ServiceError> {
         let tenant = query.tenant.as_deref().unwrap_or("local");
 
         // Wake-up fast path: SessionStart hooks call us with `intent="wake_up"`
@@ -599,7 +623,7 @@ impl MemoryService {
             const WAKE_UP_LIMIT: usize = 64;
             let candidates = self
                 .store
-                .recent_active_memories(tenant, WAKE_UP_LIMIT)
+                .recent_active_capability_capsules(tenant, WAKE_UP_LIMIT)
                 .await
                 .map_err(ServiceError::Storage)?;
             return Ok(compress::compress(&candidates, query.token_budget));
@@ -620,7 +644,7 @@ impl MemoryService {
                 Err(_) => return Vec::new(),
             };
             self.store
-                .semantic_search_memories(tenant, &q, 48)
+                .semantic_search_capability_capsules(tenant, &q, 48)
                 .await
                 .unwrap_or_default()
         };
@@ -666,7 +690,7 @@ impl MemoryService {
         &self,
         tenant: &str,
         query: &str,
-    ) -> Result<Vec<MemoryRecord>, ServiceError> {
+    ) -> Result<Vec<CapabilityCapsuleRecord>, ServiceError> {
         const BM25_TOP_K: usize = 48;
 
         let all = self
@@ -689,10 +713,13 @@ impl MemoryService {
             return Ok(all);
         }
 
-        let bm25_ids: HashSet<String> = bm25.iter().map(|m| m.memory_id.clone()).collect();
+        let bm25_ids: HashSet<String> = bm25
+            .iter()
+            .map(|m| m.capability_capsule_id.clone())
+            .collect();
         let mut combined = bm25;
         for memory in all {
-            if !bm25_ids.contains(&memory.memory_id) {
+            if !bm25_ids.contains(&memory.capability_capsule_id) {
                 combined.push(memory);
             }
         }
@@ -701,13 +728,13 @@ impl MemoryService {
 
     async fn enqueue_embedding_job_for_memory(
         &self,
-        memory: &MemoryRecord,
+        memory: &CapabilityCapsuleRecord,
     ) -> Result<(), ServiceError> {
         let now = current_timestamp();
         let insert = EmbeddingJobInsert {
             job_id: next_embedding_job_id(),
             tenant: memory.tenant.clone(),
-            memory_id: memory.memory_id.clone(),
+            capability_capsule_id: memory.capability_capsule_id.clone(),
             target_content_hash: memory.content_hash.clone(),
             provider: self.embedding_job_provider.clone(),
             available_at: now.clone(),
@@ -731,7 +758,7 @@ impl MemoryService {
 /// mutex (see `entity_repo.rs`) — the locks are sequenced, not nested. Pure
 /// async; the caller passes `now` so timestamps stay deterministic in tests.
 ///
-/// Wired into `MemoryService::ingest` and `edit_and_accept_pending` by Task 9
+/// Wired into `CapabilityCapsuleService::ingest` and `edit_and_accept_pending` by Task 9
 /// of the entity-registry roadmap.
 pub(crate) async fn resolve_drafts_to_edges(
     drafts: Vec<GraphEdgeDraft>,
@@ -742,7 +769,9 @@ pub(crate) async fn resolve_drafts_to_edges(
     let mut out = Vec::with_capacity(drafts.len());
     for draft in drafts {
         let to_node_id = match draft.to_kind {
-            ToNodeKind::LiteralMemory(memory_id) => format!("memory:{memory_id}"),
+            ToNodeKind::LiteralMemory(capability_capsule_id) => {
+                format!("capability_capsule:{capability_capsule_id}")
+            }
             ToNodeKind::EntityRef { kind, alias } => {
                 let id = registry
                     .resolve_or_create(tenant, &alias, kind, now)
@@ -771,12 +800,12 @@ fn summarize(content: &str) -> String {
     }
 }
 
-fn default_confidence(status: &MemoryStatus) -> f32 {
+fn default_confidence(status: &CapabilityCapsuleStatus) -> f32 {
     match status {
-        MemoryStatus::Active => 0.9,
-        MemoryStatus::PendingConfirmation => 0.6,
-        MemoryStatus::Provisional => 0.5,
-        MemoryStatus::Archived | MemoryStatus::Rejected => 0.0,
+        CapabilityCapsuleStatus::Active => 0.9,
+        CapabilityCapsuleStatus::PendingConfirmation => 0.6,
+        CapabilityCapsuleStatus::Provisional => 0.5,
+        CapabilityCapsuleStatus::Archived | CapabilityCapsuleStatus::Rejected => 0.0,
     }
 }
 

@@ -51,7 +51,7 @@ pub async fn tick(
         info!(
             job_id = %job.job_id,
             tenant = %job.tenant,
-            memory_id = %job.memory_id,
+            capability_capsule_id = %job.capability_capsule_id,
             attempt = job.attempt_count,
             "embedding worker claimed job"
         );
@@ -132,7 +132,7 @@ async fn pre_embed(
     }
 
     let Some(memory) = store
-        .get_memory_for_tenant(&job.tenant, &job.memory_id)
+        .get_capability_capsule_for_tenant(&job.tenant, &job.capability_capsule_id)
         .await?
     else {
         let now = current_timestamp();
@@ -182,7 +182,7 @@ async fn post_embed(
     }
 
     let Some(memory_after) = store
-        .get_memory_for_tenant(&job.tenant, &job.memory_id)
+        .get_capability_capsule_for_tenant(&job.tenant, &job.capability_capsule_id)
         .await?
     else {
         let now = current_timestamp();
@@ -215,8 +215,8 @@ async fn post_embed(
     let blob = f32_slice_to_blob(embedding);
     let now = current_timestamp();
     store
-        .upsert_memory_embedding(
-            &job.memory_id,
+        .upsert_capability_capsule_embedding(
+            &job.capability_capsule_id,
             &job.tenant,
             provider.model(),
             provider.dim() as i64,
@@ -228,7 +228,7 @@ async fn post_embed(
         .await?;
 
     // Lance handles vector indexing automatically when the embedding
-    // is added to the memory_embeddings table — no separate HNSW
+    // is added to the capability_capsule_embeddings table — no separate HNSW
     // sidecar to update (the legacy DuckDB-as-storage backend
     // maintained a usearch index manually here; that whole code path
     // is gone in the new architecture).
@@ -236,7 +236,7 @@ async fn post_embed(
     store.complete_embedding_job(&job.job_id, &now).await?;
     info!(
         job_id = %job.job_id,
-        memory_id = %job.memory_id,
+        capability_capsule_id = %job.capability_capsule_id,
         "embedding worker completed job"
     );
     Ok(())
