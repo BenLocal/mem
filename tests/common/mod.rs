@@ -1,20 +1,20 @@
 //! Shared test helpers for HTTP integration tests.
 //!
 //! The single point of truth for assembling an [`AppState`] in tests.
-//! Each test file picks the [`MemoryService`] flavor it needs (e.g.
-//! `MemoryService::new`, `new_with_graph`, `with_graph_and_embedding_providers`)
-//! and hands the repo + constructed service to [`test_app_state`]; the helper
-//! then fills in the rest of the `AppState` plumbing — currently the in-memory
-//! `transcript_index` placeholder and a no-provider [`TranscriptService`].
+//! Each test file calls `common::test_app_state(store, memory_service)`
+//! with a `MemoryService` flavor it wants (typically
+//! `MemoryService::new(store.clone())`); this helper assembles the
+//! `EntityService` + `TranscriptService` + `Config` plumbing.
 //!
-//! Centralising the boilerplate here means future `AppState` field additions
-//! only need a one-line edit in this module instead of an N-file mechanical
-//! sweep across every integration test.
+//! Centralising the boilerplate here means future `AppState` field
+//! additions only need a one-line edit in this module instead of an
+//! N-file mechanical sweep.
 //!
-//! NOTE: this module deliberately uses `#[allow(dead_code)]` on every public
-//! item — Cargo compiles `tests/common/mod.rs` separately for each
-//! `tests/foo.rs` that pulls it in via `mod common;`, and any helper not used
-//! by a particular suite would otherwise produce a dead-code warning.
+//! NOTE: this module deliberately uses `#[allow(dead_code)]` on
+//! every public item — Cargo compiles `tests/common/mod.rs`
+//! separately for each `tests/foo.rs` that pulls it in via
+//! `mod common;`, and any helper not used by a particular suite
+//! would otherwise produce a dead-code warning.
 
 #![allow(dead_code)]
 
@@ -23,25 +23,36 @@ use std::sync::Arc;
 use mem::{
     app::AppState,
     service::{EntityService, MemoryService, TranscriptService},
-    storage::{DuckDbRepository, VectorIndex},
+    storage::Store,
 };
+use tempfile::TempDir;
+
+/// Open a fresh [`Store`] under a tempdir. Returned `TempDir` must be
+/// kept alive (and dropped only after the store) — `Store` holds open
+/// handles inside the tempdir.
+pub async fn test_store() -> (TempDir, Arc<Store>) {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("mem.lance");
+    let store = Store::open(&path).await.expect("Store::open");
+    // `set_transcript_job_provider` is required before any
+    // embed-eligible `create_conversation_message` write — most
+    // tests don't write transcripts but the call is cheap and idempotent.
+    store.set_transcript_job_provider("fake");
+    (dir, Arc::new(store))
+}
 
 /// Builds an [`AppState`] suitable for integration tests.
 ///
-/// The caller passes the open [`DuckDbRepository`] (already seeded as needed)
-/// and the [`MemoryService`] flavor under test. The helper provides the
-/// transcript-side pieces: an 8-dim in-memory `VectorIndex` placeholder and
-/// a [`TranscriptService`] with no embedding provider attached. Tests that
-/// need a real-sized index or a live provider should bypass this helper and
-/// construct `AppState` directly.
-pub fn test_app_state(repo: DuckDbRepository, memory_service: MemoryService) -> AppState {
-    let transcript_index = Arc::new(VectorIndex::new_in_memory(8, "fake", "fake", 8));
-    let transcript_service = TranscriptService::new(repo.clone(), transcript_index.clone(), None);
-    let entity_service = EntityService::new(repo);
+/// The caller passes the open [`Store`] handle and the
+/// [`MemoryService`] flavor under test. The helper assembles the
+/// transcript-side and entity-side service façades and the default
+/// `Config::local()` so request handlers have a complete state.
+pub fn test_app_state(store: Arc<Store>, memory_service: MemoryService) -> AppState {
+    let transcript_service = TranscriptService::new(store.clone(), None);
+    let entity_service = EntityService::new(store);
     AppState {
         memory_service,
         config: mem::config::Config::local(),
-        transcript_index,
         transcript_service,
         entity_service,
     }
