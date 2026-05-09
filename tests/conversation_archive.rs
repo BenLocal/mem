@@ -26,7 +26,6 @@ fn sample_message(suffix: &str, embed: bool, block_type: BlockType) -> Conversat
     }
 }
 
-
 #[tokio::test]
 async fn get_by_session_returns_time_ordered_blocks() {
     let tmp = TempDir::new().unwrap();

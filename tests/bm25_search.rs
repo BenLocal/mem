@@ -6,7 +6,7 @@ use mem::{
         query::SearchMemoryRequest,
     },
     service::MemoryService,
-    storage::{Store},
+    storage::Store,
 };
 use tempfile::tempdir;
 

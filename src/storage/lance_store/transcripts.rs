@@ -782,6 +782,7 @@ mod tests {
     use crate::domain::{BlockType, ConversationMessage, MessageRole};
     use tempfile::tempdir;
 
+    #[allow(clippy::too_many_arguments)]
     fn msg(
         id: &str,
         tenant: &str,

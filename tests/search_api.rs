@@ -17,7 +17,7 @@ use mem::{
     },
     http,
     service::MemoryService,
-    storage::{Store},
+    storage::Store,
 };
 use serde_json::{json, Value};
 use tempfile::{tempdir, TempDir};
