@@ -524,6 +524,33 @@ impl Store {
             .await
     }
 
+    /// Read embedding-job status by id. Used by the embedding worker
+    /// to skip mid-flight processing when a concurrent caller has
+    /// already marked the job stale. Routes to DuckDbQuery (SQL).
+    pub async fn get_embedding_job_status(
+        &self,
+        job_id: &str,
+    ) -> Result<Option<String>, StorageError> {
+        self.query.get_embedding_job_status(job_id).await
+    }
+
+    /// Bulk decay sweep over `memories.decay_score`. Routes to
+    /// DuckDbQuery — issued as a single SQL UPDATE via the lance
+    /// extension (per-row Rust iteration is not viable for this
+    /// shape). DuckDB-side writes invalidate the connection's own
+    /// cache, so no `Store::refresh` is needed.
+    pub async fn apply_time_decay(
+        &self,
+        decay_rate_per_day: f64,
+        now_ms: f64,
+        ms_per_day: f64,
+        now_ms_str: &str,
+    ) -> Result<(), StorageError> {
+        self.query
+            .apply_time_decay(decay_rate_per_day, now_ms, ms_per_day, now_ms_str)
+            .await
+    }
+
     /// Session lifecycle (touch / open / close) — all mutations.
     /// Routed to LanceStore + DuckDbQuery refresh.
     pub async fn touch_session(
@@ -851,5 +878,116 @@ mod tests {
             .unwrap()
             .expect("row visible to SQL after lance UPDATE + refresh");
         assert_eq!(post.status, MemoryStatus::Active);
+    }
+
+    /// `get_embedding_job_status`: enqueue a job via the lance side,
+    /// read its status through DuckDbQuery (SQL), confirm round-trip.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn store_get_embedding_job_status_round_trip() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("store");
+        let store = Store::open(&path).await.unwrap();
+
+        store
+            .insert_memory(fixture("m_e", "tenant-a"))
+            .await
+            .unwrap();
+
+        let none = store
+            .get_embedding_job_status("never-existed")
+            .await
+            .unwrap();
+        assert!(none.is_none());
+
+        store
+            .try_enqueue_embedding_job(EmbeddingJobInsert {
+                job_id: "job_e1".into(),
+                tenant: "tenant-a".into(),
+                memory_id: "m_e".into(),
+                target_content_hash: "h".into(),
+                provider: "fake-test".into(),
+                available_at: "00000001778000000000".into(),
+                created_at: "00000001778000000000".into(),
+                updated_at: "00000001778000000000".into(),
+            })
+            .await
+            .unwrap();
+
+        let status = store.get_embedding_job_status("job_e1").await.unwrap();
+        assert_eq!(status.as_deref(), Some("pending"));
+    }
+
+    /// `apply_time_decay`: insert an active memory with decay_score=0
+    /// and an updated_at 10 days in the past, run decay, verify the
+    /// score moved (~0.1 with the canonical 0.01/day rate).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn store_apply_time_decay_round_trip() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("store");
+        let store = Store::open(&path).await.unwrap();
+
+        const MS_PER_DAY: f64 = 86_400_000.0;
+        const RATE: f64 = 0.01;
+        let now_ms = 100_000_000_000_000_u128; // arbitrary, big enough.
+        let ten_days_ago = now_ms - 10 * MS_PER_DAY as u128;
+        let ten_days_ago_str = format!("{ten_days_ago:020}");
+        let now_str = format!("{now_ms:020}");
+
+        let mut active = fixture("m_decay", "tenant-a");
+        active.created_at = ten_days_ago_str.clone();
+        active.updated_at = ten_days_ago_str.clone();
+        active.decay_score = 0.0;
+        store.insert_memory(active).await.unwrap();
+
+        // Saturated row should not move (`decay_score < 1.0` filter).
+        let mut sat = fixture("m_sat", "tenant-a");
+        sat.created_at = ten_days_ago_str.clone();
+        sat.updated_at = ten_days_ago_str.clone();
+        sat.decay_score = 1.0;
+        store.insert_memory(sat).await.unwrap();
+
+        // Non-active row should not move (status='active' filter).
+        let mut prov = fixture("m_prov", "tenant-a");
+        prov.status = MemoryStatus::PendingConfirmation;
+        prov.created_at = ten_days_ago_str.clone();
+        prov.updated_at = ten_days_ago_str.clone();
+        prov.decay_score = 0.0;
+        store.insert_memory(prov).await.unwrap();
+
+        store
+            .apply_time_decay(RATE, now_ms as f64, MS_PER_DAY, &now_str)
+            .await
+            .unwrap();
+
+        // The bulk UPDATE goes through DuckDbQuery's SQL path, which
+        // doesn't trigger the lance write→refresh dance (DuckDB-side
+        // writes invalidate the cache automatically). But subsequent
+        // reads through Store still go through DuckDbQuery, so they
+        // see the new state.
+        let active_after = store
+            .get_memory_for_tenant("tenant-a", "m_decay")
+            .await
+            .unwrap()
+            .unwrap();
+        // ~10 days * 0.01/day = 0.1 (allow slop for f32→f64 coercion).
+        assert!(
+            (0.05..=0.15).contains(&(active_after.decay_score as f64)),
+            "active row decay should be ~0.1 after 10 days, got {}",
+            active_after.decay_score
+        );
+
+        let sat_after = store
+            .get_memory_for_tenant("tenant-a", "m_sat")
+            .await
+            .unwrap()
+            .unwrap();
+        assert!((sat_after.decay_score - 1.0).abs() < 1e-6);
+
+        let prov_after = store
+            .get_memory_for_tenant("tenant-a", "m_prov")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(prov_after.decay_score, 0.0);
     }
 }
