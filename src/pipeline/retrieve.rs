@@ -97,50 +97,23 @@ fn merge_and_rank_hybrid_scored(
         .map(|(i, (m, _sim))| (m.capability_capsule_id.clone(), i + 1))
         .collect();
 
-    let lexical_ids: HashSet<String> = lexical
-        .iter()
-        .map(|m| m.capability_capsule_id.clone())
-        .collect();
-    let mut semantic_sims: HashMap<String, f32> = HashMap::new();
     let mut by_id: HashMap<String, CapabilityCapsuleRecord> = HashMap::new();
-
     for m in lexical {
         by_id.insert(m.capability_capsule_id.clone(), m);
     }
-    for (m, sim) in semantic {
-        let id = m.capability_capsule_id.clone();
-        semantic_sims.insert(id.clone(), sim);
-        by_id.entry(id).or_insert(m);
+    for (m, _sim) in semantic {
+        by_id.entry(m.capability_capsule_id.clone()).or_insert(m);
     }
-
     let candidates: Vec<CapabilityCapsuleRecord> = by_id.into_values().collect();
 
-    if use_legacy_ranker() {
-        score_candidates_hybrid_legacy(
-            candidates,
-            query,
-            related_capability_capsule_ids,
-            graph_boost,
-            &lexical_ids,
-            &semantic_sims,
-        )
-    } else {
-        score_candidates_hybrid_rrf(
-            candidates,
-            query,
-            related_capability_capsule_ids,
-            graph_boost,
-            &lexical_ranks,
-            &semantic_ranks,
-        )
-    }
-}
-
-fn use_legacy_ranker() -> bool {
-    std::env::var("MEM_RANKER")
-        .ok()
-        .map(|v| v == "legacy")
-        .unwrap_or(false)
+    score_candidates_hybrid(
+        candidates,
+        query,
+        related_capability_capsule_ids,
+        graph_boost,
+        &lexical_ranks,
+        &semantic_ranks,
+    )
 }
 
 pub async fn rank_with_graph_hybrid(
@@ -232,11 +205,11 @@ pub async fn candidate_memory_ids(
 }
 
 /// Computes the additive non-recall portion of a memory's score, covering
-/// the 9 signals shared by all three scorers (`_rrf`, `_legacy`,
+/// the 9 signals shared by both scorers (`score_candidates_hybrid`,
 /// `score_candidates`). The evidence bonus (`+2 when !evidence.is_empty()`)
-/// applies only to the hybrid scorers; callers add it inline before invoking
-/// this helper. Recall computation differs per scorer; this helper handles
-/// the common rest.
+/// applies only to the hybrid scorer; the caller adds it inline before
+/// invoking this helper. Recall computation differs per scorer; this helper
+/// handles the common rest.
 #[allow(dead_code)] // callers are wired in subsequent Tasks 3-5
 fn apply_lifecycle_score(
     memory: &CapabilityCapsuleRecord,
@@ -271,75 +244,7 @@ fn apply_lifecycle_score(
     score
 }
 
-fn score_candidates_hybrid_legacy(
-    candidates: Vec<CapabilityCapsuleRecord>,
-    query: &SearchCapabilityCapsuleRequest,
-    related_capability_capsule_ids: &HashSet<String>,
-    graph_boost: i64,
-    lexical_ids: &HashSet<String>,
-    semantic_sims: &HashMap<String, f32>,
-) -> Vec<ScoredMemory> {
-    let newest = candidates
-        .iter()
-        .map(|memory| timestamp_score(&memory.updated_at))
-        .max()
-        .unwrap_or(0);
-
-    let query_terms = tokenize(&query.query);
-    let scope_filters = parse_scope_filters(&query.scope_filters);
-
-    let mut scored = candidates
-        .into_iter()
-        .map(|memory| {
-            let mut score = 0i64;
-            if let Some(sim) = semantic_sims.get(&memory.capability_capsule_id) {
-                let t = sim.clamp(-1.0, 1.0);
-                score += (((t + 1.0) / 2.0) * 64.0) as i64;
-            }
-            if lexical_ids.contains(&memory.capability_capsule_id)
-                && semantic_sims.contains_key(&memory.capability_capsule_id)
-            {
-                score += 26;
-            }
-            // Lifecycle additive layer — extracted to apply_lifecycle_score for shared math.
-            // Evidence bonus stays inline because score_candidates (non-hybrid) doesn't have it.
-            if !memory.evidence.is_empty() {
-                score += 2;
-            }
-            score += apply_lifecycle_score(
-                &memory,
-                query,
-                &query_terms,
-                &scope_filters,
-                newest,
-                related_capability_capsule_ids,
-                graph_boost,
-            );
-
-            ScoredMemory { memory, score }
-        })
-        .collect::<Vec<_>>();
-
-    scored.sort_by(|left, right| {
-        right
-            .score
-            .cmp(&left.score)
-            .then_with(|| {
-                timestamp_score(&right.memory.updated_at)
-                    .cmp(&timestamp_score(&left.memory.updated_at))
-            })
-            .then_with(|| right.memory.version.cmp(&left.memory.version))
-            .then_with(|| {
-                left.memory
-                    .capability_capsule_id
-                    .cmp(&right.memory.capability_capsule_id)
-            })
-    });
-
-    scored
-}
-
-fn score_candidates_hybrid_rrf(
+fn score_candidates_hybrid(
     candidates: Vec<CapabilityCapsuleRecord>,
     query: &SearchCapabilityCapsuleRequest,
     related_capability_capsule_ids: &HashSet<String>,
@@ -770,7 +675,7 @@ mod tests {
         lex_ranks.insert("mem_a".into(), 1usize);
         let sem_ranks: HashMap<String, usize> = HashMap::new();
 
-        let scored = score_candidates_hybrid_rrf(
+        let scored = score_candidates_hybrid(
             vec![memory],
             &query,
             &HashSet::new(),
@@ -797,7 +702,7 @@ mod tests {
         lex_ranks.insert("mem_top".into(), 1usize);
         sem_ranks.insert("mem_top".into(), 1usize);
 
-        let scored = score_candidates_hybrid_rrf(
+        let scored = score_candidates_hybrid(
             vec![memory],
             &query,
             &HashSet::new(),
@@ -825,7 +730,7 @@ mod tests {
         sem_ranks.insert("rank_100".into(), 100usize);
         let lex_ranks: HashMap<String, usize> = HashMap::new();
 
-        let scored = score_candidates_hybrid_rrf(
+        let scored = score_candidates_hybrid(
             vec![m1, m50, m100],
             &query,
             &HashSet::new(),
@@ -858,7 +763,7 @@ mod tests {
         lex_ranks.insert("lex_only".into(), 1usize);
         let sem_ranks: HashMap<String, usize> = HashMap::new();
 
-        let scored = score_candidates_hybrid_rrf(
+        let scored = score_candidates_hybrid(
             vec![memory],
             &query,
             &HashSet::new(),
@@ -963,35 +868,5 @@ mod tests {
             baseline + 12,
             "memory in related set must add graph_boost"
         );
-    }
-
-    #[test]
-    fn legacy_kill_switch_replicates_old_scoring() {
-        // With MEM_RANKER=legacy, merge_and_rank_hybrid must dispatch to
-        // score_candidates_hybrid_legacy. We can't easily assert the exact
-        // score here because merge_and_rank_hybrid returns Vec<CapabilityCapsuleRecord>,
-        // not Vec<ScoredMemory>, but verifying the candidate is preserved
-        // through the legacy path (combined with the rrf_* tests proving RRF
-        // is the default) confirms the dispatch works end-to-end.
-        let memory = fixture_memory("legacy_only");
-        let query = fixture_query();
-        let lexical: Vec<CapabilityCapsuleRecord> = vec![];
-        let semantic: Vec<(CapabilityCapsuleRecord, f32)> = vec![(memory, 1.0)];
-
-        // SAFETY: env mutation is unsafe in Rust 2024. Cargo's libtest
-        // harness defaults to multi-threaded execution but each test gets
-        // its own thread; setting and clearing the var within one test
-        // is safe as long as no other concurrent test reads MEM_RANKER.
-        // No other test in this module reads it.
-        unsafe {
-            std::env::set_var("MEM_RANKER", "legacy");
-        }
-        let result = merge_and_rank_hybrid(lexical, semantic, &query, &HashSet::new(), 0);
-        unsafe {
-            std::env::remove_var("MEM_RANKER");
-        }
-
-        assert_eq!(result.len(), 1);
-        assert_eq!(result[0].capability_capsule_id, "legacy_only");
     }
 }
