@@ -2,7 +2,7 @@ use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
 #[serde(rename_all = "snake_case")]
-pub struct MemoryEmbeddingMeta {
+pub struct CapabilityCapsuleEmbeddingMeta {
     pub status: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
@@ -17,7 +17,7 @@ pub struct MemoryEmbeddingMeta {
 pub struct EmbeddingJobInfo {
     pub job_id: String,
     pub tenant: String,
-    pub memory_id: String,
+    pub capability_capsule_id: String,
     pub target_content_hash: String,
     pub provider: String,
     pub status: String,
@@ -35,7 +35,7 @@ pub struct EmbeddingsRebuildRequest {
     #[serde(default = "default_tenant")]
     pub tenant: String,
     #[serde(default)]
-    pub memory_ids: Vec<String>,
+    pub capability_capsule_ids: Vec<String>,
     #[serde(default)]
     pub force: bool,
 }

@@ -2,18 +2,20 @@ use std::sync::Arc;
 
 use mem::{
     domain::{
-        memory::{IngestMemoryRequest, MemoryType, Scope, Visibility, WriteMode},
-        query::SearchMemoryRequest,
+        capability_capsule::{
+            CapabilityCapsuleType, IngestCapabilityCapsuleRequest, Scope, Visibility, WriteMode,
+        },
+        query::SearchCapabilityCapsuleRequest,
     },
-    service::MemoryService,
-    storage::{DuckDbGraphStore, DuckDbRepository},
+    service::CapabilityCapsuleService,
+    storage::Store,
 };
 use tempfile::tempdir;
 
-fn ingest_request(content: &str, summary: &str) -> IngestMemoryRequest {
-    IngestMemoryRequest {
+fn ingest_request(content: &str, summary: &str) -> IngestCapabilityCapsuleRequest {
+    IngestCapabilityCapsuleRequest {
         tenant: "t1".into(),
-        memory_type: MemoryType::Implementation,
+        capability_capsule_type: CapabilityCapsuleType::Implementation,
         content: content.into(),
         summary: Some(summary.into()),
         evidence: vec![],
@@ -39,9 +41,8 @@ fn ingest_request(content: &str, summary: &str) -> IngestMemoryRequest {
 async fn bm25_ranks_textual_match_to_top() {
     let dir = tempdir().unwrap();
     let db = dir.path().join("bm25.duckdb");
-    let repo = DuckDbRepository::open(&db).await.unwrap();
-    let graph = Arc::new(DuckDbGraphStore::new(Arc::new(repo.clone())));
-    let svc = MemoryService::with_graph_and_embedding_providers(repo, graph, "fake".into(), None);
+    let repo = Arc::new(Store::open(&db).await.unwrap());
+    let svc = CapabilityCapsuleService::with_providers(repo, "fake".into(), None);
 
     let target = svc
         .ingest(ingest_request(
@@ -64,7 +65,7 @@ async fn bm25_ranks_textual_match_to_top() {
     .unwrap();
 
     let response = svc
-        .search(SearchMemoryRequest {
+        .search(SearchCapabilityCapsuleRequest {
             query: "classroomhoststatehistory ClassName truncation".into(),
             intent: "debugging".into(),
             scope_filters: vec![],
@@ -77,21 +78,31 @@ async fn bm25_ranks_textual_match_to_top() {
         .unwrap();
 
     let mut surfaced = Vec::new();
-    surfaced.extend(response.directives.iter().map(|d| d.memory_id.clone()));
-    surfaced.extend(response.relevant_facts.iter().map(|f| f.memory_id.clone()));
+    surfaced.extend(
+        response
+            .directives
+            .iter()
+            .map(|d| d.capability_capsule_id.clone()),
+    );
+    surfaced.extend(
+        response
+            .relevant_facts
+            .iter()
+            .map(|f| f.capability_capsule_id.clone()),
+    );
     surfaced.extend(
         response
             .reusable_patterns
             .iter()
-            .map(|p| p.memory_id.clone()),
+            .map(|p| p.capability_capsule_id.clone()),
     );
     if let Some(w) = response.suggested_workflow.as_ref() {
-        surfaced.push(w.memory_id.clone());
+        surfaced.push(w.capability_capsule_id.clone());
     }
 
     assert_eq!(
         surfaced.first(),
-        Some(&target.memory_id),
+        Some(&target.capability_capsule_id),
         "BM25-relevant memory must rank to the top, got {surfaced:?}"
     );
 }
@@ -104,9 +115,8 @@ async fn bm25_ranks_textual_match_to_top() {
 async fn unrelated_query_returns_empty_sections() {
     let dir = tempdir().unwrap();
     let db = dir.path().join("empty.duckdb");
-    let repo = DuckDbRepository::open(&db).await.unwrap();
-    let graph = Arc::new(DuckDbGraphStore::new(Arc::new(repo.clone())));
-    let svc = MemoryService::with_graph_and_embedding_providers(repo, graph, "fake".into(), None);
+    let repo = Arc::new(Store::open(&db).await.unwrap());
+    let svc = CapabilityCapsuleService::with_providers(repo, "fake".into(), None);
 
     svc.ingest(ingest_request(
         "DuckDB stores canonical memory records and indexes locally",
@@ -116,7 +126,7 @@ async fn unrelated_query_returns_empty_sections() {
     .unwrap();
 
     let response = svc
-        .search(SearchMemoryRequest {
+        .search(SearchCapabilityCapsuleRequest {
             query: "completely unrelated topic about distributed consensus algorithms".into(),
             intent: "debugging".into(),
             scope_filters: vec![],

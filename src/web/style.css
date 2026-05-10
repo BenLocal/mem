@@ -353,7 +353,7 @@ body::before {
   text-align: right; font-size: 0.66rem; min-width: 12rem;
 }
 
-/* transcript drawer (left-side, distinct from memory drawer) -- */
+/* transcript drawer (left-side, distinct from capability capsule drawer) -- */
 
 .transcript-bg {
   position: fixed; inset: 0;

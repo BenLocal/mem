@@ -1,11 +1,15 @@
 use anyhow::Result;
-use clap::Args;
+use clap::{Args, ValueEnum};
 use once_cell::sync::Lazy;
 use regex::Regex;
 use serde_json::Value;
 use std::fs::File;
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
+use std::time::Duration;
+
+use super::common::RemoteArgs;
+use super::feedback::{self, FeedbackCounts, FeedbackFromTranscriptArgs};
 
 // Only the explicit `<mem-save>...</mem-save>` tag triggers extraction.
 //
@@ -16,26 +20,67 @@ use std::path::{Path, PathBuf};
 // `重要：` 等显式 cue" matched its own meta-mention and saved the trailing
 // text as a memory (`mem_019e061e-...`, archived). Agents that want to
 // persist a fact must use `<mem-save>...</mem-save>` (or call
-// `memory_ingest` directly via MCP).
+// `capability_capsule_ingest` directly via MCP).
 static TAG_RE: Lazy<Regex> = Lazy::new(|| Regex::new(r"<mem-save>(.*?)</mem-save>").unwrap());
+
+/// Output shape for `mem mine`. `human` is the legacy stdout summary
+/// agents read interactively; `hook-stop` / `hook-precompact` print a
+/// JSON line matching the Claude Code / Codex hook envelope shape, so
+/// shell hook scripts can `exec` `mem mine` directly without sed/jq
+/// post-processing. When the mine pass yields no rows, hook variants
+/// emit `{}` (skip-the-event sentinel).
+#[derive(Debug, Clone, Copy, ValueEnum, PartialEq, Eq)]
+pub enum HookFormat {
+    /// Print a one-line `Mined: capsules sent=…` summary to stdout.
+    Human,
+    /// Print a Stop-event envelope: `{"systemMessage":"✦ mem · …"}`.
+    HookStop,
+    /// Print a PreCompact-event envelope: `{"systemMessage":"✦ mem · pre-compact · …"}`.
+    HookPrecompact,
+}
 
 #[derive(Debug, Args)]
 pub struct MineArgs {
     /// Path to Claude Code transcript file
     pub transcript_path: PathBuf,
 
-    /// Tenant ID
-    #[arg(long, default_value = "local")]
-    pub tenant: String,
+    #[command(flatten)]
+    pub remote: RemoteArgs,
 
     /// Source agent name
     #[arg(long, default_value = "claude-code")]
     pub agent: String,
 
-    /// Base URL for mem service
-    #[arg(long, default_value = "http://127.0.0.1:3000")]
-    pub base_url: String,
+    /// After mining, also POST `applies_here` feedback for capsules
+    /// whose retrieved `text` reappeared in later assistant blocks.
+    /// Equivalent to running `mem feedback-from-transcript` as a
+    /// follow-up pass; folded into the same command so hook scripts
+    /// don't have to chain two timeouts + parse two outputs.
+    #[arg(long, default_value_t = false, action = clap::ArgAction::SetTrue)]
+    pub with_feedback: bool,
+
+    /// Soft wall-clock cap (seconds) for the mine pass. 0 = no cap.
+    /// On timeout, mine yields whatever rows it managed to send and
+    /// downstream output reflects partial counts.
+    #[arg(long, default_value = "0")]
+    pub mine_timeout_secs: u64,
+
+    /// Soft cap (seconds) for the feedback pass when `--with-feedback`.
+    /// 0 = no cap.
+    #[arg(long, default_value = "0")]
+    pub feedback_timeout_secs: u64,
+
+    /// Output shape. `human` (default) prints the legacy summary line.
+    /// `hook-stop` / `hook-precompact` print a JSON envelope ready for
+    /// the agent runtime's hook channel.
+    #[arg(long, value_enum, default_value_t = HookFormat::Human)]
+    pub format: HookFormat,
 }
+
+/// Chunk size used by `mine` when fanning out to the `/batch` endpoints.
+/// Sized so that one chunk fits comfortably in a single Lance write +
+/// DuckDB refresh while keeping HTTP body sizes reasonable.
+const MINE_BATCH_CHUNK: usize = 100;
 
 pub struct ExtractedMemory {
     pub content: String,
@@ -48,7 +93,7 @@ pub struct ExtractedMemory {
 ///
 /// Field semantics mirror `http::transcripts::IngestRequest`. The CLI
 /// produces these from a single linear pass over the JSONL transcript so
-/// the "memories" extract pipeline and the "transcript archive" pipeline
+/// the "capability_capsules" extract pipeline and the "transcript archive" pipeline
 /// share a single I/O cost.
 pub struct ArchivedBlock {
     pub session_id: String,
@@ -66,6 +111,10 @@ pub struct ArchivedBlock {
     pub content: String,
     pub tool_name: Option<String>,
     pub tool_use_id: Option<String>,
+    /// JSON-encoded envelope/per-block metadata (cwd, git_branch,
+    /// parent_uuid, is_error). `None` when no metadata fields were
+    /// present on the source JSONL line.
+    pub meta_json: Option<String>,
 }
 
 /// Backwards-compatible wrapper retained for the legacy unit tests in
@@ -109,6 +158,20 @@ pub fn parse_transcript_full(path: &Path) -> Result<(Vec<ExtractedMemory>, Vec<A
         let timestamp = value["timestamp"].as_str().unwrap_or("").to_string();
         let message_uuid = value["uuid"].as_str().map(|s| s.to_string());
 
+        // Envelope-level metadata (cwd, git_branch, parent_uuid).
+        // Repeated identically on every block of this message — the
+        // redundancy is the price of a flat row schema, traded against
+        // not storing a parent table for envelope-level fields.
+        // Claude Code uses both `gitBranch` and `git_branch` over time
+        // — accept either.
+        let envelope_cwd = value["cwd"].as_str();
+        let envelope_branch = value["gitBranch"]
+            .as_str()
+            .or_else(|| value["git_branch"].as_str());
+        let envelope_parent = value["parentUuid"]
+            .as_str()
+            .or_else(|| value["parent_uuid"].as_str());
+
         // Claude Code emits user messages in two shapes: an array of
         // structured blocks (when the message has tool-uses or
         // attachments) and a plain string (the common case for raw
@@ -130,6 +193,20 @@ pub fn parse_transcript_full(path: &Path) -> Result<(Vec<ExtractedMemory>, Vec<A
 
         for (block_idx, item) in content_array.iter().enumerate() {
             let block_type = item["type"].as_str().unwrap_or("");
+
+            // Compose meta_json: always include envelope fields when
+            // present; tool_result blocks additionally carry is_error.
+            let block_is_error = if block_type == "tool_result" {
+                item["is_error"].as_bool()
+            } else {
+                None
+            };
+            let meta_json = build_meta_json(
+                envelope_cwd,
+                envelope_branch,
+                envelope_parent,
+                block_is_error,
+            );
 
             // Memory extraction (legacy path) only runs on assistant
             // text blocks — same condition the original code enforced.
@@ -161,6 +238,7 @@ pub fn parse_transcript_full(path: &Path) -> Result<(Vec<ExtractedMemory>, Vec<A
                     content: item["text"].as_str().unwrap_or("").to_string(),
                     tool_name: None,
                     tool_use_id: None,
+                    meta_json: meta_json.clone(),
                 }),
                 "thinking" => Some(ArchivedBlock {
                     session_id: session_id.clone(),
@@ -173,6 +251,7 @@ pub fn parse_transcript_full(path: &Path) -> Result<(Vec<ExtractedMemory>, Vec<A
                     content: item["thinking"].as_str().unwrap_or("").to_string(),
                     tool_name: None,
                     tool_use_id: None,
+                    meta_json: meta_json.clone(),
                 }),
                 "tool_use" => Some(ArchivedBlock {
                     session_id: session_id.clone(),
@@ -185,6 +264,7 @@ pub fn parse_transcript_full(path: &Path) -> Result<(Vec<ExtractedMemory>, Vec<A
                     content: serde_json::to_string(&item["input"]).unwrap_or_default(),
                     tool_name: item["name"].as_str().map(|s| s.to_string()),
                     tool_use_id: item["id"].as_str().map(|s| s.to_string()),
+                    meta_json: meta_json.clone(),
                 }),
                 "tool_result" => Some(ArchivedBlock {
                     session_id: session_id.clone(),
@@ -194,9 +274,10 @@ pub fn parse_transcript_full(path: &Path) -> Result<(Vec<ExtractedMemory>, Vec<A
                     message_uuid: message_uuid.clone(),
                     role: role.to_string(),
                     block_type: "tool_result".to_string(),
-                    content: extract_tool_result_content(&item["content"]),
+                    content: serialize_tool_result_content(&item["content"]),
                     tool_name: None,
                     tool_use_id: item["tool_use_id"].as_str().map(|s| s.to_string()),
+                    meta_json: meta_json.clone(),
                 }),
                 _ => {
                     // Unknown block type: silently drop. Logging would
@@ -215,29 +296,60 @@ pub fn parse_transcript_full(path: &Path) -> Result<(Vec<ExtractedMemory>, Vec<A
 }
 
 /// `tool_result.content` in Claude Code transcripts comes in two shapes:
-/// a plain string (older runs) or an array of `{type, text}` objects
-/// (newer multi-part results). Concatenate text parts when an array is
-/// supplied; pass strings through verbatim. Anything else stringifies
-/// the whole JSON value as a fallback so no information is lost.
-fn extract_tool_result_content(value: &Value) -> String {
+/// a plain string (older runs) or an array of structured items like
+/// `{"type": "text", "text": ...}` / `{"type": "image", ...}` (newer
+/// multi-part results). Preserve both shapes as-is for downstream
+/// compression / slot extraction:
+///
+///   - Strings → returned verbatim (no JSON quoting), so simple
+///     consumers (e.g. wake-up text rendering) can use the column
+///     directly without parsing.
+///   - Arrays / objects → serialized to JSON so structure (text vs
+///     image, multiple parts, embedded metadata) survives.
+///   - Null → empty string.
+///
+/// **Design note**: this changed in 2026-05 from `\n`-joining text
+/// parts (which lost multi-part structure + dropped non-text parts)
+/// to verbatim JSON preservation. Slot-based compression
+/// (`commands_run` / `errors_encountered`) needs the structure.
+fn serialize_tool_result_content(value: &Value) -> String {
     if let Some(s) = value.as_str() {
         return s.to_string();
-    }
-    if let Some(arr) = value.as_array() {
-        let mut parts = Vec::with_capacity(arr.len());
-        for item in arr {
-            if let Some(t) = item["text"].as_str() {
-                parts.push(t.to_string());
-            } else if let Some(s) = item.as_str() {
-                parts.push(s.to_string());
-            }
-        }
-        return parts.join("\n");
     }
     if value.is_null() {
         return String::new();
     }
     serde_json::to_string(value).unwrap_or_default()
+}
+
+/// Build a JSON-encoded metadata blob from envelope + per-block fields,
+/// returning `None` when every input is empty so callers can store NULL
+/// instead of `"{}"`. Field names use snake_case to match the
+/// `MessageRole` / `BlockType` serde rename rules.
+fn build_meta_json(
+    cwd: Option<&str>,
+    git_branch: Option<&str>,
+    parent_uuid: Option<&str>,
+    is_error: Option<bool>,
+) -> Option<String> {
+    let mut map = serde_json::Map::new();
+    if let Some(s) = cwd.filter(|s| !s.is_empty()) {
+        map.insert("cwd".into(), Value::String(s.to_string()));
+    }
+    if let Some(s) = git_branch.filter(|s| !s.is_empty()) {
+        map.insert("git_branch".into(), Value::String(s.to_string()));
+    }
+    if let Some(s) = parent_uuid.filter(|s| !s.is_empty()) {
+        map.insert("parent_uuid".into(), Value::String(s.to_string()));
+    }
+    if let Some(b) = is_error {
+        map.insert("is_error".into(), Value::Bool(b));
+    }
+    if map.is_empty() {
+        None
+    } else {
+        Some(Value::Object(map).to_string())
+    }
 }
 
 fn extract_memory(text: &str) -> Option<String> {
@@ -271,14 +383,183 @@ fn looks_like_real_memory(s: &str) -> bool {
     substantive >= MIN_SUBSTANTIVE
 }
 
+/// Typed result of a mine pass. Fields are wire-counted (HTTP 2xx) — the
+/// server applies dedup by `idempotency_key` (capsules) and
+/// `(transcript_path, line_number, block_index)` (transcript blocks),
+/// so a re-run on the same file produces the same `_ok` totals without
+/// double-inserting.
+#[derive(Debug, Clone, Default)]
+pub struct MineCounts {
+    pub mem_ok: u32,
+    pub mem_fail: u32,
+    pub block_ok: u32,
+    pub block_fail: u32,
+}
+
+impl MineCounts {
+    pub fn capsules_total(&self) -> u32 {
+        self.mem_ok + self.mem_fail
+    }
+    pub fn blocks_total(&self) -> u32 {
+        self.block_ok + self.block_fail
+    }
+    pub fn failed(&self) -> bool {
+        self.mem_fail > 0 || self.block_fail > 0
+    }
+}
+
 pub async fn run(args: MineArgs) -> i32 {
-    let (memories, blocks) = match parse_transcript_full(&args.transcript_path) {
-        Ok(t) => t,
-        Err(e) => {
+    let format = args.format;
+    let with_feedback = args.with_feedback;
+    let feedback_timeout = args.feedback_timeout_secs;
+    let mine_timeout = args.mine_timeout_secs;
+    let transcript_path = args.transcript_path.clone();
+    let remote = args.remote.clone();
+
+    let mine_result = with_optional_timeout(mine_timeout, run_with_counts(args)).await;
+
+    let counts = match mine_result {
+        Some(Ok(counts)) => counts,
+        Some(Err(e)) => {
+            // Transcript parse error — hard input failure. Preserve the
+            // legacy non-zero exit; hook variants additionally emit `{}`
+            // so the runtime never breaks on a malformed file.
             eprintln!("Failed to parse transcript: {}", e);
+            if !matches!(format, HookFormat::Human) {
+                // Skip-event sentinel; trailing newline matches shell
+                // heredoc convention for hook channels.
+                println!("{{}}");
+            }
+            return 1;
+        }
+        None => {
+            eprintln!("mine pass exceeded --mine-timeout-secs={}", mine_timeout);
+            if !matches!(format, HookFormat::Human) {
+                // Skip-event sentinel; trailing newline matches shell
+                // heredoc convention for hook channels.
+                println!("{{}}");
+            }
             return 1;
         }
     };
+
+    let feedback_counts = if with_feedback {
+        run_feedback_inline(&transcript_path, &remote, feedback_timeout).await
+    } else {
+        None
+    };
+
+    match format {
+        HookFormat::Human => {
+            println!(
+                "Mined: capsules sent={}/{} blocks sent={}/{} (server-side dedup applied)",
+                counts.mem_ok,
+                counts.capsules_total(),
+                counts.block_ok,
+                counts.blocks_total(),
+            );
+            if counts.failed() {
+                1
+            } else {
+                0
+            }
+        }
+        HookFormat::HookStop | HookFormat::HookPrecompact => {
+            let is_precompact = matches!(format, HookFormat::HookPrecompact);
+            let envelope = render_hook_envelope(&counts, feedback_counts.as_ref(), is_precompact);
+            println!("{envelope}");
+            // Hook channel must never error out — partial mine still
+            // emits a useful envelope; the runtime treats non-zero exit
+            // as a hook failure.
+            0
+        }
+    }
+}
+
+/// Build a `{"systemMessage": "✦ mem · …"}` envelope. Returns the
+/// skip-event sentinel `{}` when both capsules and blocks are zero
+/// (typical "transcript had nothing new" path on a re-run).
+fn render_hook_envelope(
+    mine: &MineCounts,
+    feedback: Option<&FeedbackCounts>,
+    is_precompact: bool,
+) -> Value {
+    if mine.capsules_total() == 0 && mine.blocks_total() == 0 {
+        return Value::Object(Default::default());
+    }
+    let prefix = if is_precompact {
+        "✦ mem · pre-compact · "
+    } else {
+        "✦ mem · "
+    };
+    let suffix = if is_precompact {
+        " archived"
+    } else {
+        " woven into the archive"
+    };
+    let feedback_sent = feedback.map(|f| f.sent).unwrap_or(0);
+    let msg = if feedback_sent > 0 {
+        format!(
+            "{prefix}{}/{} capsules + {}/{} blocks · {} feedback applied",
+            mine.mem_ok,
+            mine.capsules_total(),
+            mine.block_ok,
+            mine.blocks_total(),
+            feedback_sent,
+        )
+    } else {
+        format!(
+            "{prefix}{}/{} capsules + {}/{} blocks{}",
+            mine.mem_ok,
+            mine.capsules_total(),
+            mine.block_ok,
+            mine.blocks_total(),
+            suffix,
+        )
+    };
+    serde_json::json!({ "systemMessage": msg })
+}
+
+/// In-process feedback pass. Failures (HTTP, transcript scan) resolve
+/// to `None` — feedback is best-effort for the hook flow; we never
+/// surface it as an envelope-breaking error.
+async fn run_feedback_inline(
+    transcript_path: &Path,
+    remote: &RemoteArgs,
+    timeout_secs: u64,
+) -> Option<FeedbackCounts> {
+    let args = FeedbackFromTranscriptArgs {
+        transcript_path: transcript_path.to_path_buf(),
+        remote: remote.clone(),
+        kind: "applies_here".to_string(),
+        all: false,
+    };
+    with_optional_timeout(timeout_secs, feedback::run_with_counts(args))
+        .await
+        .and_then(|r| r.ok())
+}
+
+/// Wrap `fut` in a `tokio::time::timeout` when `timeout_secs > 0`.
+/// Zero disables the cap. A timeout resolves to `None`.
+async fn with_optional_timeout<F, T>(timeout_secs: u64, fut: F) -> Option<T>
+where
+    F: std::future::Future<Output = T>,
+{
+    if timeout_secs == 0 {
+        return Some(fut.await);
+    }
+    tokio::time::timeout(Duration::from_secs(timeout_secs), fut)
+        .await
+        .ok()
+}
+
+/// Same as [`run`] but returns counts directly to in-process callers
+/// (e.g. the `mem hook` handlers) instead of printing + returning an
+/// exit code. Errors only surface for unrecoverable input failures
+/// (transcript parse). Per-row HTTP failures are counted in
+/// `mem_fail` / `block_fail`, not propagated.
+pub async fn run_with_counts(args: MineArgs) -> anyhow::Result<MineCounts> {
+    let (memories, blocks) = parse_transcript_full(&args.transcript_path)?;
 
     let client = reqwest::Client::new();
     let mut mem_ok: u32 = 0;
@@ -286,83 +567,136 @@ pub async fn run(args: MineArgs) -> i32 {
     let mut block_ok: u32 = 0;
     let mut block_fail: u32 = 0;
 
-    // Legacy memories pipeline — unchanged from the original
-    // implementation. The idempotency_key shape and 409-as-success
-    // handling are explicitly preserved.
-    for memory in memories {
-        let idempotency_key = format!("{}:{}", args.transcript_path.display(), memory.line_number);
+    // ── Capsules: chunked POST to /capability_capsules/batch.
+    //
+    // Each request body is the same shape as the single endpoint plus
+    // the array wrapper; the server flushes one Lance write + one DuckDB
+    // refresh per chunk (vs. per row). 201 = all-ok, 207 = mixed; in
+    // both cases we parse the per-item `result` field. Any pre-existing
+    // capsule (idempotency_key match) returns `result: ok` because the
+    // service treats dedup-hit-with-existing-row as success.
+    let capsule_payloads: Vec<serde_json::Value> = memories
+        .into_iter()
+        .map(|memory| {
+            let idempotency_key =
+                format!("{}:{}", args.transcript_path.display(), memory.line_number);
+            serde_json::json!({
+                "tenant": args.remote.tenant,
+                "capability_capsule_type": "experience",
+                "content": memory.content,
+                "scope": "global",
+                "source_agent": args.agent,
+                "idempotency_key": idempotency_key,
+                "write_mode": "auto",
+            })
+        })
+        .collect();
 
-        let payload = serde_json::json!({
-            "tenant": args.tenant,
-            "memory_type": "experience",
-            "content": memory.content,
-            "scope": "global",
-            "source_agent": args.agent,
-            "idempotency_key": idempotency_key,
-            "write_mode": "auto",
-        });
-
+    for chunk in capsule_payloads.chunks(MINE_BATCH_CHUNK) {
         match client
-            .post(format!("{}/memories", args.base_url))
-            .json(&payload)
+            .post(format!(
+                "{}/capability_capsules/batch",
+                args.remote.base_url
+            ))
+            .json(chunk)
             .send()
             .await
         {
-            Ok(resp) if resp.status().is_success() || resp.status() == 409 => {
-                mem_ok += 1;
+            Ok(resp) if resp.status().is_success() || resp.status() == 207 => {
+                let v: serde_json::Value = match resp.json().await {
+                    Ok(v) => v,
+                    Err(e) => {
+                        eprintln!("Capsule batch parse error: {}", e);
+                        mem_fail += chunk.len() as u32;
+                        continue;
+                    }
+                };
+                let items = v.get("items").and_then(|x| x.as_array());
+                match items {
+                    Some(arr) => {
+                        for item in arr {
+                            let kind = item.get("result").and_then(|x| x.as_str()).unwrap_or("");
+                            if kind == "ok" {
+                                mem_ok += 1;
+                            } else {
+                                let err = item
+                                    .get("error")
+                                    .and_then(|x| x.as_str())
+                                    .unwrap_or("unknown");
+                                eprintln!("Capsule item error: {}", err);
+                                mem_fail += 1;
+                            }
+                        }
+                    }
+                    None => {
+                        eprintln!("Capsule batch: missing items array");
+                        mem_fail += chunk.len() as u32;
+                    }
+                }
             }
             Ok(resp) => {
-                eprintln!("Failed to save memory: {}", resp.status());
-                mem_fail += 1;
+                eprintln!("Failed to save capsule batch: {}", resp.status());
+                mem_fail += chunk.len() as u32;
             }
             Err(e) => {
-                eprintln!("Request error: {}", e);
-                mem_fail += 1;
+                eprintln!("Capsule batch request error: {}", e);
+                mem_fail += chunk.len() as u32;
             }
         }
     }
 
-    // New transcript-archive pipeline. Block-level idempotency is
-    // enforced server-side by the `(transcript_path, line_number,
-    // block_index)` unique constraint; a duplicate insert still returns
-    // 200 OK (with a freshly minted message_block_id that the server
-    // discards via `INSERT ... ON CONFLICT DO NOTHING`), so we only
-    // need to count 2xx responses.
-    for b in blocks {
-        let embed_eligible = matches!(b.block_type.as_str(), "text" | "thinking");
-        let payload = serde_json::json!({
-            "session_id": b.session_id,
-            "tenant": args.tenant,
-            "caller_agent": args.agent,
-            "transcript_path": args.transcript_path.display().to_string(),
-            "line_number": b.line_number,
-            "block_index": b.block_index,
-            "message_uuid": b.message_uuid,
-            "role": b.role,
-            "block_type": b.block_type,
-            "content": b.content,
-            "tool_name": b.tool_name,
-            "tool_use_id": b.tool_use_id,
-            "embed_eligible": embed_eligible,
-            "created_at": b.timestamp,
-        });
+    // ── Transcript blocks: chunked POST to /transcripts/messages/batch.
+    //
+    // Block-level idempotency is enforced server-side by the
+    // `(transcript_path, line_number, block_index)` triple; the batch
+    // endpoint silently skips already-present rows and reports the
+    // landed count via `inserted`. We count every block we successfully
+    // sent (regardless of dedup status) as `block_ok` to mirror the
+    // single-row endpoint's "2xx → ok" semantic.
+    let block_payloads: Vec<serde_json::Value> = blocks
+        .into_iter()
+        .map(|b| {
+            let embed_eligible = matches!(b.block_type.as_str(), "text" | "thinking");
+            serde_json::json!({
+                "session_id": b.session_id,
+                "tenant": args.remote.tenant,
+                "caller_agent": args.agent,
+                "transcript_path": args.transcript_path.display().to_string(),
+                "line_number": b.line_number,
+                "block_index": b.block_index,
+                "message_uuid": b.message_uuid,
+                "role": b.role,
+                "block_type": b.block_type,
+                "content": b.content,
+                "tool_name": b.tool_name,
+                "tool_use_id": b.tool_use_id,
+                "embed_eligible": embed_eligible,
+                "created_at": b.timestamp,
+                "meta_json": b.meta_json,
+            })
+        })
+        .collect();
 
+    for chunk in block_payloads.chunks(MINE_BATCH_CHUNK) {
         match client
-            .post(format!("{}/transcripts/messages", args.base_url))
-            .json(&payload)
+            .post(format!(
+                "{}/transcripts/messages/batch",
+                args.remote.base_url
+            ))
+            .json(chunk)
             .send()
             .await
         {
             Ok(resp) if resp.status().is_success() => {
-                block_ok += 1;
+                block_ok += chunk.len() as u32;
             }
             Ok(resp) => {
-                eprintln!("Failed to archive block: {}", resp.status());
-                block_fail += 1;
+                eprintln!("Failed to archive block batch: {}", resp.status());
+                block_fail += chunk.len() as u32;
             }
             Err(e) => {
-                eprintln!("Block POST error: {}", e);
-                block_fail += 1;
+                eprintln!("Block batch request error: {}", e);
+                block_fail += chunk.len() as u32;
             }
         }
     }
@@ -373,18 +707,12 @@ pub async fn run(args: MineArgs) -> i32 {
     // idempotency_key for memories, so re-running mine on the same file
     // returns 2xx without double-inserting. Use `mem-cli` / DuckDB queries
     // to count rows on disk if you need exact insert deltas.
-    println!(
-        "Mined: memories sent={}/{} blocks sent={}/{} (server-side dedup applied)",
+    Ok(MineCounts {
         mem_ok,
-        mem_ok + mem_fail,
+        mem_fail,
         block_ok,
-        block_ok + block_fail
-    );
-    if mem_fail > 0 || block_fail > 0 {
-        1
-    } else {
-        0
-    }
+        block_fail,
+    })
 }
 
 // `mod extract_tests` lives at file end so clippy::items_after_test_module
@@ -430,5 +758,60 @@ mod extract_tests {
         assert!(extract_memory("重要：用 tokio 而不是 std::thread").is_none());
         assert!(extract_memory("Key insight: this matters").is_none());
         assert!(extract_memory("我会记住：保持简单").is_none());
+    }
+
+    #[test]
+    fn hook_envelope_skips_when_zero_counts() {
+        let mine = MineCounts::default();
+        let v = render_hook_envelope(&mine, None, false);
+        assert_eq!(v, serde_json::json!({}));
+    }
+
+    #[test]
+    fn hook_envelope_stop_uses_woven_into_archive() {
+        let mine = MineCounts {
+            mem_ok: 3,
+            mem_fail: 0,
+            block_ok: 12,
+            block_fail: 0,
+        };
+        let v = render_hook_envelope(&mine, None, false);
+        let msg = v["systemMessage"].as_str().unwrap();
+        assert!(msg.starts_with("✦ mem · "), "got {msg}");
+        assert!(msg.contains("3/3 capsules + 12/12 blocks"));
+        assert!(msg.contains("woven into the archive"));
+    }
+
+    #[test]
+    fn hook_envelope_precompact_uses_archived() {
+        let mine = MineCounts {
+            mem_ok: 1,
+            mem_fail: 0,
+            block_ok: 4,
+            block_fail: 0,
+        };
+        let v = render_hook_envelope(&mine, None, true);
+        let msg = v["systemMessage"].as_str().unwrap();
+        assert!(msg.starts_with("✦ mem · pre-compact · "), "got {msg}");
+        assert!(msg.ends_with("blocks archived"), "got {msg}");
+    }
+
+    #[test]
+    fn hook_envelope_appends_feedback_when_sent() {
+        let mine = MineCounts {
+            mem_ok: 1,
+            mem_fail: 0,
+            block_ok: 5,
+            block_fail: 0,
+        };
+        let feedback = FeedbackCounts {
+            kind: "applies_here".to_string(),
+            sent: 2,
+            consumed: 2,
+            failed: 0,
+        };
+        let v = render_hook_envelope(&mine, Some(&feedback), false);
+        let msg = v["systemMessage"].as_str().unwrap();
+        assert!(msg.contains("2 feedback applied"), "got {msg}");
     }
 }

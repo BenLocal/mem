@@ -8,10 +8,31 @@ default-run = "mem"
 doctest = false
 
 [dependencies]
+# LanceDB is the storage backend (on-disk Lance datasets) and DuckDB
+# is the SQL query engine on top via the `lance` core extension. Both
+# are unconditional dependencies — there's only one storage path now.
+lancedb = "0.27"
+# arrow-array must be pinned to lancedb 0.27's transitive 57.x —
+# otherwise cargo can resolve to 58.x for our direct dep, leaving two
+# distinct `RecordBatch` types in the dep graph that fail to typecheck
+# across the Table::add boundary. (lancedb re-exports `arrow_schema`
+# via `lancedb::arrow::arrow_schema`, so we don't need a direct dep
+# on that.)
+arrow-array = "57"
+# `futures::TryStreamExt::try_collect` collapses LanceDB's
+# `SendableRecordBatchStream` into a `Vec<RecordBatch>`. lancedb
+# already pulls futures transitively, but cargo doesn't expose
+# transitive deps as importable, so we need a direct dep here too.
+futures = "0.3"
 anyhow = "1"
 async-trait = "0.1"
 axum = "0.8"
-clap = { version = "4", features = ["derive"] }
+clap = { version = "4", features = ["derive", "env"] }
+# duckdb is the SQL query engine: in-process Connection with the
+# `lance` core extension loaded, ATTACHing the on-disk lance datasets
+# under namespace `ns`. No DuckDB tables of our own; all storage is in
+# Lance. The `bundled` feature compiles the duckdb library statically
+# so we don't need a system-wide install.
 duckdb = { version = "1", features = ["bundled"] }
 rmcp = { version = "1.5", features = ["server", "macros", "transport-io"] }
 schemars = "0.8"
@@ -29,12 +50,23 @@ tempfile = "3"
 once_cell = "1"
 tiktoken-rs = "0.11"
 uuid = { version = "1", features = ["v5", "v7"] }
-usearch = { version = "2", default-features = false }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 rust-embed = { version = "8", features = ["debug-embed"] }
-tantivy = "0.22"
-r2d2 = "0.8"
 
 [dev-dependencies]
 rand = "0.8"
+
+# PoC: probe the Lance DuckDB extension's row-level DML capabilities
+# and Rust-write→DuckDB-read visibility model. Run with:
+#   cargo run --example lance_duckdb_poc
+# Requires network at first run (community extension download).
+[[example]]
+name = "lance_duckdb_poc"
+
+# PoC: cross-table hybrid search (lance_fts + lance_vector_search joined
+# on capability_capsule_id, with RRF computed in DuckDB SQL). Validates
+# the no-schema-change route to native hybrid retrieval. Run with:
+#   cargo run --example hybrid_sql_poc
+[[example]]
+name = "hybrid_sql_poc"

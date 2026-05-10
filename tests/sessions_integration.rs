@@ -1,18 +1,20 @@
+use std::sync::Arc;
+
 // Integration tests for session auto-bucket (ROADMAP #10).
 // Spec: docs/superpowers/specs/2026-04-29-sessions-design.md.
 //
-// These tests exercise the full HTTP path: POST /memories → storage → GET /memories/{id},
+// These tests exercise the full HTTP path: POST /memories → storage → GET /capability_capsules/{id},
 // verifying that session_id is assigned automatically and that the partitioning rules hold.
 //
 // Test 4 (idle eviction) is NOT an HTTP integration test here.  The pure logic (decide_session
 // returning OpenNew when last_seen_at is stale) is already covered by the unit tests in
 // src/pipeline/session.rs::tests.  Backdating a live session row would require either a
-// test-only mutation API on DuckDbRepository or sleeping the full idle window — both add
+// test-only mutation API on Store or sleeping the full idle window — both add
 // more friction than the value warrants for a path whose branching is already unit-tested.
 
 use axum::body::{to_bytes, Body};
 use axum::http::{Request, StatusCode};
-use mem::{http, storage::DuckDbRepository};
+use mem::{http, storage::Store};
 use serde_json::{json, Value};
 use tempfile::{tempdir, TempDir};
 use tower::util::ServiceExt;
@@ -90,9 +92,12 @@ impl TestApp {
 async fn fresh_app() -> TestApp {
     let temp_dir = tempdir().unwrap();
     let db_path = temp_dir.path().join("sessions-integration.duckdb");
-    let repo = DuckDbRepository::open(&db_path).await.unwrap();
+    let repo = Arc::new(Store::open(&db_path).await.unwrap());
 
-    let state = common::test_app_state(repo.clone(), mem::service::MemoryService::new(repo));
+    let state = common::test_app_state(
+        repo.clone(),
+        mem::service::CapabilityCapsuleService::new(repo),
+    );
 
     TestApp {
         _temp_dir: Some(temp_dir),
@@ -104,7 +109,7 @@ async fn fresh_app() -> TestApp {
 fn ingest_body(tenant: &str, agent: &str, content: &str) -> Value {
     json!({
         "tenant": tenant,
-        "memory_type": "implementation",
+        "capability_capsule_type": "implementation",
         "content": content,
         "scope": "global",
         "write_mode": "auto",
@@ -118,28 +123,30 @@ fn ingest_body(tenant: &str, agent: &str, content: &str) -> Value {
 
 async fn post_memory(app: &TestApp, tenant: &str, agent: &str, content: &str) -> String {
     let resp = app
-        .post_json("/memories", ingest_body(tenant, agent, content))
+        .post_json("/capability_capsules", ingest_body(tenant, agent, content))
         .await;
     assert_eq!(resp.status.as_u16(), 201, "ingest failed: {}", resp.body);
-    resp.json()["memory_id"]
+    resp.json()["capability_capsule_id"]
         .as_str()
-        .expect("memory_id in response")
+        .expect("capability_capsule_id in response")
         .to_string()
 }
 
-async fn get_memory(app: &TestApp, memory_id: &str) -> Value {
-    let resp = app.get(&format!("/memories/{memory_id}")).await;
+async fn get_capability_capsule(app: &TestApp, capability_capsule_id: &str) -> Value {
+    let resp = app
+        .get(&format!("/capability_capsules/{capability_capsule_id}"))
+        .await;
     assert_eq!(
         resp.status,
         StatusCode::OK,
-        "get_memory failed: {}",
+        "get_capability_capsule failed: {}",
         resp.body
     );
     resp.json()
 }
 
 fn session_id_of(memory_detail: &Value) -> String {
-    memory_detail["memory"]["session_id"]
+    memory_detail["capability_capsule"]["session_id"]
         .as_str()
         .expect("session_id should be a string in stored memory")
         .to_string()
@@ -154,7 +161,7 @@ fn session_id_of(memory_detail: &Value) -> String {
 async fn ingest_creates_first_session() {
     let app = fresh_app().await;
     let mid = post_memory(&app, "t", "agent_a", "first memory").await;
-    let detail = get_memory(&app, &mid).await;
+    let detail = get_capability_capsule(&app, &mid).await;
     let sid = session_id_of(&detail);
     assert!(!sid.is_empty(), "session_id must not be empty");
 }
@@ -167,8 +174,8 @@ async fn ingest_continues_active_session_within_idle() {
     let mid1 = post_memory(&app, "t", "agent_a", "first memory").await;
     let mid2 = post_memory(&app, "t", "agent_a", "second memory within idle").await;
 
-    let sid1 = session_id_of(&get_memory(&app, &mid1).await);
-    let sid2 = session_id_of(&get_memory(&app, &mid2).await);
+    let sid1 = session_id_of(&get_capability_capsule(&app, &mid1).await);
+    let sid2 = session_id_of(&get_capability_capsule(&app, &mid2).await);
 
     assert_eq!(
         sid1, sid2,
@@ -183,8 +190,8 @@ async fn ingest_independent_session_per_caller_agent() {
     let mid_codex = post_memory(&app, "t", "codex", "from codex").await;
     let mid_cursor = post_memory(&app, "t", "cursor", "from cursor").await;
 
-    let sid_codex = session_id_of(&get_memory(&app, &mid_codex).await);
-    let sid_cursor = session_id_of(&get_memory(&app, &mid_cursor).await);
+    let sid_codex = session_id_of(&get_capability_capsule(&app, &mid_codex).await);
+    let sid_cursor = session_id_of(&get_capability_capsule(&app, &mid_cursor).await);
 
     assert_ne!(
         sid_codex, sid_cursor,
@@ -200,8 +207,8 @@ async fn ingest_independent_session_per_tenant() {
     let mid_a = post_memory(&app, "tenant-alpha", "agent_x", "from alpha").await;
     let mid_b = post_memory(&app, "tenant-beta", "agent_x", "from beta").await;
 
-    let sid_a = session_id_of(&get_memory(&app, &mid_a).await);
-    let sid_b = session_id_of(&get_memory(&app, &mid_b).await);
+    let sid_a = session_id_of(&get_capability_capsule(&app, &mid_a).await);
+    let sid_b = session_id_of(&get_capability_capsule(&app, &mid_b).await);
 
     assert_ne!(
         sid_a, sid_b,

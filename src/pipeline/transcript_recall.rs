@@ -151,7 +151,7 @@ pub fn score_candidates(
 /// A primary hit with its hydrated context neighbors. The `primary` carries
 /// its scoring context (`ScoredBlock`); `before` and `after` are
 /// chronologically adjacent same-session blocks supplied by
-/// [`crate::storage::DuckDbRepository::context_window_for_block`].
+/// [`crate::storage::Store::context_window_for_block`].
 #[derive(Debug, Clone)]
 pub struct PrimaryWithContext {
     pub primary: ScoredBlock,
@@ -312,6 +312,7 @@ mod tests {
             tool_use_id: None,
             embed_eligible: true,
             created_at: created.to_string(),
+            meta_json: None,
         }
     }
 
@@ -590,6 +591,7 @@ mod window_tests {
             tool_use_id: None,
             embed_eligible: true,
             created_at: created.to_string(),
+            meta_json: None,
         }
     }
 

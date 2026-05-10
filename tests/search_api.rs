@@ -11,13 +11,19 @@ use axum::{
 };
 use mem::{
     domain::{
-        memory::{MemoryRecord, MemoryStatus, MemoryType, Scope, Visibility},
-        query::{DirectiveItem, FactItem, PatternItem, SearchMemoryRequest, SearchMemoryResponse},
+        capability_capsule::{
+            CapabilityCapsuleRecord, CapabilityCapsuleStatus, CapabilityCapsuleType, Scope,
+            Visibility,
+        },
+        query::{
+            DirectiveItem, FactItem, PatternItem, SearchCapabilityCapsuleRequest,
+            SearchCapabilityCapsuleResponse,
+        },
         workflow::WorkflowOutline,
     },
     http,
-    service::MemoryService,
-    storage::{DuckDbGraphStore, DuckDbRepository},
+    service::CapabilityCapsuleService,
+    storage::Store,
 };
 use serde_json::{json, Value};
 use tempfile::{tempdir, TempDir};
@@ -35,10 +41,10 @@ struct TestResponse {
     body: String,
 }
 
-struct MemorySpec<'a> {
+struct CapabilityCapsuleSpec<'a> {
     tenant: &'a str,
-    memory_id: &'a str,
-    memory_type: MemoryType,
+    capability_capsule_id: &'a str,
+    capability_capsule_type: CapabilityCapsuleType,
     scope: Scope,
     repo: Option<&'a str>,
     project: Option<&'a str>,
@@ -84,19 +90,19 @@ impl TestApp {
     }
 }
 
-fn memory(spec: MemorySpec<'_>) -> MemoryRecord {
-    MemoryRecord {
-        memory_id: spec.memory_id.into(),
+fn memory(spec: CapabilityCapsuleSpec<'_>) -> CapabilityCapsuleRecord {
+    CapabilityCapsuleRecord {
+        capability_capsule_id: spec.capability_capsule_id.into(),
         tenant: spec.tenant.into(),
-        memory_type: spec.memory_type,
-        status: MemoryStatus::Active,
+        capability_capsule_type: spec.capability_capsule_type,
+        status: CapabilityCapsuleStatus::Active,
         scope: spec.scope,
         visibility: Visibility::Shared,
         version: 1,
         summary: spec.summary.into(),
         content: spec.content.into(),
-        evidence: vec![format!("docs/{}.md", spec.memory_id)],
-        code_refs: vec![format!("src/{}.rs", spec.memory_id)],
+        evidence: vec![format!("docs/{}.md", spec.capability_capsule_id)],
+        code_refs: vec![format!("src/{}.rs", spec.capability_capsule_id)],
         project: spec.project.map(str::to_string),
         repo: spec.repo.map(str::to_string),
         module: spec.module.map(str::to_string),
@@ -105,10 +111,10 @@ fn memory(spec: MemorySpec<'_>) -> MemoryRecord {
         topics: vec![],
         confidence: 0.9,
         decay_score: spec.decay_score,
-        content_hash: format!("hash-{}", spec.memory_id),
+        content_hash: format!("hash-{}", spec.capability_capsule_id),
         idempotency_key: None,
         session_id: None,
-        supersedes_memory_id: None,
+        supersedes_capability_capsule_id: None,
         source_agent: "codex-worker".into(),
         created_at: spec.updated_at.into(),
         updated_at: spec.updated_at.into(),
@@ -116,18 +122,18 @@ fn memory(spec: MemorySpec<'_>) -> MemoryRecord {
     }
 }
 
-async fn seeded_search_app(memories: Vec<MemoryRecord>) -> TestApp {
+async fn seeded_search_app(memories: Vec<CapabilityCapsuleRecord>) -> TestApp {
     let temp_dir = tempdir().unwrap();
     let db_path = temp_dir.path().join("search-api.duckdb");
-    let repo = DuckDbRepository::open(&db_path).await.unwrap();
-    let graph = Arc::new(DuckDbGraphStore::new(Arc::new(repo.clone())));
+    let repo = Arc::new(Store::open(&db_path).await.unwrap());
 
     for memory in memories {
-        repo.insert_memory(memory.clone()).await.unwrap();
-        graph.sync_memory(&memory).await.unwrap();
+        repo.insert_capability_capsule(memory.clone())
+            .await
+            .unwrap();
     }
 
-    let state = common::test_app_state(repo.clone(), MemoryService::new_with_graph(repo, graph));
+    let state = common::test_app_state(repo.clone(), CapabilityCapsuleService::new(repo));
 
     TestApp {
         _temp_dir: temp_dir,
@@ -145,42 +151,43 @@ fn search_request_missing_required_field_fails_deserialization() {
         "expand_graph": true
     });
 
-    let result = serde_json::from_value::<SearchMemoryRequest>(value);
+    let result = serde_json::from_value::<SearchCapabilityCapsuleRequest>(value);
 
     assert!(result.is_err());
 }
 
 #[test]
 fn search_response_serializes_compressed_shapes() {
-    let response = SearchMemoryResponse {
+    let response = SearchCapabilityCapsuleResponse {
         directives: vec![DirectiveItem {
-            memory_id: "mem_1".into(),
+            capability_capsule_id: "mem_1".into(),
             text: "Use cache busting on schema changes".into(),
             source_summary: "Known rule from prior implementation".into(),
         }],
         relevant_facts: vec![FactItem {
-            memory_id: "mem_2".into(),
+            capability_capsule_id: "mem_2".into(),
             text: "DuckDB stores canonical memory records".into(),
             code_refs: vec!["src/storage/duckdb.rs".into()],
             source_summary: "Architecture note".into(),
         }],
         reusable_patterns: vec![PatternItem {
-            memory_id: "mem_3".into(),
+            capability_capsule_id: "mem_3".into(),
             text: "Check invariants before writing migrations".into(),
             applicability: None,
             source_summary: "Repeated successful workflow".into(),
         }],
         suggested_workflow: Some(WorkflowOutline {
-            memory_id: "mem_4".into(),
+            capability_capsule_id: "mem_4".into(),
             goal: "ship a safe schema change".into(),
             steps: vec!["write tests".into(), "implement".into(), "verify".into()],
             success_signals: vec!["tests pass".into()],
         }),
+        recent_conversations: Vec::new(),
     };
 
     let value = serde_json::to_value(response).unwrap();
 
-    assert_eq!(value["directives"][0]["memory_id"], "mem_1");
+    assert_eq!(value["directives"][0]["capability_capsule_id"], "mem_1");
     assert_eq!(
         value["relevant_facts"][0]["code_refs"][0],
         "src/storage/duckdb.rs"
@@ -195,10 +202,10 @@ fn search_response_serializes_compressed_shapes() {
 #[tokio::test]
 async fn search_returns_compressed_memory_pack() {
     let app = seeded_search_app(vec![
-        memory(MemorySpec {
+        memory(CapabilityCapsuleSpec {
             tenant: "local",
-            memory_id: "mem_pref",
-            memory_type: MemoryType::Preference,
+            capability_capsule_id: "mem_pref",
+            capability_capsule_type: CapabilityCapsuleType::Preference,
             scope: Scope::Global,
             repo: None,
             project: None,
@@ -208,10 +215,10 @@ async fn search_returns_compressed_memory_pack() {
             updated_at: "2026-03-21T00:00:01Z",
             decay_score: 0.0,
         }),
-        memory(MemorySpec {
+        memory(CapabilityCapsuleSpec {
             tenant: "local",
-            memory_id: "mem_fact",
-            memory_type: MemoryType::Implementation,
+            capability_capsule_id: "mem_fact",
+            capability_capsule_type: CapabilityCapsuleType::Implementation,
             scope: Scope::Repo,
             repo: Some("billing"),
             project: Some("billing"),
@@ -221,10 +228,10 @@ async fn search_returns_compressed_memory_pack() {
             updated_at: "2026-03-21T00:00:02Z",
             decay_score: 0.0,
         }),
-        memory(MemorySpec {
+        memory(CapabilityCapsuleSpec {
             tenant: "local",
-            memory_id: "mem_pattern",
-            memory_type: MemoryType::Experience,
+            capability_capsule_id: "mem_pattern",
+            capability_capsule_type: CapabilityCapsuleType::Experience,
             scope: Scope::Workspace,
             repo: Some("billing"),
             project: Some("billing"),
@@ -234,10 +241,10 @@ async fn search_returns_compressed_memory_pack() {
             updated_at: "2026-03-21T00:00:03Z",
             decay_score: 0.0,
         }),
-        memory(MemorySpec {
+        memory(CapabilityCapsuleSpec {
             tenant: "local",
-            memory_id: "mem_workflow",
-            memory_type: MemoryType::Workflow,
+            capability_capsule_id: "mem_workflow",
+            capability_capsule_type: CapabilityCapsuleType::Workflow,
             scope: Scope::Repo,
             repo: Some("billing"),
             project: Some("billing"),
@@ -252,7 +259,7 @@ async fn search_returns_compressed_memory_pack() {
 
     let response = app
         .post_json(
-            "/memories/search",
+            "/capability_capsules/search",
             json!({
                 "query": "how should I debug invoice retry failures",
                 "intent": "debugging",
@@ -279,10 +286,10 @@ async fn search_returns_compressed_memory_pack() {
 #[tokio::test]
 async fn scope_bias_prefers_matching_repo_memory() {
     let app = seeded_search_app(vec![
-        memory(MemorySpec {
+        memory(CapabilityCapsuleSpec {
             tenant: "local",
-            memory_id: "mem_other",
-            memory_type: MemoryType::Implementation,
+            capability_capsule_id: "mem_other",
+            capability_capsule_type: CapabilityCapsuleType::Implementation,
             scope: Scope::Repo,
             repo: Some("analytics"),
             project: Some("analytics"),
@@ -292,10 +299,10 @@ async fn scope_bias_prefers_matching_repo_memory() {
             updated_at: "2026-03-21T00:00:01Z",
             decay_score: 0.0,
         }),
-        memory(MemorySpec {
+        memory(CapabilityCapsuleSpec {
             tenant: "local",
-            memory_id: "mem_billing",
-            memory_type: MemoryType::Implementation,
+            capability_capsule_id: "mem_billing",
+            capability_capsule_type: CapabilityCapsuleType::Implementation,
             scope: Scope::Repo,
             repo: Some("billing"),
             project: Some("billing"),
@@ -310,7 +317,7 @@ async fn scope_bias_prefers_matching_repo_memory() {
 
     let response = app
         .post_json(
-            "/memories/search",
+            "/capability_capsules/search",
             json!({
                 "query": "invoice retry failure",
                 "intent": "debugging",
@@ -325,7 +332,7 @@ async fn scope_bias_prefers_matching_repo_memory() {
 
     assert_eq!(response.status(), 200);
     assert_eq!(
-        response.json()["relevant_facts"][0]["memory_id"],
+        response.json()["relevant_facts"][0]["capability_capsule_id"],
         "mem_billing"
     );
 }
@@ -333,10 +340,10 @@ async fn scope_bias_prefers_matching_repo_memory() {
 #[tokio::test]
 async fn stale_memory_penalty_prefers_recent_memory() {
     let app = seeded_search_app(vec![
-        memory(MemorySpec {
+        memory(CapabilityCapsuleSpec {
             tenant: "local",
-            memory_id: "mem_old",
-            memory_type: MemoryType::Implementation,
+            capability_capsule_id: "mem_old",
+            capability_capsule_type: CapabilityCapsuleType::Implementation,
             scope: Scope::Repo,
             repo: Some("billing"),
             project: Some("billing"),
@@ -346,10 +353,10 @@ async fn stale_memory_penalty_prefers_recent_memory() {
             updated_at: "2025-03-21T00:00:01Z",
             decay_score: 0.8,
         }),
-        memory(MemorySpec {
+        memory(CapabilityCapsuleSpec {
             tenant: "local",
-            memory_id: "mem_new",
-            memory_type: MemoryType::Implementation,
+            capability_capsule_id: "mem_new",
+            capability_capsule_type: CapabilityCapsuleType::Implementation,
             scope: Scope::Repo,
             repo: Some("billing"),
             project: Some("billing"),
@@ -364,7 +371,7 @@ async fn stale_memory_penalty_prefers_recent_memory() {
 
     let response = app
         .post_json(
-            "/memories/search",
+            "/capability_capsules/search",
             json!({
                 "query": "retry failures stale cache metadata",
                 "intent": "debugging",
@@ -378,16 +385,19 @@ async fn stale_memory_penalty_prefers_recent_memory() {
         .await;
 
     assert_eq!(response.status(), 200);
-    assert_eq!(response.json()["relevant_facts"][0]["memory_id"], "mem_new");
+    assert_eq!(
+        response.json()["relevant_facts"][0]["capability_capsule_id"],
+        "mem_new"
+    );
 }
 
 #[tokio::test]
 async fn search_respects_tenant_scope() {
     let app = seeded_search_app(vec![
-        memory(MemorySpec {
+        memory(CapabilityCapsuleSpec {
             tenant: "tenant-a",
-            memory_id: "mem_a",
-            memory_type: MemoryType::Implementation,
+            capability_capsule_id: "mem_a",
+            capability_capsule_type: CapabilityCapsuleType::Implementation,
             scope: Scope::Repo,
             repo: Some("billing"),
             project: Some("billing"),
@@ -397,10 +407,10 @@ async fn search_respects_tenant_scope() {
             updated_at: "2026-03-21T00:00:02Z",
             decay_score: 0.0,
         }),
-        memory(MemorySpec {
+        memory(CapabilityCapsuleSpec {
             tenant: "tenant-b",
-            memory_id: "mem_b",
-            memory_type: MemoryType::Implementation,
+            capability_capsule_id: "mem_b",
+            capability_capsule_type: CapabilityCapsuleType::Implementation,
             scope: Scope::Repo,
             repo: Some("billing"),
             project: Some("billing"),
@@ -415,7 +425,7 @@ async fn search_respects_tenant_scope() {
 
     let response = app
         .post_json(
-            "/memories/search",
+            "/capability_capsules/search",
             json!({
                 "query": "invoice retry failure",
                 "intent": "debugging",
@@ -429,16 +439,19 @@ async fn search_respects_tenant_scope() {
         .await;
 
     assert_eq!(response.status(), 200);
-    assert_eq!(response.json()["relevant_facts"][0]["memory_id"], "mem_b");
+    assert_eq!(
+        response.json()["relevant_facts"][0]["capability_capsule_id"],
+        "mem_b"
+    );
 }
 
 #[tokio::test]
 async fn negative_feedback_penalizes_future_recall() {
     let app = seeded_search_app(vec![
-        memory(MemorySpec {
+        memory(CapabilityCapsuleSpec {
             tenant: "local",
-            memory_id: "mem_target",
-            memory_type: MemoryType::Implementation,
+            capability_capsule_id: "mem_target",
+            capability_capsule_type: CapabilityCapsuleType::Implementation,
             scope: Scope::Repo,
             repo: Some("billing"),
             project: Some("billing"),
@@ -448,10 +461,10 @@ async fn negative_feedback_penalizes_future_recall() {
             updated_at: "2026-03-21T00:00:02Z",
             decay_score: 0.0,
         }),
-        memory(MemorySpec {
+        memory(CapabilityCapsuleSpec {
             tenant: "local",
-            memory_id: "mem_backup",
-            memory_type: MemoryType::Implementation,
+            capability_capsule_id: "mem_backup",
+            capability_capsule_type: CapabilityCapsuleType::Implementation,
             scope: Scope::Repo,
             repo: Some("analytics"),
             project: Some("analytics"),
@@ -466,7 +479,7 @@ async fn negative_feedback_penalizes_future_recall() {
 
     let before = app
         .post_json(
-            "/memories/search",
+            "/capability_capsules/search",
             json!({
                 "query": "invoice retry failure stale cache state",
                 "intent": "debugging",
@@ -481,16 +494,16 @@ async fn negative_feedback_penalizes_future_recall() {
 
     assert_eq!(before.status(), 200);
     assert_eq!(
-        before.json()["relevant_facts"][0]["memory_id"],
+        before.json()["relevant_facts"][0]["capability_capsule_id"],
         "mem_target"
     );
 
     let feedback = app
         .post_json(
-            "/memories/feedback",
+            "/capability_capsules/feedback",
             json!({
                 "tenant": "local",
-                "memory_id": "mem_target",
+                "capability_capsule_id": "mem_target",
                 "feedback_kind": "incorrect"
             }),
         )
@@ -501,7 +514,7 @@ async fn negative_feedback_penalizes_future_recall() {
 
     let after = app
         .post_json(
-            "/memories/search",
+            "/capability_capsules/search",
             json!({
                 "query": "invoice retry failure stale cache state",
                 "intent": "debugging",
@@ -515,7 +528,10 @@ async fn negative_feedback_penalizes_future_recall() {
         .await;
 
     assert_eq!(after.status(), 200);
-    assert_eq!(after.json()["relevant_facts"][0]["memory_id"], "mem_backup");
+    assert_eq!(
+        after.json()["relevant_facts"][0]["capability_capsule_id"],
+        "mem_backup"
+    );
 }
 
 // Regression for the FTS rebuild "stopwords has been deleted" failure mode
@@ -523,7 +539,7 @@ async fn negative_feedback_penalizes_future_recall() {
 // 1.x dependency tracker keeps a stale edge to the just-dropped `stopwords`
 // macro, so the second-and-onward rebuild on a long-lived connection used to
 // SessionStart-hook wake-up call (`intent="wake_up"`, empty `query`) takes
-// the fast path in `MemoryService::search`: it fetches a bounded slice of
+// the fast path in `CapabilityCapsuleService::search`: it fetches a bounded slice of
 // recent active memories from DuckDB, skips embedding / HNSW / BM25 / graph
 // ranking, and hands the slice straight to `compress`. The full pipeline
 // took 11–200 s in production on a moderately-loaded DB; this test pins the
@@ -533,10 +549,10 @@ async fn negative_feedback_penalizes_future_recall() {
 #[tokio::test]
 async fn wake_up_fast_path_returns_recent_active_memories() {
     let archived_memory = {
-        let mut m = memory(MemorySpec {
+        let mut m = memory(CapabilityCapsuleSpec {
             tenant: "local",
-            memory_id: "mem_archived",
-            memory_type: MemoryType::Implementation,
+            capability_capsule_id: "mem_archived",
+            capability_capsule_type: CapabilityCapsuleType::Implementation,
             scope: Scope::Repo,
             repo: Some("mem"),
             project: Some("mem"),
@@ -546,14 +562,14 @@ async fn wake_up_fast_path_returns_recent_active_memories() {
             updated_at: "2026-05-07T00:00:03Z",
             decay_score: 0.0,
         });
-        m.status = MemoryStatus::Archived;
+        m.status = CapabilityCapsuleStatus::Archived;
         m
     };
     let app = seeded_search_app(vec![
-        memory(MemorySpec {
+        memory(CapabilityCapsuleSpec {
             tenant: "local",
-            memory_id: "mem_pref",
-            memory_type: MemoryType::Preference,
+            capability_capsule_id: "mem_pref",
+            capability_capsule_type: CapabilityCapsuleType::Preference,
             scope: Scope::Global,
             repo: None,
             project: None,
@@ -563,10 +579,10 @@ async fn wake_up_fast_path_returns_recent_active_memories() {
             updated_at: "2026-05-07T00:00:02Z",
             decay_score: 0.0,
         }),
-        memory(MemorySpec {
+        memory(CapabilityCapsuleSpec {
             tenant: "local",
-            memory_id: "mem_recent_fact",
-            memory_type: MemoryType::Implementation,
+            capability_capsule_id: "mem_recent_fact",
+            capability_capsule_type: CapabilityCapsuleType::Implementation,
             scope: Scope::Repo,
             repo: Some("mem"),
             project: Some("mem"),
@@ -582,7 +598,7 @@ async fn wake_up_fast_path_returns_recent_active_memories() {
 
     let response = app
         .post_json(
-            "/memories/search",
+            "/capability_capsules/search",
             json!({
                 "query": "",
                 "intent": "wake_up",
@@ -603,7 +619,7 @@ async fn wake_up_fast_path_returns_recent_active_memories() {
         .iter()
         .chain(body["relevant_facts"].as_array().unwrap().iter())
         .chain(body["reusable_patterns"].as_array().unwrap().iter())
-        .filter_map(|item| item["memory_id"].as_str().map(str::to_string))
+        .filter_map(|item| item["capability_capsule_id"].as_str().map(str::to_string))
         .collect();
 
     assert!(
@@ -627,10 +643,10 @@ async fn wake_up_fast_path_returns_recent_active_memories() {
 // (and therefore the same long-lived DuckDB connection).
 #[tokio::test]
 async fn fts_rebuild_survives_repeat_dirty_cycles() {
-    let app = seeded_search_app(vec![memory(MemorySpec {
+    let app = seeded_search_app(vec![memory(CapabilityCapsuleSpec {
         tenant: "local",
-        memory_id: "mem_first",
-        memory_type: MemoryType::Implementation,
+        capability_capsule_id: "mem_first",
+        capability_capsule_type: CapabilityCapsuleType::Implementation,
         scope: Scope::Repo,
         repo: Some("mem"),
         project: Some("mem"),
@@ -646,7 +662,7 @@ async fn fts_rebuild_survives_repeat_dirty_cycles() {
     // `ensure_fts_index_fresh`.
     let first = app
         .post_json(
-            "/memories/search",
+            "/capability_capsules/search",
             json!({
                 "query": "rebuild probe",
                 "intent": "debugging",
@@ -664,9 +680,9 @@ async fn fts_rebuild_survives_repeat_dirty_cycles() {
     // `memories` and flips the `fts_dirty` flag back to true.
     let ingest = app
         .post_json(
-            "/memories",
+            "/capability_capsules",
             json!({
-                "memory_type": "implementation",
+                "capability_capsule_type": "implementation",
                 "content": "second round payload for the FTS rebuild probe",
                 "scope": "repo",
                 "visibility": "shared",
@@ -685,7 +701,7 @@ async fn fts_rebuild_survives_repeat_dirty_cycles() {
     //    been deleted".
     let second = app
         .post_json(
-            "/memories/search",
+            "/capability_capsules/search",
             json!({
                 "query": "rebuild probe",
                 "intent": "debugging",

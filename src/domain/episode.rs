@@ -1,7 +1,7 @@
 use serde::{Deserialize, Serialize};
 
 use super::{
-    memory::{Scope, Visibility},
+    capability_capsule::{Scope, Visibility},
     workflow::WorkflowCandidate,
 };
 

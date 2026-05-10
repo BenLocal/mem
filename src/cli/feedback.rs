@@ -1,6 +1,6 @@
 //! `mem feedback-from-transcript` — scan a Claude Code transcript for
 //! `mcp__mem__memory_search` calls, decide which retrieved memories were
-//! actually consumed by the agent, and POST `/memories/feedback` for each.
+//! actually consumed by the agent, and POST `/capability_capsules/feedback` for each.
 //!
 //! Heuristic for "consumed": the memory's `text` (returned in the
 //! `directives` / `relevant_facts` / `reusable_patterns` sections of the
@@ -23,8 +23,10 @@ use std::fs::File;
 use std::io::{BufRead, BufReader};
 use std::path::PathBuf;
 
+use super::common::RemoteArgs;
+
 /// Memory-search MCP tool names we care about. Both share the same
-/// response shape (`domain::query::SearchMemoryResponse`).
+/// response shape (`domain::query::SearchCapabilityCapsuleResponse`).
 const SEARCH_TOOL_NAMES: &[&str] = &[
     "mcp__mem__memory_search",
     "mcp__mem__memory_search_contextual",
@@ -41,18 +43,13 @@ pub struct FeedbackFromTranscriptArgs {
     /// Path to the Claude Code transcript JSONL file.
     pub transcript_path: PathBuf,
 
-    /// Tenant identifier (passed through to `/memories/feedback`).
-    #[arg(long, default_value = "local")]
-    pub tenant: String,
+    #[command(flatten)]
+    pub remote: RemoteArgs,
 
     /// One of: `useful`, `applies_here`, `outdated`, `does_not_apply_here`,
     /// `incorrect`. The default is the mildest positive signal.
     #[arg(long, default_value = "applies_here")]
     pub kind: String,
-
-    /// Base URL for the local mem service.
-    #[arg(long, default_value = "http://127.0.0.1:3000")]
-    pub base_url: String,
 
     /// Skip the "consumed" heuristic and signal every retrieved memory.
     /// Use when you want a uniform soft-positive after every search,
@@ -61,29 +58,76 @@ pub struct FeedbackFromTranscriptArgs {
     pub all: bool,
 }
 
+/// Typed result of a feedback-from-transcript pass.
+#[derive(Debug, Clone, Default)]
+pub struct FeedbackCounts {
+    pub kind: String,
+    pub sent: usize,
+    pub consumed: usize,
+    pub failed: usize,
+}
+
+impl FeedbackCounts {
+    pub fn nothing_to_send(&self) -> bool {
+        self.consumed == 0
+    }
+    /// Treat as a hard failure only when every attempt failed *and*
+    /// at least one was attempted — matches the legacy exit-code
+    /// shape (`failed > 0 && sent == 0`).
+    pub fn hard_failure(&self) -> bool {
+        self.failed > 0 && self.sent == 0
+    }
+}
+
 pub async fn run(args: FeedbackFromTranscriptArgs) -> i32 {
-    let consumed = match scan_transcript(&args) {
-        Ok(set) => set,
+    match run_with_counts(args).await {
+        Ok(counts) => {
+            if counts.nothing_to_send() {
+                println!("feedback: no consumed memories detected");
+                return 0;
+            }
+            println!(
+                "feedback: kind={} sent={}/{} failed={}",
+                counts.kind, counts.sent, counts.consumed, counts.failed,
+            );
+            if counts.hard_failure() {
+                1
+            } else {
+                0
+            }
+        }
         Err(e) => {
             eprintln!("scan transcript: {e}");
-            return 1;
+            1
         }
-    };
+    }
+}
+
+/// Same as [`run`] but returns typed counts to in-process callers (the
+/// hook handlers). Errors only surface for unrecoverable transcript-
+/// parse failures; per-row HTTP errors are counted in `failed`.
+pub async fn run_with_counts(args: FeedbackFromTranscriptArgs) -> anyhow::Result<FeedbackCounts> {
+    let consumed = scan_transcript(&args)?;
     if consumed.is_empty() {
-        println!("feedback: no consumed memories detected");
-        return 0;
+        return Ok(FeedbackCounts {
+            kind: args.kind,
+            ..Default::default()
+        });
     }
     let client = Client::new();
     let mut sent = 0usize;
     let mut failed = 0usize;
     for mid in &consumed {
         let body = serde_json::json!({
-            "tenant": args.tenant,
-            "memory_id": mid,
+            "tenant": args.remote.tenant,
+            "capability_capsule_id": mid,
             "feedback_kind": args.kind,
         });
         match client
-            .post(format!("{}/memories/feedback", args.base_url))
+            .post(format!(
+                "{}/capability_capsules/feedback",
+                args.remote.base_url
+            ))
             .json(&body)
             .send()
             .await
@@ -99,28 +143,22 @@ pub async fn run(args: FeedbackFromTranscriptArgs) -> i32 {
             }
         }
     }
-    println!(
-        "feedback: kind={} sent={}/{} failed={}",
-        args.kind,
+    Ok(FeedbackCounts {
+        kind: args.kind,
         sent,
-        consumed.len(),
+        consumed: consumed.len(),
         failed,
-    );
-    if failed > 0 && sent == 0 {
-        1
-    } else {
-        0
-    }
+    })
 }
 
-/// One pass over the JSONL transcript; returns the set of memory_ids that
+/// One pass over the JSONL transcript; returns the set of capability_capsule_ids that
 /// were both retrieved by an `mcp__mem__memory_search*` call AND whose
 /// `text` reappears in a subsequent assistant `text`/`thinking` block.
 fn scan_transcript(args: &FeedbackFromTranscriptArgs) -> Result<HashSet<String>> {
     let file = File::open(&args.transcript_path)?;
     let reader = BufReader::new(file);
 
-    // (memory_id, text-prefix snippet, line index where retrieval happened)
+    // (capability_capsule_id, text-prefix snippet, line index where retrieval happened)
     let mut retrieved: Vec<(String, String, usize)> = Vec::new();
     // (line index, lower-cased assistant block text) — query corpus.
     let mut assistant_corpus: Vec<(usize, String)> = Vec::new();
@@ -172,7 +210,7 @@ fn scan_transcript(args: &FeedbackFromTranscriptArgs) -> Result<HashSet<String>>
                     // Result content is either a string (older) or an
                     // array of `{type, text}` chunks. The MCP wrapper
                     // emits a single text chunk holding the JSON-encoded
-                    // SearchMemoryResponse — extract that string before
+                    // SearchCapabilityCapsuleResponse — extract that string before
                     // re-parsing.
                     let inner = extract_tool_result_text(&item["content"]);
                     let Ok(resp) = serde_json::from_str::<Value>(&inner) else {
@@ -181,7 +219,7 @@ fn scan_transcript(args: &FeedbackFromTranscriptArgs) -> Result<HashSet<String>>
                     for section in ["directives", "relevant_facts", "reusable_patterns"] {
                         if let Some(arr) = resp[section].as_array() {
                             for entry in arr {
-                                let mid = entry["memory_id"].as_str().unwrap_or("");
+                                let mid = entry["capability_capsule_id"].as_str().unwrap_or("");
                                 let text = entry["text"].as_str().unwrap_or("");
                                 if mid.is_empty() {
                                     continue;

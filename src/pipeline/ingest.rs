@@ -1,8 +1,9 @@
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 
-use crate::domain::memory::{
-    GraphEdge, IngestMemoryRequest, MemoryRecord, MemoryStatus, MemoryType, WriteMode,
+use crate::domain::capability_capsule::{
+    CapabilityCapsuleRecord, CapabilityCapsuleStatus, CapabilityCapsuleType, GraphEdge,
+    IngestCapabilityCapsuleRequest, WriteMode,
 };
 use crate::domain::EntityKind;
 
@@ -23,29 +24,34 @@ pub fn validate_verbatim(content: &str, caller_summary: Option<&str>) -> Result<
     Ok(())
 }
 
-pub fn initial_status(memory_type: &MemoryType, write_mode: &WriteMode) -> MemoryStatus {
-    match (memory_type, write_mode) {
-        (MemoryType::Preference | MemoryType::Workflow, _) => MemoryStatus::PendingConfirmation,
-        (_, WriteMode::Auto) => MemoryStatus::Active,
-        _ => MemoryStatus::Provisional,
+pub fn initial_status(
+    capability_capsule_type: &CapabilityCapsuleType,
+    write_mode: &WriteMode,
+) -> CapabilityCapsuleStatus {
+    match (capability_capsule_type, write_mode) {
+        (CapabilityCapsuleType::Preference | CapabilityCapsuleType::Workflow, _) => {
+            CapabilityCapsuleStatus::PendingConfirmation
+        }
+        (_, WriteMode::Auto) => CapabilityCapsuleStatus::Active,
+        _ => CapabilityCapsuleStatus::Provisional,
     }
 }
 
-pub fn compute_content_hash(request: &IngestMemoryRequest) -> String {
+pub fn compute_content_hash(request: &IngestCapabilityCapsuleRequest) -> String {
     hash_canonical(&canonical_request_json(request))
 }
 
-/// Recompute the content hash from a stored `MemoryRecord`. Equivalent to
-/// hashing the original `IngestMemoryRequest`, used by the migration that
+/// Recompute the content hash from a stored `CapabilityCapsuleRecord`. Equivalent to
+/// hashing the original `IngestCapabilityCapsuleRequest`, used by the migration that
 /// upgrades pre-sha256 rows.
-pub fn compute_content_hash_from_record(record: &MemoryRecord) -> String {
+pub fn compute_content_hash_from_record(record: &CapabilityCapsuleRecord) -> String {
     hash_canonical(&canonical_record_json(record))
 }
 
-fn canonical_request_json(request: &IngestMemoryRequest) -> Value {
+fn canonical_request_json(request: &IngestCapabilityCapsuleRequest) -> Value {
     json!({
         "tenant": request.tenant,
-        "memory_type": request.memory_type,
+        "capability_capsule_type": request.capability_capsule_type,
         "content": request.content,
         "evidence": request.evidence,
         "code_refs": request.code_refs,
@@ -60,10 +66,10 @@ fn canonical_request_json(request: &IngestMemoryRequest) -> Value {
     })
 }
 
-fn canonical_record_json(record: &MemoryRecord) -> Value {
+fn canonical_record_json(record: &CapabilityCapsuleRecord) -> Value {
     json!({
         "tenant": record.tenant,
-        "memory_type": record.memory_type,
+        "capability_capsule_type": record.capability_capsule_type,
         "content": record.content,
         "evidence": record.evidence,
         "code_refs": record.code_refs,
@@ -84,8 +90,8 @@ fn hash_canonical(value: &Value) -> String {
     format!("{:x}", hasher.finalize())
 }
 
-pub fn memory_node_id(memory_id: &str) -> String {
-    format!("memory:{memory_id}")
+pub fn memory_node_id(capability_capsule_id: &str) -> String {
+    format!("capability_capsule:{capability_capsule_id}")
 }
 
 pub fn project_node_id(project: &str) -> String {
@@ -117,7 +123,7 @@ pub enum ToNodeKind {
 
 /// A draft graph edge whose target has not yet been resolved against an
 /// `EntityRegistry`. Produced by `extract_graph_edge_drafts`; resolved by
-/// `service::memory_service::resolve_drafts_to_edges` (Task 8).
+/// `service::capability_capsule_service::resolve_drafts_to_edges` (Task 8).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GraphEdgeDraft {
     pub from_node_id: String,
@@ -126,13 +132,13 @@ pub struct GraphEdgeDraft {
 }
 
 /// Pure: produce drafts that downstream code resolves against an
-/// `EntityRegistry`. Used by both `service::memory_service::ingest`
+/// `EntityRegistry`. Used by both `service::capability_capsule_service::ingest`
 /// (live writes) and `cli::repair::rebuild_graph` (historical re-derive).
 ///
 /// Skips empty/whitespace-only field values.
-pub fn extract_graph_edge_drafts(memory: &MemoryRecord) -> Vec<GraphEdgeDraft> {
+pub fn extract_graph_edge_drafts(memory: &CapabilityCapsuleRecord) -> Vec<GraphEdgeDraft> {
     let mut drafts = Vec::new();
-    let from_node_id = memory_node_id(&memory.memory_id);
+    let from_node_id = memory_node_id(&memory.capability_capsule_id);
 
     if let Some(p) = memory.project.as_deref().filter(|v| !v.trim().is_empty()) {
         drafts.push(GraphEdgeDraft {
@@ -179,13 +185,16 @@ pub fn extract_graph_edge_drafts(memory: &MemoryRecord) -> Vec<GraphEdgeDraft> {
             },
             relation: "uses_workflow".into(),
         });
-    } else if matches!(memory.memory_type, MemoryType::Workflow) {
-        // Self-referencing workflow: alias = the memory_id itself.
+    } else if matches!(
+        memory.capability_capsule_type,
+        CapabilityCapsuleType::Workflow
+    ) {
+        // Self-referencing workflow: alias = the capability_capsule_id itself.
         drafts.push(GraphEdgeDraft {
             from_node_id: from_node_id.clone(),
             to_kind: ToNodeKind::EntityRef {
                 kind: EntityKind::Workflow,
-                alias: memory.memory_id.clone(),
+                alias: memory.capability_capsule_id.clone(),
             },
             relation: "uses_workflow".into(),
         });
@@ -201,7 +210,7 @@ pub fn extract_graph_edge_drafts(memory: &MemoryRecord) -> Vec<GraphEdgeDraft> {
         });
     }
     if let Some(prev) = memory
-        .supersedes_memory_id
+        .supersedes_capability_capsule_id
         .as_deref()
         .filter(|v| !v.trim().is_empty())
     {
@@ -250,13 +259,13 @@ fn legacy_to_node_id(kind: &ToNodeKind) -> String {
 /// **Deprecated.** Legacy wrapper that produces edges with the OLD
 /// `"project:..."` / `"repo:..."` etc. string `to_node_id` format. New
 /// code should call `extract_graph_edge_drafts` and resolve through
-/// `EntityRegistry` (see `service::memory_service::resolve_drafts_to_edges`).
+/// `EntityRegistry` (see `service::capability_capsule_service::resolve_drafts_to_edges`).
 ///
 /// This wrapper exists only so the in-tree `graph_store::sync_memory`
 /// caller and any historical tests keep compiling until they are migrated.
 #[deprecated(note = "Use extract_graph_edge_drafts + EntityRegistry resolution")]
-pub fn extract_graph_edges(memory: &MemoryRecord) -> Vec<GraphEdge> {
-    let from_node_id = memory_node_id(&memory.memory_id);
+pub fn extract_graph_edges(memory: &CapabilityCapsuleRecord) -> Vec<GraphEdge> {
+    let from_node_id = memory_node_id(&memory.capability_capsule_id);
 
     // Convert drafts via the legacy node-id scheme.
     let mut edges: Vec<GraphEdge> = extract_graph_edge_drafts(memory)
@@ -293,14 +302,14 @@ pub fn extract_graph_edges(memory: &MemoryRecord) -> Vec<GraphEdge> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::domain::memory::{MemoryStatus, Scope, Visibility};
+    use crate::domain::capability_capsule::{CapabilityCapsuleStatus, Scope, Visibility};
 
-    fn baseline_memory(id: &str) -> MemoryRecord {
-        MemoryRecord {
-            memory_id: id.to_string(),
+    fn baseline_memory(id: &str) -> CapabilityCapsuleRecord {
+        CapabilityCapsuleRecord {
+            capability_capsule_id: id.to_string(),
             tenant: "local".to_string(),
-            memory_type: MemoryType::Implementation,
-            status: MemoryStatus::Active,
+            capability_capsule_type: CapabilityCapsuleType::Implementation,
+            status: CapabilityCapsuleStatus::Active,
             scope: Scope::Global,
             visibility: Visibility::Private,
             version: 1,
@@ -308,14 +317,14 @@ mod tests {
             content: "x".to_string(),
             source_agent: "test".to_string(),
             content_hash: "00".repeat(32),
-            ..MemoryRecord::default()
+            ..CapabilityCapsuleRecord::default()
         }
     }
 
     #[test]
     fn extract_graph_edge_drafts_emits_entity_refs_for_all_field_types() {
-        let memory = MemoryRecord {
-            memory_id: "m1".to_string(),
+        let memory = CapabilityCapsuleRecord {
+            capability_capsule_id: "m1".to_string(),
             project: Some("mem".to_string()),
             repo: Some("foo/bar".to_string()),
             module: Some("storage".to_string()),
@@ -353,9 +362,9 @@ mod tests {
 
     #[test]
     fn extract_graph_edge_drafts_emits_literal_memory_for_supersedes() {
-        let memory = MemoryRecord {
-            memory_id: "m2".to_string(),
-            supersedes_memory_id: Some("m1".to_string()),
+        let memory = CapabilityCapsuleRecord {
+            capability_capsule_id: "m2".to_string(),
+            supersedes_capability_capsule_id: Some("m1".to_string()),
             ..baseline_memory("m2")
         };
         let drafts = extract_graph_edge_drafts(&memory);
@@ -367,8 +376,8 @@ mod tests {
 
     #[test]
     fn extract_graph_edge_drafts_skips_empty_topic_strings() {
-        let memory = MemoryRecord {
-            memory_id: "m3".to_string(),
+        let memory = CapabilityCapsuleRecord {
+            capability_capsule_id: "m3".to_string(),
             topics: vec!["".to_string(), "Rust".to_string(), "  ".to_string()],
             ..baseline_memory("m3")
         };

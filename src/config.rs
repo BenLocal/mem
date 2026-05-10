@@ -24,12 +24,12 @@ pub struct EmbeddingSettings {
     pub batch_size: usize,
     pub openai_api_key: Option<String>,
     pub vector_index_flush_every: usize,
-    /// Read directly via `std::env::var` in `DuckDbRepository::semantic_search_memories`.
+    /// Read directly via `std::env::var` in `DuckDbQuery::semantic_search_capability_capsules`.
     /// This struct field is populated for diagnostic/logging visibility but is not the
     /// source of truth at search time. See `mempalace-diff §8 #3` Task 14 carryover.
     #[allow(dead_code)]
     pub vector_index_oversample: usize,
-    /// Read directly via `std::env::var` in `DuckDbRepository::semantic_search_memories`.
+    /// Read directly via `std::env::var` in `DuckDbQuery::semantic_search_capability_capsules`.
     /// This struct field is populated for diagnostic/logging visibility but is not the
     /// source of truth at search time. See `mempalace-diff §8 #3` Task 14 carryover.
     #[allow(dead_code)]

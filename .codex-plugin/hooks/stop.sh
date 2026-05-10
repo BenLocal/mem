@@ -1,10 +1,15 @@
 #!/usr/bin/env bash
-# Codex Stop hook: every ~15 user exchanges, run `mem mine` and emit a
-# status line ("✦ mem · N memories + K blocks woven into the archive")
-# via `systemMessage`. Mirrors the Claude Code variant; only differences
-# are the per-runtime --agent label, the throttle file, and the transcript
-# path probe (Codex hook payload field shape varies; fall back to the
-# latest .jsonl under ~/.codex/sessions/).
+# Codex Stop hook. Mirror of the Claude Code variant; differences:
+#   - Codex hook payload uses `transcriptPath` (camelCase), with
+#     `transcript_path` accepted as a fallback for runtime variants.
+#   - Codex doesn't always include a transcript path on the wire —
+#     fall back to the freshest `~/.codex/sessions/*.jsonl`.
+#   - Per-session throttle file is `~/.mem/codex_last_save…` so it
+#     doesn't collide with Claude Code's counter.
+#
+# Mining + feedback + envelope formatting are all handled by
+# `mem mine --with-feedback --format hook-stop`; the wrapper only
+# owns stdin parse + transcript probe + throttle.
 set -uo pipefail
 
 INPUT=$(cat 2>/dev/null || echo '{}')
@@ -22,7 +27,6 @@ if [ -z "$TRANSCRIPT" ] || [ ! -f "$TRANSCRIPT" ]; then
 fi
 
 EXCHANGE_COUNT=$(grep -c '"type":"user"' "$TRANSCRIPT" 2>/dev/null || echo 0)
-# Per-session throttle (multi-session safety) — see Claude Code stop.sh.
 LAST_SAVE_FILE="$HOME/.mem/codex_last_save${SESSION_ID:+_$SESSION_ID}"
 mkdir -p "$(dirname "$LAST_SAVE_FILE")"
 LAST_SAVE=$(cat "$LAST_SAVE_FILE" 2>/dev/null || echo 0)
@@ -32,16 +36,10 @@ if [ $((EXCHANGE_COUNT - LAST_SAVE)) -lt 15 ]; then
     exit 0
 fi
 
-MINE_OUT=$(timeout 60 mem mine "$TRANSCRIPT" --agent codex 2>&1 || true)
-
 echo "$EXCHANGE_COUNT" > "$LAST_SAVE_FILE"
 
-MEMS=$(echo "$MINE_OUT" | sed -n 's/.*memories sent=\([0-9]*\).*/\1/p' | head -1)
-BLOCKS=$(echo "$MINE_OUT" | sed -n 's/.*blocks sent=\([0-9]*\).*/\1/p' | head -1)
-
-if [ -n "$MEMS" ] && [ -n "$BLOCKS" ]; then
-    MSG=$(printf '✦ mem · %s memories + %s blocks woven into the archive' "$MEMS" "$BLOCKS")
-    jq -n --arg msg "$MSG" '{"systemMessage": $msg}'
-else
-    echo '{}'
-fi
+exec mem mine "$TRANSCRIPT" \
+    --tenant local \
+    --agent codex \
+    --mine-timeout-secs 60 \
+    --format hook-stop

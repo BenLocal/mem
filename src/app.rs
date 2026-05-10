@@ -1,3 +1,6 @@
+//! Wires `Store` (LanceDB+DuckDB-via-extension) into services + workers
+//! + HTTP routes. Single entry point: `AppState::from_config(config)`.
+
 use std::sync::Arc;
 
 use axum::Router;
@@ -5,61 +8,25 @@ use tracing::info;
 
 use crate::{
     http,
-    service::{EntityService, MemoryService, TranscriptService},
-    storage::{DuckDbGraphStore, DuckDbRepository, VectorIndex, VectorIndexFingerprint},
+    service::{CapabilityCapsuleService, EntityService, TranscriptService},
+    storage::Store,
 };
 
 #[derive(Clone)]
 pub struct AppState {
-    pub memory_service: MemoryService,
+    pub capability_capsule_service: CapabilityCapsuleService,
     pub config: crate::config::Config,
-    /// Transcript-archive HNSW sidecar. Held on `AppState` (not on the
-    /// repository like the memories index) so [`TranscriptService`] can take
-    /// an explicit `Arc<VectorIndex>` rather than reaching through the
-    /// repository for it.
-    pub transcript_index: Arc<VectorIndex>,
-    /// Service façade backing the `/transcripts/*` HTTP routes. Cheap to
-    /// clone (wraps `Clone`/`Arc` collaborators) so it can sit on `AppState`.
-    pub transcript_service: TranscriptService,
-    /// Service façade backing the `/entities/*` HTTP routes. Wraps the
-    /// shared `DuckDbRepository` and exposes the `EntityRegistry` trait
-    /// behind an HTTP-friendly surface.
+    /// Service façade backing the `/transcripts/*` HTTP routes.
+    pub transcript_service: Arc<TranscriptService>,
+    /// Service façade backing the `/entities/*` HTTP routes.
     pub entity_service: EntityService,
 }
 
 impl AppState {
     pub async fn from_config(config: crate::config::Config) -> anyhow::Result<Self> {
-        let repository = DuckDbRepository::open(&config.db_path).await?;
-        info!(duckdb = %config.db_path.display(), "storage initialized");
-
-        let fp = VectorIndexFingerprint {
-            provider: config.embedding.job_provider_id().to_string(),
-            model: config.embedding.model.clone(),
-            dim: config.embedding.dim,
-        };
-        let vector_index =
-            Arc::new(VectorIndex::open_or_rebuild(&repository, &config.db_path, &fp).await?);
-        repository.attach_vector_index(vector_index.clone());
-        repository.set_transcript_job_provider(config.embedding.job_provider_id());
-        info!(
-            size = vector_index.size(),
-            provider = %fp.provider,
-            model = %fp.model,
-            dim = fp.dim,
-            "vector index ready"
-        );
-
-        let transcript_index = Arc::new(
-            VectorIndex::open_or_rebuild_transcripts(&repository, &config.db_path, &fp).await?,
-        );
-        info!(
-            size = transcript_index.size(),
-            provider = %fp.provider,
-            model = %fp.model,
-            dim = fp.dim,
-            "transcript vector index ready"
-        );
-
+        // Embedding provider — needed for both write-time auto-embed
+        // (via the EmbeddingFunction adapter on LanceStore) and
+        // search-time query embedding.
         let provider = crate::embedding::arc_embedding_provider(&config.embedding)
             .map_err(|e| anyhow::anyhow!("embedding provider: {e}"))?;
         info!(
@@ -68,62 +35,66 @@ impl AppState {
             dim = provider.dim(),
             "embedding provider initialized"
         );
+
+        // Open the unified storage handle. LanceStore creates the
+        // schema + FTS indexes; DuckDbQuery ATTACHes the lance dir.
+        let store = Arc::new(
+            Store::open_with_provider(&config.db_path, provider.clone())
+                .await
+                .map_err(|e| anyhow::anyhow!("storage open: {e}"))?,
+        );
+        info!(path = %config.db_path.display(), "storage initialized");
+
+        // Configure the transcript embedding worker's job-provider id
+        // before any transcript writes happen (writes that are
+        // embed_eligible enqueue a transcript_embedding_jobs row, and
+        // the row's provider column comes from this setter).
+        store.set_transcript_job_provider(config.embedding.job_provider_id());
+
+        // ── Workers ─────────────────────────────────────────────
         let provider_worker = provider.clone();
-        let provider_search = provider.clone();
-        let repo_worker = repository.clone();
-        let repo_decay = repository.clone();
+        let store_worker = store.clone();
         let worker_settings = config.embedding.clone();
         tokio::spawn(async move {
-            crate::worker::embedding_worker::run(repo_worker, provider_worker, worker_settings)
+            crate::worker::embedding_worker::run(store_worker, provider_worker, worker_settings)
                 .await;
         });
-        tokio::spawn(async move {
-            crate::worker::decay_worker::start_decay_worker(Arc::new(repo_decay)).await;
-        });
 
-        // The previous DuckDB-FTS-rebuild worker is gone — BM25 is now
-        // incremental via tantivy (see `storage::fts`) so writes upsert
-        // directly and no rebuild task is needed.
+        let store_decay = store.clone();
+        tokio::spawn(async move {
+            crate::worker::decay_worker::start_decay_worker(store_decay).await;
+        });
 
         if !config.embedding.transcript_disabled {
             let provider_transcript = provider.clone();
-            let repo_transcript = repository.clone();
+            let store_transcript = store.clone();
             let mut transcript_settings = config.embedding.clone();
-            // Transcript pipeline has its own flush cadence — the memories
-            // value is intentionally *not* reused.
             transcript_settings.vector_index_flush_every =
                 config.embedding.transcript_vector_index_flush_every;
-            let transcript_index_for_worker = transcript_index.clone();
             tokio::spawn(async move {
                 crate::worker::transcript_embedding_worker::run(
-                    repo_transcript,
+                    store_transcript,
                     provider_transcript,
                     transcript_settings,
-                    transcript_index_for_worker,
                 )
                 .await;
             });
         }
 
-        let embedding_provider = config.embedding.job_provider_id().to_string();
-        let graph = Arc::new(DuckDbGraphStore::new(Arc::new(repository.clone())));
-        let transcript_service = TranscriptService::new(
-            repository.clone(),
-            transcript_index.clone(),
+        // ── Services ────────────────────────────────────────────
+        let embedding_provider_id = config.embedding.job_provider_id().to_string();
+        let transcript_service = Arc::new(TranscriptService::new(
+            store.clone(),
             Some(provider.clone()),
-        );
-        let entity_service = EntityService::new(repository.clone());
-        let memory_service = MemoryService::with_graph_and_embedding_providers(
-            repository,
-            graph,
-            embedding_provider,
-            Some(provider_search),
-        );
+        ));
+        let entity_service = EntityService::new(store.clone());
+        let capability_capsule_service =
+            CapabilityCapsuleService::with_providers(store, embedding_provider_id, Some(provider))
+                .with_transcript_service(transcript_service.clone());
 
         Ok(Self {
-            memory_service,
+            capability_capsule_service,
             config,
-            transcript_index,
             transcript_service,
             entity_service,
         })

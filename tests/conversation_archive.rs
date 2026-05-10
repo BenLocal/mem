@@ -1,5 +1,7 @@
+use std::sync::Arc;
+
 use mem::domain::{BlockType, ConversationMessage, MessageRole};
-use mem::storage::DuckDbRepository;
+use mem::storage::Store;
 use tempfile::TempDir;
 
 mod common;
@@ -21,134 +23,15 @@ fn sample_message(suffix: &str, embed: bool, block_type: BlockType) -> Conversat
         tool_use_id: None,
         embed_eligible: embed,
         created_at: "2026-04-30T00:00:00Z".to_string(),
+        meta_json: None,
     }
-}
-
-#[tokio::test]
-async fn schema_creates_conversation_messages_and_jobs_tables() {
-    let tmp = TempDir::new().unwrap();
-    let db = tmp.path().join("mem.duckdb");
-    let _repo = DuckDbRepository::open(&db).await.unwrap();
-
-    let conn = duckdb::Connection::open(&db).unwrap();
-
-    let cm: i64 = conn
-        .query_row(
-            "SELECT count(*) FROM information_schema.tables WHERE table_name = 'conversation_messages'",
-            [],
-            |r| r.get(0),
-        )
-        .unwrap();
-    assert_eq!(cm, 1, "conversation_messages table should exist");
-
-    let teq: i64 = conn
-        .query_row(
-            "SELECT count(*) FROM information_schema.tables WHERE table_name = 'transcript_embedding_jobs'",
-            [],
-            |r| r.get(0),
-        )
-        .unwrap();
-    assert_eq!(teq, 1, "transcript_embedding_jobs table should exist");
-
-    conn.execute(
-        "INSERT INTO conversation_messages \
-         (message_block_id, tenant, caller_agent, transcript_path, line_number, block_index, role, block_type, content, embed_eligible, created_at) \
-         VALUES ('m1','t','a','/p',1,0,'user','text','hi',true,'2026-04-30T00:00:00Z')",
-        [],
-    )
-    .unwrap();
-    let dup = conn.execute(
-        "INSERT INTO conversation_messages \
-         (message_block_id, tenant, caller_agent, transcript_path, line_number, block_index, role, block_type, content, embed_eligible, created_at) \
-         VALUES ('m2','t','a','/p',1,0,'user','text','hi',true,'2026-04-30T00:00:00Z')",
-        [],
-    );
-    assert!(
-        dup.is_err(),
-        "duplicate (transcript_path,line_number,block_index) should be rejected"
-    );
-}
-
-#[tokio::test]
-async fn create_conversation_message_inserts_row_and_optionally_enqueues_job() {
-    let tmp = TempDir::new().unwrap();
-    let db = tmp.path().join("mem.duckdb");
-    let repo = DuckDbRepository::open(&db).await.unwrap();
-    repo.set_transcript_job_provider("embedanything");
-
-    // Eligible: row + job
-    let m1 = sample_message("eligible", true, BlockType::Text);
-    repo.create_conversation_message(&m1).await.unwrap();
-
-    let conn = duckdb::Connection::open(&db).unwrap();
-    let cm_count: i64 = conn
-        .query_row("SELECT count(*) FROM conversation_messages", [], |r| {
-            r.get(0)
-        })
-        .unwrap();
-    assert_eq!(cm_count, 1);
-
-    let job_count: i64 = conn
-        .query_row(
-            "SELECT count(*) FROM transcript_embedding_jobs WHERE message_block_id = 'mb-eligible'",
-            [],
-            |r| r.get(0),
-        )
-        .unwrap();
-    assert_eq!(job_count, 1, "embed_eligible=true should enqueue a job");
-
-    // Ineligible: row but no job
-    let mut m2 = sample_message("ineligible", false, BlockType::ToolUse);
-    m2.line_number = 2;
-    repo.create_conversation_message(&m2).await.unwrap();
-
-    let job_count_2: i64 = conn
-        .query_row(
-            "SELECT count(*) FROM transcript_embedding_jobs WHERE message_block_id = 'mb-ineligible'",
-            [],
-            |r| r.get(0),
-        )
-        .unwrap();
-    assert_eq!(job_count_2, 0, "embed_eligible=false should not enqueue");
-}
-
-#[tokio::test]
-async fn create_conversation_message_is_idempotent_on_unique_conflict() {
-    let tmp = TempDir::new().unwrap();
-    let db = tmp.path().join("mem.duckdb");
-    let repo = DuckDbRepository::open(&db).await.unwrap();
-    repo.set_transcript_job_provider("embedanything");
-
-    let m = sample_message("first", true, BlockType::Text);
-    repo.create_conversation_message(&m).await.unwrap();
-
-    // Second call with same (transcript_path, line_number, block_index) but different
-    // message_block_id -> no error, no second row, no second job.
-    let mut m2 = m.clone();
-    m2.message_block_id = "mb-different-id".to_string();
-    repo.create_conversation_message(&m2).await.unwrap();
-
-    let conn = duckdb::Connection::open(&db).unwrap();
-    let cm_count: i64 = conn
-        .query_row("SELECT count(*) FROM conversation_messages", [], |r| {
-            r.get(0)
-        })
-        .unwrap();
-    assert_eq!(cm_count, 1);
-
-    let job_count: i64 = conn
-        .query_row("SELECT count(*) FROM transcript_embedding_jobs", [], |r| {
-            r.get(0)
-        })
-        .unwrap();
-    assert_eq!(job_count, 1, "no duplicate job on idempotent insert");
 }
 
 #[tokio::test]
 async fn get_by_session_returns_time_ordered_blocks() {
     let tmp = TempDir::new().unwrap();
     let db = tmp.path().join("mem.duckdb");
-    let repo = DuckDbRepository::open(&db).await.unwrap();
+    let repo = Arc::new(Store::open(&db).await.unwrap());
     repo.set_transcript_job_provider("embedanything");
 
     let mut m1 = sample_message("a", true, BlockType::Text);
@@ -182,7 +65,7 @@ async fn get_by_session_returns_time_ordered_blocks() {
 async fn fetch_conversation_messages_by_ids_preserves_input_order() {
     let tmp = TempDir::new().unwrap();
     let db = tmp.path().join("mem.duckdb");
-    let repo = DuckDbRepository::open(&db).await.unwrap();
+    let repo = Arc::new(Store::open(&db).await.unwrap());
     repo.set_transcript_job_provider("embedanything");
 
     for (i, suffix) in ["x", "y", "z"].iter().enumerate() {
@@ -205,69 +88,10 @@ async fn fetch_conversation_messages_by_ids_preserves_input_order() {
 }
 
 #[tokio::test]
-async fn transcript_embedding_job_lifecycle() {
-    let tmp = TempDir::new().unwrap();
-    let db = tmp.path().join("mem.duckdb");
-    let repo = DuckDbRepository::open(&db).await.unwrap();
-    repo.set_transcript_job_provider("embedanything");
-
-    let m = sample_message("life", true, BlockType::Text);
-    repo.create_conversation_message(&m).await.unwrap();
-
-    // Claim the next pending job.
-    let now = "2026-04-30T00:00:00Z";
-    let claimed = repo
-        .claim_next_transcript_embedding_job(now, 5)
-        .await
-        .unwrap();
-    let job = claimed.expect("should have one pending job");
-    assert_eq!(job.message_block_id, "mb-life");
-    assert_eq!(job.tenant, "local");
-    assert_eq!(job.attempt_count, 0);
-
-    // Second claim: nothing pending (the previous one is now 'processing').
-    let none = repo
-        .claim_next_transcript_embedding_job(now, 5)
-        .await
-        .unwrap();
-    assert!(none.is_none());
-
-    // Upsert embedding row.
-    let blob = vec![0u8, 0, 128, 63, 0, 0, 0, 64]; // 1.0, 2.0 in LE f32 (sized for dim=2)
-    repo.upsert_conversation_message_embedding(
-        &job.message_block_id,
-        &job.tenant,
-        "fake-model",
-        2,
-        &blob,
-        "fake-hash",
-        &m.created_at,
-        now,
-    )
-    .await
-    .unwrap();
-
-    // Complete the job.
-    repo.complete_transcript_embedding_job(&job.job_id, now)
-        .await
-        .unwrap();
-
-    let conn = duckdb::Connection::open(&db).unwrap();
-    let status: String = conn
-        .query_row(
-            "SELECT status FROM transcript_embedding_jobs WHERE job_id = ?",
-            [&job.job_id],
-            |r| r.get(0),
-        )
-        .unwrap();
-    assert_eq!(status, "completed");
-}
-
-#[tokio::test]
 async fn recent_conversation_messages_returns_newest_first_limited() {
     let tmp = TempDir::new().unwrap();
     let db = tmp.path().join("mem.duckdb");
-    let repo = DuckDbRepository::open(&db).await.unwrap();
+    let repo = Arc::new(Store::open(&db).await.unwrap());
     repo.set_transcript_job_provider("embedanything");
 
     // Seed three messages with strictly increasing timestamps, distinct
@@ -312,16 +136,19 @@ mod http_routes {
     use axum::body::{to_bytes, Body};
     use axum::http::{Request, StatusCode};
     use mem::http;
-    use mem::service::MemoryService;
+    use mem::service::CapabilityCapsuleService;
     use serde_json::{json, Value};
     use tower::ServiceExt;
 
-    async fn build_router() -> (axum::Router, TempDir, DuckDbRepository) {
+    async fn build_router() -> (axum::Router, TempDir, Arc<Store>) {
         let dir = TempDir::new().unwrap();
         let db = dir.path().join("mem.duckdb");
-        let repo = DuckDbRepository::open(&db).await.unwrap();
+        let repo = Arc::new(Store::open(&db).await.unwrap());
         repo.set_transcript_job_provider("embedanything");
-        let state = super::common::test_app_state(repo.clone(), MemoryService::new(repo.clone()));
+        let state = super::common::test_app_state(
+            repo.clone(),
+            CapabilityCapsuleService::new(repo.clone()),
+        );
         let router = http::router().with_state(state);
         (router, dir, repo)
     }
@@ -684,5 +511,160 @@ mod http_routes {
             "block_type=tool_use yields no primaries via empty-query browse \
              (tool_use is embed-ineligible)"
         );
+    }
+
+    #[tokio::test]
+    async fn post_transcripts_messages_batch_lands_all_rows() {
+        let (app, _dir, _repo) = build_router().await;
+
+        let body = json!([
+            {
+                "session_id": "sess-batch",
+                "tenant": "local",
+                "caller_agent": "claude-code",
+                "transcript_path": "/tmp/batch.jsonl",
+                "line_number": 1,
+                "block_index": 0,
+                "role": "user",
+                "block_type": "text",
+                "content": "first batch block",
+                "embed_eligible": true,
+                "created_at": "2026-04-30T00:00:01Z"
+            },
+            {
+                "session_id": "sess-batch",
+                "tenant": "local",
+                "caller_agent": "claude-code",
+                "transcript_path": "/tmp/batch.jsonl",
+                "line_number": 2,
+                "block_index": 0,
+                "role": "assistant",
+                "block_type": "text",
+                "content": "second batch block",
+                "embed_eligible": true,
+                "created_at": "2026-04-30T00:00:02Z"
+            }
+        ]);
+
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/transcripts/messages/batch")
+                    .header("content-type", "application/json")
+                    .body(Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let v: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(v["inserted"], 2);
+        let ids = v["message_block_ids"].as_array().expect("ids array");
+        assert_eq!(ids.len(), 2);
+
+        // Verify rows are queryable.
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/transcripts")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        json!({"session_id": "sess-batch", "tenant": "local"}).to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let v: Value = serde_json::from_slice(&bytes).unwrap();
+        let messages = v["messages"].as_array().expect("messages array");
+        assert_eq!(messages.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn post_transcripts_messages_batch_dedupes_against_existing() {
+        let (app, _dir, _repo) = build_router().await;
+
+        // Pre-seed one row via the single endpoint.
+        let pre = json!({
+            "session_id": "sess-dedupe",
+            "tenant": "local",
+            "caller_agent": "claude-code",
+            "transcript_path": "/tmp/dedupe.jsonl",
+            "line_number": 5,
+            "block_index": 0,
+            "role": "user",
+            "block_type": "text",
+            "content": "pre-existing",
+            "embed_eligible": true,
+            "created_at": "2026-04-30T00:00:01Z"
+        });
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/transcripts/messages")
+                    .header("content-type", "application/json")
+                    .body(Body::from(pre.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        // Batch contains one duplicate of the pre-seeded key + one fresh
+        // row. Server reports `inserted = 1` and only the fresh row
+        // lands.
+        let body = json!([
+            {
+                "session_id": "sess-dedupe",
+                "tenant": "local",
+                "caller_agent": "claude-code",
+                "transcript_path": "/tmp/dedupe.jsonl",
+                "line_number": 5,
+                "block_index": 0,
+                "role": "user",
+                "block_type": "text",
+                "content": "duplicate of pre-existing",
+                "embed_eligible": true,
+                "created_at": "2026-04-30T00:00:02Z"
+            },
+            {
+                "session_id": "sess-dedupe",
+                "tenant": "local",
+                "caller_agent": "claude-code",
+                "transcript_path": "/tmp/dedupe.jsonl",
+                "line_number": 6,
+                "block_index": 0,
+                "role": "assistant",
+                "block_type": "text",
+                "content": "fresh row",
+                "embed_eligible": true,
+                "created_at": "2026-04-30T00:00:03Z"
+            }
+        ]);
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/transcripts/messages/batch")
+                    .header("content-type", "application/json")
+                    .body(Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let v: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(v["inserted"], 1, "only the fresh row should land");
     }
 }

@@ -1,11 +1,11 @@
 use serde::{Deserialize, Serialize};
 
-use super::memory::Scope;
+use super::capability_capsule::Scope;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub struct WorkflowOutline {
-    pub memory_id: String,
+    pub capability_capsule_id: String,
     pub goal: String,
     pub steps: Vec<String>,
     pub success_signals: Vec<String>,
@@ -14,7 +14,7 @@ pub struct WorkflowOutline {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
 #[serde(rename_all = "snake_case")]
 pub struct WorkflowCandidate {
-    pub memory_id: Option<String>,
+    pub capability_capsule_id: Option<String>,
     pub goal: String,
     pub preconditions: Vec<String>,
     pub steps: Vec<String>,

@@ -1,14 +1,17 @@
 //! Façade for the entity-registry HTTP layer. See spec
 //! docs/superpowers/specs/2026-05-02-entity-registry-design.md.
 //!
-//! Thin shim over [`EntityRegistry`] (the storage trait): the HTTP layer
-//! never touches `DuckDbRepository` directly. Method bodies stay simple —
-//! the only non-trivial helper is `create_with_aliases`, which sequences
-//! `resolve_or_create` + zero-or-more `add_alias` calls and re-fetches the
-//! resulting [`EntityWithAliases`] for the response body.
+//! Thin shim over [`Store`]'s entity surface: the HTTP layer never
+//! touches `LanceStore` or `DuckDbQuery` directly. Method bodies stay
+//! simple — the only non-trivial helper is `create_with_aliases`,
+//! which sequences `resolve_or_create` + zero-or-more `add_alias`
+//! calls and re-fetches the resulting [`EntityWithAliases`] for the
+//! response body.
 
 use crate::domain::{AddAliasOutcome, Entity, EntityKind, EntityWithAliases};
-use crate::storage::{DuckDbRepository, EntityRegistry, StorageError};
+use std::sync::Arc;
+
+use crate::storage::{StorageError, Store};
 
 /// Error variants returned by [`EntityService::create_with_aliases`].
 ///
@@ -28,12 +31,16 @@ pub enum CreateWithAliasesError {
 
 #[derive(Clone)]
 pub struct EntityService {
-    repo: DuckDbRepository,
+    /// Shared storage handle. The single `Store` exposes the full
+    /// entity surface (`resolve_or_create`, `add_alias`,
+    /// `lookup_alias`, `get_entity`, `list_entities`) — writes flow
+    /// to LanceStore and reads flow to DuckDbQuery internally.
+    store: Arc<Store>,
 }
 
 impl EntityService {
-    pub fn new(repo: DuckDbRepository) -> Self {
-        Self { repo }
+    pub fn new(store: Arc<Store>) -> Self {
+        Self { store }
     }
 
     /// Create or resolve `canonical_name` (caller's verbatim input) under
@@ -65,9 +72,9 @@ impl EntityService {
         // flag aliases owned by an entity whose canonical_name's normalized
         // form differs from the request — proxied via the canonical_name's
         // own normalized lookup below.
-        let canonical_owner = self.repo.lookup_alias(tenant, canonical_name).await?;
+        let canonical_owner = self.store.lookup_alias(tenant, canonical_name).await?;
         for alias in aliases {
-            if let Some(owner) = self.repo.lookup_alias(tenant, alias).await? {
+            if let Some(owner) = self.store.lookup_alias(tenant, alias).await? {
                 // If the canonical_name already maps to an entity, that's
                 // the would-be target; conflict only if the alias owner
                 // differs from it.
@@ -89,11 +96,11 @@ impl EntityService {
         }
 
         let entity_id = self
-            .repo
+            .store
             .resolve_or_create(tenant, canonical_name, kind, now)
             .await?;
         for alias in aliases {
-            match self.repo.add_alias(tenant, &entity_id, alias, now).await? {
+            match self.store.add_alias(tenant, &entity_id, alias, now).await? {
                 AddAliasOutcome::Inserted | AddAliasOutcome::AlreadyOnSameEntity => {}
                 AddAliasOutcome::ConflictWithDifferentEntity(other) => {
                     // Defense-in-depth: pre-check should have caught this,
@@ -107,7 +114,7 @@ impl EntityService {
             }
         }
         let with_aliases = self
-            .repo
+            .store
             .get_entity(tenant, &entity_id)
             .await?
             .ok_or_else(|| {
@@ -121,7 +128,7 @@ impl EntityService {
         tenant: &str,
         entity_id: &str,
     ) -> Result<Option<EntityWithAliases>, StorageError> {
-        self.repo.get_entity(tenant, entity_id).await
+        self.store.get_entity(tenant, entity_id).await
     }
 
     pub async fn add_alias(
@@ -131,7 +138,7 @@ impl EntityService {
         alias: &str,
         now: &str,
     ) -> Result<AddAliasOutcome, StorageError> {
-        self.repo.add_alias(tenant, entity_id, alias, now).await
+        self.store.add_alias(tenant, entity_id, alias, now).await
     }
 
     pub async fn list(
@@ -141,6 +148,6 @@ impl EntityService {
         query: Option<&str>,
         limit: usize,
     ) -> Result<Vec<Entity>, StorageError> {
-        self.repo.list_entities(tenant, kind, query, limit).await
+        self.store.list_entities(tenant, kind, query, limit).await
     }
 }

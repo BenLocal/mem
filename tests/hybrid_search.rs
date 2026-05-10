@@ -3,13 +3,16 @@ use std::sync::Arc;
 use mem::{
     config::EmbeddingSettings,
     domain::{
-        memory::{MemoryRecord, MemoryStatus, MemoryType, Scope, Visibility},
-        query::SearchMemoryRequest,
+        capability_capsule::{
+            CapabilityCapsuleRecord, CapabilityCapsuleStatus, CapabilityCapsuleType, Scope,
+            Visibility,
+        },
+        query::SearchCapabilityCapsuleRequest,
         EntityKind,
     },
     embedding::{arc_embedding_provider, deterministic_embedding},
-    service::MemoryService,
-    storage::{DuckDbGraphStore, DuckDbRepository, EntityRegistry},
+    service::CapabilityCapsuleService,
+    storage::Store,
 };
 use tempfile::tempdir;
 
@@ -30,16 +33,16 @@ async fn hybrid_search_surfaces_semantic_match_without_lexical_overlap() {
 
     let dir = tempdir().unwrap();
     let db = dir.path().join("hybrid.duckdb");
-    let repo = DuckDbRepository::open(&db).await.unwrap();
+    let repo = Arc::new(Store::open(&db).await.unwrap());
 
     let query_text = "query-unique-semantic-anchor-xyz";
     let query_vec = deterministic_embedding(query_text, dim);
 
-    let mem_noise = MemoryRecord {
-        memory_id: "mem_noise".into(),
+    let mem_noise = CapabilityCapsuleRecord {
+        capability_capsule_id: "mem_noise".into(),
         tenant: "t1".into(),
-        memory_type: MemoryType::Implementation,
-        status: MemoryStatus::Active,
+        capability_capsule_type: CapabilityCapsuleType::Implementation,
+        status: CapabilityCapsuleStatus::Active,
         scope: Scope::Repo,
         visibility: Visibility::Shared,
         version: 1,
@@ -58,18 +61,18 @@ async fn hybrid_search_surfaces_semantic_match_without_lexical_overlap() {
         content_hash: "hash-noise".into(),
         idempotency_key: None,
         session_id: None,
-        supersedes_memory_id: None,
+        supersedes_capability_capsule_id: None,
         source_agent: "test".into(),
         created_at: "1".into(),
         updated_at: "1".into(),
         last_validated_at: None,
     };
 
-    let mem_hit = MemoryRecord {
-        memory_id: "mem_hit".into(),
+    let mem_hit = CapabilityCapsuleRecord {
+        capability_capsule_id: "mem_hit".into(),
         tenant: "t1".into(),
-        memory_type: MemoryType::Implementation,
-        status: MemoryStatus::Active,
+        capability_capsule_type: CapabilityCapsuleType::Implementation,
+        status: CapabilityCapsuleStatus::Active,
         scope: Scope::Repo,
         visibility: Visibility::Shared,
         version: 1,
@@ -88,19 +91,23 @@ async fn hybrid_search_surfaces_semantic_match_without_lexical_overlap() {
         content_hash: "hash-hit".into(),
         idempotency_key: None,
         session_id: None,
-        supersedes_memory_id: None,
+        supersedes_capability_capsule_id: None,
         source_agent: "test".into(),
         created_at: "2".into(),
         updated_at: "2".into(),
         last_validated_at: None,
     };
 
-    repo.insert_memory(mem_noise.clone()).await.unwrap();
-    repo.insert_memory(mem_hit.clone()).await.unwrap();
+    repo.insert_capability_capsule(mem_noise.clone())
+        .await
+        .unwrap();
+    repo.insert_capability_capsule(mem_hit.clone())
+        .await
+        .unwrap();
 
     let now = "00000000000000000001";
-    repo.upsert_memory_embedding(
-        &mem_noise.memory_id,
+    repo.upsert_capability_capsule_embedding(
+        &mem_noise.capability_capsule_id,
         &mem_noise.tenant,
         "fake",
         dim as i64,
@@ -111,8 +118,8 @@ async fn hybrid_search_surfaces_semantic_match_without_lexical_overlap() {
     )
     .await
     .unwrap();
-    repo.upsert_memory_embedding(
-        &mem_hit.memory_id,
+    repo.upsert_capability_capsule_embedding(
+        &mem_hit.capability_capsule_id,
         &mem_hit.tenant,
         "fake",
         dim as i64,
@@ -124,16 +131,10 @@ async fn hybrid_search_surfaces_semantic_match_without_lexical_overlap() {
     .await
     .unwrap();
 
-    let graph = Arc::new(DuckDbGraphStore::new(Arc::new(repo.clone())));
-    let service = MemoryService::with_graph_and_embedding_providers(
-        repo,
-        graph,
-        "fake".into(),
-        Some(provider),
-    );
+    let service = CapabilityCapsuleService::with_providers(repo, "fake".into(), Some(provider));
 
     let response = service
-        .search(SearchMemoryRequest {
+        .search(SearchCapabilityCapsuleRequest {
             query: query_text.into(),
             intent: "debugging".into(),
             scope_filters: vec![],
@@ -146,16 +147,26 @@ async fn hybrid_search_surfaces_semantic_match_without_lexical_overlap() {
         .unwrap();
 
     let mut ids = Vec::new();
-    ids.extend(response.directives.iter().map(|d| d.memory_id.as_str()));
-    ids.extend(response.relevant_facts.iter().map(|f| f.memory_id.as_str()));
+    ids.extend(
+        response
+            .directives
+            .iter()
+            .map(|d| d.capability_capsule_id.as_str()),
+    );
+    ids.extend(
+        response
+            .relevant_facts
+            .iter()
+            .map(|f| f.capability_capsule_id.as_str()),
+    );
     ids.extend(
         response
             .reusable_patterns
             .iter()
-            .map(|p| p.memory_id.as_str()),
+            .map(|p| p.capability_capsule_id.as_str()),
     );
     if let Some(w) = response.suggested_workflow.as_ref() {
-        ids.push(w.memory_id.as_str());
+        ids.push(w.capability_capsule_id.as_str());
     }
 
     assert!(
@@ -169,15 +180,17 @@ async fn hybrid_search_surfaces_semantic_match_without_lexical_overlap() {
 // ---------------------------------------------------------------------------
 
 async fn ingest_for_e2e(
-    svc: &MemoryService,
+    svc: &CapabilityCapsuleService,
     content: &str,
     project: Option<&str>,
     repo_name: Option<&str>,
-) -> mem::service::IngestMemoryResponse {
-    use mem::domain::memory::{IngestMemoryRequest, MemoryType, Scope, Visibility, WriteMode};
-    svc.ingest(IngestMemoryRequest {
+) -> mem::service::IngestCapabilityCapsuleResponse {
+    use mem::domain::capability_capsule::{
+        CapabilityCapsuleType, IngestCapabilityCapsuleRequest, Scope, Visibility, WriteMode,
+    };
+    svc.ingest(IngestCapabilityCapsuleRequest {
         tenant: "t".into(),
-        memory_type: MemoryType::Implementation,
+        capability_capsule_type: CapabilityCapsuleType::Implementation,
         content: content.into(),
         summary: None,
         evidence: vec![],
@@ -202,9 +215,8 @@ async fn ingest_for_e2e(
 async fn graph_boost_excludes_superseded_memory_from_related_memory_ids() {
     let dir = tempdir().unwrap();
     let db = dir.path().join("graph-boost.duckdb");
-    let repo = Arc::new(DuckDbRepository::open(&db).await.unwrap());
-    let graph = Arc::new(DuckDbGraphStore::new(repo.clone()));
-    let svc = MemoryService::new_with_graph((*repo).clone(), graph.clone());
+    let repo = Arc::new(Store::open(&db).await.unwrap());
+    let svc = CapabilityCapsuleService::new(repo.clone());
 
     // Ingest two memories sharing project=foo so graph edges link them via
     // the resolved entity node (entity:<uuid>) — Task 9 routed ingest through
@@ -221,8 +233,8 @@ async fn graph_boost_excludes_superseded_memory_from_related_memory_ids() {
     let project_node = format!("entity:{project_entity_id}");
 
     // Pre-condition: both memories are reachable from the shared project node.
-    let pre = graph
-        .related_memory_ids(std::slice::from_ref(&project_node))
+    let pre = repo
+        .related_capability_capsule_ids(std::slice::from_ref(&project_node))
         .await
         .unwrap();
     let mut pre_sorted = pre.clone();
@@ -234,17 +246,19 @@ async fn graph_boost_excludes_superseded_memory_from_related_memory_ids() {
     );
 
     // Simulate the supersede side-effect: close r1's outbound edges.
-    graph.close_edges_for_memory(&r1.memory_id).await.unwrap();
+    repo.close_edges_for_capability_capsule(&r1.capability_capsule_id)
+        .await
+        .unwrap();
 
     // Post-condition: only r2 is reachable — r1 is excluded by graph_boost.
-    let post = graph
-        .related_memory_ids(std::slice::from_ref(&project_node))
+    let post = repo
+        .related_capability_capsule_ids(std::slice::from_ref(&project_node))
         .await
         .unwrap();
     assert_eq!(
         post.len(),
         1,
-        "after close_edges_for_memory, only r2 should be related: {post:?}"
+        "after close_edges_for_capability_capsule, only r2 should be related: {post:?}"
     );
-    assert_eq!(post[0], r2.memory_id);
+    assert_eq!(post[0], r2.capability_capsule_id);
 }

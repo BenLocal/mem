@@ -12,6 +12,8 @@
 //! to filter at query time. Re-run `fts_predicate_probe` (`#[ignore]`'d
 //! below) on DuckDB upgrades.
 
+use std::sync::Arc;
+
 #[test]
 #[ignore]
 fn fts_predicate_probe() {
@@ -60,7 +62,7 @@ fn fts_predicate_probe() {
 }
 
 use mem::domain::{BlockType, ConversationMessage, MessageRole};
-use mem::storage::DuckDbRepository;
+use mem::storage::Store;
 use tempfile::TempDir;
 
 mod common;
@@ -87,6 +89,7 @@ fn sample_block(
         tool_use_id: None,
         embed_eligible: embed,
         created_at: "00000000020260430000".to_string(),
+        meta_json: None,
     }
 }
 
@@ -94,7 +97,7 @@ fn sample_block(
 async fn bm25_finds_lexical_match_in_text_block() {
     let tmp = TempDir::new().unwrap();
     let db = tmp.path().join("mem.duckdb");
-    let repo = DuckDbRepository::open(&db).await.unwrap();
+    let repo = Arc::new(Store::open(&db).await.unwrap());
     repo.set_transcript_job_provider("embedanything");
 
     let mut a = sample_block("a", "the user asked about Python", BlockType::Text, true);
@@ -124,7 +127,7 @@ async fn bm25_finds_lexical_match_in_text_block() {
 async fn bm25_excludes_tool_blocks() {
     let tmp = TempDir::new().unwrap();
     let db = tmp.path().join("mem.duckdb");
-    let repo = DuckDbRepository::open(&db).await.unwrap();
+    let repo = Arc::new(Store::open(&db).await.unwrap());
     repo.set_transcript_job_provider("embedanything");
 
     // tool_use block whose JSON content has a unique keyword. embed_eligible=false
@@ -149,7 +152,7 @@ async fn bm25_excludes_tool_blocks() {
 async fn context_window_returns_neighbors_in_same_session() {
     let tmp = TempDir::new().unwrap();
     let db = tmp.path().join("mem.duckdb");
-    let repo = DuckDbRepository::open(&db).await.unwrap();
+    let repo = Arc::new(Store::open(&db).await.unwrap());
     repo.set_transcript_job_provider("embedanything");
 
     // Seed 5 text blocks, increasing line_number AND created_at.
@@ -180,7 +183,7 @@ async fn context_window_returns_neighbors_in_same_session() {
 async fn context_window_excludes_tool_blocks_by_default() {
     let tmp = TempDir::new().unwrap();
     let db = tmp.path().join("mem.duckdb");
-    let repo = DuckDbRepository::open(&db).await.unwrap();
+    let repo = Arc::new(Store::open(&db).await.unwrap());
     repo.set_transcript_job_provider("embedanything");
 
     // text, tool_use, text, tool_result, text — primary at index 2 (the middle text).
@@ -239,7 +242,7 @@ async fn context_window_excludes_tool_blocks_by_default() {
 async fn context_window_does_not_cross_session_boundary() {
     let tmp = TempDir::new().unwrap();
     let db = tmp.path().join("mem.duckdb");
-    let repo = DuckDbRepository::open(&db).await.unwrap();
+    let repo = Arc::new(Store::open(&db).await.unwrap());
     repo.set_transcript_job_provider("embedanything");
 
     // Two sessions interleaved temporally; window for session A's block must
@@ -276,7 +279,7 @@ async fn context_window_does_not_cross_session_boundary() {
 async fn context_window_returns_not_found_for_missing_id() {
     let tmp = TempDir::new().unwrap();
     let db = tmp.path().join("mem.duckdb");
-    let repo = DuckDbRepository::open(&db).await.unwrap();
+    let repo = Arc::new(Store::open(&db).await.unwrap());
     repo.set_transcript_job_provider("embedanything");
 
     let err = repo
@@ -310,13 +313,13 @@ use tower::ServiceExt;
 
 async fn build_recall_app(db_dir: &TempDir) -> axum::Router {
     use mem::config::Config;
-    use mem::service::MemoryService;
+    use mem::service::CapabilityCapsuleService;
     let mut cfg = Config::local();
     cfg.db_path = db_dir.path().join("mem.duckdb");
-    let repo = DuckDbRepository::open(&cfg.db_path).await.unwrap();
+    let repo = Arc::new(Store::open(&cfg.db_path).await.unwrap());
     repo.set_transcript_job_provider("embedanything");
-    let memory_service = MemoryService::new(repo.clone());
-    let state = common::test_app_state(repo, memory_service);
+    let capability_capsule_service = CapabilityCapsuleService::new(repo.clone());
+    let state = common::test_app_state(repo, capability_capsule_service);
     mem::http::router().with_state(state)
 }
 

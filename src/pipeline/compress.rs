@@ -1,10 +1,14 @@
 use tiktoken_rs::{o200k_base_singleton, CoreBPE};
 
 use crate::domain::{
-    memory::{MemoryRecord, MemoryType},
-    query::{DirectiveItem, FactItem, PatternItem, SearchMemoryResponse},
+    capability_capsule::{CapabilityCapsuleRecord, CapabilityCapsuleType},
+    query::{
+        ConversationHighlight, ConversationSnippet, DirectiveItem, FactItem, PatternItem,
+        SearchCapabilityCapsuleResponse,
+    },
     workflow::WorkflowOutline,
 };
+use crate::service::RecentSession;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Section {
@@ -14,9 +18,12 @@ enum Section {
     Workflow,
 }
 
-pub fn compress(candidates: &[MemoryRecord], budget: usize) -> SearchMemoryResponse {
+pub fn compress(
+    candidates: &[CapabilityCapsuleRecord],
+    budget: usize,
+) -> SearchCapabilityCapsuleResponse {
     if candidates.is_empty() || budget == 0 {
-        return SearchMemoryResponse::default();
+        return SearchCapabilityCapsuleResponse::default();
     }
 
     let budget = budget.max(80);
@@ -36,14 +43,14 @@ pub fn compress(candidates: &[MemoryRecord], budget: usize) -> SearchMemoryRespo
                 if directives_budget > 0 && directives.len() < max_items(directives_budget) =>
             {
                 directives.push(DirectiveItem {
-                    memory_id: memory.memory_id.clone(),
+                    capability_capsule_id: memory.capability_capsule_id.clone(),
                     text: compress_text(directive_text(memory), directives_budget),
                     source_summary: compress_text(&memory.summary, directives_budget / 2 + 8),
                 });
             }
             Section::Fact if facts_budget > 0 && relevant_facts.len() < max_items(facts_budget) => {
                 relevant_facts.push(FactItem {
-                    memory_id: memory.memory_id.clone(),
+                    capability_capsule_id: memory.capability_capsule_id.clone(),
                     text: compress_text(fact_text(memory), facts_budget),
                     code_refs: memory.code_refs.clone(),
                     source_summary: compress_text(&memory.summary, facts_budget / 2 + 8),
@@ -53,7 +60,7 @@ pub fn compress(candidates: &[MemoryRecord], budget: usize) -> SearchMemoryRespo
                 if patterns_budget > 0 && reusable_patterns.len() < max_items(patterns_budget) =>
             {
                 reusable_patterns.push(PatternItem {
-                    memory_id: memory.memory_id.clone(),
+                    capability_capsule_id: memory.capability_capsule_id.clone(),
                     text: compress_text(pattern_text(memory), patterns_budget),
                     applicability: applicability(memory),
                     source_summary: compress_text(&memory.summary, patterns_budget / 2 + 8),
@@ -61,7 +68,7 @@ pub fn compress(candidates: &[MemoryRecord], budget: usize) -> SearchMemoryRespo
             }
             Section::Workflow if suggested_workflow.is_none() && workflow_budget > 0 => {
                 suggested_workflow = Some(WorkflowOutline {
-                    memory_id: memory.memory_id.clone(),
+                    capability_capsule_id: memory.capability_capsule_id.clone(),
                     goal: compress_text(workflow_goal(memory), workflow_budget / 3 + 8),
                     steps: workflow_steps(memory, workflow_budget),
                     success_signals: workflow_success_signals(memory, workflow_budget),
@@ -71,20 +78,27 @@ pub fn compress(candidates: &[MemoryRecord], budget: usize) -> SearchMemoryRespo
         }
     }
 
-    SearchMemoryResponse {
+    SearchCapabilityCapsuleResponse {
         directives,
         relevant_facts,
         reusable_patterns,
         suggested_workflow,
+        recent_conversations: Vec::new(),
     }
 }
 
-fn classify(memory: &MemoryRecord) -> Section {
-    if matches!(memory.memory_type, MemoryType::Preference) {
+fn classify(memory: &CapabilityCapsuleRecord) -> Section {
+    if matches!(
+        memory.capability_capsule_type,
+        CapabilityCapsuleType::Preference
+    ) {
         return Section::Directive;
     }
 
-    if matches!(memory.memory_type, MemoryType::Workflow) {
+    if matches!(
+        memory.capability_capsule_type,
+        CapabilityCapsuleType::Workflow
+    ) {
         return Section::Workflow;
     }
 
@@ -107,7 +121,7 @@ fn classify(memory: &MemoryRecord) -> Section {
     }
 }
 
-fn directive_text(memory: &MemoryRecord) -> &str {
+fn directive_text(memory: &CapabilityCapsuleRecord) -> &str {
     if memory.summary.trim().is_empty() {
         &memory.content
     } else {
@@ -115,7 +129,7 @@ fn directive_text(memory: &MemoryRecord) -> &str {
     }
 }
 
-fn fact_text(memory: &MemoryRecord) -> &str {
+fn fact_text(memory: &CapabilityCapsuleRecord) -> &str {
     if memory.content.trim().is_empty() {
         &memory.summary
     } else {
@@ -123,7 +137,7 @@ fn fact_text(memory: &MemoryRecord) -> &str {
     }
 }
 
-fn pattern_text(memory: &MemoryRecord) -> &str {
+fn pattern_text(memory: &CapabilityCapsuleRecord) -> &str {
     if memory.content.contains('\n') {
         &memory.content
     } else {
@@ -131,7 +145,7 @@ fn pattern_text(memory: &MemoryRecord) -> &str {
     }
 }
 
-fn workflow_goal(memory: &MemoryRecord) -> &str {
+fn workflow_goal(memory: &CapabilityCapsuleRecord) -> &str {
     if memory.summary.trim().is_empty() {
         &memory.content
     } else {
@@ -139,7 +153,7 @@ fn workflow_goal(memory: &MemoryRecord) -> &str {
     }
 }
 
-fn workflow_steps(memory: &MemoryRecord, budget: usize) -> Vec<String> {
+fn workflow_steps(memory: &CapabilityCapsuleRecord, budget: usize) -> Vec<String> {
     let mut steps = split_steps(&memory.content);
     if steps.is_empty() {
         steps = split_steps(&memory.summary);
@@ -152,7 +166,7 @@ fn workflow_steps(memory: &MemoryRecord, budget: usize) -> Vec<String> {
         .collect()
 }
 
-fn workflow_success_signals(memory: &MemoryRecord, budget: usize) -> Vec<String> {
+fn workflow_success_signals(memory: &CapabilityCapsuleRecord, budget: usize) -> Vec<String> {
     let mut signals = vec![];
     if !memory.evidence.is_empty() {
         signals.push(memory.evidence.join(", "));
@@ -171,7 +185,7 @@ fn workflow_success_signals(memory: &MemoryRecord, budget: usize) -> Vec<String>
         .collect()
 }
 
-fn applicability(memory: &MemoryRecord) -> Option<String> {
+fn applicability(memory: &CapabilityCapsuleRecord) -> Option<String> {
     let mut parts = Vec::new();
     if let Some(project) = memory.project.as_deref() {
         parts.push(format!("project {project}"));
@@ -225,6 +239,48 @@ fn max_items(budget: usize) -> usize {
         251..=450 => 3,
         _ => 4,
     }
+}
+
+/// Compress a wake-up `Vec<RecentSession>` into the
+/// `ConversationSnippet` shape on `SearchCapabilityCapsuleResponse`.
+/// Each session's per-block budget is `total / sessions / blocks`,
+/// rounded down. Empty input → empty Vec; zero `total_budget` short-
+/// circuits to empty (the `recent_conversations` field is then
+/// omitted from the JSON via `serde(skip_serializing_if = Vec::is_empty)`).
+pub fn compress_recent_sessions(
+    sessions: Vec<RecentSession>,
+    total_budget: usize,
+) -> Vec<ConversationSnippet> {
+    if sessions.is_empty() || total_budget == 0 {
+        return Vec::new();
+    }
+    let n_sessions = sessions.len();
+    let per_session = (total_budget / n_sessions).max(40);
+    sessions
+        .into_iter()
+        .map(|s| {
+            let n_blocks = s.highlights.len().max(1);
+            let per_block = (per_session / n_blocks).max(20);
+            let highlights = s
+                .highlights
+                .into_iter()
+                .map(|m| ConversationHighlight {
+                    message_block_id: m.message_block_id,
+                    role: format!("{:?}", m.role).to_lowercase(),
+                    block_type: format!("{:?}", m.block_type).to_lowercase(),
+                    text: compress_text(&m.content, per_block),
+                    created_at: m.created_at,
+                })
+                .collect();
+            ConversationSnippet {
+                session_id: s.session_id,
+                last_at: s.last_at,
+                block_count: s.block_count,
+                caller_agent: s.caller_agent,
+                highlights,
+            }
+        })
+        .collect()
 }
 
 #[cfg(test)]

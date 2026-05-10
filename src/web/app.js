@@ -1,6 +1,6 @@
 'use strict';
 
-// All DOM nodes representing memory data are built with createElement +
+// All DOM nodes representing capability capsule data are built with createElement +
 // textContent + setAttribute — never innerHTML on user-supplied strings —
 // so summary/content/tags containing angle brackets, quotes, or script tags
 // can never become an XSS sink.
@@ -88,7 +88,7 @@ function showToast(msg, err = false) {
 function fmtDate(s) {
   if (!s) return '—';
   // Two formats land here:
-  //   1. memories side — `current_timestamp()` (src/storage/time.rs)
+  //   1. capability_capsules side — `current_timestamp()` (src/storage/time.rs)
   //      writes `{millis:020}`, so a 20-digit zero-padded epoch millis
   //      string like "00000001778060883021".
   //   2. transcripts side — `conversation_messages.created_at` is the
@@ -131,7 +131,7 @@ function matchesFilter(m) {
     return false;
   }
   if (filterText) {
-    const hay = `${m.summary || ''} ${m.content || ''} ${(m.tags || []).join(' ')} ${m.memory_id || ''}`.toLowerCase();
+    const hay = `${m.summary || ''} ${m.content || ''} ${(m.tags || []).join(' ')} ${m.capability_capsule_id || ''}`.toLowerCase();
     if (!hay.includes(filterText)) return false;
   }
   return true;
@@ -156,7 +156,7 @@ function el(tag, attrs = {}, ...children) {
 // ------------------------------------------------------------ render
 
 function buildCard(m) {
-  const t = m.memory_type || '';
+  const t = m.capability_capsule_type || '';
   const status = m.status || 'active';
   const summary = (m.summary || m.content || '').split('\n')[0].slice(0, 140);
   const contentRaw = (m.content || '').slice(0, 240);
@@ -165,12 +165,12 @@ function buildCard(m) {
   const tags = (m.tags || []).slice(0, 6);
 
   const card = el('article', {
-    class: 'card', 'data-id': m.memory_id,
+    class: 'card', 'data-id': m.capability_capsule_id,
     role: 'button', tabindex: '0',
-    'aria-label': `view details for ${m.memory_id}`,
+    'aria-label': `view details for ${m.capability_capsule_id}`,
   });
   card.appendChild(el('div', { class: `type-stamp ${t}`, text: typeAbbrev(t) }));
-  card.appendChild(el('div', { class: 'card-id', text: m.memory_id || '—' }));
+  card.appendChild(el('div', { class: 'card-id', text: m.capability_capsule_id || '—' }));
   card.appendChild(el('h3', { class: 'card-summary', text: summary }));
   card.appendChild(el('div', { class: 'card-content', text: contentRaw + contentEllipsis }));
 
@@ -183,7 +183,7 @@ function buildCard(m) {
   const foot = el('div', { class: 'card-foot' });
   foot.appendChild(el('span', { class: 'card-when', text: fmtDate(m.created_at) }));
   const removed = ['archived', 'rejected'].includes(status);
-  const delAttrs = { class: 'card-delete', 'data-del': m.memory_id, text: 'archive ⟶' };
+  const delAttrs = { class: 'card-delete', 'data-del': m.capability_capsule_id, text: 'archive ⟶' };
   if (removed) { delAttrs.disabled = ''; delAttrs.title = 'already removed'; }
   foot.appendChild(el('button', delAttrs));
   card.appendChild(foot);
@@ -259,10 +259,10 @@ btnYes.addEventListener('click', async () => {
   btnYes.disabled = true;
   btnYes.textContent = 'sending…';
   try {
-    const r = await fetch('/memories/feedback', {
+    const r = await fetch('/capability_capsules/feedback', {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({ tenant: TENANT, memory_id: id, feedback_kind: 'incorrect' })
+      body: JSON.stringify({ tenant: TENANT, capability_capsule_id: id, feedback_kind: 'incorrect' })
     });
     if (!r.ok) {
       const t = await r.text();
@@ -313,8 +313,8 @@ function section(title, ...children) {
 }
 
 function buildDetail(detail) {
-  const m = detail.memory || {};
-  const t = m.memory_type || '';
+  const m = detail.capability_capsule || {};
+  const t = m.capability_capsule_type || '';
   const status = m.status || 'active';
 
   const wrap = document.createDocumentFragment();
@@ -326,12 +326,12 @@ function buildDetail(detail) {
     id: 'detail-title', class: 'detail-summary',
     text: m.summary || '(no summary)',
   }));
-  wrap.appendChild(el('div', { class: 'detail-id', text: m.memory_id || '—' }));
+  wrap.appendChild(el('div', { class: 'detail-id', text: m.capability_capsule_id || '—' }));
 
   // status / type / scope inline pill row (visual continuity with the cards)
   const inlineMeta = el('div', { class: 'card-meta', style: 'margin: 0 0 1.4rem; padding-top: 0; border-top: none;' });
   inlineMeta.appendChild(el('span', { class: `status-pill ${status}`, text: status.replace('_', ' ') }));
-  inlineMeta.appendChild(el('span', { text: m.memory_type || '?' }));
+  inlineMeta.appendChild(el('span', { text: m.capability_capsule_type || '?' }));
   for (const tag of (m.tags || [])) inlineMeta.appendChild(el('span', { class: 'tag', text: tag }));
   wrap.appendChild(inlineMeta);
 
@@ -375,7 +375,7 @@ function buildDetail(detail) {
     ['decay',                 m.decay_score != null ? m.decay_score.toFixed(2) : null],
     ['source agent',          m.source_agent],
     ['session',               m.session_id],
-    ['supersedes',            m.supersedes_memory_id],
+    ['supersedes',            m.supersedes_capability_capsule_id],
     ['idempotency',           m.idempotency_key],
     ['content hash',          m.content_hash],
     ['created',               fmtDate(m.created_at)],
@@ -422,7 +422,7 @@ function buildDetail(detail) {
   if (chain.length) {
     const box = el('div');
     for (const v of chain) {
-      const here = v.memory_id === m.memory_id;
+      const here = v.capability_capsule_id === m.capability_capsule_id;
       const row = el('div', { class: `version-row${here ? ' current' : ''}` });
       row.appendChild(el('span', { class: 'v', text: 'v' + (v.version ?? '?') }));
       const right = el('span');
@@ -454,7 +454,7 @@ function buildDetail(detail) {
 /// The footer lives outside `.detail-body` so it always sits at the
 /// panel's bottom (flex sibling), no `position: sticky` games.
 function populateActions(detail) {
-  const m = detail.memory || {};
+  const m = detail.capability_capsule || {};
   const status = m.status || 'active';
   const removed = ['archived', 'rejected'].includes(status);
   detailNote.textContent = removed
@@ -462,8 +462,8 @@ function populateActions(detail) {
     : 'archiving keeps the row verbatim — only search drops it';
   detailArchiveBtn.textContent = removed ? 'already archived' : 'archive this record';
   detailArchiveBtn.disabled = removed;
-  detailArchiveBtn.onclick = removed ? null : () => openDelete(m.memory_id);
-  detailDeleteBtn.onclick = () => openHardDelete(m.memory_id);
+  detailArchiveBtn.onclick = removed ? null : () => openDelete(m.capability_capsule_id);
+  detailDeleteBtn.onclick = () => openHardDelete(m.capability_capsule_id);
   detailActions.hidden = false;
 }
 
@@ -476,7 +476,7 @@ async function openDetail(id) {
   while (detailBody.firstChild) detailBody.removeChild(detailBody.firstChild);
   detailBody.appendChild(buildPlaceholder('retrieving record', id, 'loading'));
   try {
-    const r = await fetch(`/memories/${encodeURIComponent(id)}?tenant=${encodeURIComponent(TENANT)}`);
+    const r = await fetch(`/capability_capsules/${encodeURIComponent(id)}?tenant=${encodeURIComponent(TENANT)}`);
     if (!r.ok) {
       const t = await r.text();
       throw new Error(`HTTP ${r.status}: ${t.slice(0, 160)}`);
@@ -526,7 +526,7 @@ deleteBtnYes.addEventListener('click', async () => {
   deleteBtnYes.disabled = true;
   deleteBtnYes.textContent = 'erasing…';
   try {
-    const r = await fetch(`/memories/${encodeURIComponent(id)}?tenant=${encodeURIComponent(TENANT)}`, {
+    const r = await fetch(`/capability_capsules/${encodeURIComponent(id)}?tenant=${encodeURIComponent(TENANT)}`, {
       method: 'DELETE',
     });
     if (!r.ok) {
@@ -577,7 +577,7 @@ search.addEventListener('input', () => {
 
 async function load() {
   try {
-    const r = await fetch(`/memories?tenant=${encodeURIComponent(TENANT)}`);
+    const r = await fetch(`/capability_capsules?tenant=${encodeURIComponent(TENANT)}`);
     if (!r.ok) {
       const t = await r.text();
       throw new Error(`HTTP ${r.status}: ${t.slice(0, 160)}`);
@@ -982,7 +982,7 @@ function matchesJobFilter(j) {
   const st = j.status || '';
   if (qFilterStatus !== 'all' && st !== qFilterStatus) return false;
   if (qFilterText) {
-    const hay = `${j.memory_id || ''} ${j.job_id || ''} ${j.last_error || ''}`.toLowerCase();
+    const hay = `${j.capability_capsule_id || ''} ${j.job_id || ''} ${j.last_error || ''}`.toLowerCase();
     if (!hay.includes(qFilterText)) return false;
   }
   return true;
@@ -997,7 +997,7 @@ function buildJobRow(j) {
   const memLine = el('div', { class: 'job-mem' });
   memLine.appendChild(el('span', { class: 'lead', text: '⟶' }));
   memLine.appendChild(document.createTextNode(' '));
-  memLine.appendChild(document.createTextNode(j.memory_id || '—'));
+  memLine.appendChild(document.createTextNode(j.capability_capsule_id || '—'));
   mid.appendChild(memLine);
   if (j.last_error) {
     mid.appendChild(el('div', { class: 'job-err', text: j.last_error, title: j.last_error }));

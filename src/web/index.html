@@ -40,7 +40,7 @@
     </button>
   </nav>
 
-  <!-- ─── view: archive (memories) ────────────────────────────────────── -->
+  <!-- ─── view: archive (capability capsules) ────────────────────────────────────── -->
   <section class="view view-archive" id="view-archive" role="tabpanel">
     <section class="controls">
       <div class="search-wrap">
@@ -85,7 +85,7 @@
   <section class="view view-queue" id="view-queue" role="tabpanel" hidden>
     <section class="controls">
       <div class="search-wrap">
-        <input id="q-search" class="search" type="search" placeholder="filter by memory id or error…" autocomplete="off">
+        <input id="q-search" class="search" type="search" placeholder="filter by capsule id or error…" autocomplete="off">
       </div>
       <div class="filter-group" id="q-filters">
         <button class="filter-btn active" data-q-status="all">all</button>
@@ -108,7 +108,7 @@
     </main>
   </section>
 
-  <!-- detail panel: slides in from the right, populated by GET /memories/{id} -->
+  <!-- detail panel: slides in from the right, populated by GET /capability_capsules/{id} -->
   <aside class="detail-bg" id="detail-bg" aria-hidden="true" tabindex="-1">
     <section class="detail" id="detail-panel" role="dialog" aria-modal="true" aria-labelledby="detail-title">
       <header class="detail-head">
@@ -132,8 +132,8 @@
   <!-- hard-delete confirmation modal -->
   <div class="modal-bg" id="delete-modal" aria-hidden="true">
     <div class="modal" role="dialog" aria-modal="true" aria-labelledby="delete-modal-title">
-      <h2 id="delete-modal-title"><em>delete</em> this memory forever?</h2>
-      <p>This <strong>permanently removes</strong> the memory row, its embedding, all its embedding jobs, all feedback
+      <h2 id="delete-modal-title"><em>delete</em> this capability capsule forever?</h2>
+      <p>This <strong>permanently removes</strong> the capability capsule row, its embedding, all its embedding jobs, all feedback
         events, and all of its outgoing graph edges. <strong>Cannot be undone.</strong></p>
       <p>If in doubt, prefer <code>archive</code> — same effect on search, but the row is preserved verbatim.</p>
       <div class="id-quote" id="delete-modal-id">—</div>
@@ -147,7 +147,7 @@
   <!-- delete-confirmation modal -->
   <div class="modal-bg" id="modal" aria-hidden="true">
     <div class="modal" role="dialog" aria-modal="true" aria-labelledby="modal-title">
-      <h2 id="modal-title">archive this <em>memory</em>?</h2>
+      <h2 id="modal-title">archive this <em>capability capsule</em>?</h2>
       <p>This will mark the entry as <strong>archived</strong> via a feedback signal of <code>incorrect</code>. The row
         is preserved verbatim — mem keeps history — but it will no longer surface in search results.</p>
       <div class="id-quote" id="modal-id">—</div>
@@ -159,7 +159,7 @@
   </div>
 
   <!-- transcript drawer: slides in from the LEFT (visually distinct from
-     the right-side memory detail drawer). Read-only, populated by
+     the right-side capability capsule detail drawer). Read-only, populated by
      GET /transcripts?session_id=…&tenant=… -->
   <aside class="transcript-bg" id="transcript-bg" aria-hidden="true">
     <section class="transcript-panel" role="dialog" aria-modal="true" aria-labelledby="transcript-title">

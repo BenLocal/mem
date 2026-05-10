@@ -73,7 +73,7 @@ impl MemMcpServer {
 pub struct EmptyArgs {}
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
-pub struct MemorySearchArgs {
+pub struct CapabilityCapsuleSearchArgs {
     pub query: String,
     #[serde(default)]
     pub intent: Option<String>,
@@ -89,7 +89,7 @@ pub struct MemorySearchArgs {
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
-pub struct MemoryBootstrapArgs {
+pub struct CapabilityCapsuleBootstrapArgs {
     pub tenant: String,
     pub project: String,
     #[serde(default)]
@@ -103,7 +103,7 @@ pub struct MemoryBootstrapArgs {
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
-pub struct MemorySearchContextualArgs {
+pub struct CapabilityCapsuleSearchContextualArgs {
     pub tenant: String,
     pub project: String,
     #[serde(default)]
@@ -123,11 +123,11 @@ pub struct MemorySearchContextualArgs {
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
-pub struct MemoryIngestArgs {
+pub struct CapabilityCapsuleIngestArgs {
     #[serde(default)]
     pub tenant: Option<String>,
     /// One of: implementation | experience | preference | episode | workflow
-    pub memory_type: String,
+    pub capability_capsule_type: String,
     pub content: String,
     #[serde(default)]
     pub evidence: Option<Vec<String>>,
@@ -159,7 +159,7 @@ pub struct MemoryIngestArgs {
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
-pub struct MemoryCommitFactArgs {
+pub struct CapabilityCapsuleCommitFactArgs {
     #[serde(default)]
     pub tenant: Option<String>,
     pub project: String,
@@ -179,7 +179,7 @@ pub struct MemoryCommitFactArgs {
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
-pub struct MemoryProposePreferenceArgs {
+pub struct CapabilityCapsuleProposePreferenceArgs {
     #[serde(default)]
     pub tenant: Option<String>,
     pub project: String,
@@ -196,7 +196,7 @@ pub struct MemoryProposePreferenceArgs {
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
-pub struct MemoryProposeExperienceArgs {
+pub struct CapabilityCapsuleProposeExperienceArgs {
     #[serde(default)]
     pub tenant: Option<String>,
     pub project: String,
@@ -213,29 +213,44 @@ pub struct MemoryProposeExperienceArgs {
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
-pub struct MemoryGetArgs {
-    pub memory_id: String,
+pub struct CapabilityCapsuleGetArgs {
+    pub capability_capsule_id: String,
     /// Defaults to MEM_TENANT when omitted.
     #[serde(default)]
     pub tenant: Option<String>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
-pub struct MemoryFeedbackArgs {
+pub struct TranscriptSessionGetArgs {
+    /// Claude Code session id, as exposed on
+    /// `SearchCapabilityCapsuleResponse.recent_conversations[].session_id`
+    /// from the wake-up call.
+    pub session_id: String,
+    /// Defaults to MEM_TENANT when omitted.
     #[serde(default)]
     pub tenant: Option<String>,
-    pub memory_id: String,
+    /// Block-page size. Defaults to 200 (the admin web's default);
+    /// max 1000 (server-side cap in `TranscriptService::get_by_session_paged`).
+    #[serde(default)]
+    pub limit: Option<usize>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct CapabilityCapsuleFeedbackArgs {
+    #[serde(default)]
+    pub tenant: Option<String>,
+    pub capability_capsule_id: String,
     /// One of: useful | outdated | incorrect | applies_here | does_not_apply_here
     pub feedback_kind: String,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
-pub struct MemoryApplyFeedbackArgs {
+pub struct CapabilityCapsuleApplyFeedbackArgs {
     #[serde(default)]
     pub tenant: Option<String>,
     pub project: String,
     pub caller_agent: String,
-    pub memory_id: String,
+    pub capability_capsule_id: String,
     /// One of: useful | outdated | incorrect
     pub kind: String,
     #[serde(default)]
@@ -252,14 +267,14 @@ pub struct TenantOnlyArgs {
 pub struct ReviewSimpleArgs {
     #[serde(default)]
     pub tenant: Option<String>,
-    pub memory_id: String,
+    pub capability_capsule_id: String,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct ReviewEditAcceptArgs {
     #[serde(default)]
     pub tenant: Option<String>,
-    pub memory_id: String,
+    pub capability_capsule_id: String,
     pub summary: String,
     pub content: String,
     #[serde(default)]
@@ -313,7 +328,7 @@ pub struct EmbeddingsListJobsArgs {
     #[serde(default)]
     pub status: Option<String>,
     #[serde(default)]
-    pub memory_id: Option<String>,
+    pub capability_capsule_id: Option<String>,
     /// 1..=10000, default 200
     #[serde(default)]
     pub limit: Option<u32>,
@@ -324,9 +339,146 @@ pub struct EmbeddingsRebuildArgs {
     #[serde(default)]
     pub tenant: Option<String>,
     #[serde(default)]
-    pub memory_ids: Option<Vec<String>>,
+    pub capability_capsule_ids: Option<Vec<String>>,
     #[serde(default)]
     pub force: Option<bool>,
+}
+
+// ─── batch ingest ──────────────────────────────────────────────────
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct CapabilityCapsuleBatchIngestArgs {
+    /// Default tenant for every item; per-item value overrides.
+    #[serde(default)]
+    pub tenant: Option<String>,
+    /// One row per capsule. Each item carries the same fields as
+    /// `capability_capsule_ingest`, minus the per-item `tenant`
+    /// override (passed at the outer struct).
+    pub items: Vec<CapabilityCapsuleBatchIngestItem>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct CapabilityCapsuleBatchIngestItem {
+    /// One of: implementation | experience | preference | episode | workflow
+    pub capability_capsule_type: String,
+    pub content: String,
+    #[serde(default)]
+    pub summary: Option<String>,
+    #[serde(default)]
+    pub evidence: Option<Vec<String>>,
+    #[serde(default)]
+    pub code_refs: Option<Vec<String>>,
+    /// One of: global | project | repo | workspace
+    pub scope: String,
+    /// One of: private | shared | system. Default "private".
+    #[serde(default)]
+    pub visibility: Option<String>,
+    #[serde(default)]
+    pub project: Option<String>,
+    #[serde(default)]
+    pub repo: Option<String>,
+    #[serde(default)]
+    pub module: Option<String>,
+    #[serde(default)]
+    pub task_type: Option<String>,
+    #[serde(default)]
+    pub tags: Option<Vec<String>>,
+    /// Default "mem-mcp"
+    #[serde(default)]
+    pub source_agent: Option<String>,
+    #[serde(default)]
+    pub idempotency_key: Option<String>,
+    /// One of: auto | propose. Default "auto".
+    #[serde(default)]
+    pub write_mode: Option<String>,
+}
+
+// ─── transcript search ─────────────────────────────────────────────
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct TranscriptSearchArgs {
+    /// Free-text BM25 + semantic query. Empty string falls through to
+    /// the recent-time browse path.
+    pub query: String,
+    /// Defaults to MEM_TENANT when omitted.
+    #[serde(default)]
+    pub tenant: Option<String>,
+    /// Restrict to one session (optional).
+    #[serde(default)]
+    pub session_id: Option<String>,
+    /// One of: user | assistant | system
+    #[serde(default)]
+    pub role: Option<String>,
+    /// One of: text | tool_use | tool_result | thinking
+    #[serde(default)]
+    pub block_type: Option<String>,
+    /// Lexicographic compare against `created_at` (ISO-8601). Inclusive.
+    #[serde(default)]
+    pub time_from: Option<String>,
+    #[serde(default)]
+    pub time_to: Option<String>,
+    /// 1..=100, default 20.
+    #[serde(default)]
+    pub limit: Option<usize>,
+    /// Inject this session's blocks as candidates regardless of query.
+    #[serde(default)]
+    pub anchor_session_id: Option<String>,
+    /// ±N blocks of context around each primary; capped at 10.
+    #[serde(default)]
+    pub context_window: Option<usize>,
+    /// Include tool_use / tool_result blocks in the context window.
+    #[serde(default)]
+    pub include_tool_blocks_in_context: Option<bool>,
+}
+
+// ─── entities ──────────────────────────────────────────────────────
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct EntityCreateArgs {
+    /// Defaults to MEM_TENANT when omitted.
+    #[serde(default)]
+    pub tenant: Option<String>,
+    pub canonical_name: String,
+    /// One of: topic | project | repo | module | workflow
+    pub kind: String,
+    /// Optional list of additional aliases that should resolve to this
+    /// entity (the canonical_name is implicitly an alias). Re-POSTing
+    /// with the same canonical name is idempotent on alias hit.
+    #[serde(default)]
+    pub aliases: Option<Vec<String>>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct EntityGetArgs {
+    pub entity_id: String,
+    /// Defaults to MEM_TENANT when omitted.
+    #[serde(default)]
+    pub tenant: Option<String>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct EntityAddAliasArgs {
+    pub entity_id: String,
+    pub alias: String,
+    /// Defaults to MEM_TENANT when omitted.
+    #[serde(default)]
+    pub tenant: Option<String>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct EntityListArgs {
+    /// Defaults to MEM_TENANT when omitted.
+    #[serde(default)]
+    pub tenant: Option<String>,
+    /// One of: topic | project | repo | module | workflow
+    #[serde(default)]
+    pub kind: Option<String>,
+    /// Substring match against `canonical_name` (case-sensitive).
+    #[serde(default)]
+    pub q: Option<String>,
+    /// 1..=100, default 50.
+    #[serde(default)]
+    pub limit: Option<usize>,
 }
 
 // ---------------------------------------------------------------------------
@@ -379,13 +531,13 @@ impl MemMcpServer {
         }
     }
 
-    // ------------------- memory_search -------------------
+    // ------------------- capability_capsule_search -------------------
     #[tool(
         description = "Search the shared mem service for compressed directives, facts, and patterns. Call early in a task; use scope_filters like repo:<name> to narrow results."
     )]
-    async fn memory_search(
+    async fn capability_capsule_search(
         &self,
-        Parameters(args): Parameters<MemorySearchArgs>,
+        Parameters(args): Parameters<CapabilityCapsuleSearchArgs>,
     ) -> Result<CallToolResult, McpError> {
         let body = json!({
             "query": args.query,
@@ -396,16 +548,16 @@ impl MemMcpServer {
             "expand_graph": args.expand_graph.unwrap_or(true),
             "tenant": self.resolve_tenant(args.tenant.as_ref()),
         });
-        self.post_json("memories/search", &body).await
+        self.post_json("capability_capsules/search", &body).await
     }
 
-    // ------------------- memory_bootstrap -------------------
+    // ------------------- capability_capsule_bootstrap -------------------
     #[tool(
         description = "Lightweight project-only bootstrap search for task-start context recovery."
     )]
-    async fn memory_bootstrap(
+    async fn capability_capsule_bootstrap(
         &self,
-        Parameters(args): Parameters<MemoryBootstrapArgs>,
+        Parameters(args): Parameters<CapabilityCapsuleBootstrapArgs>,
     ) -> Result<CallToolResult, McpError> {
         let body = json!({
             "query": args.query,
@@ -418,7 +570,7 @@ impl MemMcpServer {
         });
         match self
             .client
-            .request_json(Method::POST, "memories/search", Some(&body))
+            .request_json(Method::POST, "capability_capsules/search", Some(&body))
             .await
         {
             Ok(v) => Ok(ok_json(&pick_search_summary(&v))),
@@ -426,13 +578,13 @@ impl MemMcpServer {
         }
     }
 
-    // ------------------- memory_search_contextual -------------------
+    // ------------------- capability_capsule_search_contextual -------------------
     #[tool(
         description = "Intent-aware search for implementation, debugging, or review. Defaults to project scope and only widens when explicitly requested."
     )]
-    async fn memory_search_contextual(
+    async fn capability_capsule_search_contextual(
         &self,
-        Parameters(args): Parameters<MemorySearchContextualArgs>,
+        Parameters(args): Parameters<CapabilityCapsuleSearchContextualArgs>,
     ) -> Result<CallToolResult, McpError> {
         let include_repo = args.include_repo.unwrap_or(false);
         let include_personal = args.include_personal.unwrap_or(false);
@@ -459,7 +611,7 @@ impl MemMcpServer {
         });
         match self
             .client
-            .request_json(Method::POST, "memories/search", Some(&body))
+            .request_json(Method::POST, "capability_capsules/search", Some(&body))
             .await
         {
             Ok(v) => Ok(ok_json(&pick_search_summary(&v))),
@@ -467,20 +619,23 @@ impl MemMcpServer {
         }
     }
 
-    // ------------------- memory_ingest -------------------
+    // ------------------- capability_capsule_ingest -------------------
     #[tool(
         description = "Create a memory in mem. Use write_mode propose for preferences; auto is fine for implementation facts."
     )]
-    async fn memory_ingest(
+    async fn capability_capsule_ingest(
         &self,
-        Parameters(args): Parameters<MemoryIngestArgs>,
+        Parameters(args): Parameters<CapabilityCapsuleIngestArgs>,
     ) -> Result<CallToolResult, McpError> {
         let mut body = Map::new();
         body.insert(
             "tenant".into(),
             json!(self.resolve_tenant(args.tenant.as_ref())),
         );
-        body.insert("memory_type".into(), json!(args.memory_type));
+        body.insert(
+            "capability_capsule_type".into(),
+            json!(args.capability_capsule_type),
+        );
         body.insert("content".into(), json!(args.content));
         body.insert("evidence".into(), json!(args.evidence.unwrap_or_default()));
         body.insert(
@@ -519,7 +674,11 @@ impl MemMcpServer {
         let content = args.content.clone();
         match self
             .client
-            .request_json(Method::POST, "memories", Some(&Value::Object(body)))
+            .request_json(
+                Method::POST,
+                "capability_capsules",
+                Some(&Value::Object(body)),
+            )
             .await
         {
             Ok(v) => Ok(ok_json_with_content("✓ Memory saved", &content, &v)),
@@ -527,11 +686,11 @@ impl MemMcpServer {
         }
     }
 
-    // ------------------- memory_commit_fact -------------------
+    // ------------------- capability_capsule_commit_fact -------------------
     #[tool(description = "Commit a verified project fact. Uses auto write mode and project scope.")]
-    async fn memory_commit_fact(
+    async fn capability_capsule_commit_fact(
         &self,
-        Parameters(args): Parameters<MemoryCommitFactArgs>,
+        Parameters(args): Parameters<CapabilityCapsuleCommitFactArgs>,
     ) -> Result<CallToolResult, McpError> {
         let mut tags: Vec<String> = args.tags.unwrap_or_default();
         tags.push(format!("caller_agent:{}", args.caller_agent));
@@ -540,7 +699,7 @@ impl MemMcpServer {
             "tenant".into(),
             json!(self.resolve_tenant(args.tenant.as_ref())),
         );
-        body.insert("memory_type".into(), json!("implementation"));
+        body.insert("capability_capsule_type".into(), json!("implementation"));
         body.insert(
             "content".into(),
             json!(format!("{}\n\n{}", args.summary, args.content)),
@@ -564,7 +723,11 @@ impl MemMcpServer {
         let content = format!("{}\n\n{}", args.summary, args.content);
         match self
             .client
-            .request_json(Method::POST, "memories", Some(&Value::Object(body)))
+            .request_json(
+                Method::POST,
+                "capability_capsules",
+                Some(&Value::Object(body)),
+            )
             .await
         {
             Ok(v) => Ok(ok_json_with_content("✓ Fact committed", &content, &v)),
@@ -572,20 +735,20 @@ impl MemMcpServer {
         }
     }
 
-    // ------------------- memory_propose_preference -------------------
+    // ------------------- capability_capsule_propose_preference -------------------
     #[tool(
         description = "Propose a preference for review. Uses the standard memories endpoint with write_mode=propose."
     )]
-    async fn memory_propose_preference(
+    async fn capability_capsule_propose_preference(
         &self,
-        Parameters(args): Parameters<MemoryProposePreferenceArgs>,
+        Parameters(args): Parameters<CapabilityCapsuleProposePreferenceArgs>,
     ) -> Result<CallToolResult, McpError> {
         let mut body = Map::new();
         body.insert(
             "tenant".into(),
             json!(self.resolve_tenant(args.tenant.as_ref())),
         );
-        body.insert("memory_type".into(), json!("preference"));
+        body.insert("capability_capsule_type".into(), json!("preference"));
         body.insert(
             "content".into(),
             json!(format!("{}\n\n{}", args.summary, args.content)),
@@ -610,7 +773,11 @@ impl MemMcpServer {
         let content = format!("{}\n\n{}", args.summary, args.content);
         match self
             .client
-            .request_json(Method::POST, "memories", Some(&Value::Object(body)))
+            .request_json(
+                Method::POST,
+                "capability_capsules",
+                Some(&Value::Object(body)),
+            )
             .await
         {
             Ok(v) => Ok(ok_json_with_content("✓ Preference proposed", &content, &v)),
@@ -618,13 +785,13 @@ impl MemMcpServer {
         }
     }
 
-    // ------------------- memory_propose_experience -------------------
+    // ------------------- capability_capsule_propose_experience -------------------
     #[tool(
         description = "Propose a candidate experience by recording it as an episode instead of a strong fact."
     )]
-    async fn memory_propose_experience(
+    async fn capability_capsule_propose_experience(
         &self,
-        Parameters(args): Parameters<MemoryProposeExperienceArgs>,
+        Parameters(args): Parameters<CapabilityCapsuleProposeExperienceArgs>,
     ) -> Result<CallToolResult, McpError> {
         let mut body = Map::new();
         body.insert(
@@ -664,48 +831,60 @@ impl MemMcpServer {
     #[tool(
         description = "Fetch one memory by id (detail, version chain, graph links, embedding metadata)."
     )]
-    async fn memory_get(
+    async fn capability_capsule_get(
         &self,
-        Parameters(args): Parameters<MemoryGetArgs>,
+        Parameters(args): Parameters<CapabilityCapsuleGetArgs>,
     ) -> Result<CallToolResult, McpError> {
         let tenant = self.resolve_tenant(args.tenant.as_ref());
-        let path = format!("memories/{}", encode_segment(&args.memory_id));
+        let path = format!(
+            "capability_capsules/{}",
+            encode_segment(&args.capability_capsule_id)
+        );
         self.get_with_query(&path, &[("tenant", tenant)]).await
     }
 
-    // ------------------- memory_feedback -------------------
+    // ------------------- capability_capsule_feedback -------------------
     #[tool(description = "Record feedback on a memory to adjust future ranking.")]
-    async fn memory_feedback(
+    async fn capability_capsule_feedback(
         &self,
-        Parameters(args): Parameters<MemoryFeedbackArgs>,
+        Parameters(args): Parameters<CapabilityCapsuleFeedbackArgs>,
     ) -> Result<CallToolResult, McpError> {
         let body = json!({
             "tenant": self.resolve_tenant(args.tenant.as_ref()),
-            "memory_id": args.memory_id,
+            "capability_capsule_id": args.capability_capsule_id,
             "feedback_kind": args.feedback_kind,
         });
-        self.post_json("memories/feedback", &body).await
+        self.post_json("capability_capsules/feedback", &body).await
     }
 
-    // ------------------- memory_apply_feedback -------------------
+    // ------------------- capability_capsule_apply_feedback -------------------
     #[tool(
-        description = "Apply limited feedback on a memory while keeping the existing POST /memories/feedback backend contract."
+        description = "Apply limited feedback on a memory while keeping the existing POST /capability_capsules/feedback backend contract. Optional `note` is persisted verbatim on the resulting feedback_events row."
     )]
-    async fn memory_apply_feedback(
+    async fn capability_capsule_apply_feedback(
         &self,
-        Parameters(args): Parameters<MemoryApplyFeedbackArgs>,
+        Parameters(args): Parameters<CapabilityCapsuleApplyFeedbackArgs>,
     ) -> Result<CallToolResult, McpError> {
-        let body = json!({
-            "tenant": self.resolve_tenant(args.tenant.as_ref()),
-            "memory_id": args.memory_id,
-            "feedback_kind": args.kind,
-        });
-        self.post_json("memories/feedback", &body).await
+        let mut body = Map::new();
+        body.insert(
+            "tenant".into(),
+            json!(self.resolve_tenant(args.tenant.as_ref())),
+        );
+        body.insert(
+            "capability_capsule_id".into(),
+            json!(args.capability_capsule_id),
+        );
+        body.insert("feedback_kind".into(), json!(args.kind));
+        if let Some(note) = args.note.filter(|s| !s.is_empty()) {
+            body.insert("note".into(), json!(note));
+        }
+        self.post_json("capability_capsules/feedback", &Value::Object(body))
+            .await
     }
 
-    // ------------------- memory_list_pending_review -------------------
+    // ------------------- capability_capsule_list_pending_review -------------------
     #[tool(description = "List memories awaiting human confirmation for this tenant.")]
-    async fn memory_list_pending_review(
+    async fn capability_capsule_list_pending_review(
         &self,
         Parameters(args): Parameters<TenantOnlyArgs>,
     ) -> Result<CallToolResult, McpError> {
@@ -714,45 +893,45 @@ impl MemMcpServer {
             .await
     }
 
-    // ------------------- memory_review_accept -------------------
+    // ------------------- capability_capsule_review_accept -------------------
     #[tool(
         description = "Accept a pending memory (activate without edits). Use after human confirms."
     )]
-    async fn memory_review_accept(
+    async fn capability_capsule_review_accept(
         &self,
         Parameters(args): Parameters<ReviewSimpleArgs>,
     ) -> Result<CallToolResult, McpError> {
         let body = json!({
             "tenant": self.resolve_tenant(args.tenant.as_ref()),
-            "memory_id": args.memory_id,
+            "capability_capsule_id": args.capability_capsule_id,
         });
         self.post_json("reviews/pending/accept", &body).await
     }
 
-    // ------------------- memory_review_reject -------------------
+    // ------------------- capability_capsule_review_reject -------------------
     #[tool(description = "Reject a pending memory (mark rejected, no successor).")]
-    async fn memory_review_reject(
+    async fn capability_capsule_review_reject(
         &self,
         Parameters(args): Parameters<ReviewSimpleArgs>,
     ) -> Result<CallToolResult, McpError> {
         let body = json!({
             "tenant": self.resolve_tenant(args.tenant.as_ref()),
-            "memory_id": args.memory_id,
+            "capability_capsule_id": args.capability_capsule_id,
         });
         self.post_json("reviews/pending/reject", &body).await
     }
 
-    // ------------------- memory_review_edit_accept -------------------
+    // ------------------- capability_capsule_review_edit_accept -------------------
     #[tool(
         description = "Edit pending memory content then accept: creates an active successor and rejects the original pending row."
     )]
-    async fn memory_review_edit_accept(
+    async fn capability_capsule_review_edit_accept(
         &self,
         Parameters(args): Parameters<ReviewEditAcceptArgs>,
     ) -> Result<CallToolResult, McpError> {
         let body = json!({
             "tenant": self.resolve_tenant(args.tenant.as_ref()),
-            "memory_id": args.memory_id,
+            "capability_capsule_id": args.capability_capsule_id,
             "summary": args.summary,
             "content": args.content,
             "evidence": args.evidence.unwrap_or_default(),
@@ -815,16 +994,204 @@ impl MemMcpServer {
         }
     }
 
-    // ------------------- memory_graph_neighbors -------------------
+    // ------------------- capability_capsule_graph_neighbors -------------------
     #[tool(
-        description = "List graph edges adjacent to a node id (e.g. module:mem:billing, project:acme). Complements memory_search when expand_graph is not enough."
+        description = "List graph edges adjacent to a node id (e.g. module:mem:billing, project:acme). Complements capability_capsule_search when expand_graph is not enough."
     )]
-    async fn memory_graph_neighbors(
+    async fn capability_capsule_graph_neighbors(
         &self,
         Parameters(args): Parameters<GraphNeighborsArgs>,
     ) -> Result<CallToolResult, McpError> {
         let path = format!("graph/neighbors/{}", encode_segment(&args.node_id));
         self.get_with_query(&path, &[]).await
+    }
+
+    // ------------------- transcript_session_get -------------------
+    #[tool(
+        description = "Fetch the full block sequence for one Claude Code transcript session, identified by `session_id` (as exposed on the wake-up response's `recent_conversations[].session_id`). Returns chronological text/thinking/tool blocks; use this when you saw a session reference in the wake-up payload and want the full conversation."
+    )]
+    async fn transcript_session_get(
+        &self,
+        Parameters(args): Parameters<TranscriptSessionGetArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        let body = json!({
+            "tenant": self.resolve_tenant(args.tenant.as_ref()),
+            "session_id": args.session_id,
+            "limit": args.limit.unwrap_or(200),
+        });
+        self.post_json("transcripts", &body).await
+    }
+
+    // ------------------- capability_capsule_batch_ingest -------------------
+    #[tool(
+        description = "Bulk-insert multiple capsules in one call (server folds N rows into one Lance write + one DuckDB refresh; bench shows 9-227x speedup over looping `capability_capsule_ingest`). Returns 201 with per-item {result: ok | err} preserving input order, or 207 if any item failed."
+    )]
+    async fn capability_capsule_batch_ingest(
+        &self,
+        Parameters(args): Parameters<CapabilityCapsuleBatchIngestArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        let tenant = self.resolve_tenant(args.tenant.as_ref());
+        let items: Vec<Value> = args
+            .items
+            .into_iter()
+            .map(|i| {
+                let mut body = Map::new();
+                body.insert("tenant".into(), json!(tenant));
+                body.insert(
+                    "capability_capsule_type".into(),
+                    json!(i.capability_capsule_type),
+                );
+                body.insert("content".into(), json!(i.content));
+                body.insert("evidence".into(), json!(i.evidence.unwrap_or_default()));
+                body.insert("code_refs".into(), json!(i.code_refs.unwrap_or_default()));
+                body.insert("scope".into(), json!(i.scope));
+                body.insert(
+                    "visibility".into(),
+                    json!(i.visibility.unwrap_or_else(|| "private".to_string())),
+                );
+                body.insert("tags".into(), json!(i.tags.unwrap_or_default()));
+                body.insert(
+                    "source_agent".into(),
+                    json!(i.source_agent.unwrap_or_else(|| "mem-mcp".to_string())),
+                );
+                body.insert(
+                    "write_mode".into(),
+                    json!(i.write_mode.unwrap_or_else(|| "auto".to_string())),
+                );
+                if let Some(v) = i.summary {
+                    body.insert("summary".into(), json!(v));
+                }
+                if let Some(v) = i.project {
+                    body.insert("project".into(), json!(v));
+                }
+                if let Some(v) = i.repo {
+                    body.insert("repo".into(), json!(v));
+                }
+                if let Some(v) = i.module {
+                    body.insert("module".into(), json!(v));
+                }
+                if let Some(v) = i.task_type {
+                    body.insert("task_type".into(), json!(v));
+                }
+                if let Some(v) = i.idempotency_key {
+                    body.insert("idempotency_key".into(), json!(v));
+                }
+                Value::Object(body)
+            })
+            .collect();
+        self.post_json("capability_capsules/batch", &Value::Array(items))
+            .await
+    }
+
+    // ------------------- transcripts_search -------------------
+    #[tool(
+        description = "Hybrid (BM25 + semantic) search over the verbatim transcript archive. Returns merged context windows around each primary hit. Use to recall earlier conversations beyond what wake-up surfaces; pair with `transcript_session_get` to fetch full sessions."
+    )]
+    async fn transcripts_search(
+        &self,
+        Parameters(args): Parameters<TranscriptSearchArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        let mut body = Map::new();
+        body.insert(
+            "tenant".into(),
+            json!(self.resolve_tenant(args.tenant.as_ref())),
+        );
+        body.insert("query".into(), json!(args.query));
+        body.insert("limit".into(), json!(args.limit.unwrap_or(20)));
+        body.insert(
+            "include_tool_blocks_in_context".into(),
+            json!(args.include_tool_blocks_in_context.unwrap_or(false)),
+        );
+        if let Some(v) = args.session_id {
+            body.insert("session_id".into(), json!(v));
+        }
+        if let Some(v) = args.role {
+            body.insert("role".into(), json!(v));
+        }
+        if let Some(v) = args.block_type {
+            body.insert("block_type".into(), json!(v));
+        }
+        if let Some(v) = args.time_from {
+            body.insert("time_from".into(), json!(v));
+        }
+        if let Some(v) = args.time_to {
+            body.insert("time_to".into(), json!(v));
+        }
+        if let Some(v) = args.anchor_session_id {
+            body.insert("anchor_session_id".into(), json!(v));
+        }
+        if let Some(v) = args.context_window {
+            body.insert("context_window".into(), json!(v));
+        }
+        self.post_json("transcripts/search", &Value::Object(body))
+            .await
+    }
+
+    // ------------------- entity_create -------------------
+    #[tool(
+        description = "Create or resolve a canonical entity in the registry. Idempotent on alias hit (re-POSTing the same canonical_name returns the existing entity_id). Returns 201 / 409 (alias already bound to a different entity)."
+    )]
+    async fn entity_create(
+        &self,
+        Parameters(args): Parameters<EntityCreateArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        let body = json!({
+            "tenant": self.resolve_tenant(args.tenant.as_ref()),
+            "canonical_name": args.canonical_name,
+            "kind": args.kind,
+            "aliases": args.aliases.unwrap_or_default(),
+        });
+        self.post_json("entities", &body).await
+    }
+
+    // ------------------- entity_get -------------------
+    #[tool(
+        description = "Fetch one entity (canonical_name, kind, aliases) by entity_id. Returns 404 when the id is unknown."
+    )]
+    async fn entity_get(
+        &self,
+        Parameters(args): Parameters<EntityGetArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        let path = format!("entities/{}", encode_segment(&args.entity_id));
+        let tenant = self.resolve_tenant(args.tenant.as_ref());
+        self.get_with_query(&path, &[("tenant", tenant)]).await
+    }
+
+    // ------------------- entity_add_alias -------------------
+    #[tool(
+        description = "Declare an additional alias for an existing entity. Returns 200 (inserted / already_on_same_entity) or 409 (conflict_with_different_entity)."
+    )]
+    async fn entity_add_alias(
+        &self,
+        Parameters(args): Parameters<EntityAddAliasArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        let body = json!({
+            "tenant": self.resolve_tenant(args.tenant.as_ref()),
+            "alias": args.alias,
+        });
+        let path = format!("entities/{}/aliases", encode_segment(&args.entity_id));
+        self.post_json(&path, &body).await
+    }
+
+    // ------------------- entity_list -------------------
+    #[tool(
+        description = "List entities for the tenant, ordered by created_at desc. Supports filtering by `kind` and substring `q` on canonical_name. Default limit 50, server-side cap 100."
+    )]
+    async fn entity_list(
+        &self,
+        Parameters(args): Parameters<EntityListArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        let mut query: Vec<(&str, String)> = vec![
+            ("tenant", self.resolve_tenant(args.tenant.as_ref())),
+            ("limit", args.limit.unwrap_or(50).to_string()),
+        ];
+        if let Some(s) = args.kind.filter(|s| !s.is_empty()) {
+            query.push(("kind", s));
+        }
+        if let Some(s) = args.q.filter(|s| !s.is_empty()) {
+            query.push(("q", s));
+        }
+        self.get_with_query("entities", &query).await
     }
 
     // ------------------- embeddings_list_jobs (admin) -------------------
@@ -843,8 +1210,8 @@ impl MemMcpServer {
         if let Some(s) = args.status.filter(|s| !s.is_empty()) {
             query.push(("status", s));
         }
-        if let Some(m) = args.memory_id.filter(|s| !s.is_empty()) {
-            query.push(("memory_id", m));
+        if let Some(m) = args.capability_capsule_id.filter(|s| !s.is_empty()) {
+            query.push(("capability_capsule_id", m));
         }
         self.get_with_query("embeddings/jobs", &query).await
     }
@@ -862,7 +1229,7 @@ impl MemMcpServer {
         }
         let body = json!({
             "tenant": self.resolve_tenant(args.tenant.as_ref()),
-            "memory_ids": args.memory_ids.unwrap_or_default(),
+            "capability_capsule_ids": args.capability_capsule_ids.unwrap_or_default(),
             "force": args.force.unwrap_or(false),
         });
         self.post_json("embeddings/rebuild", &body).await

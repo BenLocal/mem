@@ -8,7 +8,7 @@ Local-first Rust memory service packaged as a Codex CLI plugin.
   - `SessionStart` → injects ~800-token wake-up summary from prior memories.
   - `Stop` → every ~15 user exchanges, fires `mem mine` in background to extract memories from the transcript.
   - `PreCompact` → final mine before context compression so nothing is lost.
-- **MCP tools** (configured separately, see below): `memory_search`, `memory_ingest`, `memory_get`, `memory_graph_neighbors`, `memory_feedback`, …
+- **MCP tools** (configured separately, see below): `capability_capsule_search`, `capability_capsule_ingest`, `capability_capsule_get`, `capability_capsule_graph_neighbors`, `capability_capsule_feedback`, …
 
 ## Prerequisites
 
@@ -49,7 +49,7 @@ Optional: set `MEM_MCP_EXPOSE_EMBEDDINGS = "1"` to expose admin `embeddings_*` t
 # In a fresh Codex session, look for these signals:
 # 1. SessionStart wake-up appears as injected context (if any memories exist).
 # 2. After ~15 exchanges, ~/.mem/codex_last_save updates.
-# 3. Memories show up at http://127.0.0.1:3000/memories?tenant=local.
+# 3. Memories show up at http://127.0.0.1:3000/capability_capsules?tenant=local.
 ```
 
 ## Layout

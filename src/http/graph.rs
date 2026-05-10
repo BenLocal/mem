@@ -13,6 +13,10 @@ pub fn router() -> Router<AppState> {
 async fn graph_neighbors(
     State(app): State<AppState>,
     Path(node_id): Path<String>,
-) -> Result<Json<Vec<crate::domain::memory::GraphEdge>>, AppError> {
-    Ok(Json(app.memory_service.graph_neighbors(&node_id).await?))
+) -> Result<Json<Vec<crate::domain::capability_capsule::GraphEdge>>, AppError> {
+    Ok(Json(
+        app.capability_capsule_service
+            .graph_neighbors(&node_id)
+            .await?,
+    ))
 }
