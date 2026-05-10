@@ -1,18 +1,7 @@
 #!/usr/bin/env bash
+# Wake-up envelope is rendered by `mem wake-up --format hook-session-start`
+# itself; this wrapper only exists so the plugin manifest keeps a stable
+# command path. Errors silently fall back to `{}` (skip injection) because
+# `mem wake-up` already does that internally on empty body.
 set -euo pipefail
-
-WAKEUP=$(mem wake-up --tenant local --token-budget 800 2>/dev/null || echo "")
-
-if [ -n "$WAKEUP" ]; then
-    ESCAPED=$(echo "$WAKEUP" | jq -Rs .)
-    cat <<EOF
-{
-  "hookSpecificOutput": {
-    "hookEventName": "SessionStart",
-    "additionalContext": $ESCAPED
-  }
-}
-EOF
-else
-    echo '{}'
-fi
+exec mem wake-up --tenant local --token-budget 800 --format hook-session-start

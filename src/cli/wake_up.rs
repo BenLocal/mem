@@ -1,7 +1,21 @@
 use anyhow::Result;
-use clap::Args;
+use clap::{Args, ValueEnum};
 
 use super::common::RemoteArgs;
+
+/// Output shape for `mem wake-up`.
+#[derive(Debug, Clone, Copy, ValueEnum, PartialEq, Eq)]
+pub enum WakeUpFormat {
+    /// Markdown body suitable for human display or for piping into a
+    /// file. The default; matches legacy behavior.
+    Plain,
+    /// JSON line shaped like the agent runtime's SessionStart hook
+    /// envelope:
+    /// `{"hookSpecificOutput":{"hookEventName":"SessionStart",
+    /// "additionalContext":"<markdown>"}}`. Empty body resolves to
+    /// `{}` so the runtime treats it as "no context to inject".
+    HookSessionStart,
+}
 
 #[derive(Debug, Args)]
 pub struct WakeUpArgs {
@@ -10,9 +24,50 @@ pub struct WakeUpArgs {
 
     #[arg(long, default_value = "800")]
     pub token_budget: usize,
+
+    /// Output shape. Default `plain` returns the markdown body verbatim
+    /// (legacy behavior). `hook-session-start` wraps it in the hook
+    /// envelope so shell hook scripts can `exec` `mem wake-up` without
+    /// touching `jq`.
+    #[arg(long, value_enum, default_value_t = WakeUpFormat::Plain)]
+    pub format: WakeUpFormat,
+}
+
+/// Build the SessionStart hook envelope. Public so other CLI flows
+/// (e.g. a future `mem hook` aggregator, or test code) can reuse the
+/// exact wire shape. Returns `{}` when `body` is empty after trim,
+/// matching the existing shell-hook convention for "skip injection".
+pub fn session_start_envelope(body: &str) -> serde_json::Value {
+    if body.trim().is_empty() {
+        return serde_json::Value::Object(Default::default());
+    }
+    serde_json::json!({
+        "hookSpecificOutput": {
+            "hookEventName": "SessionStart",
+            "additionalContext": body,
+        }
+    })
 }
 
 pub async fn run(args: WakeUpArgs) -> Result<String> {
+    let format = args.format;
+    let body = build_body(&args).await?;
+    match format {
+        WakeUpFormat::Plain => Ok(body),
+        WakeUpFormat::HookSessionStart => {
+            // The shell hooks treated wake-up's "## Recent Context\n\n"
+            // header alone (no memories, no transcripts) as content
+            // worth injecting. Preserve that — emit `{}` only when the
+            // entire body is whitespace, which happens only on a hard
+            // failure earlier in `build_body`. Append `\n` so the
+            // hook channel sees one terminated JSON record (matches
+            // the heredoc behavior of the legacy shell wrapper).
+            Ok(format!("{}\n", session_start_envelope(&body)))
+        }
+    }
+}
+
+async fn build_body(args: &WakeUpArgs) -> Result<String> {
     let mut output = String::from("## Recent Context\n\n");
 
     // L0: Identity file
@@ -111,4 +166,31 @@ pub async fn run(args: WakeUpArgs) -> Result<String> {
     }
 
     Ok(output)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn session_start_envelope_empty_body_is_skip_sentinel() {
+        assert_eq!(session_start_envelope(""), serde_json::json!({}));
+        assert_eq!(session_start_envelope("   \n  "), serde_json::json!({}));
+    }
+
+    #[test]
+    fn session_start_envelope_wraps_non_empty_body() {
+        let body = "## Recent Context\n\n- foo\n";
+        let v = session_start_envelope(body);
+        assert_eq!(
+            v["hookSpecificOutput"]["hookEventName"].as_str().unwrap(),
+            "SessionStart"
+        );
+        assert_eq!(
+            v["hookSpecificOutput"]["additionalContext"]
+                .as_str()
+                .unwrap(),
+            body
+        );
+    }
 }

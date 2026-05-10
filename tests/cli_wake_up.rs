@@ -7,6 +7,7 @@ async fn test_wake_up_format() {
             base_url: "http://127.0.0.1:9999".to_string(),
         },
         token_budget: 800,
+        format: mem::cli::wake_up::WakeUpFormat::Plain,
     })
     .await;
 

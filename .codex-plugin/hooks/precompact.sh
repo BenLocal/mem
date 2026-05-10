@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
-# Codex PreCompact hook: final sync mine before context compression so
-# capsules from the about-to-be-compacted exchanges are not lost.
-# Mirror of the Claude Code variant.
+# Codex PreCompact wrapper. No throttle (context loss is irreversible).
+# Mining + envelope formatting happen inside `mem mine --format
+# hook-precompact`; this script only owns stdin parse + transcript
+# probe (with the codex-specific session-dir fallback).
 set -uo pipefail
 
 INPUT=$(cat 2>/dev/null || echo '{}')
@@ -17,14 +18,8 @@ if [ -z "$TRANSCRIPT" ] || [ ! -f "$TRANSCRIPT" ]; then
     exit 0
 fi
 
-MINE_OUT=$(timeout 90 mem mine "$TRANSCRIPT" --agent codex 2>&1 || true)
-
-MEMS=$(echo "$MINE_OUT" | sed -n 's/.*capsules sent=\([0-9]*\).*/\1/p' | head -1)
-BLOCKS=$(echo "$MINE_OUT" | sed -n 's/.*blocks sent=\([0-9]*\).*/\1/p' | head -1)
-
-if [ -n "$MEMS" ] && [ -n "$BLOCKS" ]; then
-    MSG=$(printf '✦ mem · pre-compact · %s capsules + %s blocks archived' "$MEMS" "$BLOCKS")
-    jq -n --arg msg "$MSG" '{"systemMessage": $msg}'
-else
-    echo '{}'
-fi
+exec mem mine "$TRANSCRIPT" \
+    --tenant local \
+    --agent codex \
+    --mine-timeout-secs 90 \
+    --format hook-precompact

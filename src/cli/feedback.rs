@@ -58,17 +58,61 @@ pub struct FeedbackFromTranscriptArgs {
     pub all: bool,
 }
 
+/// Typed result of a feedback-from-transcript pass.
+#[derive(Debug, Clone, Default)]
+pub struct FeedbackCounts {
+    pub kind: String,
+    pub sent: usize,
+    pub consumed: usize,
+    pub failed: usize,
+}
+
+impl FeedbackCounts {
+    pub fn nothing_to_send(&self) -> bool {
+        self.consumed == 0
+    }
+    /// Treat as a hard failure only when every attempt failed *and*
+    /// at least one was attempted — matches the legacy exit-code
+    /// shape (`failed > 0 && sent == 0`).
+    pub fn hard_failure(&self) -> bool {
+        self.failed > 0 && self.sent == 0
+    }
+}
+
 pub async fn run(args: FeedbackFromTranscriptArgs) -> i32 {
-    let consumed = match scan_transcript(&args) {
-        Ok(set) => set,
+    match run_with_counts(args).await {
+        Ok(counts) => {
+            if counts.nothing_to_send() {
+                println!("feedback: no consumed memories detected");
+                return 0;
+            }
+            println!(
+                "feedback: kind={} sent={}/{} failed={}",
+                counts.kind, counts.sent, counts.consumed, counts.failed,
+            );
+            if counts.hard_failure() {
+                1
+            } else {
+                0
+            }
+        }
         Err(e) => {
             eprintln!("scan transcript: {e}");
-            return 1;
+            1
         }
-    };
+    }
+}
+
+/// Same as [`run`] but returns typed counts to in-process callers (the
+/// hook handlers). Errors only surface for unrecoverable transcript-
+/// parse failures; per-row HTTP errors are counted in `failed`.
+pub async fn run_with_counts(args: FeedbackFromTranscriptArgs) -> anyhow::Result<FeedbackCounts> {
+    let consumed = scan_transcript(&args)?;
     if consumed.is_empty() {
-        println!("feedback: no consumed memories detected");
-        return 0;
+        return Ok(FeedbackCounts {
+            kind: args.kind,
+            ..Default::default()
+        });
     }
     let client = Client::new();
     let mut sent = 0usize;
@@ -99,18 +143,12 @@ pub async fn run(args: FeedbackFromTranscriptArgs) -> i32 {
             }
         }
     }
-    println!(
-        "feedback: kind={} sent={}/{} failed={}",
-        args.kind,
+    Ok(FeedbackCounts {
+        kind: args.kind,
         sent,
-        consumed.len(),
+        consumed: consumed.len(),
         failed,
-    );
-    if failed > 0 && sent == 0 {
-        1
-    } else {
-        0
-    }
+    })
 }
 
 /// One pass over the JSONL transcript; returns the set of capability_capsule_ids that

@@ -1,13 +1,15 @@
 use anyhow::Result;
-use clap::Args;
+use clap::{Args, ValueEnum};
 use once_cell::sync::Lazy;
 use regex::Regex;
 use serde_json::Value;
 use std::fs::File;
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use super::common::RemoteArgs;
+use super::feedback::{self, FeedbackCounts, FeedbackFromTranscriptArgs};
 
 // Only the explicit `<mem-save>...</mem-save>` tag triggers extraction.
 //
@@ -21,6 +23,22 @@ use super::common::RemoteArgs;
 // `capability_capsule_ingest` directly via MCP).
 static TAG_RE: Lazy<Regex> = Lazy::new(|| Regex::new(r"<mem-save>(.*?)</mem-save>").unwrap());
 
+/// Output shape for `mem mine`. `human` is the legacy stdout summary
+/// agents read interactively; `hook-stop` / `hook-precompact` print a
+/// JSON line matching the Claude Code / Codex hook envelope shape, so
+/// shell hook scripts can `exec` `mem mine` directly without sed/jq
+/// post-processing. When the mine pass yields no rows, hook variants
+/// emit `{}` (skip-the-event sentinel).
+#[derive(Debug, Clone, Copy, ValueEnum, PartialEq, Eq)]
+pub enum HookFormat {
+    /// Print a one-line `Mined: capsules sent=…` summary to stdout.
+    Human,
+    /// Print a Stop-event envelope: `{"systemMessage":"✦ mem · …"}`.
+    HookStop,
+    /// Print a PreCompact-event envelope: `{"systemMessage":"✦ mem · pre-compact · …"}`.
+    HookPrecompact,
+}
+
 #[derive(Debug, Args)]
 pub struct MineArgs {
     /// Path to Claude Code transcript file
@@ -32,6 +50,31 @@ pub struct MineArgs {
     /// Source agent name
     #[arg(long, default_value = "claude-code")]
     pub agent: String,
+
+    /// After mining, also POST `applies_here` feedback for capsules
+    /// whose retrieved `text` reappeared in later assistant blocks.
+    /// Equivalent to running `mem feedback-from-transcript` as a
+    /// follow-up pass; folded into the same command so hook scripts
+    /// don't have to chain two timeouts + parse two outputs.
+    #[arg(long, default_value_t = false, action = clap::ArgAction::SetTrue)]
+    pub with_feedback: bool,
+
+    /// Soft wall-clock cap (seconds) for the mine pass. 0 = no cap.
+    /// On timeout, mine yields whatever rows it managed to send and
+    /// downstream output reflects partial counts.
+    #[arg(long, default_value = "0")]
+    pub mine_timeout_secs: u64,
+
+    /// Soft cap (seconds) for the feedback pass when `--with-feedback`.
+    /// 0 = no cap.
+    #[arg(long, default_value = "0")]
+    pub feedback_timeout_secs: u64,
+
+    /// Output shape. `human` (default) prints the legacy summary line.
+    /// `hook-stop` / `hook-precompact` print a JSON envelope ready for
+    /// the agent runtime's hook channel.
+    #[arg(long, value_enum, default_value_t = HookFormat::Human)]
+    pub format: HookFormat,
 }
 
 /// Chunk size used by `mine` when fanning out to the `/batch` endpoints.
@@ -340,14 +383,183 @@ fn looks_like_real_memory(s: &str) -> bool {
     substantive >= MIN_SUBSTANTIVE
 }
 
+/// Typed result of a mine pass. Fields are wire-counted (HTTP 2xx) — the
+/// server applies dedup by `idempotency_key` (capsules) and
+/// `(transcript_path, line_number, block_index)` (transcript blocks),
+/// so a re-run on the same file produces the same `_ok` totals without
+/// double-inserting.
+#[derive(Debug, Clone, Default)]
+pub struct MineCounts {
+    pub mem_ok: u32,
+    pub mem_fail: u32,
+    pub block_ok: u32,
+    pub block_fail: u32,
+}
+
+impl MineCounts {
+    pub fn capsules_total(&self) -> u32 {
+        self.mem_ok + self.mem_fail
+    }
+    pub fn blocks_total(&self) -> u32 {
+        self.block_ok + self.block_fail
+    }
+    pub fn failed(&self) -> bool {
+        self.mem_fail > 0 || self.block_fail > 0
+    }
+}
+
 pub async fn run(args: MineArgs) -> i32 {
-    let (memories, blocks) = match parse_transcript_full(&args.transcript_path) {
-        Ok(t) => t,
-        Err(e) => {
+    let format = args.format;
+    let with_feedback = args.with_feedback;
+    let feedback_timeout = args.feedback_timeout_secs;
+    let mine_timeout = args.mine_timeout_secs;
+    let transcript_path = args.transcript_path.clone();
+    let remote = args.remote.clone();
+
+    let mine_result = with_optional_timeout(mine_timeout, run_with_counts(args)).await;
+
+    let counts = match mine_result {
+        Some(Ok(counts)) => counts,
+        Some(Err(e)) => {
+            // Transcript parse error — hard input failure. Preserve the
+            // legacy non-zero exit; hook variants additionally emit `{}`
+            // so the runtime never breaks on a malformed file.
             eprintln!("Failed to parse transcript: {}", e);
+            if !matches!(format, HookFormat::Human) {
+                // Skip-event sentinel; trailing newline matches shell
+                // heredoc convention for hook channels.
+                println!("{{}}");
+            }
+            return 1;
+        }
+        None => {
+            eprintln!("mine pass exceeded --mine-timeout-secs={}", mine_timeout);
+            if !matches!(format, HookFormat::Human) {
+                // Skip-event sentinel; trailing newline matches shell
+                // heredoc convention for hook channels.
+                println!("{{}}");
+            }
             return 1;
         }
     };
+
+    let feedback_counts = if with_feedback {
+        run_feedback_inline(&transcript_path, &remote, feedback_timeout).await
+    } else {
+        None
+    };
+
+    match format {
+        HookFormat::Human => {
+            println!(
+                "Mined: capsules sent={}/{} blocks sent={}/{} (server-side dedup applied)",
+                counts.mem_ok,
+                counts.capsules_total(),
+                counts.block_ok,
+                counts.blocks_total(),
+            );
+            if counts.failed() {
+                1
+            } else {
+                0
+            }
+        }
+        HookFormat::HookStop | HookFormat::HookPrecompact => {
+            let is_precompact = matches!(format, HookFormat::HookPrecompact);
+            let envelope = render_hook_envelope(&counts, feedback_counts.as_ref(), is_precompact);
+            println!("{envelope}");
+            // Hook channel must never error out — partial mine still
+            // emits a useful envelope; the runtime treats non-zero exit
+            // as a hook failure.
+            0
+        }
+    }
+}
+
+/// Build a `{"systemMessage": "✦ mem · …"}` envelope. Returns the
+/// skip-event sentinel `{}` when both capsules and blocks are zero
+/// (typical "transcript had nothing new" path on a re-run).
+fn render_hook_envelope(
+    mine: &MineCounts,
+    feedback: Option<&FeedbackCounts>,
+    is_precompact: bool,
+) -> Value {
+    if mine.capsules_total() == 0 && mine.blocks_total() == 0 {
+        return Value::Object(Default::default());
+    }
+    let prefix = if is_precompact {
+        "✦ mem · pre-compact · "
+    } else {
+        "✦ mem · "
+    };
+    let suffix = if is_precompact {
+        " archived"
+    } else {
+        " woven into the archive"
+    };
+    let feedback_sent = feedback.map(|f| f.sent).unwrap_or(0);
+    let msg = if feedback_sent > 0 {
+        format!(
+            "{prefix}{}/{} capsules + {}/{} blocks · {} feedback applied",
+            mine.mem_ok,
+            mine.capsules_total(),
+            mine.block_ok,
+            mine.blocks_total(),
+            feedback_sent,
+        )
+    } else {
+        format!(
+            "{prefix}{}/{} capsules + {}/{} blocks{}",
+            mine.mem_ok,
+            mine.capsules_total(),
+            mine.block_ok,
+            mine.blocks_total(),
+            suffix,
+        )
+    };
+    serde_json::json!({ "systemMessage": msg })
+}
+
+/// In-process feedback pass. Failures (HTTP, transcript scan) resolve
+/// to `None` — feedback is best-effort for the hook flow; we never
+/// surface it as an envelope-breaking error.
+async fn run_feedback_inline(
+    transcript_path: &Path,
+    remote: &RemoteArgs,
+    timeout_secs: u64,
+) -> Option<FeedbackCounts> {
+    let args = FeedbackFromTranscriptArgs {
+        transcript_path: transcript_path.to_path_buf(),
+        remote: remote.clone(),
+        kind: "applies_here".to_string(),
+        all: false,
+    };
+    with_optional_timeout(timeout_secs, feedback::run_with_counts(args))
+        .await
+        .and_then(|r| r.ok())
+}
+
+/// Wrap `fut` in a `tokio::time::timeout` when `timeout_secs > 0`.
+/// Zero disables the cap. A timeout resolves to `None`.
+async fn with_optional_timeout<F, T>(timeout_secs: u64, fut: F) -> Option<T>
+where
+    F: std::future::Future<Output = T>,
+{
+    if timeout_secs == 0 {
+        return Some(fut.await);
+    }
+    tokio::time::timeout(Duration::from_secs(timeout_secs), fut)
+        .await
+        .ok()
+}
+
+/// Same as [`run`] but returns counts directly to in-process callers
+/// (e.g. the `mem hook` handlers) instead of printing + returning an
+/// exit code. Errors only surface for unrecoverable input failures
+/// (transcript parse). Per-row HTTP failures are counted in
+/// `mem_fail` / `block_fail`, not propagated.
+pub async fn run_with_counts(args: MineArgs) -> anyhow::Result<MineCounts> {
+    let (memories, blocks) = parse_transcript_full(&args.transcript_path)?;
 
     let client = reqwest::Client::new();
     let mut mem_ok: u32 = 0;
@@ -495,18 +707,12 @@ pub async fn run(args: MineArgs) -> i32 {
     // idempotency_key for memories, so re-running mine on the same file
     // returns 2xx without double-inserting. Use `mem-cli` / DuckDB queries
     // to count rows on disk if you need exact insert deltas.
-    println!(
-        "Mined: capsules sent={}/{} blocks sent={}/{} (server-side dedup applied)",
+    Ok(MineCounts {
         mem_ok,
-        mem_ok + mem_fail,
+        mem_fail,
         block_ok,
-        block_ok + block_fail
-    );
-    if mem_fail > 0 || block_fail > 0 {
-        1
-    } else {
-        0
-    }
+        block_fail,
+    })
 }
 
 // `mod extract_tests` lives at file end so clippy::items_after_test_module
@@ -552,5 +758,60 @@ mod extract_tests {
         assert!(extract_memory("重要：用 tokio 而不是 std::thread").is_none());
         assert!(extract_memory("Key insight: this matters").is_none());
         assert!(extract_memory("我会记住：保持简单").is_none());
+    }
+
+    #[test]
+    fn hook_envelope_skips_when_zero_counts() {
+        let mine = MineCounts::default();
+        let v = render_hook_envelope(&mine, None, false);
+        assert_eq!(v, serde_json::json!({}));
+    }
+
+    #[test]
+    fn hook_envelope_stop_uses_woven_into_archive() {
+        let mine = MineCounts {
+            mem_ok: 3,
+            mem_fail: 0,
+            block_ok: 12,
+            block_fail: 0,
+        };
+        let v = render_hook_envelope(&mine, None, false);
+        let msg = v["systemMessage"].as_str().unwrap();
+        assert!(msg.starts_with("✦ mem · "), "got {msg}");
+        assert!(msg.contains("3/3 capsules + 12/12 blocks"));
+        assert!(msg.contains("woven into the archive"));
+    }
+
+    #[test]
+    fn hook_envelope_precompact_uses_archived() {
+        let mine = MineCounts {
+            mem_ok: 1,
+            mem_fail: 0,
+            block_ok: 4,
+            block_fail: 0,
+        };
+        let v = render_hook_envelope(&mine, None, true);
+        let msg = v["systemMessage"].as_str().unwrap();
+        assert!(msg.starts_with("✦ mem · pre-compact · "), "got {msg}");
+        assert!(msg.ends_with("blocks archived"), "got {msg}");
+    }
+
+    #[test]
+    fn hook_envelope_appends_feedback_when_sent() {
+        let mine = MineCounts {
+            mem_ok: 1,
+            mem_fail: 0,
+            block_ok: 5,
+            block_fail: 0,
+        };
+        let feedback = FeedbackCounts {
+            kind: "applies_here".to_string(),
+            sent: 2,
+            consumed: 2,
+            failed: 0,
+        };
+        let v = render_hook_envelope(&mine, Some(&feedback), false);
+        let msg = v["systemMessage"].as_str().unwrap();
+        assert!(msg.contains("2 feedback applied"), "got {msg}");
     }
 }

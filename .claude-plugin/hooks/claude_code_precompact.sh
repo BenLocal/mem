@@ -1,11 +1,12 @@
 #!/usr/bin/env bash
-# Claude Code PreCompact hook: final sync mine before context compression
-# so capsules from the about-to-be-compacted exchanges are not lost. Emit
-# the same "✦ mem · …" systemMessage so the user sees the save happened.
+# Claude Code PreCompact hook. No throttle (context loss is
+# irreversible — every pre-compact deserves a final mine). Mining +
+# feedback + envelope formatting all happen inside `mem mine`
+# (--with-feedback --format hook-precompact); this wrapper only owns
+# stdin parse + transcript existence check.
 #
-# 90 s timeout (vs 60 s on Stop) — pre-compact runs ahead of irreversible
-# context loss, so it's worth giving mine a little more slack on a long
-# transcript.
+# Mine timeout is 90 s vs 60 s on Stop because the about-to-be-lost
+# context is worth a little more slack on a long transcript.
 set -uo pipefail
 
 INPUT=$(cat 2>/dev/null || echo '{}')
@@ -16,24 +17,10 @@ if [ -z "$TRANSCRIPT" ] || [ ! -f "$TRANSCRIPT" ]; then
     exit 0
 fi
 
-MINE_OUT=$(timeout 90 mem mine "$TRANSCRIPT" --agent claude-code 2>&1 || true)
-
-# Same auto-feedback pass as the Stop hook, slightly tighter cap (30 s)
-# because pre-compact already gave mine 90 s and we don't want the total
-# to blow through a runtime hook ceiling.
-FEEDBACK_OUT=$(timeout 30 mem feedback-from-transcript "$TRANSCRIPT" --tenant local 2>&1 || true)
-FEEDBACK_SENT=$(echo "$FEEDBACK_OUT" | sed -n 's/.*sent=\([0-9]*\).*/\1/p' | head -1)
-
-MEMS=$(echo "$MINE_OUT" | sed -n 's/.*capsules sent=\([0-9]*\/[0-9]*\).*/\1/p' | head -1)
-BLOCKS=$(echo "$MINE_OUT" | sed -n 's/.*blocks sent=\([0-9]*\/[0-9]*\).*/\1/p' | head -1)
-
-if [ -n "$MEMS" ] && [ -n "$BLOCKS" ]; then
-    if [ -n "$FEEDBACK_SENT" ] && [ "$FEEDBACK_SENT" != "0" ]; then
-        MSG=$(printf '✦ mem · pre-compact · %s capsules + %s blocks · %s feedback applied' "$MEMS" "$BLOCKS" "$FEEDBACK_SENT")
-    else
-        MSG=$(printf '✦ mem · pre-compact · %s capsules + %s blocks archived' "$MEMS" "$BLOCKS")
-    fi
-    jq -n --arg msg "$MSG" '{"systemMessage": $msg}'
-else
-    echo '{}'
-fi
+exec mem mine "$TRANSCRIPT" \
+    --tenant local \
+    --agent claude-code \
+    --with-feedback \
+    --mine-timeout-secs 90 \
+    --feedback-timeout-secs 30 \
+    --format hook-precompact
