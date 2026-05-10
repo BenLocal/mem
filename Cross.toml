@@ -19,6 +19,14 @@ default-target = "x86_64-unknown-linux-gnu"
 [target.x86_64-unknown-linux-gnu]
 # 与 Dockerfile builder 阶段使用同一套镜像，避免本机 cross 与镜像行为漂移
 image = "ghcr.io/cross-rs/x86_64-unknown-linux-gnu:edge"
+# `lance-encoding` 的 build.rs 跑 `prost-build` 编 .proto；
+# cross 镜像默认没装 protoc，pre-build 一次性 apt-get 装上。
+pre-build = [
+    "apt-get update && apt-get install -y --no-install-recommends protobuf-compiler",
+]
 
 [target.x86_64-unknown-linux-musl]
 image = "ghcr.io/cross-rs/x86_64-unknown-linux-musl:edge"
+pre-build = [
+    "apt-get update && apt-get install -y --no-install-recommends protobuf-compiler",
+]

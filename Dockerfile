@@ -15,13 +15,14 @@
 # Stage 1: builder
 # ─────────────────────────────────────────────────────────────────────────
 FROM rust:1-bookworm AS builder
+# `protobuf-compiler` is required by `lance-encoding`'s build script
+# (it shells out to `protoc` via `prost-build`).
 RUN apt-get update && apt-get install -y --no-install-recommends \
-        pkg-config libssl-dev cmake build-essential clang git \
+        pkg-config libssl-dev cmake build-essential clang git protobuf-compiler \
     && rm -rf /var/lib/apt/lists/*
 WORKDIR /build
 COPY Cargo.toml Cargo.lock Cross.toml ./
 COPY src ./src
-COPY db ./db
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/build/target \
     cargo build --release --bin mem && \
