@@ -23,6 +23,11 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 WORKDIR /build
 COPY Cargo.toml Cargo.lock Cross.toml ./
 COPY src ./src
+# Cargo.toml declares `[[example]]` blocks (hybrid_sql_poc,
+# lance_duckdb_poc); manifest parsing fails if the files are missing
+# even with `--bin mem`. Copying examples too is cheaper than dropping
+# the declarations.
+COPY examples ./examples
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/build/target \
     cargo build --release --bin mem && \
