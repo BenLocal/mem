@@ -13,3 +13,6 @@ bench-fixtures/
 target/bench-out/
 .playwright-mcp/
 admin-page-*.png
+
+# Claude Code runtime state (scheduled_tasks lock, etc.)
+.claude/
