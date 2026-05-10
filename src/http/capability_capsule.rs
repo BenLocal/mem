@@ -213,6 +213,7 @@ async fn submit_feedback(
                 &request.tenant,
                 &request.capability_capsule_id,
                 request.feedback_kind,
+                request.note,
             )
             .await?,
     ))
@@ -240,4 +241,8 @@ struct HttpFeedbackRequest {
     tenant: String,
     capability_capsule_id: String,
     feedback_kind: FeedbackKind,
+    /// Optional caller-supplied note (verbatim text). Persisted on
+    /// the resulting `feedback_events` row; not consumed by ranking.
+    #[serde(default)]
+    note: Option<String>,
 }

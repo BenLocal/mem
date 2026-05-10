@@ -344,6 +344,143 @@ pub struct EmbeddingsRebuildArgs {
     pub force: Option<bool>,
 }
 
+// ─── batch ingest ──────────────────────────────────────────────────
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct CapabilityCapsuleBatchIngestArgs {
+    /// Default tenant for every item; per-item value overrides.
+    #[serde(default)]
+    pub tenant: Option<String>,
+    /// One row per capsule. Each item carries the same fields as
+    /// `capability_capsule_ingest`, minus the per-item `tenant`
+    /// override (passed at the outer struct).
+    pub items: Vec<CapabilityCapsuleBatchIngestItem>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct CapabilityCapsuleBatchIngestItem {
+    /// One of: implementation | experience | preference | episode | workflow
+    pub capability_capsule_type: String,
+    pub content: String,
+    #[serde(default)]
+    pub summary: Option<String>,
+    #[serde(default)]
+    pub evidence: Option<Vec<String>>,
+    #[serde(default)]
+    pub code_refs: Option<Vec<String>>,
+    /// One of: global | project | repo | workspace
+    pub scope: String,
+    /// One of: private | shared | system. Default "private".
+    #[serde(default)]
+    pub visibility: Option<String>,
+    #[serde(default)]
+    pub project: Option<String>,
+    #[serde(default)]
+    pub repo: Option<String>,
+    #[serde(default)]
+    pub module: Option<String>,
+    #[serde(default)]
+    pub task_type: Option<String>,
+    #[serde(default)]
+    pub tags: Option<Vec<String>>,
+    /// Default "mem-mcp"
+    #[serde(default)]
+    pub source_agent: Option<String>,
+    #[serde(default)]
+    pub idempotency_key: Option<String>,
+    /// One of: auto | propose. Default "auto".
+    #[serde(default)]
+    pub write_mode: Option<String>,
+}
+
+// ─── transcript search ─────────────────────────────────────────────
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct TranscriptSearchArgs {
+    /// Free-text BM25 + semantic query. Empty string falls through to
+    /// the recent-time browse path.
+    pub query: String,
+    /// Defaults to MEM_TENANT when omitted.
+    #[serde(default)]
+    pub tenant: Option<String>,
+    /// Restrict to one session (optional).
+    #[serde(default)]
+    pub session_id: Option<String>,
+    /// One of: user | assistant | system
+    #[serde(default)]
+    pub role: Option<String>,
+    /// One of: text | tool_use | tool_result | thinking
+    #[serde(default)]
+    pub block_type: Option<String>,
+    /// Lexicographic compare against `created_at` (ISO-8601). Inclusive.
+    #[serde(default)]
+    pub time_from: Option<String>,
+    #[serde(default)]
+    pub time_to: Option<String>,
+    /// 1..=100, default 20.
+    #[serde(default)]
+    pub limit: Option<usize>,
+    /// Inject this session's blocks as candidates regardless of query.
+    #[serde(default)]
+    pub anchor_session_id: Option<String>,
+    /// ±N blocks of context around each primary; capped at 10.
+    #[serde(default)]
+    pub context_window: Option<usize>,
+    /// Include tool_use / tool_result blocks in the context window.
+    #[serde(default)]
+    pub include_tool_blocks_in_context: Option<bool>,
+}
+
+// ─── entities ──────────────────────────────────────────────────────
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct EntityCreateArgs {
+    /// Defaults to MEM_TENANT when omitted.
+    #[serde(default)]
+    pub tenant: Option<String>,
+    pub canonical_name: String,
+    /// One of: topic | project | repo | module | workflow
+    pub kind: String,
+    /// Optional list of additional aliases that should resolve to this
+    /// entity (the canonical_name is implicitly an alias). Re-POSTing
+    /// with the same canonical name is idempotent on alias hit.
+    #[serde(default)]
+    pub aliases: Option<Vec<String>>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct EntityGetArgs {
+    pub entity_id: String,
+    /// Defaults to MEM_TENANT when omitted.
+    #[serde(default)]
+    pub tenant: Option<String>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct EntityAddAliasArgs {
+    pub entity_id: String,
+    pub alias: String,
+    /// Defaults to MEM_TENANT when omitted.
+    #[serde(default)]
+    pub tenant: Option<String>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct EntityListArgs {
+    /// Defaults to MEM_TENANT when omitted.
+    #[serde(default)]
+    pub tenant: Option<String>,
+    /// One of: topic | project | repo | module | workflow
+    #[serde(default)]
+    pub kind: Option<String>,
+    /// Substring match against `canonical_name` (case-sensitive).
+    #[serde(default)]
+    pub q: Option<String>,
+    /// 1..=100, default 50.
+    #[serde(default)]
+    pub limit: Option<usize>,
+}
+
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
@@ -722,18 +859,27 @@ impl MemMcpServer {
 
     // ------------------- capability_capsule_apply_feedback -------------------
     #[tool(
-        description = "Apply limited feedback on a memory while keeping the existing POST /capability_capsules/feedback backend contract."
+        description = "Apply limited feedback on a memory while keeping the existing POST /capability_capsules/feedback backend contract. Optional `note` is persisted verbatim on the resulting feedback_events row."
     )]
     async fn capability_capsule_apply_feedback(
         &self,
         Parameters(args): Parameters<CapabilityCapsuleApplyFeedbackArgs>,
     ) -> Result<CallToolResult, McpError> {
-        let body = json!({
-            "tenant": self.resolve_tenant(args.tenant.as_ref()),
-            "capability_capsule_id": args.capability_capsule_id,
-            "feedback_kind": args.kind,
-        });
-        self.post_json("capability_capsules/feedback", &body).await
+        let mut body = Map::new();
+        body.insert(
+            "tenant".into(),
+            json!(self.resolve_tenant(args.tenant.as_ref())),
+        );
+        body.insert(
+            "capability_capsule_id".into(),
+            json!(args.capability_capsule_id),
+        );
+        body.insert("feedback_kind".into(), json!(args.kind));
+        if let Some(note) = args.note.filter(|s| !s.is_empty()) {
+            body.insert("note".into(), json!(note));
+        }
+        self.post_json("capability_capsules/feedback", &Value::Object(body))
+            .await
     }
 
     // ------------------- capability_capsule_list_pending_review -------------------
@@ -874,6 +1020,178 @@ impl MemMcpServer {
             "limit": args.limit.unwrap_or(200),
         });
         self.post_json("transcripts", &body).await
+    }
+
+    // ------------------- capability_capsule_batch_ingest -------------------
+    #[tool(
+        description = "Bulk-insert multiple capsules in one call (server folds N rows into one Lance write + one DuckDB refresh; bench shows 9-227x speedup over looping `capability_capsule_ingest`). Returns 201 with per-item {result: ok | err} preserving input order, or 207 if any item failed."
+    )]
+    async fn capability_capsule_batch_ingest(
+        &self,
+        Parameters(args): Parameters<CapabilityCapsuleBatchIngestArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        let tenant = self.resolve_tenant(args.tenant.as_ref());
+        let items: Vec<Value> = args
+            .items
+            .into_iter()
+            .map(|i| {
+                let mut body = Map::new();
+                body.insert("tenant".into(), json!(tenant));
+                body.insert(
+                    "capability_capsule_type".into(),
+                    json!(i.capability_capsule_type),
+                );
+                body.insert("content".into(), json!(i.content));
+                body.insert("evidence".into(), json!(i.evidence.unwrap_or_default()));
+                body.insert("code_refs".into(), json!(i.code_refs.unwrap_or_default()));
+                body.insert("scope".into(), json!(i.scope));
+                body.insert(
+                    "visibility".into(),
+                    json!(i.visibility.unwrap_or_else(|| "private".to_string())),
+                );
+                body.insert("tags".into(), json!(i.tags.unwrap_or_default()));
+                body.insert(
+                    "source_agent".into(),
+                    json!(i.source_agent.unwrap_or_else(|| "mem-mcp".to_string())),
+                );
+                body.insert(
+                    "write_mode".into(),
+                    json!(i.write_mode.unwrap_or_else(|| "auto".to_string())),
+                );
+                if let Some(v) = i.summary {
+                    body.insert("summary".into(), json!(v));
+                }
+                if let Some(v) = i.project {
+                    body.insert("project".into(), json!(v));
+                }
+                if let Some(v) = i.repo {
+                    body.insert("repo".into(), json!(v));
+                }
+                if let Some(v) = i.module {
+                    body.insert("module".into(), json!(v));
+                }
+                if let Some(v) = i.task_type {
+                    body.insert("task_type".into(), json!(v));
+                }
+                if let Some(v) = i.idempotency_key {
+                    body.insert("idempotency_key".into(), json!(v));
+                }
+                Value::Object(body)
+            })
+            .collect();
+        self.post_json("capability_capsules/batch", &Value::Array(items))
+            .await
+    }
+
+    // ------------------- transcripts_search -------------------
+    #[tool(
+        description = "Hybrid (BM25 + semantic) search over the verbatim transcript archive. Returns merged context windows around each primary hit. Use to recall earlier conversations beyond what wake-up surfaces; pair with `transcript_session_get` to fetch full sessions."
+    )]
+    async fn transcripts_search(
+        &self,
+        Parameters(args): Parameters<TranscriptSearchArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        let mut body = Map::new();
+        body.insert(
+            "tenant".into(),
+            json!(self.resolve_tenant(args.tenant.as_ref())),
+        );
+        body.insert("query".into(), json!(args.query));
+        body.insert("limit".into(), json!(args.limit.unwrap_or(20)));
+        body.insert(
+            "include_tool_blocks_in_context".into(),
+            json!(args.include_tool_blocks_in_context.unwrap_or(false)),
+        );
+        if let Some(v) = args.session_id {
+            body.insert("session_id".into(), json!(v));
+        }
+        if let Some(v) = args.role {
+            body.insert("role".into(), json!(v));
+        }
+        if let Some(v) = args.block_type {
+            body.insert("block_type".into(), json!(v));
+        }
+        if let Some(v) = args.time_from {
+            body.insert("time_from".into(), json!(v));
+        }
+        if let Some(v) = args.time_to {
+            body.insert("time_to".into(), json!(v));
+        }
+        if let Some(v) = args.anchor_session_id {
+            body.insert("anchor_session_id".into(), json!(v));
+        }
+        if let Some(v) = args.context_window {
+            body.insert("context_window".into(), json!(v));
+        }
+        self.post_json("transcripts/search", &Value::Object(body))
+            .await
+    }
+
+    // ------------------- entity_create -------------------
+    #[tool(
+        description = "Create or resolve a canonical entity in the registry. Idempotent on alias hit (re-POSTing the same canonical_name returns the existing entity_id). Returns 201 / 409 (alias already bound to a different entity)."
+    )]
+    async fn entity_create(
+        &self,
+        Parameters(args): Parameters<EntityCreateArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        let body = json!({
+            "tenant": self.resolve_tenant(args.tenant.as_ref()),
+            "canonical_name": args.canonical_name,
+            "kind": args.kind,
+            "aliases": args.aliases.unwrap_or_default(),
+        });
+        self.post_json("entities", &body).await
+    }
+
+    // ------------------- entity_get -------------------
+    #[tool(
+        description = "Fetch one entity (canonical_name, kind, aliases) by entity_id. Returns 404 when the id is unknown."
+    )]
+    async fn entity_get(
+        &self,
+        Parameters(args): Parameters<EntityGetArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        let path = format!("entities/{}", encode_segment(&args.entity_id));
+        let tenant = self.resolve_tenant(args.tenant.as_ref());
+        self.get_with_query(&path, &[("tenant", tenant)]).await
+    }
+
+    // ------------------- entity_add_alias -------------------
+    #[tool(
+        description = "Declare an additional alias for an existing entity. Returns 200 (inserted / already_on_same_entity) or 409 (conflict_with_different_entity)."
+    )]
+    async fn entity_add_alias(
+        &self,
+        Parameters(args): Parameters<EntityAddAliasArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        let body = json!({
+            "tenant": self.resolve_tenant(args.tenant.as_ref()),
+            "alias": args.alias,
+        });
+        let path = format!("entities/{}/aliases", encode_segment(&args.entity_id));
+        self.post_json(&path, &body).await
+    }
+
+    // ------------------- entity_list -------------------
+    #[tool(
+        description = "List entities for the tenant, ordered by created_at desc. Supports filtering by `kind` and substring `q` on canonical_name. Default limit 50, server-side cap 100."
+    )]
+    async fn entity_list(
+        &self,
+        Parameters(args): Parameters<EntityListArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        let mut query: Vec<(&str, String)> = vec![
+            ("tenant", self.resolve_tenant(args.tenant.as_ref())),
+            ("limit", args.limit.unwrap_or(50).to_string()),
+        ];
+        if let Some(s) = args.kind.filter(|s| !s.is_empty()) {
+            query.push(("kind", s));
+        }
+        if let Some(s) = args.q.filter(|s| !s.is_empty()) {
+            query.push(("q", s));
+        }
+        self.get_with_query("entities", &query).await
     }
 
     // ------------------- embeddings_list_jobs (admin) -------------------

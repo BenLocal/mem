@@ -14,6 +14,9 @@ pub struct FeedbackEvent {
     pub capability_capsule_id: String,
     pub feedback_kind: String,
     pub created_at: String,
+    /// Optional caller-supplied free-text note. Persisted verbatim;
+    /// not consumed by ranking. `None` when not provided.
+    pub note: Option<String>,
 }
 
 /// Row claimed by the embedding worker (`status = processing`).

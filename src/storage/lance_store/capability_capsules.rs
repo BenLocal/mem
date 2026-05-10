@@ -1443,6 +1443,7 @@ mod tests {
             capability_capsule_id: memory.capability_capsule_id.clone(),
             feedback_kind: kind.into(),
             created_at: ts.into(),
+            note: None,
         };
         let _ = repo
             .apply_feedback(&memory, make("useful", "2026-05-08T01:00:00Z", "1"))

@@ -285,6 +285,47 @@ score = round(1000 × (1/(60 + rank_lex) + 1/(60 + rank_sem)))   # 召回融合
 
 `MemoryService::search` 里两路顺序 await，没有 `tokio::join!`。BM25 + 一次 embed_text + ANN 全在 request 关键路径上。优化机会，见 §4.6。
 
+### 3.7 批量写入端点性能（bench）
+
+`POST /capability_capsules/batch` 与 `POST /transcripts/messages/batch` 把 N 行写入折叠成一次 Lance manifest commit + 一次 `DuckDbQuery::refresh()`，吃掉了原来"每行一次 refresh"的瓶颈。`examples/ingest_bench.rs` 在 service 层 release build + 干净 tempdir 上对比单条 / 批量两条路径（每场景独立开 store，不复用 disk cache）：
+
+```
+== Capability capsules ==
+    N   single (ms)    batch (ms)    speedup    per-row μs
+----------------------------------------------------------
+   10       21998.1        2257.3       9.7x    2200 →  226
+   50       93777.1       18218.6       5.1x    1876 →  364
+  100      130312.1       14246.8       9.1x    1303 →  142
+
+== Transcript blocks ==
+    N   single (ms)    batch (ms)    speedup    per-row μs
+----------------------------------------------------------
+   10         673.9          72.8       9.3x      67 →    7
+   50       12335.5          81.2     151.9x     247 →    2
+  100       21808.4          96.3     226.6x     218 →    1
+```
+
+**几个值得记的观察**：
+
+- **Capsule 路径每行 ~1-2 ms 主要被 `lance_write_then_refresh!` 的 DuckDB 连接 swap 吞掉**——批量后 N 次 refresh → 1 次，所以 9-11× 提升基本是常数项摊销。Service 层的 graph edge 解析、entity registry 查询、embedding job enqueue 也合并成单次调用。
+- **Transcript 收益更夸张（最高 227×）是因为单条路径在 `create_conversation_message` 里每行都跑一次 `count_rows((path,line,block))` 做 dedup**——表越大扫描越慢，N=100 时已经是 218 μs/行的扫描放大。批量路径用一次 `transcript_path IN (...)` filter 拉所有现有 key，剩下全部内存里 dedup → 近 O(1)。
+- **典型 `mem mine` 场景**：一份会话 transcript 通常 100s–1000s blocks + 几十个 capsule。整体写入从分钟级降到秒级（100 capsule + 100 block 从 152 s → 14 s，约 10×）。
+
+**复现命令**：
+
+```bash
+cargo run --example ingest_bench --release
+# 或自定义规模：
+MEM_BENCH_SIZES=10,50 cargo run --example ingest_bench --release
+```
+
+**HTTP 端点契约**：
+
+- 批量 capsule 返回 `{items: [{result: "ok"|"err", capability_capsule_id?, status?, error?}, ...]}`。201（全成功）或 207 Multi-Status（任一失败）。
+- 批量 transcript 返回 `{message_block_ids: [...], inserted: <usize>}`。`inserted` 是真正落库的行数（去重后），`message_block_ids` 是输入序号一一对应的 id。
+
+详见 `bench(ingest)` commit `1b800e5`、`feat(ingest): batch …` commit `f3e7100`。
+
 ---
 
 ## 4. 可优化方向（按优先级）

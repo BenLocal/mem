@@ -432,14 +432,17 @@ async fn ensure_table(conn: &Connection, name: &str, schema: Schema) -> Result<(
 }
 
 /// Arrow schema for the `feedback_events` LanceDB table. Mirrors the
-/// `feedback_events` DuckDB schema (4 columns: feedback_id PK,
-/// capability_capsule_id, feedback_kind, created_at).
+/// `feedback_events` schema (5 columns: feedback_id PK,
+/// capability_capsule_id, feedback_kind, created_at, optional note).
 fn feedback_events_schema() -> Schema {
     Schema::new(vec![
         Field::new("feedback_id", DataType::Utf8, false),
         Field::new("capability_capsule_id", DataType::Utf8, false),
         Field::new("feedback_kind", DataType::Utf8, false),
         Field::new("created_at", DataType::Utf8, false),
+        // Optional caller note (verbatim text). Nullable so old rows
+        // and clients that never provide one stay valid.
+        Field::new("note", DataType::Utf8, true),
     ])
 }
 
@@ -450,11 +453,16 @@ pub(super) fn feedback_events_to_record_batch(
     let mut capability_capsule_id = StringBuilder::new();
     let mut feedback_kind = StringBuilder::new();
     let mut created_at = StringBuilder::new();
+    let mut note = StringBuilder::new();
     for e in events {
         feedback_id.append_value(&e.feedback_id);
         capability_capsule_id.append_value(&e.capability_capsule_id);
         feedback_kind.append_value(&e.feedback_kind);
         created_at.append_value(&e.created_at);
+        match &e.note {
+            Some(n) => note.append_value(n),
+            None => note.append_null(),
+        }
     }
     let schema = Arc::new(feedback_events_schema());
     let columns: Vec<Arc<dyn Array>> = vec![
@@ -462,6 +470,7 @@ pub(super) fn feedback_events_to_record_batch(
         Arc::new(capability_capsule_id.finish()),
         Arc::new(feedback_kind.finish()),
         Arc::new(created_at.finish()),
+        Arc::new(note.finish()),
     ];
     RecordBatch::try_new(schema, columns)
         .map_err(|e| StorageError::InvalidInput(format!("feedback record batch: {e}")))
@@ -485,6 +494,18 @@ pub(super) fn record_batch_to_feedback_events(
     let capability_capsule_id = col::<StringArray>(batch, "capability_capsule_id")?;
     let feedback_kind = col::<StringArray>(batch, "feedback_kind")?;
     let created_at = col::<StringArray>(batch, "created_at")?;
+    // `note` is optional in the batch — older datasets that pre-date
+    // the column won't have it. Read defensively.
+    let note = batch
+        .column_by_name("note")
+        .and_then(|c| c.as_any().downcast_ref::<StringArray>());
+    let opt = |arr: &StringArray, i: usize| -> Option<String> {
+        if arr.is_null(i) {
+            None
+        } else {
+            Some(arr.value(i).to_string())
+        }
+    };
     let mut out = Vec::with_capacity(batch.num_rows());
     for i in 0..batch.num_rows() {
         out.push(FeedbackEvent {
@@ -492,6 +513,7 @@ pub(super) fn record_batch_to_feedback_events(
             capability_capsule_id: capability_capsule_id.value(i).to_string(),
             feedback_kind: feedback_kind.value(i).to_string(),
             created_at: created_at.value(i).to_string(),
+            note: note.and_then(|arr| opt(arr, i)),
         });
     }
     Ok(out)

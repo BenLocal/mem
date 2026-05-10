@@ -742,6 +742,7 @@ impl CapabilityCapsuleService {
         tenant: &str,
         capability_capsule_id: &str,
         feedback_kind: FeedbackKind,
+        note: Option<String>,
     ) -> Result<CapabilityCapsuleRecord, ServiceError> {
         let memory = self
             .store
@@ -754,6 +755,7 @@ impl CapabilityCapsuleService {
             capability_capsule_id: memory.capability_capsule_id.clone(),
             feedback_kind: feedback_kind.as_str().to_string(),
             created_at: current_timestamp(),
+            note: note.filter(|s| !s.is_empty()),
         };
 
         Ok(self.store.apply_feedback(&memory, feedback).await?)

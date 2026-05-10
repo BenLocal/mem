@@ -267,14 +267,15 @@
 
 **Schema** (`fn feedback_events_schema`, `mod.rs:437`)
 
-| 字段 | 类型 |
-|---|---|
-| feedback_id | Utf8 (PK, `fb_` UUIDv7) |
-| capability_capsule_id | Utf8 (FK) |
-| feedback_kind | Utf8（5 种 `FeedbackKind`） |
-| created_at | Utf8 |
+| 字段 | 类型 | nullable | 备注 |
+|---|---|---|---|
+| feedback_id | Utf8 | no | PK，`fb_` UUIDv7 |
+| capability_capsule_id | Utf8 | no | FK |
+| feedback_kind | Utf8 | no | 5 种 `FeedbackKind` |
+| created_at | Utf8 | no | |
+| note | Utf8 | yes | 调用方提供的自由文本注释；不参与排序，仅审计 |
 
-**写入** — `apply_feedback`。
+**写入** — `apply_feedback`（`note` 由 `Service::submit_feedback(.., note)` 透传过来；HTTP `/capability_capsules/feedback` body 接 `note?`，MCP 工具 `capability_capsule_apply_feedback` 也带 forward）。
 
 **读取** — `list_feedback_for_memory` + `feedback_summary`（LanceStore native，被详情页用）。
 
