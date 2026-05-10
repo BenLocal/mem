@@ -15,10 +15,13 @@
 # Stage 1: builder
 # ─────────────────────────────────────────────────────────────────────────
 FROM rust:1-bookworm AS builder
-# `protobuf-compiler` is required by `lance-encoding`'s build script
-# (it shells out to `protoc` via `prost-build`).
+# `protobuf-compiler` provides protoc; `libprotobuf-dev` ships the
+# well-known protos under `/usr/include/google/protobuf/` (lance's
+# `encodings_v2_0.proto` imports `google/protobuf/empty.proto`,
+# which is in -dev only).
 RUN apt-get update && apt-get install -y --no-install-recommends \
-        pkg-config libssl-dev cmake build-essential clang git protobuf-compiler \
+        pkg-config libssl-dev cmake build-essential clang git \
+        protobuf-compiler libprotobuf-dev \
     && rm -rf /var/lib/apt/lists/*
 WORKDIR /build
 COPY Cargo.toml Cargo.lock Cross.toml ./
