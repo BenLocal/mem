@@ -6,7 +6,8 @@ target/
 docs/
 tests/
 benches/
-examples/
+# `examples/` is referenced by `[[example]]` blocks in Cargo.toml;
+# excluding it makes manifest parsing fail.
 .github/
 .claude-plugin/
 .codex-plugin/
