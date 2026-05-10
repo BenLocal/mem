@@ -14,9 +14,12 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
-      # See ci.yml: `lance-encoding`'s build script needs protoc.
-      - name: Install protoc
-        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends protobuf-compiler
+      # See ci.yml: `lance-encoding`'s build script needs a recent
+      # protoc (apt's is too old to ship google/protobuf/empty.proto).
+      - uses: arduino/setup-protoc@v3
+        with:
+          version: "27.x"
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
       - name: cargo fmt
         run: cargo fmt --all -- --check
       - name: cargo clippy

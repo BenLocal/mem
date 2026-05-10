@@ -15,10 +15,14 @@ jobs:
         with:
           components: rustfmt, clippy
       # `lance-encoding`'s build script invokes `prost-build` to compile
-      # `.proto` files; protoc isn't on the GitHub-hosted runner image
-      # by default. Install before any cargo step.
-      - name: Install protoc
-        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends protobuf-compiler
+      # `.proto` files. The runner's apt protobuf-compiler ships an
+      # ancient (~3.12) protoc that doesn't bundle
+      # `google/protobuf/empty.proto`; lance imports it. Use
+      # arduino/setup-protoc to pin a recent release instead.
+      - uses: arduino/setup-protoc@v3
+        with:
+          version: "27.x"
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
       - run: cargo fmt --all -- --check
       - run: cargo clippy --all-targets -- -D warnings
       - run: cargo test

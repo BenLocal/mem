@@ -19,14 +19,23 @@ default-target = "x86_64-unknown-linux-gnu"
 [target.x86_64-unknown-linux-gnu]
 # 与 Dockerfile builder 阶段使用同一套镜像，避免本机 cross 与镜像行为漂移
 image = "ghcr.io/cross-rs/x86_64-unknown-linux-gnu:edge"
-# `lance-encoding` 的 build.rs 跑 `prost-build` 编 .proto；
-# cross 镜像默认没装 protoc，pre-build 一次性 apt-get 装上。
+# `lance-encoding` 的 build.rs 跑 `prost-build` 编 .proto；focal-based
+# 镜像 apt 的 protoc (3.6.x) 缺 google/protobuf/empty.proto，
+# 直接抓上游 release 装一份。
 pre-build = [
-    "apt-get update && apt-get install -y --no-install-recommends protobuf-compiler",
+    "apt-get update && apt-get install -y --no-install-recommends curl unzip ca-certificates",
+    "curl -fsSL https://github.com/protocolbuffers/protobuf/releases/download/v27.3/protoc-27.3-linux-x86_64.zip -o /tmp/protoc.zip",
+    "unzip -o /tmp/protoc.zip -d /usr/local",
+    "chmod +x /usr/local/bin/protoc",
+    "rm /tmp/protoc.zip",
 ]
 
 [target.x86_64-unknown-linux-musl]
 image = "ghcr.io/cross-rs/x86_64-unknown-linux-musl:edge"
 pre-build = [
-    "apt-get update && apt-get install -y --no-install-recommends protobuf-compiler",
+    "apt-get update && apt-get install -y --no-install-recommends curl unzip ca-certificates",
+    "curl -fsSL https://github.com/protocolbuffers/protobuf/releases/download/v27.3/protoc-27.3-linux-x86_64.zip -o /tmp/protoc.zip",
+    "unzip -o /tmp/protoc.zip -d /usr/local",
+    "chmod +x /usr/local/bin/protoc",
+    "rm /tmp/protoc.zip",
 ]
