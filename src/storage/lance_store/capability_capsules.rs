@@ -99,7 +99,7 @@ impl LanceStore {
 
     /// Read all `embedding_jobs` rows matching `filter`, parsed into
     /// [`EmbeddingJobRow`]s. Shared by every queue read path: the claim
-    /// flow, `first_embedding_job_id_for_capability_capsule`, `list_embedding_jobs`,
+    /// flow, `list_embedding_jobs`, `latest_embedding_job_status_for_hash`,
     /// and the duplicate-detection in `try_enqueue_embedding_job`.
     pub(crate) async fn query_embedding_jobs(
         &self,
@@ -260,22 +260,6 @@ impl LanceStore {
         let batch = embedding_job_row_to_record_batch(&row)?;
         table.add(batch).execute().await.map_err(lancedb_err)?;
         Ok(true)
-    }
-
-    pub async fn first_embedding_job_id_for_capability_capsule(
-        &self,
-        capability_capsule_id: &str,
-    ) -> Result<Option<String>, StorageError> {
-        let mut rows = self
-            .query_embedding_jobs(format!(
-                "capability_capsule_id = {}",
-                sql_quote(capability_capsule_id)
-            ))
-            .await?;
-        // LanceDB has no ORDER BY — sort in memory by created_at ASC
-        // (same shape as the DuckDB SQL).
-        rows.sort_by(|a, b| a.created_at.cmp(&b.created_at));
-        Ok(rows.into_iter().next().map(|r| r.job_id))
     }
 
     pub async fn claim_next_n_embedding_jobs(
@@ -1562,17 +1546,6 @@ mod tests {
         assert!(enq1, "first enqueue should create");
         let enq1b = repo.try_enqueue_embedding_job(insert1).await.unwrap();
         assert!(!enq1b, "duplicate enqueue must return false");
-
-        let first = repo
-            .first_embedding_job_id_for_capability_capsule("mem_q1")
-            .await
-            .unwrap();
-        assert_eq!(first, Some("job_1".into()));
-        let none = repo
-            .first_embedding_job_id_for_capability_capsule("does-not-exist")
-            .await
-            .unwrap();
-        assert!(none.is_none());
 
         let status = repo
             .latest_embedding_job_status_for_hash("tenant-a", "mem_q1", "hash_q1")

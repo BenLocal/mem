@@ -513,26 +513,6 @@ impl Store {
 // Marked individually with `// TODO: route to DuckDbQuery once added`.
 impl Store {
     /// TODO: route to DuckDbQuery once added.
-    pub async fn first_embedding_job_id_for_capability_capsule(
-        &self,
-        capability_capsule_id: &str,
-    ) -> Result<Option<String>, StorageError> {
-        self.lance
-            .first_embedding_job_id_for_capability_capsule(capability_capsule_id)
-            .await
-    }
-
-    /// TODO: route to DuckDbQuery once added.
-    pub async fn list_feedback_for_memory(
-        &self,
-        capability_capsule_id: &str,
-    ) -> Result<Vec<FeedbackEvent>, StorageError> {
-        self.lance
-            .list_feedback_for_memory(capability_capsule_id)
-            .await
-    }
-
-    /// TODO: route to DuckDbQuery once added.
     pub async fn feedback_summary(
         &self,
         capability_capsule_id: &str,
