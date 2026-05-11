@@ -889,7 +889,7 @@ impl LanceStore {
             cursor = r.supersedes_capability_capsule_id.clone();
             chain.push(r);
         }
-        chain.sort_by(|a, b| b.version.cmp(&a.version));
+        chain.sort_by_key(|r| std::cmp::Reverse(r.version));
         Ok(chain
             .into_iter()
             .map(|r| CapabilityCapsuleVersionLink {
