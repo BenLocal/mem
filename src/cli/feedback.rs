@@ -1,6 +1,8 @@
 //! `mem feedback-from-transcript` — scan a Claude Code transcript for
-//! `mcp__mem__memory_search` calls, decide which retrieved memories were
-//! actually consumed by the agent, and POST `/capability_capsules/feedback` for each.
+//! capsule-search MCP tool calls (see [`is_capsule_search_tool`] for
+//! the accepted name shape), decide which retrieved capsules were
+//! actually consumed by the agent, and POST
+//! `/capability_capsules/feedback` for each.
 //!
 //! Heuristic for "consumed": the memory's `text` (returned in the
 //! `directives` / `relevant_facts` / `reusable_patterns` sections of the
@@ -25,13 +27,36 @@ use std::path::PathBuf;
 
 use super::common::RemoteArgs;
 
-/// Memory-search MCP tool names we care about. Both share the same
-/// response shape (`domain::query::SearchCapabilityCapsuleResponse`).
-const SEARCH_TOOL_NAMES: &[&str] = &[
-    "mcp__mem__memory_search",
-    "mcp__mem__memory_search_contextual",
-    "mcp__mem__memory_bootstrap",
-];
+/// True if `name` is one of the capsule/memory search MCP tools whose
+/// results we want to scan for consumed hits. Covers a 2x3 matrix:
+///
+///   - prefix `mcp__mem__` (direct MCP registration) OR
+///     `mcp__plugin_mem_mem__` (loaded as a Claude Code plugin)
+///   - suffix `memory_search` / `memory_search_contextual` /
+///     `memory_bootstrap` (pre-rename) OR
+///     `capability_capsule_search` / `capability_capsule_search_contextual` /
+///     `capability_capsule_bootstrap` (post-rename, current)
+///
+/// All six suffix variants share the same
+/// `SearchCapabilityCapsuleResponse` body shape, so the downstream
+/// snippet-match code works for any of them.
+fn is_capsule_search_tool(name: &str) -> bool {
+    let Some(suffix) = name
+        .strip_prefix("mcp__mem__")
+        .or_else(|| name.strip_prefix("mcp__plugin_mem_mem__"))
+    else {
+        return false;
+    };
+    matches!(
+        suffix,
+        "memory_search"
+            | "memory_search_contextual"
+            | "memory_bootstrap"
+            | "capability_capsule_search"
+            | "capability_capsule_search_contextual"
+            | "capability_capsule_bootstrap"
+    )
+}
 
 /// Snippet length used for the substring match. Long enough that a hit
 /// is unlikely to be coincidental, short enough that minor tail edits
@@ -151,9 +176,10 @@ pub async fn run_with_counts(args: FeedbackFromTranscriptArgs) -> anyhow::Result
     })
 }
 
-/// One pass over the JSONL transcript; returns the set of capability_capsule_ids that
-/// were both retrieved by an `mcp__mem__memory_search*` call AND whose
-/// `text` reappears in a subsequent assistant `text`/`thinking` block.
+/// One pass over the JSONL transcript; returns the set of
+/// capability_capsule_ids that were both retrieved by a capsule-search
+/// MCP call (see [`is_capsule_search_tool`]) AND whose `text`
+/// reappears in a subsequent assistant `text`/`thinking` block.
 fn scan_transcript(args: &FeedbackFromTranscriptArgs) -> Result<HashSet<String>> {
     let file = File::open(&args.transcript_path)?;
     let reader = BufReader::new(file);
@@ -196,7 +222,7 @@ fn scan_transcript(args: &FeedbackFromTranscriptArgs) -> Result<HashSet<String>>
             match block_type {
                 "tool_use" => {
                     let name = item["name"].as_str().unwrap_or("");
-                    if SEARCH_TOOL_NAMES.contains(&name) {
+                    if is_capsule_search_tool(name) {
                         if let Some(id) = item["id"].as_str() {
                             search_calls.insert(id.to_string(), line_idx);
                         }
@@ -337,5 +363,59 @@ mod tests {
 
         let v = serde_json::json!([{"type": "text", "text": "first"}, {"type": "text", "text": "second"}]);
         assert_eq!(extract_tool_result_text(&v), "first\nsecond");
+    }
+
+    /// Real transcripts carry four variants of the search-tool name
+    /// (pre-/post-rename × direct/plugin-namespace). The matcher must
+    /// accept all four and reject unrelated tool names.
+    #[test]
+    fn is_capsule_search_tool_accepts_all_four_variants() {
+        // direct + pre-rename
+        assert!(is_capsule_search_tool("mcp__mem__memory_search"));
+        assert!(is_capsule_search_tool("mcp__mem__memory_search_contextual"));
+        assert!(is_capsule_search_tool("mcp__mem__memory_bootstrap"));
+        // plugin + pre-rename
+        assert!(is_capsule_search_tool("mcp__plugin_mem_mem__memory_search"));
+        assert!(is_capsule_search_tool(
+            "mcp__plugin_mem_mem__memory_search_contextual"
+        ));
+        assert!(is_capsule_search_tool(
+            "mcp__plugin_mem_mem__memory_bootstrap"
+        ));
+        // direct + post-rename
+        assert!(is_capsule_search_tool(
+            "mcp__mem__capability_capsule_search"
+        ));
+        assert!(is_capsule_search_tool(
+            "mcp__mem__capability_capsule_search_contextual"
+        ));
+        assert!(is_capsule_search_tool(
+            "mcp__mem__capability_capsule_bootstrap"
+        ));
+        // plugin + post-rename (today's live shape)
+        assert!(is_capsule_search_tool(
+            "mcp__plugin_mem_mem__capability_capsule_search"
+        ));
+        assert!(is_capsule_search_tool(
+            "mcp__plugin_mem_mem__capability_capsule_search_contextual"
+        ));
+        assert!(is_capsule_search_tool(
+            "mcp__plugin_mem_mem__capability_capsule_bootstrap"
+        ));
+    }
+
+    #[test]
+    fn is_capsule_search_tool_rejects_unrelated() {
+        // wrong prefix
+        assert!(!is_capsule_search_tool("memory_search"));
+        assert!(!is_capsule_search_tool("mcp__other__memory_search"));
+        // wrong suffix
+        assert!(!is_capsule_search_tool("mcp__mem__memory_ingest"));
+        assert!(!is_capsule_search_tool("mcp__mem__memory_feedback"));
+        assert!(!is_capsule_search_tool(
+            "mcp__plugin_mem_mem__capability_capsule_ingest"
+        ));
+        // empty
+        assert!(!is_capsule_search_tool(""));
     }
 }
