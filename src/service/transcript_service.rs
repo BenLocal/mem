@@ -140,7 +140,9 @@ impl TranscriptService {
     /// per request; the admin UI defaults to 200 and scrolls. `since`/`until`
     /// are 20-digit millisecond strings (same encoding as
     /// `current_timestamp`); a wrong-format value is passed through and
-    /// simply matches nothing.
+    /// simply matches nothing. `role` ∈ {user, assistant, system} and
+    /// `block_type` ∈ {text, tool_use, tool_result, thinking} narrow
+    /// the page when provided.
     #[allow(clippy::too_many_arguments)]
     pub async fn get_by_session_paged(
         &self,
@@ -148,13 +150,15 @@ impl TranscriptService {
         session_id: &str,
         since: Option<&str>,
         until: Option<&str>,
+        role: Option<&str>,
+        block_type: Option<&str>,
         cursor: Option<(&str, i64, i64)>,
         limit: usize,
     ) -> Result<(Vec<ConversationMessage>, bool), StorageError> {
         let limit = limit.clamp(1, 1000);
         self.store
             .get_conversation_messages_by_session_paged(
-                tenant, session_id, since, until, cursor, limit,
+                tenant, session_id, since, until, role, block_type, cursor, limit,
             )
             .await
     }

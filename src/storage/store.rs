@@ -856,12 +856,14 @@ impl Store {
         session_id: &str,
         since: Option<&str>,
         until: Option<&str>,
+        role: Option<&str>,
+        block_type: Option<&str>,
         cursor: Option<(&str, i64, i64)>,
         limit: usize,
     ) -> Result<(Vec<ConversationMessage>, bool), StorageError> {
         self.query
             .get_conversation_messages_by_session_paged(
-                tenant, session_id, since, until, cursor, limit,
+                tenant, session_id, since, until, role, block_type, cursor, limit,
             )
             .await
     }

@@ -205,6 +205,13 @@ pub struct GetBySessionRequest {
     pub cursor: Option<CursorTuple>,
     pub since: Option<String>,
     pub until: Option<String>,
+    /// Optional filter — one of user / assistant / system. When set,
+    /// only blocks with the matching role are returned.
+    pub role: Option<MessageRole>,
+    /// Optional filter — one of text / tool_use / tool_result /
+    /// thinking. When set, only blocks of the matching kind are
+    /// returned.
+    pub block_type: Option<BlockType>,
 }
 
 #[derive(Debug, Serialize)]
@@ -238,7 +245,18 @@ async fn post_get_by_session(
     State(state): State<AppState>,
     Json(req): Json<GetBySessionRequest>,
 ) -> Result<Json<GetBySessionResponse>, AppError> {
-    let Some(limit) = req.limit else {
+    // Role / block_type filters route through the paged path even when
+    // the caller omits `limit` — passing `None` for limit short-circuits
+    // to the unfiltered `get_by_session`, which would silently drop the
+    // filter. Default to a high cap (1000) when the caller skipped both.
+    let want_filter = req.role.is_some() || req.block_type.is_some();
+    let role = req.role.map(|r| match r {
+        MessageRole::User => "user",
+        MessageRole::Assistant => "assistant",
+        MessageRole::System => "system",
+    });
+    let block_type = req.block_type.map(|b| b.as_db_str());
+    if req.limit.is_none() && !want_filter {
         let messages = state
             .transcript_service
             .get_by_session(&req.tenant, &req.session_id)
@@ -248,7 +266,8 @@ async fn post_get_by_session(
             next_cursor: None,
             has_more: false,
         }));
-    };
+    }
+    let limit = req.limit.unwrap_or(1000);
     let cursor_ref = req
         .cursor
         .as_ref()
@@ -260,6 +279,8 @@ async fn post_get_by_session(
             &req.session_id,
             req.since.as_deref(),
             req.until.as_deref(),
+            role,
+            block_type,
             cursor_ref,
             limit,
         )

@@ -113,6 +113,8 @@ impl DuckDbQuery {
         session_id: &str,
         since: Option<&str>,
         until: Option<&str>,
+        role: Option<&str>,
+        block_type: Option<&str>,
         cursor: Option<(&str, i64, i64)>,
         limit: usize,
     ) -> Result<(Vec<ConversationMessage>, bool), StorageError> {
@@ -121,6 +123,8 @@ impl DuckDbQuery {
         let session_id = session_id.to_string();
         let since = since.map(str::to_owned);
         let until = until.map(str::to_owned);
+        let role = role.map(str::to_owned);
+        let block_type = block_type.map(str::to_owned);
         let cursor: Option<(String, i64, i64)> = cursor.map(|(s, l, b)| (s.to_owned(), l, b));
         let lim = i64::try_from(limit).unwrap_or(64);
         spawn_blocking_storage(move || {
@@ -139,6 +143,14 @@ impl DuckDbQuery {
             if let Some(u) = until {
                 sql.push_str(&format!(" AND created_at < ?{}", params_vec.len() + 1));
                 params_vec.push(Box::new(u));
+            }
+            if let Some(r) = role {
+                sql.push_str(&format!(" AND role = ?{}", params_vec.len() + 1));
+                params_vec.push(Box::new(r));
+            }
+            if let Some(b) = block_type {
+                sql.push_str(&format!(" AND block_type = ?{}", params_vec.len() + 1));
+                params_vec.push(Box::new(b));
             }
             if let Some((cur_at, cur_line, cur_idx)) = cursor {
                 let p = params_vec.len();
@@ -847,7 +859,9 @@ mod tests {
 
         // get_paged: walk through 2 pages with cursor + has_more flag.
         let (page1, more1) = q
-            .get_conversation_messages_by_session_paged("tenant-a", "sess_a", None, None, None, 2)
+            .get_conversation_messages_by_session_paged(
+                "tenant-a", "sess_a", None, None, None, None, None, 2,
+            )
             .await
             .unwrap();
         assert_eq!(page1.len(), 2);
@@ -859,6 +873,8 @@ mod tests {
             .get_conversation_messages_by_session_paged(
                 "tenant-a",
                 "sess_a",
+                None,
+                None,
                 None,
                 None,
                 Some((
@@ -882,6 +898,8 @@ mod tests {
                 Some("00000001778000000020"),
                 Some("00000001778000000031"),
                 None,
+                None,
+                None,
                 10,
             )
             .await
@@ -891,5 +909,78 @@ mod tests {
             .map(|m| m.message_block_id.as_str())
             .collect();
         assert_eq!(win_ids, vec!["blk_2", "blk_3"]);
+
+        // role filter — fixture has role=Assistant for every block, so
+        // role=user yields 0 rows and role=assistant yields all 3.
+        let (role_user, _) = q
+            .get_conversation_messages_by_session_paged(
+                "tenant-a",
+                "sess_a",
+                None,
+                None,
+                Some("user"),
+                None,
+                None,
+                10,
+            )
+            .await
+            .unwrap();
+        assert!(
+            role_user.is_empty(),
+            "role=user must drop all-assistant fixture rows; got {role_user:?}"
+        );
+        let (role_assistant, _) = q
+            .get_conversation_messages_by_session_paged(
+                "tenant-a",
+                "sess_a",
+                None,
+                None,
+                Some("assistant"),
+                None,
+                None,
+                10,
+            )
+            .await
+            .unwrap();
+        assert_eq!(role_assistant.len(), 3);
+
+        // block_type filter — fixture is text / tool_use / thinking;
+        // each filter narrows to exactly one block.
+        let (text_only, _) = q
+            .get_conversation_messages_by_session_paged(
+                "tenant-a",
+                "sess_a",
+                None,
+                None,
+                None,
+                Some("text"),
+                None,
+                10,
+            )
+            .await
+            .unwrap();
+        let text_ids: Vec<&str> = text_only
+            .iter()
+            .map(|m| m.message_block_id.as_str())
+            .collect();
+        assert_eq!(text_ids, vec!["blk_1"]);
+        let (thinking_only, _) = q
+            .get_conversation_messages_by_session_paged(
+                "tenant-a",
+                "sess_a",
+                None,
+                None,
+                None,
+                Some("thinking"),
+                None,
+                10,
+            )
+            .await
+            .unwrap();
+        let thinking_ids: Vec<&str> = thinking_only
+            .iter()
+            .map(|m| m.message_block_id.as_str())
+            .collect();
+        assert_eq!(thinking_ids, vec!["blk_3"]);
     }
 }

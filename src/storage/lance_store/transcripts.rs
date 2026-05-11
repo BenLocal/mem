@@ -561,20 +561,23 @@ impl LanceStore {
         Ok(msgs)
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub async fn get_conversation_messages_by_session_paged(
         &self,
         tenant: &str,
         session_id: &str,
         since: Option<&str>,
         until: Option<&str>,
+        role: Option<&str>,
+        block_type: Option<&str>,
         cursor: Option<(&str, i64, i64)>,
         limit: usize,
     ) -> Result<(Vec<ConversationMessage>, bool), StorageError> {
         // LanceDB doesn't support tuple-comparison cursors; fetch all
-        // matching rows for (tenant, session_id) [+ since/until] then
-        // apply cursor + sort + limit in Rust. Acceptable because a
-        // single session is bounded by transcript length (typically
-        // <10K rows even for long sessions).
+        // matching rows for (tenant, session_id) [+ since/until +
+        // role/block_type] then apply cursor + sort + limit in Rust.
+        // Acceptable because a single session is bounded by transcript
+        // length (typically <10K rows even for long sessions).
         let mut filter = format!(
             "tenant = {} AND session_id = {}",
             sql_quote(tenant),
@@ -585,6 +588,12 @@ impl LanceStore {
         }
         if let Some(u) = until {
             filter.push_str(&format!(" AND created_at < {}", sql_quote(u)));
+        }
+        if let Some(r) = role {
+            filter.push_str(&format!(" AND role = {}", sql_quote(r)));
+        }
+        if let Some(b) = block_type {
+            filter.push_str(&format!(" AND block_type = {}", sql_quote(b)));
         }
         let mut msgs = self.query_conversation_messages(filter).await?;
         if let Some((cur_at, cur_line, cur_idx)) = cursor {
@@ -1120,7 +1129,9 @@ mod tests {
 
         // get_paged: cursor + has_more.
         let (page1, more1) = repo
-            .get_conversation_messages_by_session_paged("tenant-a", "sess_a", None, None, None, 2)
+            .get_conversation_messages_by_session_paged(
+                "tenant-a", "sess_a", None, None, None, None, None, 2,
+            )
             .await
             .unwrap();
         assert_eq!(page1.len(), 2);
@@ -1133,6 +1144,8 @@ mod tests {
             .get_conversation_messages_by_session_paged(
                 "tenant-a",
                 "sess_a",
+                None,
+                None,
                 None,
                 None,
                 Some((
@@ -1155,6 +1168,8 @@ mod tests {
                 "sess_a",
                 Some("00000001778000000020"),
                 Some("00000001778000000031"),
+                None,
+                None,
                 None,
                 10,
             )

@@ -233,6 +233,21 @@ pub struct TranscriptSessionGetArgs {
     /// max 1000 (server-side cap in `TranscriptService::get_by_session_paged`).
     #[serde(default)]
     pub limit: Option<usize>,
+    /// Optional filter — one of: user | assistant | system. When set,
+    /// only blocks with the matching role come back.
+    #[serde(default)]
+    pub role: Option<String>,
+    /// Optional filter — one of: text | tool_use | tool_result | thinking.
+    /// When set, only blocks of the matching kind come back.
+    #[serde(default)]
+    pub block_type: Option<String>,
+    /// Lexicographic lower bound on `created_at` (inclusive). Same 20-digit
+    /// millisecond string encoding as `current_timestamp`.
+    #[serde(default)]
+    pub since: Option<String>,
+    /// Lexicographic upper bound on `created_at` (exclusive).
+    #[serde(default)]
+    pub until: Option<String>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -1008,18 +1023,32 @@ impl MemMcpServer {
 
     // ------------------- transcript_session_get -------------------
     #[tool(
-        description = "Fetch the full block sequence for one Claude Code transcript session, identified by `session_id` (as exposed on the wake-up response's `recent_conversations[].session_id`). Returns chronological text/thinking/tool blocks; use this when you saw a session reference in the wake-up payload and want the full conversation."
+        description = "Fetch the full block sequence for one Claude Code transcript session, identified by `session_id` (as exposed on the wake-up response's `recent_conversations[].session_id`). Returns chronological text/thinking/tool blocks. Optional `role` / `block_type` / `since` / `until` narrow the page to specific speakers, block kinds, or time windows — useful for 'show only assistant text from session X' style queries."
     )]
     async fn transcript_session_get(
         &self,
         Parameters(args): Parameters<TranscriptSessionGetArgs>,
     ) -> Result<CallToolResult, McpError> {
-        let body = json!({
-            "tenant": self.resolve_tenant(args.tenant.as_ref()),
-            "session_id": args.session_id,
-            "limit": args.limit.unwrap_or(200),
-        });
-        self.post_json("transcripts", &body).await
+        let mut body = Map::new();
+        body.insert(
+            "tenant".into(),
+            json!(self.resolve_tenant(args.tenant.as_ref())),
+        );
+        body.insert("session_id".into(), json!(args.session_id));
+        body.insert("limit".into(), json!(args.limit.unwrap_or(200)));
+        if let Some(v) = args.role {
+            body.insert("role".into(), json!(v));
+        }
+        if let Some(v) = args.block_type {
+            body.insert("block_type".into(), json!(v));
+        }
+        if let Some(v) = args.since {
+            body.insert("since".into(), json!(v));
+        }
+        if let Some(v) = args.until {
+            body.insert("until".into(), json!(v));
+        }
+        self.post_json("transcripts", &Value::Object(body)).await
     }
 
     // ------------------- transcripts_list_sessions -------------------
