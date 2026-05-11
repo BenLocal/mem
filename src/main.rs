@@ -62,7 +62,15 @@ async fn main() -> error::Result<()> {
 }
 
 fn init_tracing(stdio_protocol: bool) {
-    let env_filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
+    let env_filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| {
+        EnvFilter::new(
+            "info,\
+             lance=warn,lance_core=warn,lance_io=warn,lance_table=warn,\
+             lance_index=warn,lance_encoding=warn,lance_file=warn,\
+             lance_datafusion=warn,lance_arrow=warn,lancedb=warn,\
+             datafusion=warn",
+        )
+    });
     let builder = fmt().with_env_filter(env_filter).with_target(false);
     if stdio_protocol {
         // MCP uses stdout for JSON-RPC framing; logs MUST go to stderr.
