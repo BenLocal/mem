@@ -1,5 +1,5 @@
 # mem — Rust memory service
-# 运行 `make help` 看所有可用目标。
+# Run `make help` to list all available targets.
 
 .DEFAULT_GOAL := help
 .PHONY: help build release install run serve mcp repair-check repair-rebuild \
@@ -9,88 +9,90 @@
 
 CARGO ?= cargo
 
-help: ## 显示可用目标
+help: ## Show available targets
 	@awk 'BEGIN {FS = ":.*?## "} /^[a-zA-Z0-9_-]+:.*?## / {printf "  \033[36m%-22s\033[0m %s\n", $$1, $$2}' $(MAKEFILE_LIST)
 
-# ==== 构建 ====
+# ==== Build ====
 
-build: ## 调试构建
+build: ## Debug build
 	$(CARGO) build
 
-release: ## release 构建
+release: ## Release build
 	$(CARGO) build --release
 
-install: release ## 安装到 ~/.cargo/bin
+install: release ## Install to ~/.cargo/bin
 	$(CARGO) install --path .
 
-# ==== 运行（与 AGENTS.md 列出的子命令一致） ====
+# ==== Run (matches the subcommands listed in AGENTS.md) ====
 
-run: serve ## 默认 = serve
+run: serve ## Default = serve
 
-serve: ## 启动 HTTP 服务（127.0.0.1:3000）
+serve: ## Start the HTTP service (127.0.0.1:3000)
 	$(CARGO) run -- serve
 
-mcp: ## 启动 stdio MCP，转发到 $$MEM_BASE_URL
+mcp: ## Start stdio MCP, forwarding to $$MEM_BASE_URL
 	$(CARGO) run -- mcp
 
-repair-check: ## 诊断 vector index sidecar（只读）
+repair-check: ## Diagnose the vector index sidecar (read-only)
 	$(CARGO) run -- repair --check
 
-repair-rebuild: ## 强制重建 sidecar（先停掉 mem serve）
+repair-rebuild: ## Force-rebuild the sidecar (stop mem serve first)
 	$(CARGO) run -- repair --rebuild
 
-# ==== 测试 ====
+# ==== Tests ====
 
-test: ## 全套测试（含 tests/ 集成测试）
+test: ## Full test suite (includes tests/ integration tests)
 	$(CARGO) test -q
 
-test-unit: ## 仅单测（lib 内 #[cfg(test)] mod tests）
+test-unit: ## Unit tests only (in-lib #[cfg(test)] mod tests)
 	$(CARGO) test --lib -q
 
-test-fast: test-unit ## test-unit 的别名
+test-fast: test-unit ## Alias for test-unit
 
-# ==== 代码质量 ====
+# ==== Code quality ====
 
-fmt: ## 格式化所有代码
+fmt: ## Format all code
 	$(CARGO) fmt --all
 
-fmt-check: ## 检查格式（CI 用，不修改文件）
+fmt-check: ## Check formatting (CI; does not modify files)
 	$(CARGO) fmt --all -- --check
 
-clippy: ## clippy，视警告为错
+clippy: ## clippy, treating warnings as errors
 	$(CARGO) clippy --all-targets -- -D warnings
 
 lint: fmt-check clippy ## fmt-check + clippy
 
-# ==== 流程 ====
+# ==== Workflow ====
 
-check: fmt-check clippy test ## pre-commit gate：fmt-check + clippy + 全套测试
+check: fmt-check clippy test ## Pre-commit gate: fmt-check + clippy + full test suite
 
-# 只观察影响 binary 输出的路径，避免 docs / Dockerfile / .github / hooks
-# 等改动把 mem serve mid-handler SIGTERM 了。`db/schema/*.sql` 经
-# `include_str!` 编入二进制，必须看；tests/ 不影响 `cargo run` 产物，跳过。
-WATCH_PATHS := -w src -w Cargo.toml -w Cargo.lock -w db
+# Only watch paths that affect the binary output, so docs / Dockerfile /
+# .github / hooks changes don't SIGTERM mem serve mid-handler. The schema
+# is now inlined into src/storage/lance_store/, so db/ no longer needs to
+# be watched; tests/ does not affect `cargo run` artifacts, so it's
+# skipped.
+WATCH_PATHS := -w src -w Cargo.toml -w Cargo.lock
 
-watch: ## 仅 src/ Cargo.* db/ 改动时自动重启 mem serve（release 构建，避免 debug 模式下向量打分慢到把 SessionStart hook 拖死；需 `cargo install cargo-watch`）
+watch: ## Auto-restart mem serve only on src/ Cargo.* changes (release build, since debug-mode vector scoring is slow enough to stall the SessionStart hook; requires `cargo install cargo-watch`)
 	$(CARGO) watch $(WATCH_PATHS) -x 'run --release -- serve'
 
-watch-check: ## 仅 src/ Cargo.* db/ 改动时跑 cargo check --all-targets（快速类型反馈，不启服务）
+watch-check: ## Run cargo check --all-targets only on src/ Cargo.* changes (fast type feedback, no service startup)
 	$(CARGO) watch $(WATCH_PATHS) -x 'check --all-targets'
 
-# ==== 跨平台（Cross.toml） ====
+# ==== Cross-compilation (Cross.toml) ====
 
-cross: cross-linux-gnu ## 默认 cross 目标 = linux-gnu
+cross: cross-linux-gnu ## Default cross target = linux-gnu
 
-cross-linux-gnu: ## release 构建 x86_64-unknown-linux-gnu
+cross-linux-gnu: ## Release build for x86_64-unknown-linux-gnu
 	cross build --release --target x86_64-unknown-linux-gnu
 
-cross-linux-musl: ## release 构建 x86_64-unknown-linux-musl（静态/Alpine）
+cross-linux-musl: ## Release build for x86_64-unknown-linux-musl (static / Alpine)
 	cross build --release --target x86_64-unknown-linux-musl
 
-cross-arm64: ## release 构建 aarch64-unknown-linux-gnu
+cross-arm64: ## Release build for aarch64-unknown-linux-gnu
 	cross build --release --target aarch64-unknown-linux-gnu
 
-# ==== 清理 ====
+# ==== Cleanup ====
 
 clean: ## cargo clean
 	$(CARGO) clean
