@@ -24,11 +24,16 @@ description: |
       `mem_019dfba4` FK retry-loop, `mem_019e05b0` DB invalidation race).
       Search before guessing at the cause.
 
-  (e) **About to ingest a hard-won learning** — finished a debugging session,
+  (e) **About to persist a hard-won learning** — finished a debugging session,
       landed a non-obvious fix, or hit a concurrency / SQL / framework gotcha.
-      Use `capability_capsule_ingest` (capability_capsule_type: experience) so the next session doesn't
-      retread the same ground. The verbatim-rule still applies: write the full
-      explanation, not a refined summary.
+      Default to `capability_capsule_propose_experience` (lands in the review
+      queue — `list_pending_review` shows it; `review_accept` promotes it to
+      the active pool) so false positives stay cheap. Use the stronger
+      `capability_capsule_ingest` only when the user **explicitly** asks to save
+      a verbatim fact (via `/mem:save` or "remember this exactly") — that path
+      writes straight into the active pool, no review gate. The verbatim-rule
+      applies in both: write the full explanation as `content`, not a refined
+      summary.
 allowed-tools: Bash, Read, Grep
 
 # mem — local memory service
@@ -44,7 +49,14 @@ allowed-tools: Bash, Read, Grep
 3. If a returned memory directly resolved the question, send `feedback_kind: useful` for that `capability_capsule_id` (one signal per memory per session, max).
 4. If nothing relevant came back, proceed normally — silence is fine, don't over-invoke.
 
-**When to ingest, not just search**: after a non-trivial debugging session, landing a non-obvious fix, or hitting a concurrency/SQL/framework gotcha, use `mcp__mem__capability_capsule_ingest` with `capability_capsule_type: experience` and write the full explanation (cause + symptom + fix), not just a one-liner. Verbatim rule applies — `content` is the fact source, never a refined summary.
+**When to persist, not just search** — pick the right tool for who's making the call:
+
+- **You (agent) judged it's worth remembering** → `mcp__mem__capability_capsule_propose_experience`. Required args: `summary` (one-line headline ≤80 chars), `content` (cause + symptom + fix, verbatim), `project` (repo basename), `caller_agent`/`source_agent` (`"claude-code"`). Lands in the review queue — `list_pending_review` shows pending; user/agent later runs `review_accept` to promote. False positives cost nothing.
+- **User explicitly asked to save** ("remember this", `/mem:save`) → `mcp__mem__capability_capsule_ingest` with `capability_capsule_type: experience`. Writes directly to the active pool, no review gate.
+
+After a `git commit fix(*)` / `feat(*)` / `refactor(*)`, a PostToolUse hook fires a system reminder nudging the propose path. Trust it — that's the canonical "we just landed something worth thinking about" trigger.
+
+Verbatim rule applies in both: `content` is the fact source, never a refined summary.
 
 ## Verifying the service is running
 
@@ -97,6 +109,8 @@ This plugin ships matching commands under `/mem:`:
 - `/mem:mine [<transcript_path>]` — mine the current Claude Code transcript (or an explicit path) into memories + archive
 - `/mem:wake-up` — print the wake-up context block
 - `/mem:summary` — one-screen state of the local mem instance (health + pending review + recent + wake-up)
+- `/mem:save <text>` — direct write to active pool; bypasses both the `<mem-save>` extractor and the review queue. For verbatim user-provided facts only
+- `/mem:feedback <capability_capsule_id> <kind>` — fire `useful` / `applies_here` / `outdated` / `does_not_apply_here` / `incorrect` for a capsule you just used (one signal per capsule per session, max)
 
 ## Verbatim rule (read before writing memories)
 
