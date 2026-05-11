@@ -1022,6 +1022,19 @@ impl MemMcpServer {
         self.post_json("transcripts", &body).await
     }
 
+    // ------------------- transcripts_list_sessions -------------------
+    #[tool(
+        description = "List all Claude Code transcript sessions for a tenant as `{session_id, block_count, first_at, last_at, caller_agent}` summaries, ordered newest-first by `last_at`. Discovery entry point — pair with `transcript_session_get` to drill into a specific session, or with `transcripts_search` when looking for content rather than recent activity."
+    )]
+    async fn transcripts_list_sessions(
+        &self,
+        Parameters(args): Parameters<TenantOnlyArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        let tenant = self.resolve_tenant(args.tenant.as_ref());
+        self.get_with_query("transcripts/sessions", &[("tenant", tenant)])
+            .await
+    }
+
     // ------------------- capability_capsule_batch_ingest -------------------
     #[tool(
         description = "Bulk-insert multiple capsules in one call (server folds N rows into one Lance write + one DuckDB refresh; bench shows 9-227x speedup over looping `capability_capsule_ingest`). Returns 201 with per-item {result: ok | err} preserving input order, or 207 if any item failed."
