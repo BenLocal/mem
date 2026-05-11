@@ -10,6 +10,17 @@ use crate::domain::capability_capsule::{
 };
 use crate::storage::types::StorageError;
 
+/// True if `err` is the Lance "dataset at path … was not found" error
+/// for the `capability_capsule_embeddings` table. The table is
+/// lazy-created on first upsert (dim is provider-dependent), so a
+/// brand-new store hits this on every search until the first ingest
+/// lands. `hybrid_candidates` uses this to decide whether to retry as
+/// text-only instead of bubbling up a 500.
+fn is_capability_capsule_embeddings_missing(err: &duckdb::Error) -> bool {
+    let msg = err.to_string();
+    msg.contains("Failed to open Lance dataset") && msg.contains("capability_capsule_embeddings")
+}
+
 /// 27-column projection shared by every memory-row read method.
 /// Order must match `row_to_capability_capsule_record` below — keep in sync.
 const CAPABILITY_CAPSULE_COLS: &str =
@@ -448,109 +459,143 @@ impl DuckDbQuery {
         spawn_blocking_storage(move || {
             let conn = conn.lock().expect("duckdb_query mutex poisoned");
 
-            // Build the SQL + params in lockstep so DuckDB's strict
-            // bind-count check (excess binds reject the prepare with
-            // InvalidParameterCount) doesn't fire. Each shape numbers
-            // placeholders contiguously.
-            let mut params_vec: Vec<Box<dyn duckdb::ToSql>> = Vec::with_capacity(7);
-            let mut next_idx = 0_usize;
-            let mut bind = |v: Box<dyn duckdb::ToSql>| -> usize {
-                params_vec.push(v);
-                next_idx += 1;
-                next_idx
-            };
+            // Build + execute the hybrid SQL with `effective_has_vec`
+            // controlling whether the `lance_vector_search(...)` branch
+            // is included. Factored into a closure so we can retry
+            // text-only when the embeddings dataset doesn't exist yet
+            // (lazy-created on first upsert).
+            let run = |effective_has_vec: bool| -> Result<
+                Vec<(CapabilityCapsuleRecord, f32)>,
+                StorageError,
+            > {
+                // Build the SQL + params in lockstep so DuckDB's strict
+                // bind-count check (excess binds reject the prepare
+                // with InvalidParameterCount) doesn't fire. Each shape
+                // numbers placeholders contiguously.
+                let mut params_vec: Vec<Box<dyn duckdb::ToSql>> = Vec::with_capacity(7);
+                let mut next_idx = 0_usize;
+                let mut bind = |v: Box<dyn duckdb::ToSql>| -> usize {
+                    params_vec.push(v);
+                    next_idx += 1;
+                    next_idx
+                };
 
-            let fts_cte = if has_text {
-                let p1 = bind(Box::new(query_text.clone()));
-                let p2 = bind(Box::new(oversample));
-                let p3 = bind(Box::new(tenant.clone()));
-                let p4 = bind(Box::new(archived.clone()));
-                let p5 = bind(Box::new(rejected.clone()));
-                format!(
+                let fts_cte = if has_text {
+                    let p1 = bind(Box::new(query_text.clone()));
+                    let p2 = bind(Box::new(oversample));
+                    let p3 = bind(Box::new(tenant.clone()));
+                    let p4 = bind(Box::new(archived.clone()));
+                    let p5 = bind(Box::new(rejected.clone()));
+                    format!(
+                        "fts AS ( \
+                            SELECT capability_capsule_id, \
+                                   ROW_NUMBER() OVER (ORDER BY _score DESC, capability_capsule_id ASC) AS rank_lex \
+                            FROM lance_fts('ns.main.capability_capsules', 'content', ?{p1}, k => ?{p2}) \
+                            WHERE tenant = ?{p3} AND status NOT IN (?{p4}, ?{p5}) \
+                        )"
+                    )
+                } else {
                     "fts AS ( \
-                        SELECT capability_capsule_id, \
-                               ROW_NUMBER() OVER (ORDER BY _score DESC, capability_capsule_id ASC) AS rank_lex \
-                        FROM lance_fts('ns.main.capability_capsules', 'content', ?{p1}, k => ?{p2}) \
-                        WHERE tenant = ?{p3} AND status NOT IN (?{p4}, ?{p5}) \
+                        SELECT NULL::VARCHAR AS capability_capsule_id, \
+                               NULL::BIGINT  AS rank_lex \
+                        WHERE FALSE \
                     )"
-                )
-            } else {
-                "fts AS ( \
-                    SELECT NULL::VARCHAR AS capability_capsule_id, \
-                           NULL::BIGINT  AS rank_lex \
-                    WHERE FALSE \
-                )"
-                    .to_string()
-            };
+                        .to_string()
+                };
 
-            let vec_cte = if has_vec {
-                // Vector literal is interpolated into SQL (duckdb-rs
-                // has no FLOAT[] bind path); tenant is rebound here
-                // since the FTS branch may or may not have bound it.
-                // Rebind tenant — duckdb-rs has no positional reuse,
-                // and CTE branches that don't run cost nothing.
-                let p_tenant_v = bind(Box::new(tenant.clone()));
-                let p_over = bind(Box::new(oversample));
-                format!(
+                let vec_cte = if effective_has_vec {
+                    // Vector literal is interpolated into SQL
+                    // (duckdb-rs has no FLOAT[] bind path); tenant is
+                    // rebound here since the FTS branch may or may not
+                    // have bound it. Rebind tenant — duckdb-rs has no
+                    // positional reuse, and CTE branches that don't run
+                    // cost nothing.
+                    let p_tenant_v = bind(Box::new(tenant.clone()));
+                    let p_over = bind(Box::new(oversample));
+                    format!(
+                        "vec AS ( \
+                            SELECT e.capability_capsule_id, \
+                                   ROW_NUMBER() OVER (ORDER BY e._distance ASC, e.capability_capsule_id ASC) AS rank_sem \
+                            FROM lance_vector_search( \
+                                    'ns.main.capability_capsule_embeddings', 'embedding', \
+                                    {vector_lit}, k => ?{p_over} \
+                                  ) AS e \
+                            WHERE e.tenant = ?{p_tenant_v} \
+                        )"
+                    )
+                } else {
                     "vec AS ( \
-                        SELECT e.capability_capsule_id, \
-                               ROW_NUMBER() OVER (ORDER BY e._distance ASC, e.capability_capsule_id ASC) AS rank_sem \
-                        FROM lance_vector_search( \
-                                'ns.main.capability_capsule_embeddings', 'embedding', \
-                                {vector_lit}, k => ?{p_over} \
-                              ) AS e \
-                        WHERE e.tenant = ?{p_tenant_v} \
+                        SELECT NULL::VARCHAR AS capability_capsule_id, \
+                               NULL::BIGINT  AS rank_sem \
+                        WHERE FALSE \
                     )"
-                )
-            } else {
-                "vec AS ( \
-                    SELECT NULL::VARCHAR AS capability_capsule_id, \
-                           NULL::BIGINT  AS rank_sem \
-                    WHERE FALSE \
-                )"
-                    .to_string()
+                        .to_string()
+                };
+
+                // Outer hydration filter — always rebound, regardless
+                // of which inner CTE produced the row.
+                let p_outer_tenant = bind(Box::new(tenant.clone()));
+                let p_outer_arch = bind(Box::new(archived.clone()));
+                let p_outer_rej = bind(Box::new(rejected.clone()));
+                let p_outer_lim = bind(Box::new(k_i));
+
+                let sql = format!(
+                    "WITH \
+                     {fts_cte}, \
+                     {vec_cte}, \
+                     fused AS ( \
+                         SELECT \
+                             COALESCE(fts.capability_capsule_id, vec.capability_capsule_id) AS capability_capsule_id, \
+                               COALESCE(1.0 / (60.0 + fts.rank_lex), 0.0) \
+                             + COALESCE(1.0 / (60.0 + vec.rank_sem), 0.0) AS rrf_score \
+                         FROM fts FULL OUTER JOIN vec USING (capability_capsule_id) \
+                     ) \
+                     SELECT {m_cols}, CAST(f.rrf_score AS FLOAT) AS rrf_score \
+                     FROM fused f \
+                     JOIN ns.main.capability_capsules m USING (capability_capsule_id) \
+                     WHERE m.tenant = ?{p_outer_tenant} \
+                       AND m.status NOT IN (?{p_outer_arch}, ?{p_outer_rej}) \
+                     ORDER BY f.rrf_score DESC, m.updated_at DESC, m.capability_capsule_id ASC \
+                     LIMIT ?{p_outer_lim}"
+                );
+
+                let params_refs: Vec<&dyn duckdb::ToSql> =
+                    params_vec.iter().map(|b| b.as_ref()).collect();
+                let mut stmt = conn.prepare(&sql)?;
+                let rows = stmt.query_map(params_refs.as_slice(), |row| {
+                    let mem = row_to_capability_capsule_record(row)?;
+                    let rrf: f32 = row.get(27)?;
+                    Ok((mem, rrf))
+                })?;
+                let mut out = Vec::new();
+                for r in rows {
+                    out.push(r.map_err(StorageError::DuckDb)?);
+                }
+                Ok(out)
             };
 
-            // Outer hydration filter — always rebound, regardless of
-            // which inner CTE produced the row.
-            let p_outer_tenant = bind(Box::new(tenant.clone()));
-            let p_outer_arch = bind(Box::new(archived.clone()));
-            let p_outer_rej = bind(Box::new(rejected.clone()));
-            let p_outer_lim = bind(Box::new(k_i));
-
-            let sql = format!(
-                "WITH \
-                 {fts_cte}, \
-                 {vec_cte}, \
-                 fused AS ( \
-                     SELECT \
-                         COALESCE(fts.capability_capsule_id, vec.capability_capsule_id) AS capability_capsule_id, \
-                           COALESCE(1.0 / (60.0 + fts.rank_lex), 0.0) \
-                         + COALESCE(1.0 / (60.0 + vec.rank_sem), 0.0) AS rrf_score \
-                     FROM fts FULL OUTER JOIN vec USING (capability_capsule_id) \
-                 ) \
-                 SELECT {m_cols}, CAST(f.rrf_score AS FLOAT) AS rrf_score \
-                 FROM fused f \
-                 JOIN ns.main.capability_capsules m USING (capability_capsule_id) \
-                 WHERE m.tenant = ?{p_outer_tenant} \
-                   AND m.status NOT IN (?{p_outer_arch}, ?{p_outer_rej}) \
-                 ORDER BY f.rrf_score DESC, m.updated_at DESC, m.capability_capsule_id ASC \
-                 LIMIT ?{p_outer_lim}"
-            );
-
-            let params_refs: Vec<&dyn duckdb::ToSql> =
-                params_vec.iter().map(|b| b.as_ref()).collect();
-            let mut stmt = conn.prepare(&sql)?;
-            let rows = stmt.query_map(params_refs.as_slice(), |row| {
-                let mem = row_to_capability_capsule_record(row)?;
-                let rrf: f32 = row.get(27)?;
-                Ok((mem, rrf))
-            })?;
-            let mut out = Vec::new();
-            for r in rows {
-                out.push(r.map_err(StorageError::DuckDb)?);
+            // First attempt with the full hybrid SQL. If the embeddings
+            // dataset hasn't been lazy-created yet (no successful
+            // ingest has run), drop the vec branch and retry as
+            // text-only — or return empty when there was no text to
+            // fall back to.
+            match run(has_vec) {
+                Err(StorageError::DuckDb(e))
+                    if has_vec && is_capability_capsule_embeddings_missing(&e) =>
+                {
+                    tracing::debug!(
+                        "capability_capsule_embeddings dataset not yet created; \
+                         falling back to {}",
+                        if has_text { "text-only search" } else { "empty result" }
+                    );
+                    if has_text {
+                        run(false)
+                    } else {
+                        Ok(Vec::new())
+                    }
+                }
+                other => other,
             }
-            Ok(out)
         })
         .await
     }
@@ -1093,5 +1138,56 @@ mod tests {
             .await
             .unwrap();
         assert!(zero.is_empty());
+    }
+
+    /// Fresh stores have no `capability_capsule_embeddings` table yet
+    /// (it's lazy-created on first upsert). A search that asks for the
+    /// vector branch must not 500 — it should silently fall back to
+    /// FTS-only when text is supplied, or return empty when vec is the
+    /// only signal.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn duckdb_query_hybrid_candidates_missing_embeddings_table() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("store");
+        let lance = LanceStore::open(&path).await.unwrap();
+
+        // Capsules only — no embedding upserts, so the
+        // `capability_capsule_embeddings` dataset stays uncreated.
+        let mut m1 = fixture("m1", "tenant-a");
+        m1.content = "ANN HNSW retrieval".into();
+        let mut m2 = fixture("m2", "tenant-a");
+        m2.content = "Lance datasets store vectors".into();
+        for m in [&m1, &m2] {
+            lance.insert_capability_capsule(m.clone()).await.unwrap();
+        }
+
+        let q = DuckDbQuery::open(&path).await.unwrap();
+        let query_vec = vec![1.0_f32, 0.0, 0.0, 0.0];
+
+        // Hybrid (text + vec): vec branch errors on missing dataset, we
+        // fall back to text-only and still surface FTS hits.
+        let hybrid = q
+            .hybrid_candidates("tenant-a", "ANN HNSW retrieval", &query_vec, 10)
+            .await
+            .expect("missing embeddings table must not bubble up as 500");
+        let ids: Vec<_> = hybrid
+            .iter()
+            .map(|(m, _)| m.capability_capsule_id.as_str())
+            .collect();
+        assert!(
+            ids.contains(&"m1"),
+            "text-only fallback should surface FTS hits; got {ids:?}"
+        );
+
+        // Vec-only: no text to fall back to → empty result, still not
+        // a 500.
+        let vec_only = q
+            .hybrid_candidates("tenant-a", "", &query_vec, 10)
+            .await
+            .expect("missing embeddings table must not bubble up as 500");
+        assert!(
+            vec_only.is_empty(),
+            "vec-only with no embeddings table must return empty; got {vec_only:?}"
+        );
     }
 }
