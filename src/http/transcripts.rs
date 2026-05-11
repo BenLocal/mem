@@ -35,6 +35,7 @@ pub fn router() -> Router<AppState> {
         .route("/transcripts/messages/batch", post(post_messages_batch))
         .route("/transcripts/search", post(post_search))
         .route("/transcripts/sessions", get(get_sessions))
+        .route("/transcripts/range", post(post_range))
         .route("/transcripts", post(post_get_by_session))
 }
 
@@ -283,6 +284,59 @@ async fn post_get_by_session(
             block_type,
             cursor_ref,
             limit,
+        )
+        .await?;
+    let next_cursor = if has_more {
+        messages.last().map(make_cursor)
+    } else {
+        None
+    };
+    Ok(Json(GetBySessionResponse {
+        messages,
+        next_cursor,
+        has_more,
+    }))
+}
+
+// ---------------------------------------------------------------------------
+// POST /transcripts/range — cross-session time-window scan.
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Deserialize)]
+pub struct RangeRequest {
+    pub tenant: String,
+    pub time_from: Option<String>,
+    pub time_to: Option<String>,
+    pub role: Option<MessageRole>,
+    pub block_type: Option<BlockType>,
+    pub cursor: Option<CursorTuple>,
+    pub limit: Option<usize>,
+}
+
+async fn post_range(
+    State(state): State<AppState>,
+    Json(req): Json<RangeRequest>,
+) -> Result<Json<GetBySessionResponse>, AppError> {
+    let role = req.role.map(|r| match r {
+        MessageRole::User => "user",
+        MessageRole::Assistant => "assistant",
+        MessageRole::System => "system",
+    });
+    let block_type = req.block_type.map(|b| b.as_db_str());
+    let cursor_ref = req
+        .cursor
+        .as_ref()
+        .map(|c| (c.created_at.as_str(), c.line_number, c.block_index));
+    let (messages, has_more) = state
+        .transcript_service
+        .list_in_range(
+            &req.tenant,
+            req.time_from.as_deref(),
+            req.time_to.as_deref(),
+            role,
+            block_type,
+            cursor_ref,
+            req.limit.unwrap_or(200),
         )
         .await?;
     let next_cursor = if has_more {

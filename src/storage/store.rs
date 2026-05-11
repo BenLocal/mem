@@ -875,6 +875,24 @@ impl Store {
         self.query.list_transcript_sessions(tenant).await
     }
 
+    #[allow(clippy::too_many_arguments)]
+    pub async fn list_conversation_messages_in_range(
+        &self,
+        tenant: &str,
+        time_from: Option<&str>,
+        time_to: Option<&str>,
+        role: Option<&str>,
+        block_type: Option<&str>,
+        cursor: Option<(&str, i64, i64)>,
+        limit: usize,
+    ) -> Result<(Vec<ConversationMessage>, bool), StorageError> {
+        self.query
+            .list_conversation_messages_in_range(
+                tenant, time_from, time_to, role, block_type, cursor, limit,
+            )
+            .await
+    }
+
     pub async fn fetch_conversation_messages_by_ids(
         &self,
         tenant: &str,

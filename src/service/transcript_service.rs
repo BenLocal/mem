@@ -163,6 +163,34 @@ impl TranscriptService {
             .await
     }
 
+    /// Cross-session time-window scan. Returns every transcript block
+    /// for `tenant` whose `created_at` falls in `[time_from, time_to)`
+    /// (each bound optional), narrowed by `role` / `block_type` when
+    /// provided. Page size capped at 1000; the same composite cursor
+    /// as [`Self::get_by_session_paged`] paginates.
+    ///
+    /// Both bounds being `None` scans the whole tenant archive; the
+    /// limit + cursor still bound a single response so callers can
+    /// paginate freely.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn list_in_range(
+        &self,
+        tenant: &str,
+        time_from: Option<&str>,
+        time_to: Option<&str>,
+        role: Option<&str>,
+        block_type: Option<&str>,
+        cursor: Option<(&str, i64, i64)>,
+        limit: usize,
+    ) -> Result<(Vec<ConversationMessage>, bool), StorageError> {
+        let limit = limit.clamp(1, 1000);
+        self.store
+            .list_conversation_messages_in_range(
+                tenant, time_from, time_to, role, block_type, cursor, limit,
+            )
+            .await
+    }
+
     /// Wake-up enrichment: pick the N most recently active transcript
     /// sessions for `tenant`, hydrate up to `blocks_per_session` of
     /// each session's freshest embed_eligible blocks (text / thinking

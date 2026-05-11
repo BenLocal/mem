@@ -188,6 +188,100 @@ impl DuckDbQuery {
         .await
     }
 
+    /// Cross-session range scan: every transcript block for `tenant`
+    /// inside the `[time_from, time_to)` half-open window (each bound
+    /// optional), optionally narrowed by `role` / `block_type`,
+    /// ordered chronologically and paginated by the same composite
+    /// cursor as [`Self::get_conversation_messages_by_session_paged`].
+    ///
+    /// Use case: "show me everything that happened between time X and
+    /// Y, across all my sessions". Unlike the per-session paged path,
+    /// `session_id` is not filtered — rows from any session in scope
+    /// come back. Null-session blocks are excluded so the result is
+    /// always anchored to a conversation.
+    ///
+    /// Both bounds being `None` scans the whole tenant archive; the
+    /// limit + cursor still bound a single response, so the caller
+    /// can paginate freely.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn list_conversation_messages_in_range(
+        &self,
+        tenant: &str,
+        time_from: Option<&str>,
+        time_to: Option<&str>,
+        role: Option<&str>,
+        block_type: Option<&str>,
+        cursor: Option<(&str, i64, i64)>,
+        limit: usize,
+    ) -> Result<(Vec<ConversationMessage>, bool), StorageError> {
+        let conn = self.conn.clone();
+        let tenant = tenant.to_string();
+        let time_from = time_from.map(str::to_owned);
+        let time_to = time_to.map(str::to_owned);
+        let role = role.map(str::to_owned);
+        let block_type = block_type.map(str::to_owned);
+        let cursor: Option<(String, i64, i64)> = cursor.map(|(s, l, b)| (s.to_owned(), l, b));
+        let lim = i64::try_from(limit).unwrap_or(64);
+        spawn_blocking_storage(move || {
+            let conn = conn.lock().expect("duckdb_query mutex poisoned");
+            let mut sql = format!(
+                "SELECT {CONVERSATION_COLS} FROM ns.main.conversation_messages \
+                 WHERE tenant = ?1 AND session_id IS NOT NULL",
+                CONVERSATION_COLS = CONVERSATION_COLS,
+            );
+            let mut params_vec: Vec<Box<dyn duckdb::ToSql>> = vec![Box::new(tenant)];
+            if let Some(s) = time_from {
+                sql.push_str(&format!(" AND created_at >= ?{}", params_vec.len() + 1));
+                params_vec.push(Box::new(s));
+            }
+            if let Some(u) = time_to {
+                sql.push_str(&format!(" AND created_at < ?{}", params_vec.len() + 1));
+                params_vec.push(Box::new(u));
+            }
+            if let Some(r) = role {
+                sql.push_str(&format!(" AND role = ?{}", params_vec.len() + 1));
+                params_vec.push(Box::new(r));
+            }
+            if let Some(b) = block_type {
+                sql.push_str(&format!(" AND block_type = ?{}", params_vec.len() + 1));
+                params_vec.push(Box::new(b));
+            }
+            if let Some((cur_at, cur_line, cur_idx)) = cursor {
+                let p = params_vec.len();
+                sql.push_str(&format!(
+                    " AND (created_at > ?{a} \
+                       OR (created_at = ?{a} AND (line_number > ?{b} \
+                                              OR (line_number = ?{b} AND block_index > ?{c}))))",
+                    a = p + 1,
+                    b = p + 2,
+                    c = p + 3,
+                ));
+                params_vec.push(Box::new(cur_at));
+                params_vec.push(Box::new(cur_line));
+                params_vec.push(Box::new(cur_idx));
+            }
+            sql.push_str(" ORDER BY created_at ASC, line_number ASC, block_index ASC");
+            sql.push_str(&format!(" LIMIT ?{}", params_vec.len() + 1));
+            let fetch = lim.saturating_add(1);
+            params_vec.push(Box::new(fetch));
+
+            let mut stmt = conn.prepare(&sql)?;
+            let params_refs: Vec<&dyn duckdb::ToSql> =
+                params_vec.iter().map(|b| b.as_ref()).collect();
+            let rows = stmt.query_map(params_refs.as_slice(), row_to_conversation_message)?;
+            let mut out = Vec::new();
+            for r in rows {
+                out.push(r.map_err(StorageError::DuckDb)?);
+            }
+            let has_more = out.len() as i64 == fetch;
+            if has_more {
+                out.pop();
+            }
+            Ok((out, has_more))
+        })
+        .await
+    }
+
     /// Per-session aggregate. Replaces the legacy backend's hand-
     /// written aggregation (count + min + max in Rust over a full
     /// scan) with one DuckDB `GROUP BY` — the canonical example of
@@ -982,5 +1076,157 @@ mod tests {
             .map(|m| m.message_block_id.as_str())
             .collect();
         assert_eq!(thinking_ids, vec!["blk_3"]);
+    }
+
+    /// Cross-session range scan reuses the same fixture as
+    /// `duckdb_query_transcript_reads`: 3 blocks in sess_a (text /
+    /// tool_use / thinking, all role=Assistant), 1 in tenant-b/sess_b,
+    /// and 1 null-session block.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn duckdb_query_list_conversation_messages_in_range() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("store");
+        let lance = LanceStore::open(&path).await.unwrap();
+        lance.set_transcript_job_provider("fake-test");
+
+        let m1 = msg(
+            "blk_1",
+            "tenant-a",
+            Some("sess_a"),
+            10,
+            0,
+            BlockType::Text,
+            "alpha",
+            "00000001778000000010",
+        );
+        let m2 = msg(
+            "blk_2",
+            "tenant-a",
+            Some("sess_a"),
+            12,
+            0,
+            BlockType::ToolUse,
+            "{\"tool\":\"Bash\"}",
+            "00000001778000000020",
+        );
+        let m3 = msg(
+            "blk_3",
+            "tenant-a",
+            Some("sess_a"),
+            14,
+            0,
+            BlockType::Thinking,
+            "gamma",
+            "00000001778000000030",
+        );
+        let m4 = msg(
+            "blk_4",
+            "tenant-b",
+            Some("sess_b"),
+            5,
+            0,
+            BlockType::Text,
+            "cross-tenant noise",
+            "00000001778000000040",
+        );
+        let m_null = msg(
+            "blk_null",
+            "tenant-a",
+            None,
+            1,
+            0,
+            BlockType::Text,
+            "null-session",
+            "00000001778000000005",
+        );
+        for m in [&m1, &m2, &m3, &m4, &m_null] {
+            lance.create_conversation_message(m).await.unwrap();
+        }
+
+        let q = DuckDbQuery::open(&path).await.unwrap();
+
+        // No bounds → all in-tenant rows, ordered chronologically.
+        // Null-session block excluded; cross-tenant excluded.
+        let (all, _) = q
+            .list_conversation_messages_in_range("tenant-a", None, None, None, None, None, 100)
+            .await
+            .unwrap();
+        let all_ids: Vec<&str> = all.iter().map(|m| m.message_block_id.as_str()).collect();
+        assert_eq!(all_ids, vec!["blk_1", "blk_2", "blk_3"]);
+
+        // Cross-tenant isolation.
+        let (other, _) = q
+            .list_conversation_messages_in_range("tenant-b", None, None, None, None, None, 100)
+            .await
+            .unwrap();
+        let other_ids: Vec<&str> = other.iter().map(|m| m.message_block_id.as_str()).collect();
+        assert_eq!(other_ids, vec!["blk_4"]);
+
+        // [time_from, time_to) is half-open.
+        let (windowed, _) = q
+            .list_conversation_messages_in_range(
+                "tenant-a",
+                Some("00000001778000000020"),
+                Some("00000001778000000031"),
+                None,
+                None,
+                None,
+                100,
+            )
+            .await
+            .unwrap();
+        let win_ids: Vec<&str> = windowed
+            .iter()
+            .map(|m| m.message_block_id.as_str())
+            .collect();
+        assert_eq!(win_ids, vec!["blk_2", "blk_3"]);
+
+        // block_type filter narrows further.
+        let (text_only, _) = q
+            .list_conversation_messages_in_range(
+                "tenant-a",
+                None,
+                None,
+                None,
+                Some("text"),
+                None,
+                100,
+            )
+            .await
+            .unwrap();
+        let text_ids: Vec<&str> = text_only
+            .iter()
+            .map(|m| m.message_block_id.as_str())
+            .collect();
+        assert_eq!(text_ids, vec!["blk_1"]);
+
+        // Pagination: limit=2 returns first two + has_more, cursor
+        // resumes after the last row.
+        let (page1, more1) = q
+            .list_conversation_messages_in_range("tenant-a", None, None, None, None, None, 2)
+            .await
+            .unwrap();
+        assert_eq!(page1.len(), 2);
+        assert!(more1);
+        let last = page1.last().unwrap();
+        let (page2, more2) = q
+            .list_conversation_messages_in_range(
+                "tenant-a",
+                None,
+                None,
+                None,
+                None,
+                Some((
+                    last.created_at.as_str(),
+                    last.line_number as i64,
+                    last.block_index as i64,
+                )),
+                100,
+            )
+            .await
+            .unwrap();
+        let page2_ids: Vec<&str> = page2.iter().map(|m| m.message_block_id.as_str()).collect();
+        assert_eq!(page2_ids, vec!["blk_3"]);
+        assert!(!more2);
     }
 }

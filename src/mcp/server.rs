@@ -4,7 +4,7 @@ use rmcp::{
     model::{CallToolResult, Implementation, ProtocolVersion, ServerCapabilities, ServerInfo},
     schemars, tool, tool_handler, tool_router, ErrorData as McpError, ServerHandler,
 };
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
 
 use super::client::{encode_segment, MemHttpClient};
@@ -409,6 +409,42 @@ pub struct CapabilityCapsuleBatchIngestItem {
 }
 
 // ─── transcript search ─────────────────────────────────────────────
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct TranscriptRangeArgs {
+    /// Defaults to MEM_TENANT when omitted.
+    #[serde(default)]
+    pub tenant: Option<String>,
+    /// Lexicographic lower bound on `created_at` (inclusive). Same
+    /// 20-digit millisecond encoding as `current_timestamp`. Omit for
+    /// "from the beginning of the archive".
+    #[serde(default)]
+    pub time_from: Option<String>,
+    /// Lexicographic upper bound on `created_at` (exclusive). Omit for
+    /// "up to now".
+    #[serde(default)]
+    pub time_to: Option<String>,
+    /// Optional filter — one of: user | assistant | system.
+    #[serde(default)]
+    pub role: Option<String>,
+    /// Optional filter — one of: text | tool_use | tool_result | thinking.
+    #[serde(default)]
+    pub block_type: Option<String>,
+    /// Page cursor from a prior response's `next_cursor`. Pass back
+    /// verbatim to continue scrolling.
+    #[serde(default)]
+    pub cursor: Option<TranscriptCursor>,
+    /// Page size. Defaults to 200; capped at 1000 server-side.
+    #[serde(default)]
+    pub limit: Option<usize>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema, Serialize)]
+pub struct TranscriptCursor {
+    pub created_at: String,
+    pub line_number: i64,
+    pub block_index: i64,
+}
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct TranscriptSearchArgs {
@@ -1061,6 +1097,39 @@ impl MemMcpServer {
     ) -> Result<CallToolResult, McpError> {
         let tenant = self.resolve_tenant(args.tenant.as_ref());
         self.get_with_query("transcripts/sessions", &[("tenant", tenant)])
+            .await
+    }
+
+    // ------------------- transcripts_range -------------------
+    #[tool(
+        description = "Cross-session time-window scan over the transcript archive. Returns every block for the tenant inside `[time_from, time_to)` (each bound optional), chronologically ordered and paginated by a composite cursor. Optional `role` / `block_type` narrow the result. Use when you want 'everything between time X and Y across all sessions' or 'recent activity since cursor Z' rather than per-session drill-down (`transcript_session_get`) or content search (`transcripts_search`)."
+    )]
+    async fn transcripts_range(
+        &self,
+        Parameters(args): Parameters<TranscriptRangeArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        let mut body = Map::new();
+        body.insert(
+            "tenant".into(),
+            json!(self.resolve_tenant(args.tenant.as_ref())),
+        );
+        if let Some(v) = args.time_from {
+            body.insert("time_from".into(), json!(v));
+        }
+        if let Some(v) = args.time_to {
+            body.insert("time_to".into(), json!(v));
+        }
+        if let Some(v) = args.role {
+            body.insert("role".into(), json!(v));
+        }
+        if let Some(v) = args.block_type {
+            body.insert("block_type".into(), json!(v));
+        }
+        if let Some(v) = args.cursor {
+            body.insert("cursor".into(), json!(v));
+        }
+        body.insert("limit".into(), json!(args.limit.unwrap_or(200)));
+        self.post_json("transcripts/range", &Value::Object(body))
             .await
     }
 
