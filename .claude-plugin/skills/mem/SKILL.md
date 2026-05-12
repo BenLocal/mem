@@ -2,6 +2,7 @@
 name: mem
 description: Local-first Rust memory service (DuckDB + HNSW + Tantivy + MCP). Use proactively when the user mentions mem / memory / capsule / recall / remember when… / 上次怎么做的 / 之前那个 bug; when starting a non-trivial task in a known repo (search prior decisions before planning); when an error resembles a documented incident; or when a hard-won fix just landed (propose an experience capsule so the next session doesn't re-derive it).
 allowed-tools: Bash, Read, Grep
+---
 
 # mem — local memory service
 
