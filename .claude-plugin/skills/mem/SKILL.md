@@ -1,42 +1,27 @@
 ---
 name: mem
-description: |
-  Local-first Rust memory service backed by DuckDB + HNSW + Tantivy. Use this skill
-  proactively in any of these scenarios — don't wait for the user to invoke it
-  by name:
-
-  (a) **Explicit mention** — user says mem / mem serve / mem mine / memory ingest /
-      memory search / memory feedback / wake-up context / DuckDB-backed memory.
-
-  (b) **Start of a non-trivial task in a familiar repo** — debugging, design,
-      refactoring, "how should I do X here?". Call `capability_capsule_search` *first* to
-      surface prior decisions, incidents, conventions, or commit-message lessons
-      before formulating a plan. Skipping this step means re-deriving context the
-      user already taught you.
-
-  (c) **Recall intent signals** — "remember when...", "how did we handle...",
-      "上次怎么做的", "之前那个 bug", "what was the URL / port / config for X".
-      These are explicit recall asks; respond by querying memory before answering
-      from training-time priors.
-
-  (d) **Error / bug resembling something we've seen** — DuckDB / FK / index /
-      embedding / hook errors are often documented incidents (e.g.
-      `mem_019dfba4` FK retry-loop, `mem_019e05b0` DB invalidation race).
-      Search before guessing at the cause.
-
-  (e) **About to persist a hard-won learning** — finished a debugging session,
-      landed a non-obvious fix, or hit a concurrency / SQL / framework gotcha.
-      Default to `capability_capsule_propose_experience` (lands in the review
-      queue — `list_pending_review` shows it; `review_accept` promotes it to
-      the active pool) so false positives stay cheap. Use the stronger
-      `capability_capsule_ingest` only when the user **explicitly** asks to save
-      a verbatim fact (via `/mem:save` or "remember this exactly") — that path
-      writes straight into the active pool, no review gate. The verbatim-rule
-      applies in both: write the full explanation as `content`, not a refined
-      summary.
+description: Local-first Rust memory service (DuckDB + HNSW + Tantivy + MCP). Use proactively when the user mentions mem / memory / capsule / recall / remember when… / 上次怎么做的 / 之前那个 bug; when starting a non-trivial task in a known repo (search prior decisions before planning); when an error resembles a documented incident; or when a hard-won fix just landed (propose an experience capsule so the next session doesn't re-derive it).
 allowed-tools: Bash, Read, Grep
 
 # mem — local memory service
+
+## When to load this skill (the original 5 triggers, expanded)
+
+Don't wait for the user to invoke this skill by name — load it on any of:
+
+(a) **Explicit mention** — user says mem / mem serve / mem mine / capability_capsule_ingest / capability_capsule_search / memory feedback / wake-up context / DuckDB-backed memory.
+
+(b) **Start of a non-trivial task in a familiar repo** — debugging, design, refactoring, "how should I do X here?". Call `capability_capsule_search` *first* to surface prior decisions, incidents, conventions, or commit-message lessons before formulating a plan. Skipping this step means re-deriving context the user already taught you.
+
+(c) **Recall intent signals** — "remember when…", "how did we handle…", "上次怎么做的", "之前那个 bug", "what was the URL / port / config for X". These are explicit recall asks; respond by querying memory before answering from training-time priors.
+
+(d) **Error / bug resembling something we've seen** — DuckDB / FK / index / embedding / hook errors are often documented incidents (e.g. `mem_019dfba4` FK retry-loop, `mem_019e05b0` DB invalidation race). Search before guessing at the cause.
+
+(e) **About to persist a hard-won learning** — finished a debugging session, landed a non-obvious fix, or hit a concurrency / SQL / framework gotcha. Default to `capability_capsule_propose_experience` (lands in the review queue — `list_pending_review` shows it; `review_accept` promotes it to the active pool) so false positives stay cheap. Use the stronger `capability_capsule_ingest` only when the user **explicitly** asks to save a verbatim fact (via `/mem:save` or "remember this exactly") — that path writes straight into the active pool, no review gate. The verbatim-rule applies in both: write the full explanation as `content`, not a refined summary.
+
+---
+
+# Reference: mem — local memory service
 
 `mem` is a single-binary Rust service (DuckDB + HNSW + Tantivy + r2d2 read pool) exposing both an HTTP API and an MCP server. Default base URL: `http://127.0.0.1:3000`. Default tenant: `local`. Both can be overridden via `MEM_BASE_URL` / `MEM_TENANT`.
 
