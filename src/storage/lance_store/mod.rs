@@ -391,8 +391,16 @@ fn sessions_schema() -> Schema {
 }
 
 /// Arrow schema for the `episodes` table.
+///
+/// `item` of every `List` field is declared nullable to match the
+/// shape Lance/Arrow's default `ListBuilder<StringBuilder>` emits;
+/// the parallel `capability_capsules` schema (line ~259) already
+/// uses this convention. Marking items non-null here caused every
+/// `propose_experience` write to fail validation with `column types
+/// must match schema types, expected List(non-null Utf8) but found
+/// List(Utf8)`.
 fn episodes_schema() -> Schema {
-    let list_str = || DataType::List(Arc::new(Field::new("item", DataType::Utf8, false)));
+    let list_str = || DataType::List(Arc::new(Field::new("item", DataType::Utf8, true)));
     Schema::new(vec![
         Field::new("episode_id", DataType::Utf8, false),
         Field::new("tenant", DataType::Utf8, false),
