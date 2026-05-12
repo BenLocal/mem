@@ -242,6 +242,21 @@ pub struct GraphEdge {
     pub valid_to: Option<String>,
 }
 
+/// Aggregate counts over the whole `graph_edges` table. Tenant-less
+/// because the schema has no tenant column — all tenants share one
+/// graph. `top_relations` is the top-N `(relation, count)` pairs
+/// (currently N=16) for at-a-glance distribution; the full
+/// breakdown can be obtained via a dedicated SQL query if needed.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub struct GraphStats {
+    pub node_count: i64,
+    pub total_edges: i64,
+    pub active_edges: i64,
+    pub closed_edges: i64,
+    pub top_relations: Vec<(String, i64)>,
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub struct FeedbackSummary {

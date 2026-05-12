@@ -953,6 +953,25 @@ impl Store {
         self.query.neighbors(node_id).await
     }
 
+    pub async fn neighbors_within(
+        &self,
+        node_id: &str,
+        max_hops: u32,
+        as_of: Option<&str>,
+    ) -> Result<Vec<GraphEdge>, GraphError> {
+        self.query.neighbors_within(node_id, max_hops, as_of).await
+    }
+
+    pub async fn kg_timeline(&self, node_id: &str) -> Result<Vec<GraphEdge>, GraphError> {
+        self.query.kg_timeline(node_id).await
+    }
+
+    pub async fn graph_stats(
+        &self,
+    ) -> Result<crate::domain::capability_capsule::GraphStats, GraphError> {
+        self.query.graph_stats().await
+    }
+
     pub async fn related_capability_capsule_ids(
         &self,
         node_ids: &[String],
@@ -966,6 +985,44 @@ impl Store {
         now: &str,
     ) -> Result<(), GraphError> {
         let result = self.lance.sync_memory_edges(edges, now).await;
+        if let Err(e) = self.query.refresh().await {
+            return match result {
+                Ok(_) => Err(GraphError::Backend(e.to_string())),
+                Err(orig) => Err(orig),
+            };
+        }
+        result
+    }
+
+    /// Caller-supplied direct edge write. Goes through the same Lance
+    /// table as `sync_memory_edges` but preserves the caller's
+    /// `valid_from` / `valid_to` verbatim (no server-side `now`
+    /// override). Idempotent on active `(from, to, relation)`.
+    pub async fn add_edge_direct(&self, edge: &GraphEdge) -> Result<bool, GraphError> {
+        let result = self.lance.add_edge_direct(edge).await;
+        if let Err(e) = self.query.refresh().await {
+            return match result {
+                Ok(_) => Err(GraphError::Backend(e.to_string())),
+                Err(orig) => Err(orig),
+            };
+        }
+        result
+    }
+
+    /// Invalidate one specific `(from, predicate, to)` active edge by
+    /// stamping `valid_to = ended_at`. Idempotent — returns 0 when
+    /// the triple has no active edge.
+    pub async fn invalidate_edge(
+        &self,
+        from_node_id: &str,
+        predicate: &str,
+        to_node_id: &str,
+        ended_at: &str,
+    ) -> Result<usize, GraphError> {
+        let result = self
+            .lance
+            .invalidate_edge(from_node_id, predicate, to_node_id, ended_at)
+            .await;
         if let Err(e) = self.query.refresh().await {
             return match result {
                 Ok(_) => Err(GraphError::Backend(e.to_string())),

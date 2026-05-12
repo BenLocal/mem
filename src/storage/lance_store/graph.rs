@@ -111,6 +111,89 @@ impl LanceStore {
         Ok(())
     }
 
+    /// Write one caller-supplied edge. Same idempotency rule as
+    /// [`Self::sync_memory_edges`]: skip when an active edge with the
+    /// same `(from, to, relation)` already exists. `valid_from` is
+    /// taken from `edge` (unlike `sync_memory_edges`, which overrides
+    /// it with the server's `now` — callers using this direct path
+    /// can backdate edges, useful for importing historical facts).
+    /// `valid_to` from `edge` is preserved verbatim so the caller can
+    /// insert a pre-closed edge in one shot if they want.
+    ///
+    /// Returns `true` if the edge was actually written, `false` if
+    /// the idempotency check found a duplicate.
+    pub async fn add_edge_direct(&self, edge: &GraphEdge) -> Result<bool, GraphError> {
+        let table = self
+            .conn
+            .open_table("graph_edges")
+            .execute()
+            .await
+            .map_err(|e| GraphError::Backend(e.to_string()))?;
+        let exists = table
+            .count_rows(Some(format!(
+                "from_node_id = {} AND to_node_id = {} AND relation = {} AND valid_to IS NULL",
+                sql_quote(&edge.from_node_id),
+                sql_quote(&edge.to_node_id),
+                sql_quote(&edge.relation),
+            )))
+            .await
+            .map_err(|e| GraphError::Backend(e.to_string()))?;
+        if exists > 0 {
+            return Ok(false);
+        }
+        let batch =
+            graph_edge_to_record_batch(edge).map_err(|e| GraphError::Backend(e.to_string()))?;
+        table
+            .add(batch)
+            .execute()
+            .await
+            .map_err(|e| GraphError::Backend(e.to_string()))?;
+        Ok(true)
+    }
+
+    /// Invalidate (close) one active edge identified by the
+    /// `(from, predicate, to)` triple by setting `valid_to = ended_at`.
+    /// Idempotent: a triple that has no active edge (already closed
+    /// or never existed) returns `0` without erroring. Use this when
+    /// the caller learns a previously-true fact is no longer true at
+    /// a specific time — the parallel to MemPalace's
+    /// `tool_kg_invalidate(subj, pred, obj, ended)`.
+    pub async fn invalidate_edge(
+        &self,
+        from_node_id: &str,
+        predicate: &str,
+        to_node_id: &str,
+        ended_at: &str,
+    ) -> Result<usize, GraphError> {
+        let table = self
+            .conn
+            .open_table("graph_edges")
+            .execute()
+            .await
+            .map_err(|e| GraphError::Backend(e.to_string()))?;
+        let filter = format!(
+            "from_node_id = {} AND to_node_id = {} AND relation = {} AND valid_to IS NULL",
+            sql_quote(from_node_id),
+            sql_quote(to_node_id),
+            sql_quote(predicate),
+        );
+        let count = table
+            .count_rows(Some(filter.clone()))
+            .await
+            .map_err(|e| GraphError::Backend(e.to_string()))?;
+        if count == 0 {
+            return Ok(0);
+        }
+        let result = table
+            .update()
+            .only_if(filter)
+            .column("valid_to", sql_quote(ended_at))
+            .execute()
+            .await
+            .map_err(|e| GraphError::Backend(e.to_string()))?;
+        Ok(usize::try_from(result.rows_updated).unwrap_or(count as usize))
+    }
+
     pub async fn close_edges_for_capability_capsule(
         &self,
         capability_capsule_id: &str,

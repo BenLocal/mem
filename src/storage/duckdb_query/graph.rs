@@ -5,15 +5,25 @@
 use duckdb::params;
 
 use super::{row_to_graph_edge, spawn_blocking_graph, DuckDbQuery};
-use crate::domain::capability_capsule::GraphEdge;
+use crate::domain::capability_capsule::{GraphEdge, GraphStats};
 use crate::storage::types::GraphError;
 
+/// Upper cap on `neighbors_within` `max_hops` to prevent blow-up on
+/// dense graphs. Three hops is enough to express the common patterns
+/// (capsule → entity → adjacent capsule → entity) without combinatorial
+/// explosion.
+const MAX_HOPS_CAP: u32 = 3;
+
+/// Upper cap on the visited-set size during BFS. Stops a runaway walk
+/// over a pathologically dense subgraph before it eats memory.
+const NEIGHBORS_VISITED_CAP: usize = 10_000;
+
 impl DuckDbQuery {
-    /// Active edges incident on `node_id` (either endpoint). Only
-    /// `valid_to IS NULL` are surfaced — closed (superseded) edges
-    /// stay in the table for audit but never enter recall. Ordered
-    /// `(relation, from_node_id, to_node_id)` for deterministic
-    /// output (mirrors the legacy backend).
+    /// Active edges incident on `node_id` (either endpoint), 1-hop.
+    /// Convenience wrapper over [`Self::neighbors_within`] that
+    /// hard-codes `max_hops = 1` and `as_of = None`. Kept for
+    /// callers (and tests) that don't need the multi-hop / time-point
+    /// machinery.
     pub async fn neighbors(&self, node_id: &str) -> Result<Vec<GraphEdge>, GraphError> {
         let conn = self.conn.clone();
         let node_id = node_id.to_string();
@@ -31,6 +41,177 @@ impl DuckDbQuery {
                 out.push(r?);
             }
             Ok(out)
+        })
+        .await
+    }
+
+    /// Multi-hop BFS from `node_id`. Returns every edge reachable in
+    /// at most `max_hops` hops (clamped to `MAX_HOPS_CAP = 3`), with
+    /// edge-set dedup (an edge that closes two different walks counts
+    /// once). The edge filter follows the `valid_from <= as_of` /
+    /// `valid_to IS NULL OR valid_to > as_of` convention when `as_of`
+    /// is supplied; otherwise it falls back to "active now"
+    /// (`valid_to IS NULL`).
+    ///
+    /// Walk order: BFS level by level. Visited-set capped at
+    /// `NEIGHBORS_VISITED_CAP = 10_000` to bound memory on a
+    /// pathological subgraph.
+    ///
+    /// Returns the **edge** list (sorted `(relation, from, to)` for
+    /// determinism), not the node list — the caller can derive the
+    /// node set from the edges.
+    pub async fn neighbors_within(
+        &self,
+        node_id: &str,
+        max_hops: u32,
+        as_of: Option<&str>,
+    ) -> Result<Vec<GraphEdge>, GraphError> {
+        let hops = max_hops.clamp(1, MAX_HOPS_CAP);
+        let conn = self.conn.clone();
+        let start = node_id.to_string();
+        let as_of = as_of.map(str::to_owned);
+        spawn_blocking_graph(move || {
+            let conn = conn.lock().expect("duckdb_query mutex poisoned");
+            let validity_sql = match &as_of {
+                Some(_) => "valid_from <= ?2 AND (valid_to IS NULL OR valid_to > ?2)",
+                None => "valid_to IS NULL",
+            };
+
+            // BFS: maintain `frontier` (nodes to expand this round),
+            // `visited` (all nodes seen so far), `edges` (the
+            // accumulated edge set, deduped on
+            // (from, to, relation, valid_from)).
+            let mut visited: std::collections::HashSet<String> =
+                std::collections::HashSet::from([start.clone()]);
+            let mut frontier: Vec<String> = vec![start];
+            let mut edges: std::collections::HashMap<(String, String, String, String), GraphEdge> =
+                std::collections::HashMap::new();
+
+            for _ in 0..hops {
+                if frontier.is_empty() {
+                    break;
+                }
+                let mut next_frontier: Vec<String> = Vec::new();
+                for node in frontier.drain(..) {
+                    let mut sql = String::from(
+                        "SELECT from_node_id, to_node_id, relation, valid_from, valid_to \
+                         FROM ns.main.graph_edges \
+                         WHERE (from_node_id = ?1 OR to_node_id = ?1) AND ",
+                    );
+                    sql.push_str(validity_sql);
+                    let mut stmt = conn.prepare(&sql)?;
+                    let rows = match &as_of {
+                        Some(ts) => stmt.query_map(params![node, ts], row_to_graph_edge)?,
+                        None => stmt.query_map(params![node], row_to_graph_edge)?,
+                    };
+                    for r in rows {
+                        let edge = r?;
+                        let key = (
+                            edge.from_node_id.clone(),
+                            edge.to_node_id.clone(),
+                            edge.relation.clone(),
+                            edge.valid_from.clone(),
+                        );
+                        edges.entry(key).or_insert_with(|| edge.clone());
+                        for endpoint in [&edge.from_node_id, &edge.to_node_id] {
+                            if !visited.contains(endpoint.as_str()) {
+                                if visited.len() >= NEIGHBORS_VISITED_CAP {
+                                    continue;
+                                }
+                                visited.insert(endpoint.clone());
+                                next_frontier.push(endpoint.clone());
+                            }
+                        }
+                    }
+                }
+                frontier = next_frontier;
+            }
+
+            let mut out: Vec<GraphEdge> = edges.into_values().collect();
+            out.sort_by(|a, b| {
+                a.relation
+                    .cmp(&b.relation)
+                    .then_with(|| a.from_node_id.cmp(&b.from_node_id))
+                    .then_with(|| a.to_node_id.cmp(&b.to_node_id))
+                    .then_with(|| a.valid_from.cmp(&b.valid_from))
+            });
+            Ok(out)
+        })
+        .await
+    }
+
+    /// All edges involving `node_id` (either endpoint), **including
+    /// closed ones**, ordered `(valid_from ASC, relation ASC)`. The
+    /// canonical "show me the full history of this entity" view —
+    /// equivalent of MemPalace's `tool_kg_timeline`. Unlike
+    /// [`Self::neighbors`], closed edges (`valid_to IS NOT NULL`) are
+    /// surfaced here because that's the whole point of a timeline.
+    pub async fn kg_timeline(&self, node_id: &str) -> Result<Vec<GraphEdge>, GraphError> {
+        let conn = self.conn.clone();
+        let node_id = node_id.to_string();
+        spawn_blocking_graph(move || {
+            let conn = conn.lock().expect("duckdb_query mutex poisoned");
+            let mut stmt = conn.prepare(
+                "SELECT from_node_id, to_node_id, relation, valid_from, valid_to \
+                 FROM ns.main.graph_edges \
+                 WHERE from_node_id = ?1 OR to_node_id = ?1 \
+                 ORDER BY valid_from ASC, relation ASC, from_node_id ASC, to_node_id ASC",
+            )?;
+            let rows = stmt.query_map(params![node_id], row_to_graph_edge)?;
+            let mut out = Vec::new();
+            for r in rows {
+                out.push(r?);
+            }
+            Ok(out)
+        })
+        .await
+    }
+
+    /// Whole-graph aggregate: node and edge counts, active vs closed
+    /// split, top-N relation kinds. Tenant-less because the
+    /// `graph_edges` schema has no tenant column (all tenants share
+    /// one graph — see schema doc-comment for the design rationale).
+    /// Use the `top_relations` field for at-a-glance relation
+    /// distribution; full per-kind breakdown can be derived with a
+    /// dedicated SQL query.
+    pub async fn graph_stats(&self) -> Result<GraphStats, GraphError> {
+        let conn = self.conn.clone();
+        spawn_blocking_graph(move || {
+            let conn = conn.lock().expect("duckdb_query mutex poisoned");
+            let total_edges: i64 =
+                conn.query_row("SELECT count(*) FROM ns.main.graph_edges", [], |r| r.get(0))?;
+            let active_edges: i64 = conn.query_row(
+                "SELECT count(*) FROM ns.main.graph_edges WHERE valid_to IS NULL",
+                [],
+                |r| r.get(0),
+            )?;
+            let closed_edges = total_edges - active_edges;
+            let node_count: i64 = conn.query_row(
+                "SELECT count(*) FROM ( \
+                   SELECT from_node_id AS n FROM ns.main.graph_edges \
+                   UNION SELECT to_node_id FROM ns.main.graph_edges \
+                 )",
+                [],
+                |r| r.get(0),
+            )?;
+            let mut stmt = conn.prepare(
+                "SELECT relation, count(*) AS c FROM ns.main.graph_edges \
+                 GROUP BY relation ORDER BY c DESC, relation ASC LIMIT 16",
+            )?;
+            let rows = stmt.query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+            })?;
+            let mut top_relations: Vec<(String, i64)> = Vec::new();
+            for r in rows {
+                top_relations.push(r?);
+            }
+            Ok(GraphStats {
+                node_count,
+                total_edges,
+                active_edges,
+                closed_edges,
+                top_relations,
+            })
         })
         .await
     }
@@ -100,5 +281,197 @@ impl DuckDbQuery {
             Ok(out)
         })
         .await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::storage::lance_store::LanceStore;
+    use tempfile::tempdir;
+
+    /// Build a four-node graph for the multi-hop / timeline / stats tests:
+    ///
+    ///   capability_capsule:c1 ─mentions─> entity:e_alpha ─mentions─> capability_capsule:c2
+    ///                                                    \─tagged─>  topic:t1
+    ///   capability_capsule:c3 ─supersedes─> capability_capsule:c1   (closed at ts=20020)
+    ///
+    /// 1-hop from `entity:e_alpha` → 3 edges (mentions × 2 + tagged × 1)
+    /// 2-hop → adds the c1↔c3 supersedes edge if it's still active
+    async fn seed_graph(path: &std::path::Path) -> LanceStore {
+        let store = LanceStore::open(path).await.unwrap();
+        let edges = vec![
+            GraphEdge {
+                from_node_id: "capability_capsule:c1".into(),
+                to_node_id: "entity:e_alpha".into(),
+                relation: "mentions".into(),
+                valid_from: "00000001778000010000".into(),
+                valid_to: None,
+            },
+            GraphEdge {
+                from_node_id: "capability_capsule:c2".into(),
+                to_node_id: "entity:e_alpha".into(),
+                relation: "mentions".into(),
+                valid_from: "00000001778000010001".into(),
+                valid_to: None,
+            },
+            GraphEdge {
+                from_node_id: "entity:e_alpha".into(),
+                to_node_id: "topic:t1".into(),
+                relation: "tagged".into(),
+                valid_from: "00000001778000010002".into(),
+                valid_to: None,
+            },
+            // Pre-closed historical edge — relevant for timeline ordering
+            // and graph_stats `closed_edges` count.
+            GraphEdge {
+                from_node_id: "capability_capsule:c3".into(),
+                to_node_id: "capability_capsule:c1".into(),
+                relation: "supersedes".into(),
+                valid_from: "00000001778000010003".into(),
+                valid_to: Some("00000001778000020000".into()),
+            },
+        ];
+        for e in &edges {
+            store.add_edge_direct(e).await.unwrap();
+        }
+        store
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn neighbors_within_walks_multi_hop_and_dedupes() {
+        let dir = tempdir().unwrap();
+        let _store = seed_graph(dir.path()).await;
+        let q = DuckDbQuery::open(dir.path()).await.unwrap();
+
+        // 1-hop from entity:e_alpha → 3 incident active edges
+        // (c1-mentions, c2-mentions, alpha-tagged-t1).
+        let one = q.neighbors_within("entity:e_alpha", 1, None).await.unwrap();
+        assert_eq!(one.len(), 3, "1-hop neighbors_within mismatch: {one:?}");
+
+        // 2-hop from entity:e_alpha should still only see those 3
+        // edges — the only other active edge is c1->e_alpha (already
+        // captured) and the c3->c1 edge is closed (valid_to set).
+        let two = q.neighbors_within("entity:e_alpha", 2, None).await.unwrap();
+        assert_eq!(two.len(), 3, "2-hop with no closed-edge inclusion: {two:?}");
+
+        // Edge-set dedup: the c1->e_alpha edge is reached both as a
+        // 1-hop from e_alpha and as a 1-hop from c1 in the 2-hop pass.
+        // It must appear exactly once.
+        let c1_two = q
+            .neighbors_within("capability_capsule:c1", 2, None)
+            .await
+            .unwrap();
+        let c1_mentions: Vec<&GraphEdge> = c1_two
+            .iter()
+            .filter(|e| e.from_node_id == "capability_capsule:c1" && e.relation == "mentions")
+            .collect();
+        assert_eq!(
+            c1_mentions.len(),
+            1,
+            "edge-set dedup failed: {c1_mentions:?}"
+        );
+
+        // max_hops=0 should clamp to 1 (no off-by-one early return).
+        let zero = q.neighbors_within("entity:e_alpha", 0, None).await.unwrap();
+        assert_eq!(zero.len(), 3);
+
+        // max_hops well above cap clamps to 3 — same graph, same edge
+        // count, just doesn't error.
+        let huge = q
+            .neighbors_within("entity:e_alpha", 99, None)
+            .await
+            .unwrap();
+        assert_eq!(huge.len(), 3);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn neighbors_within_honors_as_of() {
+        let dir = tempdir().unwrap();
+        let store = seed_graph(dir.path()).await;
+        // Add one freshly-active edge whose valid_from is *after* the
+        // historical inspection point. The as_of probe should NOT see
+        // it.
+        store
+            .add_edge_direct(&GraphEdge {
+                from_node_id: "entity:e_alpha".into(),
+                to_node_id: "entity:e_beta".into(),
+                relation: "co_occurs_with".into(),
+                valid_from: "00000001778000030000".into(),
+                valid_to: None,
+            })
+            .await
+            .unwrap();
+        let q = DuckDbQuery::open(dir.path()).await.unwrap();
+
+        // as_of = 00000001778000015000 → between the seed edges and
+        // the late edge. Late edge is excluded (valid_from > as_of);
+        // the closed c3->c1 edge is also excluded because it was
+        // closed at 20000, which is after 15000, so it WAS active
+        // then — meaning the closed edge SHOULD reappear here.
+        let historic = q
+            .neighbors_within("entity:e_alpha", 2, Some("00000001778000015000"))
+            .await
+            .unwrap();
+        assert!(
+            !historic.iter().any(|e| e.to_node_id == "entity:e_beta"),
+            "as_of must exclude edges with valid_from > as_of"
+        );
+        // Late edge surfaces only when as_of >= its valid_from.
+        let now_view = q
+            .neighbors_within("entity:e_alpha", 1, Some("00000001778000040000"))
+            .await
+            .unwrap();
+        assert!(
+            now_view.iter().any(|e| e.to_node_id == "entity:e_beta"),
+            "as_of past the late edge's valid_from must surface it: {now_view:?}"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn kg_timeline_includes_closed_edges_in_chrono_order() {
+        let dir = tempdir().unwrap();
+        let _store = seed_graph(dir.path()).await;
+        let q = DuckDbQuery::open(dir.path()).await.unwrap();
+
+        // c1 is on two edges: mentions e_alpha (active, valid_from
+        // 10000) and supersedes c1 reverse (closed, valid_from 10003).
+        let timeline = q.kg_timeline("capability_capsule:c1").await.unwrap();
+        assert_eq!(
+            timeline.len(),
+            2,
+            "expected 2 edges in c1 timeline: {timeline:?}"
+        );
+        // Chrono order — earliest valid_from first.
+        assert_eq!(timeline[0].valid_from, "00000001778000010000");
+        assert_eq!(timeline[1].valid_from, "00000001778000010003");
+        // Closed edge IS surfaced (timeline shows history, not just
+        // active state).
+        assert!(timeline.iter().any(|e| e.valid_to.is_some()));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn graph_stats_counts_split_and_top_relations() {
+        let dir = tempdir().unwrap();
+        let _store = seed_graph(dir.path()).await;
+        let q = DuckDbQuery::open(dir.path()).await.unwrap();
+
+        let s = q.graph_stats().await.unwrap();
+        assert_eq!(s.total_edges, 4);
+        assert_eq!(s.active_edges, 3);
+        assert_eq!(s.closed_edges, 1);
+        // Five distinct nodes: c1, c2, c3, e_alpha, t1.
+        assert_eq!(s.node_count, 5);
+        // top_relations is ordered desc by count, then asc by name.
+        // mentions (2), then supersedes (1) and tagged (1) tied by
+        // count and broken by name asc → supersedes, tagged.
+        assert_eq!(
+            s.top_relations,
+            vec![
+                ("mentions".to_string(), 2),
+                ("supersedes".to_string(), 1),
+                ("tagged".to_string(), 1),
+            ]
+        );
     }
 }

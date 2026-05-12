@@ -334,6 +334,48 @@ pub struct EpisodeIngestArgs {
 pub struct GraphNeighborsArgs {
     /// Graph node id as returned by mem APIs (e.g. module:mem:billing).
     pub node_id: String,
+    /// Walk depth. Default 1 (single-hop neighbors). Storage layer
+    /// caps at 3 to prevent dense-graph blow-up.
+    #[serde(default)]
+    pub max_hops: Option<u32>,
+    /// Point-in-time edge filter (20-digit ms string). When set, only
+    /// edges with `valid_from <= as_of AND (valid_to IS NULL OR
+    /// valid_to > as_of)` are returned. Omit for "active now".
+    #[serde(default)]
+    pub as_of: Option<String>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct KgTimelineArgs {
+    /// Node id whose full edge history to surface (active + closed,
+    /// ordered chronologically by `valid_from`).
+    pub node_id: String,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct KgAddEdgeArgs {
+    pub from_node_id: String,
+    pub to_node_id: String,
+    pub relation: String,
+    /// Optional caller-supplied `valid_from` (20-digit ms string).
+    /// Empty / missing → server stamps `current_timestamp()`.
+    #[serde(default)]
+    pub valid_from: Option<String>,
+    /// Optional pre-set `valid_to` for inserting an already-closed
+    /// historical edge in one shot.
+    #[serde(default)]
+    pub valid_to: Option<String>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct KgInvalidateEdgeArgs {
+    pub from_node_id: String,
+    pub to_node_id: String,
+    pub relation: String,
+    /// Optional `valid_to` stamp. Empty / missing → server stamps
+    /// `current_timestamp()`.
+    #[serde(default)]
+    pub ended_at: Option<String>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -1047,14 +1089,84 @@ impl MemMcpServer {
 
     // ------------------- capability_capsule_graph_neighbors -------------------
     #[tool(
-        description = "List graph edges adjacent to a node id (e.g. module:mem:billing, project:acme). Complements capability_capsule_search when expand_graph is not enough."
+        description = "List graph edges adjacent to a node id (e.g. module:mem:billing, project:acme). Optional `max_hops` (default 1, cap 3) performs a BFS walk; `as_of` filters to edges active at a point in time (20-digit ms string). Complements capability_capsule_search when expand_graph is not enough."
     )]
     async fn capability_capsule_graph_neighbors(
         &self,
         Parameters(args): Parameters<GraphNeighborsArgs>,
     ) -> Result<CallToolResult, McpError> {
         let path = format!("graph/neighbors/{}", encode_segment(&args.node_id));
+        let mut query: Vec<(&str, String)> = Vec::new();
+        if let Some(h) = args.max_hops {
+            query.push(("max_hops", h.to_string()));
+        }
+        if let Some(t) = args.as_of {
+            query.push(("as_of", t));
+        }
+        self.get_with_query(&path, &query).await
+    }
+
+    // ------------------- capability_capsule_kg_timeline -------------------
+    #[tool(
+        description = "Full edge history for one node (active + closed), ordered `valid_from ASC, relation ASC`. Use to see how an entity / project / topic evolved over time — which capsules referenced it, which relations have been invalidated, which are still active. Pairs with `capability_capsule_kg_invalidate_edge` for the write side."
+    )]
+    async fn capability_capsule_kg_timeline(
+        &self,
+        Parameters(args): Parameters<KgTimelineArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        let path = format!("graph/timeline/{}", encode_segment(&args.node_id));
         self.get_with_query(&path, &[]).await
+    }
+
+    // ------------------- capability_capsule_graph_stats -------------------
+    #[tool(
+        description = "Whole-graph aggregate counts: node_count, total/active/closed edge counts, top-N relation kinds. Tenant-less (graph_edges has no tenant column — all tenants share one graph by design). Use for observability and to spot KG health regressions (e.g. closed_edges growing without bound)."
+    )]
+    async fn capability_capsule_graph_stats(
+        &self,
+        Parameters(_args): Parameters<EmptyArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        self.get_with_query("graph/stats", &[]).await
+    }
+
+    // ------------------- capability_capsule_kg_add_edge -------------------
+    #[tool(
+        description = "Write a caller-supplied edge directly. Use when an agent learns a new fact (`X depends on Y`, `project Z owns module W`) that the auto-extractor wouldn't catch. Idempotent on the active `(from, to, relation)` triple. Pass `valid_from` to backdate; omit for `now`. Pass `valid_to` only for the rare pre-closed historical edge case."
+    )]
+    async fn capability_capsule_kg_add_edge(
+        &self,
+        Parameters(args): Parameters<KgAddEdgeArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        let mut body = Map::new();
+        body.insert("from_node_id".into(), json!(args.from_node_id));
+        body.insert("to_node_id".into(), json!(args.to_node_id));
+        body.insert("relation".into(), json!(args.relation));
+        if let Some(v) = args.valid_from {
+            body.insert("valid_from".into(), json!(v));
+        }
+        if let Some(v) = args.valid_to {
+            body.insert("valid_to".into(), json!(v));
+        }
+        self.post_json("graph/edges", &Value::Object(body)).await
+    }
+
+    // ------------------- capability_capsule_kg_invalidate_edge -------------------
+    #[tool(
+        description = "Close (invalidate) one specific active edge by `(from, predicate, to)` triple — stamps `valid_to = ended_at` (defaults to `current_timestamp()`). Idempotent: a triple with no active edge returns `{closed: 0}` without error. Use when you learn a previously-true fact is no longer true; the closed row stays in the table for audit / timeline reconstruction."
+    )]
+    async fn capability_capsule_kg_invalidate_edge(
+        &self,
+        Parameters(args): Parameters<KgInvalidateEdgeArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        let mut body = Map::new();
+        body.insert("from_node_id".into(), json!(args.from_node_id));
+        body.insert("to_node_id".into(), json!(args.to_node_id));
+        body.insert("relation".into(), json!(args.relation));
+        if let Some(v) = args.ended_at {
+            body.insert("ended_at".into(), json!(v));
+        }
+        self.post_json("graph/edges/invalidate", &Value::Object(body))
+            .await
     }
 
     // ------------------- transcript_session_get -------------------

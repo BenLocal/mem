@@ -822,6 +822,61 @@ impl CapabilityCapsuleService {
         Ok(self.store.neighbors(node_id).await?)
     }
 
+    /// Multi-hop BFS variant. `max_hops` defaults to 1 when 0 is
+    /// passed; the storage layer caps at 3 to prevent dense-graph
+    /// blow-up.
+    pub async fn graph_neighbors_within(
+        &self,
+        node_id: &str,
+        max_hops: u32,
+        as_of: Option<&str>,
+    ) -> Result<Vec<GraphEdge>, ServiceError> {
+        let hops = if max_hops == 0 { 1 } else { max_hops };
+        Ok(self.store.neighbors_within(node_id, hops, as_of).await?)
+    }
+
+    /// Full edge history for a node, closed edges included. Used by
+    /// the `kg_timeline` MCP tool.
+    pub async fn graph_timeline(&self, node_id: &str) -> Result<Vec<GraphEdge>, ServiceError> {
+        Ok(self.store.kg_timeline(node_id).await?)
+    }
+
+    /// Whole-graph aggregate counts (`GraphStats`).
+    pub async fn graph_stats(
+        &self,
+    ) -> Result<crate::domain::capability_capsule::GraphStats, ServiceError> {
+        Ok(self.store.graph_stats().await?)
+    }
+
+    /// Caller-supplied direct edge write. `edge.valid_from` is taken
+    /// verbatim; when the caller omits a meaningful timestamp the
+    /// service stamps `current_timestamp()` as a courtesy.
+    pub async fn graph_add_edge(&self, mut edge: GraphEdge) -> Result<bool, ServiceError> {
+        if edge.valid_from.trim().is_empty() {
+            edge.valid_from = crate::storage::current_timestamp();
+        }
+        Ok(self.store.add_edge_direct(&edge).await?)
+    }
+
+    /// Invalidate one active edge by triple. `ended_at` defaults to
+    /// `current_timestamp()` when None or empty.
+    pub async fn graph_invalidate_edge(
+        &self,
+        from_node_id: &str,
+        predicate: &str,
+        to_node_id: &str,
+        ended_at: Option<&str>,
+    ) -> Result<usize, ServiceError> {
+        let now = match ended_at {
+            Some(s) if !s.is_empty() => s.to_owned(),
+            _ => crate::storage::current_timestamp(),
+        };
+        Ok(self
+            .store
+            .invalidate_edge(from_node_id, predicate, to_node_id, &now)
+            .await?)
+    }
+
     pub async fn search(
         &self,
         query: SearchCapabilityCapsuleRequest,
