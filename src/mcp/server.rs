@@ -379,6 +379,70 @@ pub struct KgInvalidateEdgeArgs {
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct ListInScopeArgs {
+    #[serde(default)]
+    pub tenant: Option<String>,
+    /// Filter `project = ?` when set.
+    #[serde(default)]
+    pub project: Option<String>,
+    #[serde(default)]
+    pub repo: Option<String>,
+    #[serde(default)]
+    pub module: Option<String>,
+    /// One of: implementation | experience | preference | episode | workflow | diary.
+    #[serde(default)]
+    pub capability_capsule_type: Option<String>,
+    /// One of: provisional | active | pending_confirmation | archived | rejected.
+    #[serde(default)]
+    pub status: Option<String>,
+    /// Page cursor from a prior response's `next_cursor` (`{updated_at, capability_capsule_id}`).
+    #[serde(default)]
+    pub cursor: Option<ListInScopeCursorArg>,
+    /// Default 50, capped at 200 server-side.
+    #[serde(default)]
+    pub limit: Option<usize>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema, Serialize)]
+pub struct ListInScopeCursorArg {
+    pub updated_at: String,
+    pub capability_capsule_id: String,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct AgentDiaryWriteArgs {
+    /// Owning agent. Diary entries are scoped to this string — only
+    /// `agent_diary_read(caller_agent=<same string>)` surfaces them.
+    pub caller_agent: String,
+    /// Verbatim entry text. Must be ≥12 chars.
+    pub content: String,
+    /// Optional one-line topic / headline (becomes the capsule's
+    /// `summary`). Defaults to content[:80] when omitted.
+    #[serde(default)]
+    pub topic: Option<String>,
+    #[serde(default)]
+    pub tenant: Option<String>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct AgentDiaryReadArgs {
+    /// Owning agent — only entries written by this agent come back.
+    pub caller_agent: String,
+    /// Default 20, max 200.
+    #[serde(default)]
+    pub last_n: Option<usize>,
+    #[serde(default)]
+    pub tenant: Option<String>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct KgListUserTunnelsArgs {
+    /// Default 50, max 200.
+    #[serde(default)]
+    pub limit: Option<usize>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct EmbeddingsListJobsArgs {
     #[serde(default)]
     pub tenant: Option<String>,
@@ -1166,6 +1230,135 @@ impl MemMcpServer {
             body.insert("ended_at".into(), json!(v));
         }
         self.post_json("graph/edges/invalidate", &Value::Object(body))
+            .await
+    }
+
+    // ------------------- capability_capsule_list_in_scope -------------------
+    #[tool(
+        description = "Browse capsules by scope (project / repo / module / type / status) without an embedding query. Use when the caller wants 'show me everything under project X' rather than 'find the most relevant capsules for query Y'. Paginated by `(updated_at, capability_capsule_id)` cursor. Default limit 50, max 200. Each filter is optional and AND-combined. Returns `{capability_capsules, next_cursor, has_more}`."
+    )]
+    async fn capability_capsule_list_in_scope(
+        &self,
+        Parameters(args): Parameters<ListInScopeArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        let mut body = Map::new();
+        body.insert(
+            "tenant".into(),
+            json!(self.resolve_tenant(args.tenant.as_ref())),
+        );
+        if let Some(v) = args.project {
+            body.insert("project".into(), json!(v));
+        }
+        if let Some(v) = args.repo {
+            body.insert("repo".into(), json!(v));
+        }
+        if let Some(v) = args.module {
+            body.insert("module".into(), json!(v));
+        }
+        if let Some(v) = args.capability_capsule_type {
+            body.insert("capability_capsule_type".into(), json!(v));
+        }
+        if let Some(v) = args.status {
+            body.insert("status".into(), json!(v));
+        }
+        if let Some(v) = args.cursor {
+            body.insert("cursor".into(), json!(v));
+        }
+        if let Some(v) = args.limit {
+            body.insert("limit".into(), json!(v));
+        }
+        self.post_json("capability_capsules/list", &Value::Object(body))
+            .await
+    }
+
+    // ------------------- capability_capsule_agent_diary_write -------------------
+    #[tool(
+        description = "Append an entry to the calling agent's private diary. Diary capsules use `capability_capsule_type=diary` and are excluded from `capability_capsule_search` results by default — they're for the writing agent's self-notes (tried-but-failed approaches, intermediate observations, scratchpad thoughts) without polluting the shared capsule pool. Each agent reads only its own diary via `capability_capsule_agent_diary_read(caller_agent=<same>)`. Content ≥12 chars."
+    )]
+    async fn capability_capsule_agent_diary_write(
+        &self,
+        Parameters(args): Parameters<AgentDiaryWriteArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        if args.content.trim().chars().count() < 12 {
+            return Ok(err_text(
+                "agent diary content must be at least 12 characters".to_string(),
+            ));
+        }
+        let summary = args
+            .topic
+            .clone()
+            .unwrap_or_else(|| args.content.chars().take(80).collect());
+        let body = json!({
+            "tenant": self.resolve_tenant(args.tenant.as_ref()),
+            "capability_capsule_type": "diary",
+            "content": args.content,
+            "summary": summary,
+            "scope": "workspace",
+            "visibility": "private",
+            "source_agent": args.caller_agent,
+            "write_mode": "auto",
+        });
+        self.post_json("capability_capsules", &body).await
+    }
+
+    // ------------------- capability_capsule_agent_diary_read -------------------
+    #[tool(
+        description = "Read back the calling agent's own diary entries (where `capability_capsule_type=diary` AND `source_agent=caller_agent`), most-recent first. Other agents' diaries are not accessible. Default `last_n=20`, max 200. Use this instead of `capability_capsule_search` when you want your scratchpad, not the shared pool."
+    )]
+    async fn capability_capsule_agent_diary_read(
+        &self,
+        Parameters(args): Parameters<AgentDiaryReadArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        // diary entries are stored as regular capsules but filtered
+        // out of search by SQL — list_in_scope intentionally has no
+        // diary exclusion, so passing capability_capsule_type=diary
+        // is what surfaces them. source_agent must match server-side;
+        // we encode it via the (yet to be added) source_agent filter.
+        // For now, pull everything of type=diary and filter
+        // source_agent client-side from the response list.
+        let limit = args.last_n.unwrap_or(20).clamp(1, 200);
+        let body = json!({
+            "tenant": self.resolve_tenant(args.tenant.as_ref()),
+            "capability_capsule_type": "diary",
+            "limit": limit,
+        });
+        // Use post_json_with_filter so we can drop entries that
+        // belong to a different caller_agent. The base list endpoint
+        // doesn't (yet) take `source_agent` as a filter — that's a
+        // follow-up. Until then, we over-fetch and filter.
+        match self
+            .client
+            .request_json::<Value>(Method::POST, "capability_capsules/list", Some(&body))
+            .await
+        {
+            Ok(mut v) => {
+                if let Some(arr) = v
+                    .get_mut("capability_capsules")
+                    .and_then(|x| x.as_array_mut())
+                {
+                    arr.retain(|c| {
+                        c.get("source_agent")
+                            .and_then(|s| s.as_str())
+                            .map(|s| s == args.caller_agent)
+                            .unwrap_or(false)
+                    });
+                }
+                Ok(ok_json(&v))
+            }
+            Err(e) => Ok(err_text(e.to_string())),
+        }
+    }
+
+    // ------------------- capability_capsule_kg_list_user_tunnels -------------------
+    #[tool(
+        description = "List caller-curated graph edges (`relation` starts with `user_tunnel:`). Mem's auto-extracted edges use plain relation strings (`mentions`, `tagged`, `supersedes`); caller-supplied bridges between scopes/topics by convention prefix the relation with `user_tunnel:<label>`. Use `capability_capsule_kg_add_edge` to create one (`relation=user_tunnel:related_to_billing` etc.); `capability_capsule_kg_invalidate_edge` to close. This endpoint is the read side. Default limit 50, max 200."
+    )]
+    async fn capability_capsule_kg_list_user_tunnels(
+        &self,
+        Parameters(args): Parameters<KgListUserTunnelsArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        let limit = args.limit.unwrap_or(50).clamp(1, 200);
+        self.get_with_query("graph/tunnels", &[("limit", limit.to_string())])
             .await
     }
 

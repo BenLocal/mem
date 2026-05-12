@@ -398,6 +398,14 @@ fn parse_scope_filters(filters: &[String]) -> HashMap<String, Vec<String>> {
 }
 
 fn memory_type_score(capability_capsule_type: &CapabilityCapsuleType, intent: &str) -> i64 {
+    // Diary entries are filtered out at SQL level (see
+    // `hybrid_candidates` outer WHERE), so they shouldn't reach this
+    // scorer. Score 0 as a defense-in-depth fallback in case the SQL
+    // filter ever drifts.
+    if matches!(capability_capsule_type, CapabilityCapsuleType::Diary) {
+        return 0;
+    }
+
     let intent = intent.to_lowercase();
     if intent.contains("debug") {
         return match capability_capsule_type {
@@ -406,6 +414,7 @@ fn memory_type_score(capability_capsule_type: &CapabilityCapsuleType, intent: &s
             CapabilityCapsuleType::Episode => 7,
             CapabilityCapsuleType::Workflow => 5,
             CapabilityCapsuleType::Preference => 1,
+            CapabilityCapsuleType::Diary => 0,
         };
     }
 
@@ -416,6 +425,7 @@ fn memory_type_score(capability_capsule_type: &CapabilityCapsuleType, intent: &s
             CapabilityCapsuleType::Implementation => 4,
             CapabilityCapsuleType::Episode => 5,
             CapabilityCapsuleType::Preference => 1,
+            CapabilityCapsuleType::Diary => 0,
         };
     }
 
@@ -425,6 +435,7 @@ fn memory_type_score(capability_capsule_type: &CapabilityCapsuleType, intent: &s
         CapabilityCapsuleType::Experience => 6,
         CapabilityCapsuleType::Implementation => 5,
         CapabilityCapsuleType::Episode => 4,
+        CapabilityCapsuleType::Diary => 0,
     }
 }
 

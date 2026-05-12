@@ -481,6 +481,38 @@ impl CapabilityCapsuleService {
             .await?)
     }
 
+    /// Scope-filtered, paginated browse. See repo doc-comment on
+    /// `list_capability_capsules_in_scope` for the cursor protocol.
+    /// Service-layer guard: `limit` defaults to 50 if 0, capped at 200
+    /// inside the repo.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn list_capability_capsules_in_scope(
+        &self,
+        tenant: &str,
+        project: Option<&str>,
+        repo: Option<&str>,
+        module: Option<&str>,
+        capsule_type: Option<&str>,
+        status: Option<&str>,
+        cursor: Option<(&str, &str)>,
+        limit: usize,
+    ) -> Result<(Vec<CapabilityCapsuleRecord>, bool), ServiceError> {
+        let lim = if limit == 0 { 50 } else { limit };
+        Ok(self
+            .store
+            .list_capability_capsules_in_scope(
+                tenant,
+                project,
+                repo,
+                module,
+                capsule_type,
+                status,
+                cursor,
+                lim,
+            )
+            .await?)
+    }
+
     /// Hard-delete a memory and all its references. **Irreversible.**
     /// Backs `DELETE /capability_capsules/{id}` from the admin web page.
     ///
@@ -839,6 +871,15 @@ impl CapabilityCapsuleService {
     /// the `kg_timeline` MCP tool.
     pub async fn graph_timeline(&self, node_id: &str) -> Result<Vec<GraphEdge>, ServiceError> {
         Ok(self.store.kg_timeline(node_id).await?)
+    }
+
+    /// Caller-curated tunnel listing (relation prefix `user_tunnel:`).
+    pub async fn graph_list_user_tunnels(
+        &self,
+        limit: usize,
+    ) -> Result<Vec<GraphEdge>, ServiceError> {
+        let lim = if limit == 0 { 50 } else { limit };
+        Ok(self.store.list_user_tunnels(lim).await?)
     }
 
     /// Whole-graph aggregate counts (`GraphStats`).

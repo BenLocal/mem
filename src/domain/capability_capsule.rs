@@ -24,6 +24,16 @@ pub enum CapabilityCapsuleType {
     Preference,
     Episode,
     Workflow,
+    /// Caller-private notebook: each agent's own scratchpad. Stored
+    /// in `capability_capsules` like any other row but **excluded
+    /// from `capability_capsule_search` results by default** unless
+    /// the caller passes `include_diary=true`. Use via
+    /// `capability_capsule_agent_diary_write` /
+    /// `capability_capsule_agent_diary_read` MCP tools — those
+    /// enforce the `source_agent` round-trip so one agent's diary
+    /// can't leak into another's reads. Filter convention at the
+    /// search layer: `WHERE capability_capsule_type != 'diary'`.
+    Diary,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]

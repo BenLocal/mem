@@ -140,6 +140,39 @@ impl DuckDbQuery {
         .await
     }
 
+    /// Caller-curated graph edges — by convention these are written
+    /// with `relation` prefixed `user_tunnel:` (the rest of `relation`
+    /// is the human-readable label). Distinct from auto-extracted
+    /// edges (`mentions`, `tagged`, `supersedes`, etc.) which
+    /// originate from `pipeline::ingest::extract_graph_edges`. Active
+    /// only; ordered `(relation, from_node_id, to_node_id)`.
+    ///
+    /// This is a `relation LIKE` filter rather than a schema-level
+    /// `origin` column on `graph_edges` (see mempalace-diff-v2 §3
+    /// #20 phase-A discussion). When/if a real `origin` column lands,
+    /// this method should switch to a strict equality filter.
+    pub async fn list_user_tunnels(&self, limit: usize) -> Result<Vec<GraphEdge>, GraphError> {
+        let conn = self.conn.clone();
+        let lim = i64::try_from(limit.clamp(1, 200)).unwrap_or(50);
+        spawn_blocking_graph(move || {
+            let conn = conn.lock().expect("duckdb_query mutex poisoned");
+            let mut stmt = conn.prepare(
+                "SELECT from_node_id, to_node_id, relation, valid_from, valid_to \
+                 FROM ns.main.graph_edges \
+                 WHERE relation LIKE 'user_tunnel:%' AND valid_to IS NULL \
+                 ORDER BY relation, from_node_id, to_node_id \
+                 LIMIT ?1",
+            )?;
+            let rows = stmt.query_map(params![lim], row_to_graph_edge)?;
+            let mut out = Vec::new();
+            for r in rows {
+                out.push(r?);
+            }
+            Ok(out)
+        })
+        .await
+    }
+
     /// All edges involving `node_id` (either endpoint), **including
     /// closed ones**, ordered `(valid_from ASC, relation ASC)`. The
     /// canonical "show me the full history of this entity" view —
@@ -448,6 +481,66 @@ mod tests {
         // Closed edge IS surfaced (timeline shows history, not just
         // active state).
         assert!(timeline.iter().any(|e| e.valid_to.is_some()));
+    }
+
+    /// `list_user_tunnels` filters by the `user_tunnel:` relation
+    /// prefix convention and ignores closed / auto edges.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn list_user_tunnels_filters_by_relation_prefix() {
+        let dir = tempdir().unwrap();
+        let store = seed_graph(dir.path()).await; // 3 active + 1 closed auto-style edges
+        store
+            .add_edge_direct(&GraphEdge {
+                from_node_id: "capability_capsule:c1".into(),
+                to_node_id: "capability_capsule:c2".into(),
+                relation: "user_tunnel:cross_project_link".into(),
+                valid_from: "00000001778000050000".into(),
+                valid_to: None,
+            })
+            .await
+            .unwrap();
+        store
+            .add_edge_direct(&GraphEdge {
+                from_node_id: "topic:t1".into(),
+                to_node_id: "topic:t2".into(),
+                relation: "user_tunnel:related_topics".into(),
+                valid_from: "00000001778000050001".into(),
+                valid_to: None,
+            })
+            .await
+            .unwrap();
+        // closed user-tunnel — must not surface (active-only)
+        store
+            .add_edge_direct(&GraphEdge {
+                from_node_id: "topic:t1".into(),
+                to_node_id: "topic:t3".into(),
+                relation: "user_tunnel:archived".into(),
+                valid_from: "00000001778000050002".into(),
+                valid_to: Some("00000001778000060000".into()),
+            })
+            .await
+            .unwrap();
+
+        let q = DuckDbQuery::open(dir.path()).await.unwrap();
+        let tunnels = q.list_user_tunnels(100).await.unwrap();
+        let relations: Vec<&str> = tunnels.iter().map(|e| e.relation.as_str()).collect();
+        // Two active user_tunnel edges; ordered by (relation, from, to).
+        assert_eq!(
+            relations,
+            vec![
+                "user_tunnel:cross_project_link",
+                "user_tunnel:related_topics"
+            ]
+        );
+        // Auto edges and closed tunnels must be excluded.
+        assert!(
+            !tunnels.iter().any(|e| e.relation == "mentions"),
+            "auto edges must not appear: {tunnels:?}"
+        );
+        assert!(
+            !tunnels.iter().any(|e| e.relation == "user_tunnel:archived"),
+            "closed tunnel must not appear: {tunnels:?}"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread")]

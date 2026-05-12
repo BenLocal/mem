@@ -16,6 +16,7 @@ pub fn router() -> Router<AppState> {
         .route("/graph/neighbors/{node_id}", get(graph_neighbors))
         .route("/graph/timeline/{node_id}", get(graph_timeline))
         .route("/graph/stats", get(graph_stats))
+        .route("/graph/tunnels", get(graph_list_user_tunnels))
         .route("/graph/edges", post(graph_add_edge))
         .route("/graph/edges/invalidate", post(graph_invalidate_edge))
 }
@@ -65,6 +66,23 @@ async fn graph_timeline(
 
 async fn graph_stats(State(app): State<AppState>) -> Result<Json<GraphStats>, AppError> {
     Ok(Json(app.capability_capsule_service.graph_stats().await?))
+}
+
+#[derive(Debug, Deserialize, Default)]
+pub struct ListUserTunnelsQuery {
+    #[serde(default)]
+    pub limit: Option<usize>,
+}
+
+async fn graph_list_user_tunnels(
+    State(app): State<AppState>,
+    Query(q): Query<ListUserTunnelsQuery>,
+) -> Result<Json<Vec<GraphEdge>>, AppError> {
+    Ok(Json(
+        app.capability_capsule_service
+            .graph_list_user_tunnels(q.limit.unwrap_or(50))
+            .await?,
+    ))
 }
 
 #[derive(Debug, Deserialize)]

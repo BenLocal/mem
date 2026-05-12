@@ -33,6 +33,10 @@ pub fn router() -> Router<AppState> {
             "/capability_capsules/search",
             post(search_capability_capsule),
         )
+        .route(
+            "/capability_capsules/list",
+            post(list_capability_capsules_in_scope),
+        )
         .route("/capability_capsules/feedback", post(submit_feedback))
         .route(
             "/capability_capsules/{id}",
@@ -68,6 +72,79 @@ async fn list_capability_capsules(
             .list_capability_capsules(&query.tenant)
             .await?,
     ))
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "snake_case")]
+struct ListInScopeRequest {
+    #[serde(default = "default_tenant")]
+    tenant: String,
+    #[serde(default)]
+    project: Option<String>,
+    #[serde(default)]
+    repo: Option<String>,
+    #[serde(default)]
+    module: Option<String>,
+    #[serde(default)]
+    capability_capsule_type: Option<String>,
+    #[serde(default)]
+    status: Option<String>,
+    #[serde(default)]
+    cursor: Option<ListInScopeCursor>,
+    #[serde(default)]
+    limit: Option<usize>,
+}
+
+#[derive(Debug, Deserialize, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+struct ListInScopeCursor {
+    updated_at: String,
+    capability_capsule_id: String,
+}
+
+#[derive(Debug, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+struct ListInScopeResponse {
+    capability_capsules: Vec<crate::domain::capability_capsule::CapabilityCapsuleRecord>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    next_cursor: Option<ListInScopeCursor>,
+    has_more: bool,
+}
+
+async fn list_capability_capsules_in_scope(
+    State(app): State<AppState>,
+    Json(req): Json<ListInScopeRequest>,
+) -> Result<Json<ListInScopeResponse>, AppError> {
+    let cursor_ref = req
+        .cursor
+        .as_ref()
+        .map(|c| (c.updated_at.as_str(), c.capability_capsule_id.as_str()));
+    let (capability_capsules, has_more) = app
+        .capability_capsule_service
+        .list_capability_capsules_in_scope(
+            &req.tenant,
+            req.project.as_deref(),
+            req.repo.as_deref(),
+            req.module.as_deref(),
+            req.capability_capsule_type.as_deref(),
+            req.status.as_deref(),
+            cursor_ref,
+            req.limit.unwrap_or(50),
+        )
+        .await?;
+    let next_cursor = if has_more {
+        capability_capsules.last().map(|r| ListInScopeCursor {
+            updated_at: r.updated_at.clone(),
+            capability_capsule_id: r.capability_capsule_id.clone(),
+        })
+    } else {
+        None
+    };
+    Ok(Json(ListInScopeResponse {
+        capability_capsules,
+        next_cursor,
+        has_more,
+    }))
 }
 
 #[derive(Debug, Deserialize)]

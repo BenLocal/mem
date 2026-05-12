@@ -406,6 +406,32 @@ impl Store {
         self.query.list_capability_capsules_for_tenant(tenant).await
     }
 
+    #[allow(clippy::too_many_arguments)]
+    pub async fn list_capability_capsules_in_scope(
+        &self,
+        tenant: &str,
+        project: Option<&str>,
+        repo: Option<&str>,
+        module: Option<&str>,
+        capsule_type: Option<&str>,
+        status: Option<&str>,
+        cursor: Option<(&str, &str)>,
+        limit: usize,
+    ) -> Result<(Vec<CapabilityCapsuleRecord>, bool), StorageError> {
+        self.query
+            .list_capability_capsules_in_scope(
+                tenant,
+                project,
+                repo,
+                module,
+                capsule_type,
+                status,
+                cursor,
+                limit,
+            )
+            .await
+    }
+
     pub async fn get_capability_capsule_for_tenant(
         &self,
         tenant: &str,
@@ -964,6 +990,10 @@ impl Store {
 
     pub async fn kg_timeline(&self, node_id: &str) -> Result<Vec<GraphEdge>, GraphError> {
         self.query.kg_timeline(node_id).await
+    }
+
+    pub async fn list_user_tunnels(&self, limit: usize) -> Result<Vec<GraphEdge>, GraphError> {
+        self.query.list_user_tunnels(limit).await
     }
 
     pub async fn graph_stats(

@@ -121,9 +121,9 @@
 | **#16** ✅ | **KG 多跳 + 时序导出**：`graph_neighbors` 加 `max_hops` + `as_of` 参数；新加 `kg_timeline(entity)` 和 `kg_invalidate(subj, pred, obj, ended)`；同时**修复 `neighbors_at` 文档漂移**（要么实现，要么从 CLAUDE.md 删） | 1 个 repo 方法签名扩展 + 2 个新 repo 方法 + service + http + mcp | ~6h | **P0** — 数据全在，纯暴露 |
 | **#17** ✅ | **`graph_stats` MCP**：节点 / 边总数、按 kind 分布、平均度数、`valid_to IS NULL` 活跃边比例 | 1 个 repo SQL + service + http + mcp | ~2h | P1 — 运维可观测性 |
 | **#16.1** ✅ | **`kg_add_edge` MCP**：caller-supplied 直接写边（不走 ingest 路径自动抽取），保留 caller 的 `valid_from`，幂等于 active `(from, to, relation)` | 1 个新 LanceStore 方法 + service + http + mcp | ~1h | 由 #16 同 PR 顺手做了 |
-| **#18** | **浏览路径**：`capability_capsule_list_in_scope(project?, repo?, module?, capability_capsule_type?, status?, cursor, limit)` MCP + HTTP；不需要 embedding 命中即可看 | repo SQL 加 filter + cursor + service + http + mcp | ~4h | P1 — 解决"列 project X 下所有 capsule"的真实需求 |
-| **#19** | **Agent diary**：MCP `agent_diary_write(caller_agent, content, topic?)` / `_read(caller_agent, last_n)`；底层走 capsule 表 + `scope=diary` + `caller_agent` 必填 + 默认从 search 路径**排除**（除非显式 `include_diary=true`） | 1 个 scope 枚举值 + ingest 路径校验 + retrieve 过滤 + 2 MCP | ~3h | P1 — 解决"agent 自言自语不污染主池" |
-| **#20** | **User tunnels**（caller-curated 跨 scope 链接） | 新表 `user_tunnels` 或 `graph_edges` 加 `origin: auto \| user` 列 + CRUD MCP + retrieve 时 boost | ~8h | P2 — 价值真但需要新 schema，先 #16–#19 落地观察是否还需要 |
+| **#18** ✅ | **浏览路径**：`capability_capsule_list_in_scope(project?, repo?, module?, capability_capsule_type?, status?, cursor, limit)` MCP + HTTP；不需要 embedding 命中即可看 | repo SQL 加 filter + cursor + service + http + mcp | ~4h | P1 — 解决"列 project X 下所有 capsule"的真实需求 |
+| **#19** ✅ | **Agent diary**：MCP `agent_diary_write(caller_agent, content, topic?)` / `_read(caller_agent, last_n)`；底层走 capsule 表 + `capability_capsule_type=diary` + 默认从 search 路径**排除**；read 端按 `source_agent` 过滤 | 1 个新 `CapabilityCapsuleType::Diary` 变体 + 3 处 hybrid_candidates SQL 加 `!= 'diary'` + 2 MCP + retrieve `memory_type_score` 加 Diary→0 兜底 | ~3h | P1 — 解决"agent 自言自语不污染主池" |
+| **#20** ✅ (phase A) | **User tunnels**（caller-curated 跨 scope 链接）：以 `relation` 字符串前缀 `user_tunnel:<label>` 作为约定（不动 schema）；新加 `kg_list_user_tunnels` MCP 用 `relation LIKE 'user_tunnel:%'` 过滤；create / delete 复用 #16 的 `kg_add_edge` / `kg_invalidate_edge` | 1 个新 repo 方法 + service + http + mcp | ~2h | Phase A 落地，避免 schema 迁移；Phase B（`origin` 列 + retrieve boost）继续延后 |
 
 ### 决策点
 

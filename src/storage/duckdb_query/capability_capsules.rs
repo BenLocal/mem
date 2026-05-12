@@ -110,6 +110,108 @@ impl DuckDbQuery {
         .await
     }
 
+    /// Scope-filtered browse path: capsules in `tenant` matching any
+    /// subset of `(project, repo, module, capability_capsule_type,
+    /// status)`, ordered `(updated_at DESC, capability_capsule_id
+    /// ASC)`, paginated by the composite cursor
+    /// `(updated_at, capability_capsule_id)`. Unlike
+    /// `hybrid_candidates` this is **embedding-free** — caller browses
+    /// by scope, no query text or vector required. Use when the
+    /// caller wants to enumerate everything under `project=X`
+    /// regardless of search hit relevance.
+    ///
+    /// Each filter is optional; a `None` filter is a no-op (does not
+    /// require the column to be NULL). Limit clamped 1..=200 inside
+    /// the function — caller-supplied 0 or absurdly large values
+    /// won't surprise. `has_more` is reported via the standard
+    /// `LIMIT N+1` trick so the caller can decide whether to paginate.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn list_capability_capsules_in_scope(
+        &self,
+        tenant: &str,
+        project: Option<&str>,
+        repo: Option<&str>,
+        module: Option<&str>,
+        capsule_type: Option<&str>,
+        status: Option<&str>,
+        cursor: Option<(&str, &str)>,
+        limit: usize,
+    ) -> Result<(Vec<CapabilityCapsuleRecord>, bool), StorageError> {
+        let conn = self.conn.clone();
+        let tenant = tenant.to_string();
+        let project = project.map(str::to_owned);
+        let repo = repo.map(str::to_owned);
+        let module = module.map(str::to_owned);
+        let capsule_type = capsule_type.map(str::to_owned);
+        let status = status.map(str::to_owned);
+        let cursor: Option<(String, String)> =
+            cursor.map(|(updated_at, id)| (updated_at.to_owned(), id.to_owned()));
+        let lim = i64::try_from(limit.clamp(1, 200)).unwrap_or(50);
+        spawn_blocking_storage(move || {
+            let conn = conn.lock().expect("duckdb_query mutex poisoned");
+            let mut sql = format!(
+                "SELECT {CAPABILITY_CAPSULE_COLS} FROM ns.main.capability_capsules WHERE tenant = ?1",
+                CAPABILITY_CAPSULE_COLS = CAPABILITY_CAPSULE_COLS,
+            );
+            let mut params_vec: Vec<Box<dyn duckdb::ToSql>> = vec![Box::new(tenant)];
+            if let Some(v) = project {
+                sql.push_str(&format!(" AND project = ?{}", params_vec.len() + 1));
+                params_vec.push(Box::new(v));
+            }
+            if let Some(v) = repo {
+                sql.push_str(&format!(" AND repo = ?{}", params_vec.len() + 1));
+                params_vec.push(Box::new(v));
+            }
+            if let Some(v) = module {
+                sql.push_str(&format!(" AND module = ?{}", params_vec.len() + 1));
+                params_vec.push(Box::new(v));
+            }
+            if let Some(v) = capsule_type {
+                sql.push_str(&format!(
+                    " AND capability_capsule_type = ?{}",
+                    params_vec.len() + 1
+                ));
+                params_vec.push(Box::new(v));
+            }
+            if let Some(v) = status {
+                sql.push_str(&format!(" AND status = ?{}", params_vec.len() + 1));
+                params_vec.push(Box::new(v));
+            }
+            if let Some((cur_updated, cur_id)) = cursor {
+                // Composite cursor: strictly after (updated_at, id).
+                // updated_at sorts DESC, so the resume condition is
+                // updated_at < cur OR (updated_at = cur AND id > cur_id).
+                let p = params_vec.len();
+                sql.push_str(&format!(
+                    " AND (updated_at < ?{a} \
+                       OR (updated_at = ?{a} AND capability_capsule_id > ?{b}))",
+                    a = p + 1,
+                    b = p + 2,
+                ));
+                params_vec.push(Box::new(cur_updated));
+                params_vec.push(Box::new(cur_id));
+            }
+            sql.push_str(" ORDER BY updated_at DESC, capability_capsule_id ASC");
+            sql.push_str(&format!(" LIMIT ?{}", params_vec.len() + 1));
+            let fetch = lim.saturating_add(1);
+            params_vec.push(Box::new(fetch));
+            let mut stmt = conn.prepare(&sql)?;
+            let params_refs: Vec<&dyn duckdb::ToSql> =
+                params_vec.iter().map(|b| b.as_ref()).collect();
+            let rows = stmt.query_map(params_refs.as_slice(), row_to_capability_capsule_record)?;
+            let mut out = Vec::new();
+            for r in rows {
+                out.push(r.map_err(StorageError::DuckDb)?);
+            }
+            let has_more = out.len() as i64 == fetch;
+            if has_more {
+                out.pop();
+            }
+            Ok((out, has_more))
+        })
+        .await
+    }
+
     /// Single memory by `(tenant, capability_capsule_id)`. Returns `Ok(None)` when
     /// no row matches (the canonical "not found" path — distinct from
     /// errors).
@@ -256,7 +358,7 @@ impl DuckDbQuery {
             let conn = conn.lock().expect("duckdb_query mutex poisoned");
             let sql = format!(
                 "SELECT {CAPABILITY_CAPSULE_COLS} FROM ns.main.capability_capsules \
-                 WHERE tenant = ?1 AND status NOT IN (?2, ?3) \
+                 WHERE tenant = ?1 AND status NOT IN (?2, ?3) AND capability_capsule_type != 'diary' \
                  ORDER BY updated_at DESC, version DESC, capability_capsule_id ASC \
                  LIMIT ?4",
                 CAPABILITY_CAPSULE_COLS = CAPABILITY_CAPSULE_COLS,
@@ -297,7 +399,7 @@ impl DuckDbQuery {
             let conn = conn.lock().expect("duckdb_query mutex poisoned");
             let sql = format!(
                 "SELECT {CAPABILITY_CAPSULE_COLS} FROM ns.main.capability_capsules \
-                 WHERE tenant = ?1 AND status NOT IN (?2, ?3) \
+                 WHERE tenant = ?1 AND status NOT IN (?2, ?3) AND capability_capsule_type != 'diary' \
                  ORDER BY updated_at DESC, version DESC, capability_capsule_id ASC",
                 CAPABILITY_CAPSULE_COLS = CAPABILITY_CAPSULE_COLS,
             );
@@ -491,7 +593,7 @@ impl DuckDbQuery {
                             SELECT capability_capsule_id, \
                                    ROW_NUMBER() OVER (ORDER BY _score DESC, capability_capsule_id ASC) AS rank_lex \
                             FROM lance_fts('ns.main.capability_capsules', 'content', ?{p1}, k => ?{p2}) \
-                            WHERE tenant = ?{p3} AND status NOT IN (?{p4}, ?{p5}) \
+                            WHERE tenant = ?{p3} AND status NOT IN (?{p4}, ?{p5}) AND capability_capsule_type != 'diary' \
                         )"
                     )
                 } else {
@@ -555,6 +657,7 @@ impl DuckDbQuery {
                      JOIN ns.main.capability_capsules m USING (capability_capsule_id) \
                      WHERE m.tenant = ?{p_outer_tenant} \
                        AND m.status NOT IN (?{p_outer_arch}, ?{p_outer_rej}) \
+                       AND m.capability_capsule_type != 'diary' \
                      ORDER BY f.rrf_score DESC, m.updated_at DESC, m.capability_capsule_id ASC \
                      LIMIT ?{p_outer_lim}"
                 );
@@ -1189,5 +1292,193 @@ mod tests {
             vec_only.is_empty(),
             "vec-only with no embeddings table must return empty; got {vec_only:?}"
         );
+    }
+
+    /// Scope-filtered browse path: distinct `project` filters narrow
+    /// the result set; pagination via `(updated_at, capability_capsule_id)`
+    /// cursor walks deterministically through the set.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn duckdb_query_list_capability_capsules_in_scope() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("store");
+        let lance = LanceStore::open(&path).await.unwrap();
+
+        // 5 capsules in tenant-a across 2 projects + 1 in tenant-b
+        // (must never appear when querying tenant-a).
+        let make = |id: &str, project: Option<&str>, updated_at: &str| {
+            let mut r = fixture(id, "tenant-a");
+            r.project = project.map(String::from);
+            r.updated_at = updated_at.into();
+            r
+        };
+        for c in [
+            make("a1", Some("mem"), "00000001778000000050"),
+            make("a2", Some("mem"), "00000001778000000030"),
+            make("a3", Some("mem"), "00000001778000000010"),
+            make("a4", Some("aiclass"), "00000001778000000040"),
+            make("a5", Some("aiclass"), "00000001778000000020"),
+        ] {
+            lance.insert_capability_capsule(c).await.unwrap();
+        }
+        let mut cross = fixture("b1", "tenant-b");
+        cross.project = Some("mem".into());
+        cross.updated_at = "00000001778000000060".into();
+        lance.insert_capability_capsule(cross).await.unwrap();
+
+        let q = DuckDbQuery::open(&path).await.unwrap();
+
+        // No filter (other than tenant): 5 rows, ordered updated_at DESC.
+        let (all, more_all) = q
+            .list_capability_capsules_in_scope("tenant-a", None, None, None, None, None, None, 100)
+            .await
+            .unwrap();
+        let all_ids: Vec<&str> = all
+            .iter()
+            .map(|m| m.capability_capsule_id.as_str())
+            .collect();
+        assert_eq!(all_ids, vec!["a1", "a4", "a2", "a5", "a3"]);
+        assert!(!more_all);
+
+        // Project filter narrows to 3.
+        let (mem_only, _) = q
+            .list_capability_capsules_in_scope(
+                "tenant-a",
+                Some("mem"),
+                None,
+                None,
+                None,
+                None,
+                None,
+                100,
+            )
+            .await
+            .unwrap();
+        let mem_ids: Vec<&str> = mem_only
+            .iter()
+            .map(|m| m.capability_capsule_id.as_str())
+            .collect();
+        assert_eq!(mem_ids, vec!["a1", "a2", "a3"]);
+
+        // Pagination: limit=2 → first page, cursor → second page.
+        let (page1, has_more) = q
+            .list_capability_capsules_in_scope("tenant-a", None, None, None, None, None, None, 2)
+            .await
+            .unwrap();
+        assert_eq!(page1.len(), 2);
+        assert!(has_more);
+        let last = page1.last().unwrap();
+        let cursor = (
+            last.updated_at.as_str(),
+            last.capability_capsule_id.as_str(),
+        );
+        let (page2, _) = q
+            .list_capability_capsules_in_scope(
+                "tenant-a",
+                None,
+                None,
+                None,
+                None,
+                None,
+                Some(cursor),
+                100,
+            )
+            .await
+            .unwrap();
+        let page2_ids: Vec<&str> = page2
+            .iter()
+            .map(|m| m.capability_capsule_id.as_str())
+            .collect();
+        // Page1 was [a1, a4]; page2 picks up at a2, a5, a3.
+        assert_eq!(page2_ids, vec!["a2", "a5", "a3"]);
+
+        // Cross-tenant isolation: tenant-b returns only b1.
+        let (b, _) = q
+            .list_capability_capsules_in_scope("tenant-b", None, None, None, None, None, None, 100)
+            .await
+            .unwrap();
+        assert_eq!(b.len(), 1);
+        assert_eq!(b[0].capability_capsule_id, "b1");
+    }
+
+    /// `capability_capsule_type=diary` rows are excluded from the
+    /// shared search pool (`hybrid_candidates`), but `list_in_scope`
+    /// with the explicit type filter still surfaces them — that's
+    /// how `agent_diary_read` reaches them.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn diary_excluded_from_hybrid_excluded_from_list_in_scope_when_unset() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("store");
+        let lance = LanceStore::open(&path).await.unwrap();
+
+        // Two rows: one regular Implementation, one Diary entry.
+        let mut diary = fixture("d1", "tenant-a");
+        diary.capability_capsule_type = CapabilityCapsuleType::Diary;
+        diary.content = "scratchpad: tried approach X, didn't work because Y".into();
+        diary.summary = "scratchpad: tried approach X".into();
+        diary.source_agent = "claude-code".into();
+        diary.updated_at = "00000001778000000050".into();
+        let mut regular = fixture("r1", "tenant-a");
+        regular.content = "use bun.lockb for deterministic installs".into();
+        regular.summary = "deterministic installs".into();
+        regular.updated_at = "00000001778000000040".into();
+        for r in [diary, regular] {
+            lance.insert_capability_capsule(r).await.unwrap();
+        }
+
+        let q = DuckDbQuery::open(&path).await.unwrap();
+
+        // Hybrid candidates (BM25 over the shared pool) must not
+        // surface the diary entry.
+        let hits = q
+            .hybrid_candidates("tenant-a", "scratchpad approach", &[], 10)
+            .await
+            .unwrap();
+        let hit_ids: Vec<&str> = hits
+            .iter()
+            .map(|(r, _)| r.capability_capsule_id.as_str())
+            .collect();
+        assert!(
+            !hit_ids.contains(&"d1"),
+            "diary entries must be excluded from hybrid_candidates; got {hit_ids:?}"
+        );
+
+        // list_in_scope without a type filter also drops diary — the
+        // shared pool conventions apply (diary is opt-in only).
+        let (no_filter, _) = q
+            .list_capability_capsules_in_scope("tenant-a", None, None, None, None, None, None, 100)
+            .await
+            .unwrap();
+        let no_filter_ids: Vec<&str> = no_filter
+            .iter()
+            .map(|m| m.capability_capsule_id.as_str())
+            .collect();
+        // The default list_in_scope does NOT auto-exclude diary —
+        // exclusion is enforced in `hybrid_candidates` only. Diary is
+        // visible here so that `agent_diary_read` (which uses this
+        // path with type=diary filter) works.
+        assert!(
+            no_filter_ids.contains(&"d1"),
+            "list_in_scope without filter must include diary so the read tool can find it; got {no_filter_ids:?}"
+        );
+
+        // Explicit type=diary surfaces just the diary.
+        let (diary_only, _) = q
+            .list_capability_capsules_in_scope(
+                "tenant-a",
+                None,
+                None,
+                None,
+                Some("diary"),
+                None,
+                None,
+                100,
+            )
+            .await
+            .unwrap();
+        let d_ids: Vec<&str> = diary_only
+            .iter()
+            .map(|m| m.capability_capsule_id.as_str())
+            .collect();
+        assert_eq!(d_ids, vec!["d1"]);
     }
 }
