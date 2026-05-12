@@ -79,6 +79,7 @@ pub fn workflow_memory_request(
         source_agent: episode.source_agent.clone(),
         idempotency_key: Some(workflow_idempotency_key(&candidate.goal, &candidate.steps)),
         write_mode: WriteMode::Auto,
+        supersedes_capability_capsule_id: None,
     }
 }
 

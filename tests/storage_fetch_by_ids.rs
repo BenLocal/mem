@@ -32,6 +32,7 @@ async fn fetch_by_ids_filters_tenant_and_status() {
         source_agent: "test".into(),
         idempotency_key: None,
         write_mode: WriteMode::Auto,
+        supersedes_capability_capsule_id: None,
     };
     let a = svc.ingest(make("ten-a", "alpha")).await.unwrap();
     let b = svc.ingest(make("ten-b", "beta")).await.unwrap();

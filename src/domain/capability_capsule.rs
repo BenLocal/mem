@@ -137,6 +137,15 @@ pub struct IngestCapabilityCapsuleRequest {
     #[serde(skip_serializing_if = "skip_none")]
     pub idempotency_key: Option<String>,
     pub write_mode: WriteMode,
+    /// Optional supersession link. When set, the new row is written
+    /// with `supersedes_capability_capsule_id` pointing at the
+    /// caller-supplied id; the original row stays in place for audit
+    /// (the canonical "update by writing a new version" path).
+    /// Caller is responsible for separately invalidating any edges
+    /// that the supersession should close — the ingest pipeline does
+    /// not auto-close them.
+    #[serde(default, skip_serializing_if = "skip_none")]
+    pub supersedes_capability_capsule_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]

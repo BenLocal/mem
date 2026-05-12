@@ -124,10 +124,17 @@
 | **#18** ✅ | **浏览路径**：`capability_capsule_list_in_scope(project?, repo?, module?, capability_capsule_type?, status?, cursor, limit)` MCP + HTTP；不需要 embedding 命中即可看 | repo SQL 加 filter + cursor + service + http + mcp | ~4h | P1 — 解决"列 project X 下所有 capsule"的真实需求 |
 | **#19** ✅ | **Agent diary**：MCP `agent_diary_write(caller_agent, content, topic?)` / `_read(caller_agent, last_n)`；底层走 capsule 表 + `capability_capsule_type=diary` + 默认从 search 路径**排除**；read 端按 `source_agent` 过滤 | 1 个新 `CapabilityCapsuleType::Diary` 变体 + 3 处 hybrid_candidates SQL 加 `!= 'diary'` + 2 MCP + retrieve `memory_type_score` 加 Diary→0 兜底 | ~3h | P1 — 解决"agent 自言自语不污染主池" |
 | **#20** ✅ (phase A) | **User tunnels**（caller-curated 跨 scope 链接）：以 `relation` 字符串前缀 `user_tunnel:<label>` 作为约定（不动 schema）；新加 `kg_list_user_tunnels` MCP 用 `relation LIKE 'user_tunnel:%'` 过滤；create / delete 复用 #16 的 `kg_add_edge` / `kg_invalidate_edge` | 1 个新 repo 方法 + service + http + mcp | ~2h | Phase A 落地，避免 schema 迁移；Phase B（`origin` 列 + retrieve boost）继续延后 |
+| **#21** ✅ | **`list_wings` MCP**：列 distinct `project` 的导航工具 | 1 SQL 聚合 + 全栈贯穿 | ~1h | MemPalace `tool_list_wings` 等价 |
+| **#22** ✅ | **`get_taxonomy` MCP**：两级 project → repos 树 | 1 SQL `GROUP BY` + Rust 分组 + 全栈贯穿 | ~1h | MemPalace `tool_get_taxonomy` 等价 |
+| **#23** ✅ | **`kg_find_tunnels` MCP**：按两端 node-id 前缀双向查 user_tunnel | 1 repo SQL（双向 OR）+ 全栈贯穿 | ~2h | MemPalace `tool_find_tunnels(wing_a, wing_b)` 等价 |
+| **#24** ✅ | **`kg_follow_tunnels` MCP**：从一个 node 沿 user_tunnel 边 BFS | 1 repo BFS + 全栈贯穿 | ~1h | MemPalace `tool_follow_tunnels(wing, room)` 等价 |
+| **#25** ✅ | **`capability_capsule_delete` MCP**：硬删，包 HTTP `DELETE /capability_capsules/{id}` | 1 个 MCP wrapper（HTTP 已有） | ~30min | 强警告 destructive；优先 `feedback_kind=incorrect` 走软删 |
+| **#26** ✅ | **`capability_capsule_supersede` MCP**：版本链写入新行，链回原 id | `IngestCapabilityCapsuleRequest` 加可选 `supersedes_capability_capsule_id` + 贯穿 HTTP/service/pipeline；新 MCP wrapper | ~3h | MemPalace `tool_update_drawer` 等价但保留 verbatim 原则——不动旧行 |
+| **#27** ✅ | **`list_in_scope` 加 `source_agent` 服务端过滤** + diary read 改走服务端 | repo SQL 加 `AND source_agent = ?` + 贯穿 | ~1h | 收紧多 agent 共享 tenant 场景下的 diary 隔离 |
 
 ### 决策点
 
-- **现在做**：#16 + #17 一个 PR 落地（KG 这组工具数据全有，最高 ROI），#18 / #19 各一 PR。#20 推迟到 #16–#19 落地后观察。
+- **现在做**：#16–#27 已全部 ✅ 落地（包含 phase A 的 user-tunnels；phase B `origin` 列 + retrieve boost 仍延后）。
 - **不做**：dedup probe（无编号）—— 当前 `idempotency_key` + `content_hash` 已能解决 90% 写入侧 dedup 需求，read-only probe 用 `_search` query=content[:80] 就能近似实现，单独工具回报有限。
 
 ---

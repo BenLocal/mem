@@ -192,6 +192,7 @@ fn content_hash_is_deterministic_for_same_request() {
         source_agent: "api".into(),
         idempotency_key: Some("idem".into()),
         write_mode: WriteMode::Auto,
+        supersedes_capability_capsule_id: None,
     };
 
     let hash = compute_content_hash(&request);

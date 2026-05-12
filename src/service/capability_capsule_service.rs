@@ -210,7 +210,7 @@ impl CapabilityCapsuleService {
             content_hash,
             idempotency_key: request.idempotency_key,
             session_id: Some(session_id.clone()),
-            supersedes_capability_capsule_id: None,
+            supersedes_capability_capsule_id: request.supersedes_capability_capsule_id,
             source_agent: request.source_agent,
             created_at: now.clone(),
             updated_at: now.clone(),
@@ -481,6 +481,21 @@ impl CapabilityCapsuleService {
             .await?)
     }
 
+    /// Distinct project names for `tenant`, alphabetically — the
+    /// list-wings analogue.
+    pub async fn list_wings(&self, tenant: &str) -> Result<Vec<String>, ServiceError> {
+        Ok(self.store.list_wings(tenant).await?)
+    }
+
+    /// Two-level (project → repos) taxonomy. Returns a Vec of
+    /// `(project, repos)` pairs; service-layer pure passthrough.
+    pub async fn get_taxonomy(
+        &self,
+        tenant: &str,
+    ) -> Result<Vec<(String, Vec<String>)>, ServiceError> {
+        Ok(self.store.get_taxonomy(tenant).await?)
+    }
+
     /// Scope-filtered, paginated browse. See repo doc-comment on
     /// `list_capability_capsules_in_scope` for the cursor protocol.
     /// Service-layer guard: `limit` defaults to 50 if 0, capped at 200
@@ -494,6 +509,7 @@ impl CapabilityCapsuleService {
         module: Option<&str>,
         capsule_type: Option<&str>,
         status: Option<&str>,
+        source_agent: Option<&str>,
         cursor: Option<(&str, &str)>,
         limit: usize,
     ) -> Result<(Vec<CapabilityCapsuleRecord>, bool), ServiceError> {
@@ -507,6 +523,7 @@ impl CapabilityCapsuleService {
                 module,
                 capsule_type,
                 status,
+                source_agent,
                 cursor,
                 lim,
             )
@@ -816,6 +833,7 @@ impl CapabilityCapsuleService {
             source_agent: original.source_agent.clone(),
             idempotency_key: None,
             write_mode: crate::domain::capability_capsule::WriteMode::Auto,
+            supersedes_capability_capsule_id: Some(original.capability_capsule_id.clone()),
         };
         let now = current_timestamp();
 
@@ -880,6 +898,29 @@ impl CapabilityCapsuleService {
     ) -> Result<Vec<GraphEdge>, ServiceError> {
         let lim = if limit == 0 { 50 } else { limit };
         Ok(self.store.list_user_tunnels(lim).await?)
+    }
+
+    /// Tunnels whose endpoints match the two node-id prefixes
+    /// (bidirectional). Empty prefix = "any".
+    pub async fn graph_find_tunnels(
+        &self,
+        prefix_a: &str,
+        prefix_b: &str,
+        limit: usize,
+    ) -> Result<Vec<GraphEdge>, ServiceError> {
+        let lim = if limit == 0 { 50 } else { limit };
+        Ok(self.store.find_tunnels(prefix_a, prefix_b, lim).await?)
+    }
+
+    /// BFS from `node_id` following only user-tunnel edges. `max_hops`
+    /// defaults to 1 when 0; storage caps at `MAX_HOPS_CAP = 3`.
+    pub async fn graph_follow_tunnels(
+        &self,
+        node_id: &str,
+        max_hops: u32,
+    ) -> Result<Vec<GraphEdge>, ServiceError> {
+        let hops = if max_hops == 0 { 1 } else { max_hops };
+        Ok(self.store.follow_tunnels(node_id, hops).await?)
     }
 
     /// Whole-graph aggregate counts (`GraphStats`).

@@ -31,6 +31,7 @@ fn ingest_request(content: &str, summary: &str) -> IngestCapabilityCapsuleReques
         source_agent: "test".into(),
         idempotency_key: None,
         write_mode: WriteMode::Auto,
+        supersedes_capability_capsule_id: None,
     }
 }
 

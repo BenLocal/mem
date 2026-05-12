@@ -206,6 +206,7 @@ async fn ingest_for_e2e(
         source_agent: "test".into(),
         idempotency_key: None,
         write_mode: WriteMode::Auto,
+        supersedes_capability_capsule_id: None,
     })
     .await
     .unwrap()

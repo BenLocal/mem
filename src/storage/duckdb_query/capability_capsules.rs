@@ -110,15 +110,96 @@ impl DuckDbQuery {
         .await
     }
 
+    /// Distinct `project` values in `tenant`, ordered alphabetically.
+    /// MemPalace's `tool_list_wings` analogue — a navigation hint
+    /// for MCP clients building a sidebar / tree. NULL projects are
+    /// dropped so the result is always a meaningful name list. Diary
+    /// capsules are included since they participate in the project /
+    /// repo space too (a "diary about project X" is still a thing
+    /// for that project).
+    pub async fn list_wings(&self, tenant: &str) -> Result<Vec<String>, StorageError> {
+        let conn = self.conn.clone();
+        let tenant = tenant.to_string();
+        spawn_blocking_storage(move || {
+            let conn = conn.lock().expect("duckdb_query mutex poisoned");
+            let mut stmt = conn.prepare(
+                "SELECT DISTINCT project FROM ns.main.capability_capsules \
+                 WHERE tenant = ?1 AND project IS NOT NULL \
+                 ORDER BY project",
+            )?;
+            let rows = stmt.query_map(params![tenant], |row| row.get::<_, String>(0))?;
+            let mut out = Vec::new();
+            for r in rows {
+                out.push(r.map_err(StorageError::DuckDb)?);
+            }
+            Ok(out)
+        })
+        .await
+    }
+
+    /// Two-level taxonomy: distinct `(project, repo)` pairs for
+    /// `tenant`, grouped under the project. MemPalace's
+    /// `tool_get_taxonomy` analogue — gives an MCP client the full
+    /// project → repo navigation tree in one round trip. Both project
+    /// and repo NULLs are dropped per the same reasoning as
+    /// `list_wings`.
+    ///
+    /// Output shape: `[(project, Vec<repo>)]`, sorted by project then
+    /// repo. A project with no recorded repo appears as `(project,
+    /// [])`. The flat list is grouped by the caller (service / HTTP
+    /// layer) rather than collated in SQL because DuckDB lacks a
+    /// clean `GROUP_CONCAT` over distinct elements.
+    pub async fn get_taxonomy(
+        &self,
+        tenant: &str,
+    ) -> Result<Vec<(String, Vec<String>)>, StorageError> {
+        let conn = self.conn.clone();
+        let tenant = tenant.to_string();
+        spawn_blocking_storage(move || {
+            let conn = conn.lock().expect("duckdb_query mutex poisoned");
+            let mut stmt = conn.prepare(
+                "SELECT project, repo FROM ns.main.capability_capsules \
+                 WHERE tenant = ?1 AND project IS NOT NULL \
+                 GROUP BY project, repo \
+                 ORDER BY project, repo",
+            )?;
+            let rows = stmt.query_map(params![tenant], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?))
+            })?;
+            let mut grouped: Vec<(String, Vec<String>)> = Vec::new();
+            for r in rows {
+                let (project, repo) = r.map_err(StorageError::DuckDb)?;
+                match grouped.last_mut() {
+                    Some(last) if last.0 == project => {
+                        if let Some(r) = repo {
+                            last.1.push(r);
+                        }
+                    }
+                    _ => {
+                        let repos = repo.map(|r| vec![r]).unwrap_or_default();
+                        grouped.push((project, repos));
+                    }
+                }
+            }
+            Ok(grouped)
+        })
+        .await
+    }
+
     /// Scope-filtered browse path: capsules in `tenant` matching any
     /// subset of `(project, repo, module, capability_capsule_type,
-    /// status)`, ordered `(updated_at DESC, capability_capsule_id
-    /// ASC)`, paginated by the composite cursor
+    /// status, source_agent)`, ordered `(updated_at DESC,
+    /// capability_capsule_id ASC)`, paginated by the composite cursor
     /// `(updated_at, capability_capsule_id)`. Unlike
     /// `hybrid_candidates` this is **embedding-free** — caller browses
     /// by scope, no query text or vector required. Use when the
     /// caller wants to enumerate everything under `project=X`
     /// regardless of search hit relevance.
+    ///
+    /// `source_agent` is the lever the agent-diary read tool uses to
+    /// scope diary entries to one caller — passing both
+    /// `capsule_type="diary"` and `source_agent="claude-code"` returns
+    /// only that agent's notebook.
     ///
     /// Each filter is optional; a `None` filter is a no-op (does not
     /// require the column to be NULL). Limit clamped 1..=200 inside
@@ -134,6 +215,7 @@ impl DuckDbQuery {
         module: Option<&str>,
         capsule_type: Option<&str>,
         status: Option<&str>,
+        source_agent: Option<&str>,
         cursor: Option<(&str, &str)>,
         limit: usize,
     ) -> Result<(Vec<CapabilityCapsuleRecord>, bool), StorageError> {
@@ -144,6 +226,7 @@ impl DuckDbQuery {
         let module = module.map(str::to_owned);
         let capsule_type = capsule_type.map(str::to_owned);
         let status = status.map(str::to_owned);
+        let source_agent = source_agent.map(str::to_owned);
         let cursor: Option<(String, String)> =
             cursor.map(|(updated_at, id)| (updated_at.to_owned(), id.to_owned()));
         let lim = i64::try_from(limit.clamp(1, 200)).unwrap_or(50);
@@ -175,6 +258,10 @@ impl DuckDbQuery {
             }
             if let Some(v) = status {
                 sql.push_str(&format!(" AND status = ?{}", params_vec.len() + 1));
+                params_vec.push(Box::new(v));
+            }
+            if let Some(v) = source_agent {
+                sql.push_str(&format!(" AND source_agent = ?{}", params_vec.len() + 1));
                 params_vec.push(Box::new(v));
             }
             if let Some((cur_updated, cur_id)) = cursor {
@@ -1329,7 +1416,9 @@ mod tests {
 
         // No filter (other than tenant): 5 rows, ordered updated_at DESC.
         let (all, more_all) = q
-            .list_capability_capsules_in_scope("tenant-a", None, None, None, None, None, None, 100)
+            .list_capability_capsules_in_scope(
+                "tenant-a", None, None, None, None, None, None, None, 100,
+            )
             .await
             .unwrap();
         let all_ids: Vec<&str> = all
@@ -1349,6 +1438,7 @@ mod tests {
                 None,
                 None,
                 None,
+                None,
                 100,
             )
             .await
@@ -1361,7 +1451,9 @@ mod tests {
 
         // Pagination: limit=2 → first page, cursor → second page.
         let (page1, has_more) = q
-            .list_capability_capsules_in_scope("tenant-a", None, None, None, None, None, None, 2)
+            .list_capability_capsules_in_scope(
+                "tenant-a", None, None, None, None, None, None, None, 2,
+            )
             .await
             .unwrap();
         assert_eq!(page1.len(), 2);
@@ -1374,6 +1466,7 @@ mod tests {
         let (page2, _) = q
             .list_capability_capsules_in_scope(
                 "tenant-a",
+                None,
                 None,
                 None,
                 None,
@@ -1393,7 +1486,9 @@ mod tests {
 
         // Cross-tenant isolation: tenant-b returns only b1.
         let (b, _) = q
-            .list_capability_capsules_in_scope("tenant-b", None, None, None, None, None, None, 100)
+            .list_capability_capsules_in_scope(
+                "tenant-b", None, None, None, None, None, None, None, 100,
+            )
             .await
             .unwrap();
         assert_eq!(b.len(), 1);
@@ -1445,7 +1540,9 @@ mod tests {
         // list_in_scope without a type filter also drops diary — the
         // shared pool conventions apply (diary is opt-in only).
         let (no_filter, _) = q
-            .list_capability_capsules_in_scope("tenant-a", None, None, None, None, None, None, 100)
+            .list_capability_capsules_in_scope(
+                "tenant-a", None, None, None, None, None, None, None, 100,
+            )
             .await
             .unwrap();
         let no_filter_ids: Vec<&str> = no_filter
@@ -1469,6 +1566,7 @@ mod tests {
                 None,
                 None,
                 Some("diary"),
+                None,
                 None,
                 None,
                 100,

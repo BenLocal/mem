@@ -140,6 +140,136 @@ impl DuckDbQuery {
         .await
     }
 
+    /// Caller-curated edges where both endpoints' node_id starts with
+    /// the given prefixes — the parallel of MemPalace's
+    /// `tool_find_tunnels(wing_a, wing_b)`. The directionality is
+    /// **bidirectional**: an edge with `from` matching `prefix_a` AND
+    /// `to` matching `prefix_b` qualifies, AS DOES the reverse pair
+    /// (`from`→`prefix_b`, `to`→`prefix_a`). Active user-tunnel only.
+    ///
+    /// `prefix_a` / `prefix_b` are caller-supplied node-id prefixes
+    /// such as `capability_capsule:`, `entity:`, `topic:project_x`,
+    /// or specific full ids. Use empty string for "any". Both being
+    /// empty is equivalent to a broad [`Self::list_user_tunnels`].
+    pub async fn find_tunnels(
+        &self,
+        prefix_a: &str,
+        prefix_b: &str,
+        limit: usize,
+    ) -> Result<Vec<GraphEdge>, GraphError> {
+        let conn = self.conn.clone();
+        let prefix_a = format!("{prefix_a}%");
+        let prefix_b = format!("{prefix_b}%");
+        let lim = i64::try_from(limit.clamp(1, 200)).unwrap_or(50);
+        spawn_blocking_graph(move || {
+            let conn = conn.lock().expect("duckdb_query mutex poisoned");
+            // (from LIKE A AND to LIKE B) OR (from LIKE B AND to LIKE A)
+            // covers both directions; we de-dupe via the SET shape
+            // below (HashSet on the tuple) in case prefix_a == prefix_b.
+            let mut stmt = conn.prepare(
+                "SELECT from_node_id, to_node_id, relation, valid_from, valid_to \
+                 FROM ns.main.graph_edges \
+                 WHERE relation LIKE 'user_tunnel:%' AND valid_to IS NULL \
+                   AND ((from_node_id LIKE ?1 AND to_node_id LIKE ?2) \
+                     OR (from_node_id LIKE ?2 AND to_node_id LIKE ?1)) \
+                 ORDER BY relation, from_node_id, to_node_id \
+                 LIMIT ?3",
+            )?;
+            let rows = stmt.query_map(params![prefix_a, prefix_b, lim], row_to_graph_edge)?;
+            let mut seen: std::collections::HashSet<(String, String, String, String)> =
+                std::collections::HashSet::new();
+            let mut out = Vec::new();
+            for r in rows {
+                let e = r?;
+                let key = (
+                    e.from_node_id.clone(),
+                    e.to_node_id.clone(),
+                    e.relation.clone(),
+                    e.valid_from.clone(),
+                );
+                if seen.insert(key) {
+                    out.push(e);
+                }
+            }
+            Ok(out)
+        })
+        .await
+    }
+
+    /// BFS from `node_id` following **only** user-tunnel edges
+    /// (`relation LIKE 'user_tunnel:%'`), up to `max_hops` (cap 3).
+    /// Active only — closed tunnels are skipped. Returns the edge
+    /// set (sorted `(relation, from, to)`) rather than the node set
+    /// so callers can render the tunnel labels.
+    ///
+    /// Use when starting from a known node (e.g. a capsule the user
+    /// is reading) and wanting to surface the user-curated bridges
+    /// outward — distinct from `neighbors_within`, which walks all
+    /// active edges including auto-extracted ones.
+    pub async fn follow_tunnels(
+        &self,
+        node_id: &str,
+        max_hops: u32,
+    ) -> Result<Vec<GraphEdge>, GraphError> {
+        let hops = max_hops.clamp(1, MAX_HOPS_CAP);
+        let conn = self.conn.clone();
+        let start = node_id.to_string();
+        spawn_blocking_graph(move || {
+            let conn = conn.lock().expect("duckdb_query mutex poisoned");
+            let mut visited: std::collections::HashSet<String> =
+                std::collections::HashSet::from([start.clone()]);
+            let mut frontier: Vec<String> = vec![start];
+            let mut edges: std::collections::HashMap<(String, String, String, String), GraphEdge> =
+                std::collections::HashMap::new();
+
+            for _ in 0..hops {
+                if frontier.is_empty() {
+                    break;
+                }
+                let mut next_frontier: Vec<String> = Vec::new();
+                for node in frontier.drain(..) {
+                    let mut stmt = conn.prepare(
+                        "SELECT from_node_id, to_node_id, relation, valid_from, valid_to \
+                         FROM ns.main.graph_edges \
+                         WHERE (from_node_id = ?1 OR to_node_id = ?1) \
+                           AND relation LIKE 'user_tunnel:%' \
+                           AND valid_to IS NULL",
+                    )?;
+                    let rows = stmt.query_map(params![node], row_to_graph_edge)?;
+                    for r in rows {
+                        let edge = r?;
+                        let key = (
+                            edge.from_node_id.clone(),
+                            edge.to_node_id.clone(),
+                            edge.relation.clone(),
+                            edge.valid_from.clone(),
+                        );
+                        edges.entry(key).or_insert_with(|| edge.clone());
+                        for endpoint in [&edge.from_node_id, &edge.to_node_id] {
+                            if !visited.contains(endpoint.as_str()) {
+                                if visited.len() >= NEIGHBORS_VISITED_CAP {
+                                    continue;
+                                }
+                                visited.insert(endpoint.clone());
+                                next_frontier.push(endpoint.clone());
+                            }
+                        }
+                    }
+                }
+                frontier = next_frontier;
+            }
+            let mut out: Vec<GraphEdge> = edges.into_values().collect();
+            out.sort_by(|a, b| {
+                a.relation
+                    .cmp(&b.relation)
+                    .then_with(|| a.from_node_id.cmp(&b.from_node_id))
+                    .then_with(|| a.to_node_id.cmp(&b.to_node_id))
+            });
+            Ok(out)
+        })
+        .await
+    }
+
     /// Caller-curated graph edges — by convention these are written
     /// with `relation` prefixed `user_tunnel:` (the rest of `relation`
     /// is the human-readable label). Distinct from auto-extracted

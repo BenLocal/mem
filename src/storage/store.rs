@@ -406,6 +406,17 @@ impl Store {
         self.query.list_capability_capsules_for_tenant(tenant).await
     }
 
+    pub async fn list_wings(&self, tenant: &str) -> Result<Vec<String>, StorageError> {
+        self.query.list_wings(tenant).await
+    }
+
+    pub async fn get_taxonomy(
+        &self,
+        tenant: &str,
+    ) -> Result<Vec<(String, Vec<String>)>, StorageError> {
+        self.query.get_taxonomy(tenant).await
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub async fn list_capability_capsules_in_scope(
         &self,
@@ -415,6 +426,7 @@ impl Store {
         module: Option<&str>,
         capsule_type: Option<&str>,
         status: Option<&str>,
+        source_agent: Option<&str>,
         cursor: Option<(&str, &str)>,
         limit: usize,
     ) -> Result<(Vec<CapabilityCapsuleRecord>, bool), StorageError> {
@@ -426,6 +438,7 @@ impl Store {
                 module,
                 capsule_type,
                 status,
+                source_agent,
                 cursor,
                 limit,
             )
@@ -994,6 +1007,23 @@ impl Store {
 
     pub async fn list_user_tunnels(&self, limit: usize) -> Result<Vec<GraphEdge>, GraphError> {
         self.query.list_user_tunnels(limit).await
+    }
+
+    pub async fn find_tunnels(
+        &self,
+        prefix_a: &str,
+        prefix_b: &str,
+        limit: usize,
+    ) -> Result<Vec<GraphEdge>, GraphError> {
+        self.query.find_tunnels(prefix_a, prefix_b, limit).await
+    }
+
+    pub async fn follow_tunnels(
+        &self,
+        node_id: &str,
+        max_hops: u32,
+    ) -> Result<Vec<GraphEdge>, GraphError> {
+        self.query.follow_tunnels(node_id, max_hops).await
     }
 
     pub async fn graph_stats(

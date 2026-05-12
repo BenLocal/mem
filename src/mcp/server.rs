@@ -123,6 +123,53 @@ pub struct CapabilityCapsuleSearchContextualArgs {
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct CapabilityCapsuleDeleteArgs {
+    pub capability_capsule_id: String,
+    #[serde(default)]
+    pub tenant: Option<String>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct CapabilityCapsuleSupersedeArgs {
+    /// The original capsule that's being superseded. Required.
+    pub supersedes_capability_capsule_id: String,
+    /// One of: implementation | experience | preference | episode |
+    /// workflow | diary. Usually matches the original capsule's type.
+    pub capability_capsule_type: String,
+    /// Verbatim replacement content. The original row stays in place
+    /// (audit trail); the new row links back via
+    /// `supersedes_capability_capsule_id` and forms the next version.
+    pub content: String,
+    #[serde(default)]
+    pub summary: Option<String>,
+    /// One of: global | project | repo | workspace. Usually inherits
+    /// from the original.
+    pub scope: String,
+    #[serde(default)]
+    pub visibility: Option<String>,
+    #[serde(default)]
+    pub evidence: Option<Vec<String>>,
+    #[serde(default)]
+    pub code_refs: Option<Vec<String>>,
+    #[serde(default)]
+    pub project: Option<String>,
+    #[serde(default)]
+    pub repo: Option<String>,
+    #[serde(default)]
+    pub module: Option<String>,
+    #[serde(default)]
+    pub task_type: Option<String>,
+    #[serde(default)]
+    pub tags: Option<Vec<String>>,
+    #[serde(default)]
+    pub topics: Option<Vec<String>>,
+    #[serde(default)]
+    pub source_agent: Option<String>,
+    #[serde(default)]
+    pub tenant: Option<String>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct CapabilityCapsuleIngestArgs {
     #[serde(default)]
     pub tenant: Option<String>,
@@ -156,6 +203,12 @@ pub struct CapabilityCapsuleIngestArgs {
     /// One of: auto | propose. Default "auto".
     #[serde(default)]
     pub write_mode: Option<String>,
+    /// Optional supersession link. When set, this row becomes the
+    /// "next version" of the prior capsule (the original stays for
+    /// audit, version-chain reads link both). Equivalent to calling
+    /// `capability_capsule_supersede` directly.
+    #[serde(default)]
+    pub supersedes_capability_capsule_id: Option<String>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -395,6 +448,11 @@ pub struct ListInScopeArgs {
     /// One of: provisional | active | pending_confirmation | archived | rejected.
     #[serde(default)]
     pub status: Option<String>,
+    /// Restrict to one writer agent (matches the row's `source_agent`).
+    /// `capability_capsule_agent_diary_read` uses this to keep one
+    /// caller's notebook isolated when multiple agents share a tenant.
+    #[serde(default)]
+    pub source_agent: Option<String>,
     /// Page cursor from a prior response's `next_cursor` (`{updated_at, capability_capsule_id}`).
     #[serde(default)]
     pub cursor: Option<ListInScopeCursorArg>,
@@ -440,6 +498,31 @@ pub struct KgListUserTunnelsArgs {
     /// Default 50, max 200.
     #[serde(default)]
     pub limit: Option<usize>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct KgFindTunnelsArgs {
+    /// Node-id prefix on one endpoint (e.g. `capability_capsule:`, `entity:e_alpha`,
+    /// `topic:project_mem`). Empty / omitted = "any".
+    #[serde(default)]
+    pub prefix_a: Option<String>,
+    /// Node-id prefix on the other endpoint; bidirectional with
+    /// `prefix_a` — a tunnel with `from` matching A and `to` matching
+    /// B counts, AND the reverse.
+    #[serde(default)]
+    pub prefix_b: Option<String>,
+    /// Default 50, max 200.
+    #[serde(default)]
+    pub limit: Option<usize>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct KgFollowTunnelsArgs {
+    pub node_id: String,
+    /// Default 1 (single hop along tunnels). Cap 3, same as
+    /// `capability_capsule_graph_neighbors`.
+    #[serde(default)]
+    pub max_hops: Option<u32>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -828,6 +911,9 @@ impl MemMcpServer {
         if let Some(v) = args.idempotency_key {
             body.insert("idempotency_key".into(), json!(v));
         }
+        if let Some(v) = args.supersedes_capability_capsule_id {
+            body.insert("supersedes_capability_capsule_id".into(), json!(v));
+        }
         let content = args.content.clone();
         match self
             .client
@@ -998,6 +1084,89 @@ impl MemMcpServer {
             encode_segment(&args.capability_capsule_id)
         );
         self.get_with_query(&path, &[("tenant", tenant)]).await
+    }
+
+    // ------------------- capability_capsule_delete -------------------
+    #[tool(
+        description = "Hard-delete a capsule and its references. **Irreversible.** Prefer `capability_capsule_feedback` with `feedback_kind=incorrect` for the soft path (status → Archived, row retained for audit) — use hard delete only when the row must physically disappear (e.g. accidental secret leak). MemPalace's `tool_delete_drawer` analogue; mem's HTTP `DELETE /capability_capsules/{id}` was previously HTTP-only."
+    )]
+    async fn capability_capsule_delete(
+        &self,
+        Parameters(args): Parameters<CapabilityCapsuleDeleteArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        let tenant = self.resolve_tenant(args.tenant.as_ref());
+        let path = format!(
+            "capability_capsules/{}",
+            encode_segment(&args.capability_capsule_id)
+        );
+        // Use a manual DELETE request — `get_with_query` is GET, and
+        // the harness has no generic delete helper.
+        match self
+            .client
+            .request_json_with_query::<Value>(Method::DELETE, &path, None, &[("tenant", tenant)])
+            .await
+        {
+            Ok(v) => Ok(ok_json(&v)),
+            Err(e) => Ok(err_text(e.to_string())),
+        }
+    }
+
+    // ------------------- capability_capsule_supersede -------------------
+    #[tool(
+        description = "Write a new version of an existing capsule. The original row stays in place for audit; the new row links back via `supersedes_capability_capsule_id`, and version-chain reads surface both. MemPalace's `tool_update_drawer` analogue — but instead of mutating the existing row in place (which would violate mem's verbatim rule), supersession appends a new row with the corrected content. Required: the original `capability_capsule_id`, replacement `content`, plus the standard `capability_capsule_type` and `scope` fields. Optional fields default to the equivalent on `capability_capsule_ingest`. Edge closure is NOT automatic — invoke `capability_capsule_kg_invalidate_edge` separately if a previous edge should be retired together with the old content."
+    )]
+    async fn capability_capsule_supersede(
+        &self,
+        Parameters(args): Parameters<CapabilityCapsuleSupersedeArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        let mut body = Map::new();
+        body.insert(
+            "tenant".into(),
+            json!(self.resolve_tenant(args.tenant.as_ref())),
+        );
+        body.insert(
+            "capability_capsule_type".into(),
+            json!(args.capability_capsule_type),
+        );
+        body.insert("content".into(), json!(args.content));
+        body.insert("scope".into(), json!(args.scope));
+        body.insert(
+            "visibility".into(),
+            json!(args.visibility.unwrap_or_else(|| "private".to_string())),
+        );
+        body.insert("evidence".into(), json!(args.evidence.unwrap_or_default()));
+        body.insert(
+            "code_refs".into(),
+            json!(args.code_refs.unwrap_or_default()),
+        );
+        body.insert("tags".into(), json!(args.tags.unwrap_or_default()));
+        body.insert("topics".into(), json!(args.topics.unwrap_or_default()));
+        body.insert(
+            "source_agent".into(),
+            json!(args.source_agent.unwrap_or_else(|| "mem-mcp".to_string())),
+        );
+        body.insert("write_mode".into(), json!("auto"));
+        body.insert(
+            "supersedes_capability_capsule_id".into(),
+            json!(args.supersedes_capability_capsule_id),
+        );
+        if let Some(v) = args.summary {
+            body.insert("summary".into(), json!(v));
+        }
+        if let Some(v) = args.project {
+            body.insert("project".into(), json!(v));
+        }
+        if let Some(v) = args.repo {
+            body.insert("repo".into(), json!(v));
+        }
+        if let Some(v) = args.module {
+            body.insert("module".into(), json!(v));
+        }
+        if let Some(v) = args.task_type {
+            body.insert("task_type".into(), json!(v));
+        }
+        self.post_json("capability_capsules", &Value::Object(body))
+            .await
     }
 
     // ------------------- capability_capsule_feedback -------------------
@@ -1233,6 +1402,32 @@ impl MemMcpServer {
             .await
     }
 
+    // ------------------- capability_capsule_list_wings -------------------
+    #[tool(
+        description = "List distinct `project` names visible in the tenant, alphabetically sorted. MCP equivalent of MemPalace's `tool_list_wings` — a navigation hint for clients building a sidebar / project picker. NULL projects (capsules with no project tag) are dropped from the list, so every entry is a real project name. Pair with `capability_capsule_get_taxonomy` for the full project → repos tree."
+    )]
+    async fn capability_capsule_list_wings(
+        &self,
+        Parameters(args): Parameters<TenantOnlyArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        let tenant = self.resolve_tenant(args.tenant.as_ref());
+        self.get_with_query("capability_capsules/wings", &[("tenant", tenant)])
+            .await
+    }
+
+    // ------------------- capability_capsule_get_taxonomy -------------------
+    #[tool(
+        description = "Return the two-level project → repos taxonomy for the tenant in one round trip, sorted by project then repo. Each entry is `{project, repos: [...]}` — a project with no recorded repos appears as `{project, repos: []}`. MCP equivalent of MemPalace's `tool_get_taxonomy`. Use to render a navigation tree without first round-tripping `list_wings` then a `list_in_scope` per project."
+    )]
+    async fn capability_capsule_get_taxonomy(
+        &self,
+        Parameters(args): Parameters<TenantOnlyArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        let tenant = self.resolve_tenant(args.tenant.as_ref());
+        self.get_with_query("capability_capsules/taxonomy", &[("tenant", tenant)])
+            .await
+    }
+
     // ------------------- capability_capsule_list_in_scope -------------------
     #[tool(
         description = "Browse capsules by scope (project / repo / module / type / status) without an embedding query. Use when the caller wants 'show me everything under project X' rather than 'find the most relevant capsules for query Y'. Paginated by `(updated_at, capability_capsule_id)` cursor. Default limit 50, max 200. Each filter is optional and AND-combined. Returns `{capability_capsules, next_cursor, has_more}`."
@@ -1260,6 +1455,9 @@ impl MemMcpServer {
         }
         if let Some(v) = args.status {
             body.insert("status".into(), json!(v));
+        }
+        if let Some(v) = args.source_agent {
+            body.insert("source_agent".into(), json!(v));
         }
         if let Some(v) = args.cursor {
             body.insert("cursor".into(), json!(v));
@@ -1309,44 +1507,20 @@ impl MemMcpServer {
         &self,
         Parameters(args): Parameters<AgentDiaryReadArgs>,
     ) -> Result<CallToolResult, McpError> {
-        // diary entries are stored as regular capsules but filtered
-        // out of search by SQL — list_in_scope intentionally has no
-        // diary exclusion, so passing capability_capsule_type=diary
-        // is what surfaces them. source_agent must match server-side;
-        // we encode it via the (yet to be added) source_agent filter.
-        // For now, pull everything of type=diary and filter
-        // source_agent client-side from the response list.
+        // Diary entries live in `capability_capsules` like anything
+        // else but are excluded from `capability_capsule_search` by
+        // SQL filter. Reading them goes through `list_in_scope` with
+        // both `capability_capsule_type=diary` and the caller's own
+        // `source_agent` — the latter prevents one agent's notes from
+        // leaking into another's read.
         let limit = args.last_n.unwrap_or(20).clamp(1, 200);
         let body = json!({
             "tenant": self.resolve_tenant(args.tenant.as_ref()),
             "capability_capsule_type": "diary",
+            "source_agent": args.caller_agent,
             "limit": limit,
         });
-        // Use post_json_with_filter so we can drop entries that
-        // belong to a different caller_agent. The base list endpoint
-        // doesn't (yet) take `source_agent` as a filter — that's a
-        // follow-up. Until then, we over-fetch and filter.
-        match self
-            .client
-            .request_json::<Value>(Method::POST, "capability_capsules/list", Some(&body))
-            .await
-        {
-            Ok(mut v) => {
-                if let Some(arr) = v
-                    .get_mut("capability_capsules")
-                    .and_then(|x| x.as_array_mut())
-                {
-                    arr.retain(|c| {
-                        c.get("source_agent")
-                            .and_then(|s| s.as_str())
-                            .map(|s| s == args.caller_agent)
-                            .unwrap_or(false)
-                    });
-                }
-                Ok(ok_json(&v))
-            }
-            Err(e) => Ok(err_text(e.to_string())),
-        }
+        self.post_json("capability_capsules/list", &body).await
     }
 
     // ------------------- capability_capsule_kg_list_user_tunnels -------------------
@@ -1360,6 +1534,41 @@ impl MemMcpServer {
         let limit = args.limit.unwrap_or(50).clamp(1, 200);
         self.get_with_query("graph/tunnels", &[("limit", limit.to_string())])
             .await
+    }
+
+    // ------------------- capability_capsule_kg_find_tunnels -------------------
+    #[tool(
+        description = "Find user-curated tunnels (`relation LIKE 'user_tunnel:%'`) whose endpoints match the two given node-id prefixes. Bidirectional: a tunnel `A→B` is returned for both `(prefix_a, prefix_b)` and `(prefix_b, prefix_a)` argument orders. Use to enumerate cross-scope bridges (e.g. `prefix_a=topic:project_mem`, `prefix_b=topic:project_aiclass`). Empty prefix matches anything. MemPalace equivalent: `tool_find_tunnels(wing_a, wing_b)`."
+    )]
+    async fn capability_capsule_kg_find_tunnels(
+        &self,
+        Parameters(args): Parameters<KgFindTunnelsArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        let limit = args.limit.unwrap_or(50).clamp(1, 200);
+        let mut query: Vec<(&str, String)> = vec![("limit", limit.to_string())];
+        if let Some(v) = args.prefix_a {
+            query.push(("prefix_a", v));
+        }
+        if let Some(v) = args.prefix_b {
+            query.push(("prefix_b", v));
+        }
+        self.get_with_query("graph/tunnels/find", &query).await
+    }
+
+    // ------------------- capability_capsule_kg_follow_tunnels -------------------
+    #[tool(
+        description = "BFS from `node_id` following ONLY user-tunnel edges (`relation LIKE 'user_tunnel:%'`), up to `max_hops` (default 1, cap 3). Active edges only — closed tunnels skipped. Use to walk outward from a known node along caller-curated bridges (distinct from `capability_capsule_graph_neighbors`, which walks every active edge including auto-extracted ones). MemPalace equivalent: `tool_follow_tunnels`."
+    )]
+    async fn capability_capsule_kg_follow_tunnels(
+        &self,
+        Parameters(args): Parameters<KgFollowTunnelsArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        let path = format!("graph/tunnels/follow/{}", encode_segment(&args.node_id));
+        let mut query: Vec<(&str, String)> = Vec::new();
+        if let Some(h) = args.max_hops {
+            query.push(("max_hops", h.to_string()));
+        }
+        self.get_with_query(&path, &query).await
     }
 
     // ------------------- transcript_session_get -------------------

@@ -17,6 +17,8 @@ pub fn router() -> Router<AppState> {
         .route("/graph/timeline/{node_id}", get(graph_timeline))
         .route("/graph/stats", get(graph_stats))
         .route("/graph/tunnels", get(graph_list_user_tunnels))
+        .route("/graph/tunnels/find", get(graph_find_tunnels))
+        .route("/graph/tunnels/follow/{node_id}", get(graph_follow_tunnels))
         .route("/graph/edges", post(graph_add_edge))
         .route("/graph/edges/invalidate", post(graph_invalidate_edge))
 }
@@ -81,6 +83,49 @@ async fn graph_list_user_tunnels(
     Ok(Json(
         app.capability_capsule_service
             .graph_list_user_tunnels(q.limit.unwrap_or(50))
+            .await?,
+    ))
+}
+
+#[derive(Debug, Deserialize, Default)]
+pub struct FindTunnelsQuery {
+    #[serde(default)]
+    pub prefix_a: Option<String>,
+    #[serde(default)]
+    pub prefix_b: Option<String>,
+    #[serde(default)]
+    pub limit: Option<usize>,
+}
+
+async fn graph_find_tunnels(
+    State(app): State<AppState>,
+    Query(q): Query<FindTunnelsQuery>,
+) -> Result<Json<Vec<GraphEdge>>, AppError> {
+    Ok(Json(
+        app.capability_capsule_service
+            .graph_find_tunnels(
+                q.prefix_a.as_deref().unwrap_or(""),
+                q.prefix_b.as_deref().unwrap_or(""),
+                q.limit.unwrap_or(50),
+            )
+            .await?,
+    ))
+}
+
+#[derive(Debug, Deserialize, Default)]
+pub struct FollowTunnelsQuery {
+    #[serde(default)]
+    pub max_hops: Option<u32>,
+}
+
+async fn graph_follow_tunnels(
+    State(app): State<AppState>,
+    axum::extract::Path(node_id): axum::extract::Path<String>,
+    Query(q): Query<FollowTunnelsQuery>,
+) -> Result<Json<Vec<GraphEdge>>, AppError> {
+    Ok(Json(
+        app.capability_capsule_service
+            .graph_follow_tunnels(&node_id, q.max_hops.unwrap_or(1))
             .await?,
     ))
 }

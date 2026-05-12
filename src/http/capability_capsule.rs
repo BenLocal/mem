@@ -37,6 +37,8 @@ pub fn router() -> Router<AppState> {
             "/capability_capsules/list",
             post(list_capability_capsules_in_scope),
         )
+        .route("/capability_capsules/wings", get(list_wings))
+        .route("/capability_capsules/taxonomy", get(get_taxonomy))
         .route("/capability_capsules/feedback", post(submit_feedback))
         .route(
             "/capability_capsules/{id}",
@@ -74,6 +76,39 @@ async fn list_capability_capsules(
     ))
 }
 
+async fn list_wings(
+    State(app): State<AppState>,
+    Query(query): Query<CapabilityCapsuleListQuery>,
+) -> Result<Json<Vec<String>>, AppError> {
+    Ok(Json(
+        app.capability_capsule_service
+            .list_wings(&query.tenant)
+            .await?,
+    ))
+}
+
+#[derive(Debug, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+struct TaxonomyWing {
+    project: String,
+    repos: Vec<String>,
+}
+
+async fn get_taxonomy(
+    State(app): State<AppState>,
+    Query(query): Query<CapabilityCapsuleListQuery>,
+) -> Result<Json<Vec<TaxonomyWing>>, AppError> {
+    let raw = app
+        .capability_capsule_service
+        .get_taxonomy(&query.tenant)
+        .await?;
+    let wings: Vec<TaxonomyWing> = raw
+        .into_iter()
+        .map(|(project, repos)| TaxonomyWing { project, repos })
+        .collect();
+    Ok(Json(wings))
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "snake_case")]
 struct ListInScopeRequest {
@@ -89,6 +124,11 @@ struct ListInScopeRequest {
     capability_capsule_type: Option<String>,
     #[serde(default)]
     status: Option<String>,
+    /// Restrict to one writer agent (the field stored as `source_agent`
+    /// on the capsule). Combined with `capability_capsule_type=diary`
+    /// this is the path `capability_capsule_agent_diary_read` uses.
+    #[serde(default)]
+    source_agent: Option<String>,
     #[serde(default)]
     cursor: Option<ListInScopeCursor>,
     #[serde(default)]
@@ -128,6 +168,7 @@ async fn list_capability_capsules_in_scope(
             req.module.as_deref(),
             req.capability_capsule_type.as_deref(),
             req.status.as_deref(),
+            req.source_agent.as_deref(),
             cursor_ref,
             req.limit.unwrap_or(50),
         )
@@ -181,6 +222,14 @@ struct HttpIngestMemoryRequest {
     idempotency_key: Option<String>,
     #[serde(default)]
     write_mode: WriteMode,
+    /// Optional supersession link (caller passes the prior capsule's
+    /// id). The new row keeps `supersedes_capability_capsule_id`
+    /// pointing back at the original; audit / version-chain reads
+    /// surface both. Edge closure is not automatic — use
+    /// `kg_invalidate_edge` if you also want to close edges from the
+    /// previous version.
+    #[serde(default)]
+    supersedes_capability_capsule_id: Option<String>,
 }
 
 impl From<HttpIngestMemoryRequest> for IngestCapabilityCapsuleRequest {
@@ -203,6 +252,7 @@ impl From<HttpIngestMemoryRequest> for IngestCapabilityCapsuleRequest {
             source_agent: request.source_agent,
             idempotency_key: request.idempotency_key,
             write_mode: request.write_mode,
+            supersedes_capability_capsule_id: request.supersedes_capability_capsule_id,
         }
     }
 }
