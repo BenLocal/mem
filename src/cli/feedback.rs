@@ -4,13 +4,21 @@
 //! actually consumed by the agent, and POST
 //! `/capability_capsules/feedback` for each.
 //!
-//! Heuristic for "consumed": the memory's `text` (returned in the
-//! `directives` / `relevant_facts` / `reusable_patterns` sections of the
-//! search response) starts with a 40-char prefix that appears verbatim in
-//! a *subsequent* assistant `text`/`thinking` block. False negatives on
-//! paraphrased usage are accepted; false positives on `applies_here`
-//! (+0.05 confidence) are mild — design favors false-negatives so the
-//! signal stays trustworthy.
+//! Heuristic for "consumed": tokenize both the memory's `text` (from
+//! the `directives` / `relevant_facts` / `reusable_patterns` sections
+//! of the search response) and any *subsequent* assistant
+//! `text`/`thinking` block, count distinct shared tokens, and accept
+//! as consumed when ≥`HIT_THRESHOLD` (3) match. Tokens are produced by
+//! [`fingerprint`]: ASCII alphanumeric runs ≥4 chars are kept whole;
+//! CJK runs emit 2-char n-grams to handle no-whitespace languages.
+//! This is intentionally paraphrase-tolerant: an agent that quotes
+//! "DuckDB" + "MVCC" + "concurrency" from a memory triggers a hit
+//! even when the surrounding prose is reworded.
+//!
+//! Trade-off, per design: `applies_here` is +0.05 confidence, so the
+//! occasional false positive is mild. The replaced heuristic
+//! (verbatim 40-char prefix substring) was too strict — agents
+//! almost never quote 40 chars verbatim, so the signal rarely fired.
 //!
 //! Default kind is `applies_here`. Negative kinds (`outdated`,
 //! `incorrect`, `does_not_apply_here`) are out of scope for this hook —
@@ -58,10 +66,26 @@ fn is_capsule_search_tool(name: &str) -> bool {
     )
 }
 
-/// Snippet length used for the substring match. Long enough that a hit
-/// is unlikely to be coincidental, short enough that minor tail edits
-/// (whitespace, punctuation) don't break detection.
-const SNIPPET_CHARS: usize = 40;
+/// Minimum char count for a kept ASCII-alphanumeric run. Shorter
+/// (1-3 char) tokens are mostly stopwords / particles and would
+/// dominate false positives.
+const ASCII_TOKEN_MIN: usize = 4;
+
+/// Window size for CJK-run n-grams. 2 chars per gram is the sweet
+/// spot for Chinese (most distinctive 2-char terms are content
+/// words: 学校 / 排查 / 字幕 / 录像 etc.).
+const CJK_NGRAM_WINDOW: usize = 2;
+
+/// Cap on fingerprint vector length per memory text. Bounds the
+/// per-row work on a multi-KB capsule (the 广信息 handbook is 10K+
+/// chars and would otherwise yield 1000s of n-grams).
+const FINGERPRINT_BUDGET: usize = 64;
+
+/// Minimum distinct fingerprint tokens that must reappear in a
+/// later assistant block before that block counts as "consumed
+/// this memory". Raise to reduce false positives; lower to catch
+/// more paraphrased usage.
+const HIT_THRESHOLD: usize = 3;
 
 #[derive(Debug, Args)]
 pub struct FeedbackFromTranscriptArgs {
@@ -185,7 +209,7 @@ fn scan_transcript(args: &FeedbackFromTranscriptArgs) -> Result<HashSet<String>>
     let reader = BufReader::new(file);
 
     // (capability_capsule_id, text-prefix snippet, line index where retrieval happened)
-    let mut retrieved: Vec<(String, String, usize)> = Vec::new();
+    let mut retrieved: Vec<(String, Vec<String>, usize)> = Vec::new();
     // (line index, lower-cased assistant block text) — query corpus.
     let mut assistant_corpus: Vec<(usize, String)> = Vec::new();
     // tool_use_id → line index where the search call was issued.
@@ -250,24 +274,24 @@ fn scan_transcript(args: &FeedbackFromTranscriptArgs) -> Result<HashSet<String>>
                                 if mid.is_empty() {
                                     continue;
                                 }
-                                let snippet = if args.all {
-                                    String::new()
+                                let fp = if args.all {
+                                    Vec::new()
                                 } else {
-                                    snippet_lower(text)
+                                    fingerprint(text)
                                 };
-                                retrieved.push((mid.to_string(), snippet, line_idx));
+                                retrieved.push((mid.to_string(), fp, line_idx));
                             }
                         }
                     }
                 }
                 "text" if role == "assistant" => {
                     if let Some(t) = item["text"].as_str() {
-                        assistant_corpus.push((line_idx, t.to_lowercase()));
+                        assistant_corpus.push((line_idx, t.to_string()));
                     }
                 }
                 "thinking" if role == "assistant" => {
                     if let Some(t) = item["thinking"].as_str() {
-                        assistant_corpus.push((line_idx, t.to_lowercase()));
+                        assistant_corpus.push((line_idx, t.to_string()));
                     }
                 }
                 _ => {}
@@ -275,38 +299,105 @@ fn scan_transcript(args: &FeedbackFromTranscriptArgs) -> Result<HashSet<String>>
         }
     }
 
+    // Pre-compute fingerprint sets for each subsequent assistant
+    // block once, so we don't re-tokenize per memory-row check.
+    let assistant_fingerprints: Vec<(usize, HashSet<String>)> = assistant_corpus
+        .iter()
+        .map(|(line, text)| (*line, fingerprint(text).into_iter().collect()))
+        .collect();
+
     let mut used: HashSet<String> = HashSet::new();
-    for (mid, snippet, ridx) in &retrieved {
+    for (mid, fp, ridx) in &retrieved {
         if used.contains(mid) {
             continue;
         }
-        if args.all || snippet.is_empty() {
-            // `--all` or no snippet to match against → accept.
+        if args.all || fp.is_empty() {
+            // `--all` or no usable fingerprint → accept.
             used.insert(mid.clone());
             continue;
         }
-        let hit = assistant_corpus
+        let consumed = assistant_fingerprints
             .iter()
             .filter(|(l, _)| *l > *ridx)
-            .any(|(_, t)| t.contains(snippet));
-        if hit {
+            .any(|(_, fp_set)| {
+                fp.iter().filter(|t| fp_set.contains(t.as_str())).count() >= HIT_THRESHOLD
+            });
+        if consumed {
             used.insert(mid.clone());
         }
     }
     Ok(used)
 }
 
-/// Lowercased, char-bounded prefix of `text` for substring matching.
-/// Returns empty string for trivially short input — caller treats empty
-/// as "no usable snippet, skip" unless `--all` is set.
-fn snippet_lower(text: &str) -> String {
-    let trimmed = text.trim();
-    let prefix: String = trimmed.chars().take(SNIPPET_CHARS).collect();
-    if prefix.chars().count() < 12 {
-        // Too short to be a distinctive marker; treat as no signal.
-        return String::new();
+/// Extract distinctive content tokens from `text` for paraphrase-
+/// tolerant matching:
+/// - **ASCII / latin alphanumeric runs ≥`ASCII_TOKEN_MIN` chars**:
+///   kept whole, lowercased. Drops common 1-3 char particles.
+/// - **CJK runs**: emit `CJK_NGRAM_WINDOW` (2) char sliding-window
+///   n-grams. No-whitespace languages need this since the whole
+///   run would otherwise be one giant token that only matches
+///   exact paraphrases.
+///
+/// Capped at `FINGERPRINT_BUDGET` distinct tokens (preserves input
+/// order). Returns empty Vec when the text yields no distinctive
+/// tokens — caller treats empty as "no signal, skip" unless
+/// `--all` is set.
+fn fingerprint(text: &str) -> Vec<String> {
+    let lower = text.to_lowercase();
+    let mut tokens: Vec<String> = Vec::new();
+    let mut seen: HashSet<String> = HashSet::new();
+    let mut current: Vec<char> = Vec::new();
+    let mut current_has_cjk = false;
+    for c in lower.chars() {
+        if c.is_alphanumeric() {
+            if !c.is_ascii() {
+                current_has_cjk = true;
+            }
+            current.push(c);
+        } else {
+            flush_chunk(&current, current_has_cjk, &mut tokens, &mut seen);
+            current.clear();
+            current_has_cjk = false;
+            if tokens.len() >= FINGERPRINT_BUDGET {
+                return tokens;
+            }
+        }
     }
-    prefix.to_lowercase()
+    flush_chunk(&current, current_has_cjk, &mut tokens, &mut seen);
+    tokens.truncate(FINGERPRINT_BUDGET);
+    tokens
+}
+
+/// Helper for [`fingerprint`]: emit tokens from one accumulated
+/// alphanumeric run. Mixed-script runs (e.g. `duckdb广信息`) take
+/// the CJK n-gram path on the principle that any CJK presence
+/// means the run is structurally CJK-shaped and benefits from
+/// finer-grained segmentation.
+fn flush_chunk(
+    chunk: &[char],
+    has_cjk: bool,
+    tokens: &mut Vec<String>,
+    seen: &mut HashSet<String>,
+) {
+    if chunk.is_empty() {
+        return;
+    }
+    if has_cjk {
+        if chunk.len() < CJK_NGRAM_WINDOW {
+            return;
+        }
+        for i in 0..=chunk.len() - CJK_NGRAM_WINDOW {
+            let ngram: String = chunk[i..i + CJK_NGRAM_WINDOW].iter().collect();
+            if seen.insert(ngram.clone()) {
+                tokens.push(ngram);
+            }
+        }
+    } else if chunk.len() >= ASCII_TOKEN_MIN {
+        let s: String = chunk.iter().collect();
+        if seen.insert(s.clone()) {
+            tokens.push(s);
+        }
+    }
 }
 
 /// Mirrors `cli::mine::extract_tool_result_content` shape but kept local
@@ -336,24 +427,99 @@ mod tests {
     use super::*;
 
     #[test]
-    fn snippet_skips_short_text() {
-        assert_eq!(snippet_lower("short"), "");
-        assert_eq!(snippet_lower("           "), "");
+    fn fingerprint_extracts_ascii_tokens_min_4_chars() {
+        let fp = fingerprint("DuckDB is single-writer per file but supports MVCC concurrency");
+        // Lowercased, dedupes, keeps ≥4-char alphanumeric runs.
+        // "is" / "per" / "but" dropped (<4 chars). "mvcc" kept (=4).
+        assert!(fp.contains(&"duckdb".to_string()));
+        assert!(fp.contains(&"single".to_string()));
+        assert!(fp.contains(&"writer".to_string()));
+        assert!(fp.contains(&"file".to_string()));
+        assert!(fp.contains(&"supports".to_string()));
+        assert!(fp.contains(&"mvcc".to_string()));
+        assert!(fp.contains(&"concurrency".to_string()));
+        assert!(!fp.contains(&"is".to_string()));
+        assert!(!fp.contains(&"per".to_string()));
+        assert!(!fp.contains(&"but".to_string()));
     }
 
     #[test]
-    fn snippet_lowercases_and_truncates() {
-        let s = snippet_lower("DuckDB is single-writer per file but supports MVCC concurrency");
-        assert!(s.starts_with("duckdb is single-writer"));
-        assert!(s.chars().count() <= SNIPPET_CHARS);
+    fn fingerprint_emits_2_char_ngrams_for_cjk() {
+        // 6 distinct Chinese chars → 5 unique 2-grams (sliding).
+        let fp = fingerprint("广信息学校排查");
+        assert_eq!(fp, vec!["广信", "信息", "息学", "学校", "校排", "排查"]);
     }
 
     #[test]
-    fn snippet_handles_unicode_boundaries() {
-        // 50 Chinese chars: char-bounded slicing must not panic.
-        let text: String = "中".repeat(50);
-        let s = snippet_lower(&text);
-        assert_eq!(s.chars().count(), SNIPPET_CHARS);
+    fn fingerprint_paraphrase_overlap_meets_threshold() {
+        // Memory + paraphrase share at least HIT_THRESHOLD distinct
+        // tokens. This is the key correctness property of the new
+        // matcher — the OLD 40-char-prefix heuristic would have
+        // missed every case below.
+        let memory = "DuckDB is single-writer per file but supports MVCC concurrency";
+        let paraphrase = "Watch out — DuckDB's MVCC handling makes concurrency tricky when multiple writers hit one file";
+        let mfp = fingerprint(memory);
+        let pset: HashSet<String> = fingerprint(paraphrase).into_iter().collect();
+        let hits = mfp.iter().filter(|t| pset.contains(t.as_str())).count();
+        assert!(
+            hits >= HIT_THRESHOLD,
+            "expected ≥{HIT_THRESHOLD} shared tokens between memory and paraphrase; got {hits}\nmemory tokens: {mfp:?}\nparaphrase tokens: {pset:?}",
+        );
+    }
+
+    #[test]
+    fn fingerprint_cjk_paraphrase_overlap_meets_threshold() {
+        // Chinese memory + Chinese paraphrase with overlapping
+        // 2-grams (学校 / 排查 in both).
+        let memory = "广信息学校排查参考手册";
+        let paraphrase = "今天又翻了一遍广信息学校的排查手册";
+        let mfp = fingerprint(memory);
+        let pset: HashSet<String> = fingerprint(paraphrase).into_iter().collect();
+        let hits = mfp.iter().filter(|t| pset.contains(t.as_str())).count();
+        assert!(
+            hits >= HIT_THRESHOLD,
+            "expected ≥{HIT_THRESHOLD} shared CJK 2-grams; got {hits}\nmemory: {mfp:?}\nparaphrase set: {pset:?}",
+        );
+    }
+
+    #[test]
+    fn fingerprint_rejects_uncorrelated_text() {
+        // Memory and an unrelated assistant block should share <
+        // HIT_THRESHOLD tokens.
+        let memory = "DuckDB single-writer MVCC concurrency lock contention";
+        let unrelated = "let me know if you want to grab lunch tomorrow at noon";
+        let mfp = fingerprint(memory);
+        let pset: HashSet<String> = fingerprint(unrelated).into_iter().collect();
+        let hits = mfp.iter().filter(|t| pset.contains(t.as_str())).count();
+        assert!(
+            hits < HIT_THRESHOLD,
+            "uncorrelated text should not meet threshold; got {hits} hits\nmemory: {mfp:?}\nunrelated set: {pset:?}",
+        );
+    }
+
+    #[test]
+    fn fingerprint_respects_budget_cap() {
+        // Very long input must not produce more than FINGERPRINT_BUDGET tokens.
+        let long_text = (0..200)
+            .map(|i| format!("token{i:04}"))
+            .collect::<Vec<_>>()
+            .join(" ");
+        let fp = fingerprint(&long_text);
+        assert!(
+            fp.len() <= FINGERPRINT_BUDGET,
+            "fingerprint must be capped at {FINGERPRINT_BUDGET}; got {}",
+            fp.len()
+        );
+    }
+
+    #[test]
+    fn fingerprint_empty_or_trivial_returns_empty() {
+        assert!(fingerprint("").is_empty());
+        assert!(fingerprint("   ").is_empty());
+        // Single 3-char ASCII run drops below MIN.
+        assert!(fingerprint("foo").is_empty());
+        // Two too-short runs.
+        assert!(fingerprint("foo bar baz").is_empty());
     }
 
     #[test]
