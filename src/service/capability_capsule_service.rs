@@ -487,6 +487,16 @@ impl CapabilityCapsuleService {
         Ok(self.store.list_wings(tenant).await?)
     }
 
+    /// Capsule-pool snapshot for `tenant`: total + per-status counts.
+    /// Backing `mem_health`'s richer payload and the `/mem:summary`
+    /// slash command — read-only, no side effects.
+    pub async fn capsule_stats(
+        &self,
+        tenant: &str,
+    ) -> Result<crate::domain::capability_capsule::CapsuleStats, ServiceError> {
+        Ok(self.store.capsule_stats(tenant).await?)
+    }
+
     /// Two-level (project → repos) taxonomy. Returns a Vec of
     /// `(project, repos)` pairs; service-layer pure passthrough.
     pub async fn get_taxonomy(

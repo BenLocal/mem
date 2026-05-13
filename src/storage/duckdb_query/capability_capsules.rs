@@ -6,7 +6,7 @@ use duckdb::{params, OptionalExt};
 
 use super::{enum_to_text, get_string_list, parse_enum, spawn_blocking_storage, DuckDbQuery};
 use crate::domain::capability_capsule::{
-    CapabilityCapsuleRecord, CapabilityCapsuleStatus, CapabilityCapsuleVersionLink,
+    CapabilityCapsuleRecord, CapabilityCapsuleStatus, CapabilityCapsuleVersionLink, CapsuleStats,
 };
 use crate::storage::types::StorageError;
 
@@ -106,6 +106,41 @@ impl DuckDbQuery {
             let mut stmt = conn.prepare(&sql)?;
             let rows = stmt.query_map(params![tenant], row_to_capability_capsule_record)?;
             collect_capability_capsules(rows)
+        })
+        .await
+    }
+
+    /// Capsule-pool snapshot for `tenant`: total row count + per-status
+    /// breakdown. One `GROUP BY status` query; Rust folds the rows into
+    /// the discrete fields on `CapsuleStats`. Unknown status strings
+    /// (future enum additions reading old data) are silently dropped —
+    /// caller can detect via `sum(by_status) != total`.
+    pub async fn capsule_stats(&self, tenant: &str) -> Result<CapsuleStats, StorageError> {
+        let conn = self.conn.clone();
+        let tenant = tenant.to_string();
+        spawn_blocking_storage(move || {
+            let conn = conn.lock().expect("duckdb_query mutex poisoned");
+            let mut stmt = conn.prepare(
+                "SELECT status, COUNT(*) FROM ns.main.capability_capsules \
+                 WHERE tenant = ?1 GROUP BY status",
+            )?;
+            let rows = stmt.query_map(params![tenant], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+            })?;
+            let mut stats = CapsuleStats::default();
+            for r in rows {
+                let (status, count) = r.map_err(StorageError::DuckDb)?;
+                stats.total += count;
+                match status.as_str() {
+                    "pending_confirmation" => stats.pending_confirmation = count,
+                    "provisional" => stats.provisional = count,
+                    "active" => stats.active = count,
+                    "archived" => stats.archived = count,
+                    "rejected" => stats.rejected = count,
+                    _ => {}
+                }
+            }
+            Ok(stats)
         })
         .await
     }
@@ -1578,5 +1613,51 @@ mod tests {
             .map(|m| m.capability_capsule_id.as_str())
             .collect();
         assert_eq!(d_ids, vec!["d1"]);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn capsule_stats_groups_per_status_and_scopes_by_tenant() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("store");
+        let lance = LanceStore::open(&path).await.unwrap();
+
+        // Seed tenant-a with 2 active, 1 pending, 1 archived;
+        // tenant-b with 1 rejected. Distinct content_hash per row so
+        // ingest dedup doesn't collapse them.
+        let mut a1 = fixture("c_a1", "tenant-a");
+        a1.content_hash = "h-a1".into();
+        let mut a2 = fixture("c_a2", "tenant-a");
+        a2.content_hash = "h-a2".into();
+        let mut p1 = fixture("c_p1", "tenant-a");
+        p1.status = CapabilityCapsuleStatus::PendingConfirmation;
+        p1.content_hash = "h-p1".into();
+        let mut x1 = fixture("c_x1", "tenant-a");
+        x1.status = CapabilityCapsuleStatus::Archived;
+        x1.content_hash = "h-x1".into();
+        let mut r1 = fixture("c_r1", "tenant-b");
+        r1.status = CapabilityCapsuleStatus::Rejected;
+        r1.content_hash = "h-r1".into();
+        for m in [&a1, &a2, &p1, &x1, &r1] {
+            lance.insert_capability_capsule(m.clone()).await.unwrap();
+        }
+
+        let q = DuckDbQuery::open(&path).await.unwrap();
+
+        let a = q.capsule_stats("tenant-a").await.unwrap();
+        assert_eq!(a.total, 4);
+        assert_eq!(a.active, 2);
+        assert_eq!(a.pending_confirmation, 1);
+        assert_eq!(a.archived, 1);
+        assert_eq!(a.rejected, 0);
+        assert_eq!(a.provisional, 0);
+
+        let b = q.capsule_stats("tenant-b").await.unwrap();
+        assert_eq!(b.total, 1);
+        assert_eq!(b.rejected, 1);
+        assert_eq!(b.active, 0);
+
+        let empty = q.capsule_stats("does-not-exist").await.unwrap();
+        assert_eq!(empty.total, 0);
+        assert_eq!(empty.active, 0);
     }
 }

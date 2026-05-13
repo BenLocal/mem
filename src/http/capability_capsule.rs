@@ -39,6 +39,7 @@ pub fn router() -> Router<AppState> {
         )
         .route("/capability_capsules/wings", get(list_wings))
         .route("/capability_capsules/taxonomy", get(get_taxonomy))
+        .route("/capability_capsules/stats", get(capsule_stats))
         .route("/capability_capsules/feedback", post(submit_feedback))
         .route(
             "/capability_capsules/{id}",
@@ -83,6 +84,17 @@ async fn list_wings(
     Ok(Json(
         app.capability_capsule_service
             .list_wings(&query.tenant)
+            .await?,
+    ))
+}
+
+async fn capsule_stats(
+    State(app): State<AppState>,
+    Query(query): Query<CapabilityCapsuleListQuery>,
+) -> Result<Json<crate::domain::capability_capsule::CapsuleStats>, AppError> {
+    Ok(Json(
+        app.capability_capsule_service
+            .capsule_stats(&query.tenant)
             .await?,
     ))
 }

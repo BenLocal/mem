@@ -69,7 +69,7 @@
 
 | MemPalace | mem 对应 | 映射强度 | 备注 |
 |---|---|---|---|
-| `tool_status` | `mem_health` | ⚠️ | mem 只回 `{reachable, health_body}`，没有 capsule count / 各 status 分布 |
+| `tool_status` | `mem_health` | ✅ | mem 现回 `{reachable, health_body, capsule_stats:{total, pending_confirmation, provisional, active, archived, rejected}, graph_stats:{node_count, total_edges, active_edges, closed_edges, top_relations}}` —— capsule / graph 子段读失败时只是缺字段，`reachable` 不变（partial-degradation 可观测） |
 | `tool_list_wings` | — | ❌ | **缺**：列 distinct `project` / `repo`。等价于一个 `SELECT DISTINCT project FROM capability_capsules` |
 | `tool_list_rooms(wing)` | `transcripts_list_sessions` | ⚠️ | mem 这一侧只覆盖 transcript sessions（本会话刚加），capsule 的 sessions 等价物（按时间桶分组）没单独暴露 |
 | `tool_get_taxonomy` | — | ❌ | **缺**：一次性拿到 `{wings: [...], rooms: {...}}` 全貌——MCP 客户端做导航 UI 用得到 |
@@ -131,6 +131,7 @@
 | **#25** ✅ | **`capability_capsule_delete` MCP**：硬删，包 HTTP `DELETE /capability_capsules/{id}` | 1 个 MCP wrapper（HTTP 已有） | ~30min | 强警告 destructive；优先 `feedback_kind=incorrect` 走软删 |
 | **#26** ✅ | **`capability_capsule_supersede` MCP**：版本链写入新行，链回原 id | `IngestCapabilityCapsuleRequest` 加可选 `supersedes_capability_capsule_id` + 贯穿 HTTP/service/pipeline；新 MCP wrapper | ~3h | MemPalace `tool_update_drawer` 等价但保留 verbatim 原则——不动旧行 |
 | **#27** ✅ | **`list_in_scope` 加 `source_agent` 服务端过滤** + diary read 改走服务端 | repo SQL 加 `AND source_agent = ?` + 贯穿 | ~1h | 收紧多 agent 共享 tenant 场景下的 diary 隔离 |
+| **#28** ✅ | **`mem_health` 富化**：新增 `GET /capability_capsules/stats?tenant=` 返回 `{total, by_status×5}`；MCP `mem_health` 聚合 `/health` + `/capability_capsules/stats` + `/graph/stats` 三段；子段读失败只缺字段，`reachable` 不变 | 1 个新 repo SQL + store/service 贯穿 + http route + MCP 聚合 | ~1h | MemPalace `tool_status` 等价补齐 |
 
 ### 决策点
 

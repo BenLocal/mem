@@ -756,19 +756,41 @@ fn embeddings_disabled_error() -> CallToolResult {
 impl MemMcpServer {
     // ------------------- mem_health -------------------
     #[tool(
-        description = "Check that the mem HTTP server is reachable (GET /health). Use when MCP tools fail to see if the service is up."
+        description = "Liveness probe + at-a-glance capsule-pool snapshot. Returns `reachable`/`health_body` (GET /health) plus, when reachable, `capsule_stats` for the resolved tenant (total + per-status counts) and `graph_stats` (node / edge totals + top relations). Capsule / graph fields are absent if their fetches fail — the tool still returns reachable=true so callers can detect partial degradation."
     )]
     async fn mem_health(
         &self,
         Parameters(_): Parameters<EmptyArgs>,
     ) -> Result<CallToolResult, McpError> {
-        match self.client.get_text("health").await {
-            Ok(body) => Ok(ok_json(&json!({
-                "reachable": true,
-                "health_body": body.trim(),
-            }))),
-            Err(e) => Ok(err_text(e.to_string())),
+        let body = match self.client.get_text("health").await {
+            Ok(b) => b,
+            Err(e) => return Ok(err_text(e.to_string())),
+        };
+        let mut out = json!({
+            "reachable": true,
+            "health_body": body.trim(),
+        });
+        let tenant = self.resolve_tenant(None);
+        if let Ok(stats) = self
+            .client
+            .request_json_with_query::<Value>(
+                Method::GET,
+                "capability_capsules/stats",
+                None,
+                &[("tenant", tenant)],
+            )
+            .await
+        {
+            out["capsule_stats"] = stats;
         }
+        if let Ok(g) = self
+            .client
+            .request_json::<Value>(Method::GET, "graph/stats", None)
+            .await
+        {
+            out["graph_stats"] = g;
+        }
+        Ok(ok_json(&out))
     }
 
     // ------------------- capability_capsule_search -------------------

@@ -276,6 +276,23 @@ pub struct GraphStats {
     pub top_relations: Vec<(String, i64)>,
 }
 
+/// Per-tenant capsule-pool snapshot: total row count plus a count per
+/// `CapabilityCapsuleStatus` variant. The five status fields cover the
+/// full enum so the caller can always sum to `total`; an unknown
+/// status string from a future enum addition would be dropped silently
+/// (caller can detect via `pending_confirmation + provisional + active
+/// + archived + rejected != total`).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub struct CapsuleStats {
+    pub total: i64,
+    pub pending_confirmation: i64,
+    pub provisional: i64,
+    pub active: i64,
+    pub archived: i64,
+    pub rejected: i64,
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub struct FeedbackSummary {

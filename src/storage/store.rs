@@ -410,6 +410,13 @@ impl Store {
         self.query.list_wings(tenant).await
     }
 
+    pub async fn capsule_stats(
+        &self,
+        tenant: &str,
+    ) -> Result<crate::domain::capability_capsule::CapsuleStats, StorageError> {
+        self.query.capsule_stats(tenant).await
+    }
+
     pub async fn get_taxonomy(
         &self,
         tenant: &str,
