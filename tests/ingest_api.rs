@@ -158,8 +158,13 @@ async fn seeded_app(memories: Vec<CapabilityCapsuleRecord>) -> TestApp {
 
 #[test]
 fn initial_status_routes_memory_types_as_expected() {
+    // Preference + Workflow: always PendingConfirmation regardless of write_mode.
     assert_eq!(
         initial_status(&CapabilityCapsuleType::Preference, &WriteMode::Propose),
+        CapabilityCapsuleStatus::PendingConfirmation
+    );
+    assert_eq!(
+        initial_status(&CapabilityCapsuleType::Preference, &WriteMode::Auto),
         CapabilityCapsuleStatus::PendingConfirmation
     );
     assert_eq!(
@@ -167,8 +172,36 @@ fn initial_status_routes_memory_types_as_expected() {
         CapabilityCapsuleStatus::PendingConfirmation
     );
     assert_eq!(
+        initial_status(&CapabilityCapsuleType::Workflow, &WriteMode::Propose),
+        CapabilityCapsuleStatus::PendingConfirmation
+    );
+    // Implementation + Experience + Episode + Diary: Auto = Active.
+    assert_eq!(
         initial_status(&CapabilityCapsuleType::Implementation, &WriteMode::Auto),
         CapabilityCapsuleStatus::Active
+    );
+    assert_eq!(
+        initial_status(&CapabilityCapsuleType::Experience, &WriteMode::Auto),
+        CapabilityCapsuleStatus::Active
+    );
+    // Propose on the non-special types now routes to PendingConfirmation
+    // (previously Provisional). This is the load-bearing change: agent-
+    // driven propose calls actually surface in `list_pending_review`.
+    assert_eq!(
+        initial_status(&CapabilityCapsuleType::Implementation, &WriteMode::Propose),
+        CapabilityCapsuleStatus::PendingConfirmation
+    );
+    assert_eq!(
+        initial_status(&CapabilityCapsuleType::Experience, &WriteMode::Propose),
+        CapabilityCapsuleStatus::PendingConfirmation
+    );
+    assert_eq!(
+        initial_status(&CapabilityCapsuleType::Episode, &WriteMode::Propose),
+        CapabilityCapsuleStatus::PendingConfirmation
+    );
+    assert_eq!(
+        initial_status(&CapabilityCapsuleType::Diary, &WriteMode::Propose),
+        CapabilityCapsuleStatus::PendingConfirmation
     );
 }
 

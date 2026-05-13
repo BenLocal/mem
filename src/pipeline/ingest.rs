@@ -24,6 +24,30 @@ pub fn validate_verbatim(content: &str, caller_summary: Option<&str>) -> Result<
     Ok(())
 }
 
+/// Compute the initial `status` for a freshly-ingested capsule.
+///
+/// Status routing table:
+///
+/// | type \\ write_mode | `Auto`               | `Propose`            |
+/// |--------------------|----------------------|----------------------|
+/// | Preference         | PendingConfirmation  | PendingConfirmation  |
+/// | Workflow           | PendingConfirmation  | PendingConfirmation  |
+/// | Implementation     | Active               | PendingConfirmation  |
+/// | Experience         | Active               | PendingConfirmation  |
+/// | Episode            | Active               | PendingConfirmation  |
+/// | Diary              | Active               | PendingConfirmation  |
+///
+/// Rationale: `Propose` is the caller's explicit signal that the
+/// row should be human-reviewed before joining the active pool —
+/// the agent-driven nudge path (PostToolUse hook → SKILL.md trigger
+/// (e)) relies on this. The previous matrix routed
+/// `(non-Preference/Workflow, Propose)` to `Provisional` instead,
+/// which silently put the capsule in the active pool with low
+/// confidence but no review hook — agents' propose calls became
+/// invisible to `list_pending_review`. `Provisional` is still a
+/// valid status the rest of the pipeline understands (retrieve.rs
+/// scores it identically to `PendingConfirmation`), but no longer
+/// reachable via this entry point.
 pub fn initial_status(
     capability_capsule_type: &CapabilityCapsuleType,
     write_mode: &WriteMode,
@@ -32,8 +56,8 @@ pub fn initial_status(
         (CapabilityCapsuleType::Preference | CapabilityCapsuleType::Workflow, _) => {
             CapabilityCapsuleStatus::PendingConfirmation
         }
+        (_, WriteMode::Propose) => CapabilityCapsuleStatus::PendingConfirmation,
         (_, WriteMode::Auto) => CapabilityCapsuleStatus::Active,
-        _ => CapabilityCapsuleStatus::Provisional,
     }
 }
 
