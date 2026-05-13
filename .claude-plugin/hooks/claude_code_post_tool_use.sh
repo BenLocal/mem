@@ -1,8 +1,13 @@
 #!/usr/bin/env bash
 # PostToolUse hook for Bash. After a successful `git commit` of a
 # substantive type (fix / feat / refactor / perf), nudge the agent to
-# fire `capability_capsule_propose_experience` so the durable learning
-# lands in the review queue. Routine commits (chore(deps) / docs / pure
+# fire `capability_capsule_ingest` with `write_mode=propose` so the
+# durable learning lands in the review queue (status =
+# PendingConfirmation; visible via `list_pending_review`,
+# promoted via `review_accept`). The `propose_experience` MCP tool
+# writes to a parallel `episodes` table that's NOT in the review
+# queue, so it's NOT what we nudge here — see commit on the
+# misleading naming and the doc-fix in mempalace-diff-v2. Routine commits (chore(deps) / docs / pure
 # test moves) and commits that didn't actually succeed are skipped.
 #
 # Output protocol: print `{}` to skip injection, or
@@ -77,7 +82,7 @@ cat <<EOF
 {
   "hookSpecificOutput": {
     "hookEventName": "PostToolUse",
-    "additionalContext": "Commit just landed: \`${SUBJECT_JSON}\`. **Default action: call \`mcp__mem__capability_capsule_propose_experience\` now.** It lands in the review queue (not the active pool) — a human or future agent runs \`review_accept\` to promote, so over-proposing is harmless. The threshold is low: any commit that touches business logic, non-trivial config, a bug fix, an architectural decision, or a learned API gotcha is worth proposing. Args: summary (≤80 char headline of the fact), content (full cause/symptom/fix verbatim — never refine), project (repo basename), caller_agent/source_agent (\"claude-code\"). Skip only for: typo-only commits, dependency bumps, pure formatting / rename-only refactors, or commits whose entire content was already captured by an earlier capsule in this session. When in doubt → propose."
+    "additionalContext": "Commit just landed: \`${SUBJECT_JSON}\`. **Default action: call \`mcp__mem__capability_capsule_ingest\` with \`capability_capsule_type=\"experience\"\` and \`write_mode=\"propose\"\` now.** This writes a capsule row with status=PendingConfirmation — it sits in the review queue (visible via \`capability_capsule_list_pending_review\`), NOT the active pool, so a human or future agent must run \`review_accept\` (or \`review_edit_accept\` for edits) to promote, and over-proposing is harmless (one \`review_reject\` click discards a noise row). The threshold is low: any commit that touches business logic, non-trivial config, a bug fix, an architectural decision, or a learned API gotcha is worth proposing. Required args: capability_capsule_type=\"experience\", content (full cause/symptom/fix verbatim — never refine), scope (e.g. \"repo\" or \"project\"), write_mode=\"propose\". Optional but useful: summary (≤80 char headline), project (repo basename), source_agent (\"claude-code\"). Skip only for: typo-only commits, dependency bumps, pure formatting / rename-only refactors, or commits whose entire content was already captured by an earlier capsule in this session. NOTE: do NOT use \`capability_capsule_propose_experience\` — that one writes to a parallel \`episodes\` table that the review queue does not see. When in doubt → propose."
   }
 }
 EOF
