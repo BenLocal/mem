@@ -77,7 +77,7 @@ cat <<EOF
 {
   "hookSpecificOutput": {
     "hookEventName": "PostToolUse",
-    "additionalContext": "Commit just landed: \`${SUBJECT_JSON}\`. If this carries a non-obvious durable learning (root cause + symptom + fix that the next session shouldn't re-derive), call \`mcp__mem__capability_capsule_propose_experience\` now. Args: summary (≤80 char headline), content (full cause/symptom/fix verbatim — never refine), project (repo basename), caller_agent/source_agent (\"claude-code\"). It lands in the review queue, not the active pool, so false positives are free. If this was routine plumbing with no durable insight, stay silent — silence is the right call."
+    "additionalContext": "Commit just landed: \`${SUBJECT_JSON}\`. **Default action: call \`mcp__mem__capability_capsule_propose_experience\` now.** It lands in the review queue (not the active pool) — a human or future agent runs \`review_accept\` to promote, so over-proposing is harmless. The threshold is low: any commit that touches business logic, non-trivial config, a bug fix, an architectural decision, or a learned API gotcha is worth proposing. Args: summary (≤80 char headline of the fact), content (full cause/symptom/fix verbatim — never refine), project (repo basename), caller_agent/source_agent (\"claude-code\"). Skip only for: typo-only commits, dependency bumps, pure formatting / rename-only refactors, or commits whose entire content was already captured by an earlier capsule in this session. When in doubt → propose."
   }
 }
 EOF
