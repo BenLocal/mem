@@ -1002,7 +1002,7 @@ impl MemMcpServer {
 
     // ------------------- capability_capsule_propose_preference -------------------
     #[tool(
-        description = "Propose a preference for review. Uses the standard memories endpoint with write_mode=propose."
+        description = "Propose a PREFERENCE for human review. Use only when the preference is unverified and needs an operator to accept it via `capability_capsule_review_accept` before joining the active pool. Lands as `PendingConfirmation` (confidence 0.6, still searchable but down-ranked). For already-validated facts/observations, prefer `capability_capsule_ingest` with `capability_capsule_type=experience` (or implementation/episode/diary) and `write_mode=auto` — that path lands Active immediately."
     )]
     async fn capability_capsule_propose_preference(
         &self,
@@ -1052,7 +1052,7 @@ impl MemMcpServer {
 
     // ------------------- capability_capsule_propose_experience -------------------
     #[tool(
-        description = "Propose a candidate experience by recording it as an episode instead of a strong fact."
+        description = "Propose a CANDIDATE experience (unverified, low-confidence hunch) by recording it as an Episode. If the episode set yields a workflow, the derived Workflow capsule lands as `PendingConfirmation`. For verified lessons-learned that should be active immediately (e.g. a bug you just fixed and confirmed, a pattern you just validated), use `capability_capsule_ingest` with `capability_capsule_type=experience` and `write_mode=auto` instead — that bypasses the review queue."
     )]
     async fn capability_capsule_propose_experience(
         &self,
