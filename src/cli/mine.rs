@@ -498,20 +498,25 @@ fn render_hook_envelope(
         " woven into the archive"
     };
     let feedback_sent = feedback.map(|f| f.sent).unwrap_or(0);
+    // Drop the capsules segment when no `<mem-save>` cues were extracted —
+    // sessions that persist via MCP `capability_capsule_ingest` (or the
+    // `propose_*` flows) never produce capsule rows from the mine pass, so
+    // a permanent `0/0 capsules + …` prefix is noise.
+    let capsules_segment = if mine.capsules_total() > 0 {
+        format!("{}/{} capsules + ", mine.mem_ok, mine.capsules_total(),)
+    } else {
+        String::new()
+    };
     let msg = if feedback_sent > 0 {
         format!(
-            "{prefix}{}/{} capsules + {}/{} blocks · {} feedback applied",
-            mine.mem_ok,
-            mine.capsules_total(),
+            "{prefix}{capsules_segment}{}/{} blocks · {} feedback applied",
             mine.block_ok,
             mine.blocks_total(),
             feedback_sent,
         )
     } else {
         format!(
-            "{prefix}{}/{} capsules + {}/{} blocks{}",
-            mine.mem_ok,
-            mine.capsules_total(),
+            "{prefix}{capsules_segment}{}/{} blocks{}",
             mine.block_ok,
             mine.blocks_total(),
             suffix,
@@ -780,6 +785,44 @@ mod extract_tests {
         assert!(msg.starts_with("✦ mem · "), "got {msg}");
         assert!(msg.contains("3/3 capsules + 12/12 blocks"));
         assert!(msg.contains("woven into the archive"));
+    }
+
+    #[test]
+    fn hook_envelope_drops_capsules_segment_when_zero() {
+        let mine = MineCounts {
+            mem_ok: 0,
+            mem_fail: 0,
+            block_ok: 696,
+            block_fail: 0,
+        };
+        let v = render_hook_envelope(&mine, None, false);
+        let msg = v["systemMessage"].as_str().unwrap();
+        assert!(!msg.contains("capsules"), "got {msg}");
+        assert!(msg.contains("696/696 blocks"), "got {msg}");
+        assert!(msg.contains("woven into the archive"), "got {msg}");
+    }
+
+    #[test]
+    fn hook_envelope_drops_capsules_segment_with_feedback() {
+        let mine = MineCounts {
+            mem_ok: 0,
+            mem_fail: 0,
+            block_ok: 696,
+            block_fail: 0,
+        };
+        let feedback = FeedbackCounts {
+            kind: "applies_here".to_string(),
+            sent: 3,
+            consumed: 3,
+            failed: 0,
+        };
+        let v = render_hook_envelope(&mine, Some(&feedback), false);
+        let msg = v["systemMessage"].as_str().unwrap();
+        assert!(!msg.contains("capsules"), "got {msg}");
+        assert!(
+            msg.contains("696/696 blocks · 3 feedback applied"),
+            "got {msg}"
+        );
     }
 
     #[test]
