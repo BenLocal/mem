@@ -5,6 +5,10 @@
 //! services run synchronously inside a request future, workers run
 //! forever in their own tokio tasks.
 //!
+//! - `auto_promote_worker` — periodic sweep of long-idle
+//!   `PendingConfirmation` rows → `Active`, audited via a
+//!   `feedback_events` row with `kind=auto_promoted`. Opt-in via
+//!   `MEM_AUTO_PROMOTE_ENABLED=1`.
 //! - `decay_worker` — bulk SQL UPDATE of `memories.decay_score`
 //!   (active rows only, capped at 1.0). Goes through
 //!   `Store::apply_time_decay` (DuckDB SQL via the lance extension).
@@ -20,6 +24,7 @@
 //! `(conversation_messages, content)` via the lance extension's
 //! native FTS. Writes update the inverted index automatically.
 
+pub mod auto_promote_worker;
 pub mod decay_worker;
 pub mod embedding_worker;
 pub mod transcript_embedding_worker;

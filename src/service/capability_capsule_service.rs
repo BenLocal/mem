@@ -753,6 +753,22 @@ impl CapabilityCapsuleService {
             .await?)
     }
 
+    /// Service entry point for the auto-promote sweep — delegates to
+    /// `crate::worker::auto_promote_worker::sweep_once`. Used by the
+    /// HTTP `/reviews/auto_promote` endpoint for manual / cron-driven
+    /// runs; the background worker (when enabled) bypasses this and
+    /// calls the worker function directly.
+    pub async fn auto_promote_sweep(
+        &self,
+        tenant: &str,
+        settings: &crate::config::AutoPromoteSettings,
+        dry_run: bool,
+    ) -> Result<Vec<String>, ServiceError> {
+        crate::worker::auto_promote_worker::sweep_once(&self.store, settings, tenant, dry_run)
+            .await
+            .map_err(ServiceError::Storage)
+    }
+
     /// Supersede flow: accept a pending memory by replacing it with an edited active version.
     ///
     /// After storage is updated, the graph is kept consistent:

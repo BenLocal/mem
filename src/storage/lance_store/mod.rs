@@ -1350,13 +1350,13 @@ pub(super) fn feedback_adjustments(
         "incorrect" => FeedbackKind::Incorrect,
         "applies_here" => FeedbackKind::AppliesHere,
         "does_not_apply_here" => FeedbackKind::DoesNotApplyHere,
+        "auto_promoted" => FeedbackKind::AutoPromoted,
         _ => return None,
     };
-    let archive = kind.archived_status();
     Some((
         kind.confidence_delta(),
         kind.decay_delta(),
-        archive.then_some(crate::domain::capability_capsule::CapabilityCapsuleStatus::Archived),
+        kind.status_after(),
         kind.marks_validated(),
     ))
 }

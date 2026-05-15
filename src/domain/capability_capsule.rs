@@ -72,6 +72,13 @@ pub enum FeedbackKind {
     Incorrect,
     AppliesHere,
     DoesNotApplyHere,
+    /// System-emitted: the auto-promote sweep moved a long-idle
+    /// `PendingConfirmation` row to `Active`. Carries no confidence /
+    /// decay delta — promotion alone is the signal — and produces a
+    /// `feedback_events` audit row so the source of the transition
+    /// stays queryable. Not a user-driven judgment; never sent by
+    /// `submit_feedback`.
+    AutoPromoted,
 }
 
 impl FeedbackKind {
@@ -82,6 +89,7 @@ impl FeedbackKind {
             Self::Incorrect => "incorrect",
             Self::AppliesHere => "applies_here",
             Self::DoesNotApplyHere => "does_not_apply_here",
+            Self::AutoPromoted => "auto_promoted",
         }
     }
 
@@ -105,8 +113,15 @@ impl FeedbackKind {
         matches!(self, Self::Useful | Self::AppliesHere)
     }
 
-    pub fn archived_status(&self) -> bool {
-        matches!(self, Self::Incorrect)
+    /// Status transition the event triggers on its parent capsule, if any.
+    /// `Incorrect` archives; `AutoPromoted` activates; all others leave
+    /// status alone.
+    pub fn status_after(&self) -> Option<CapabilityCapsuleStatus> {
+        match self {
+            Self::Incorrect => Some(CapabilityCapsuleStatus::Archived),
+            Self::AutoPromoted => Some(CapabilityCapsuleStatus::Active),
+            _ => None,
+        }
     }
 }
 

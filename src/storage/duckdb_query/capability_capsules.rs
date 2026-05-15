@@ -6,7 +6,8 @@ use duckdb::{params, OptionalExt};
 
 use super::{enum_to_text, get_string_list, parse_enum, spawn_blocking_storage, DuckDbQuery};
 use crate::domain::capability_capsule::{
-    CapabilityCapsuleRecord, CapabilityCapsuleStatus, CapabilityCapsuleVersionLink, CapsuleStats,
+    CapabilityCapsuleRecord, CapabilityCapsuleStatus, CapabilityCapsuleType,
+    CapabilityCapsuleVersionLink, CapsuleStats,
 };
 use crate::storage::types::StorageError;
 
@@ -437,6 +438,77 @@ impl DuckDbQuery {
     /// `pending_confirmation`) under `tenant`, oldest-newest first
     /// (well, ordered `created_at DESC` per legacy convention — newest
     /// arrivals at the top of the queue).
+    /// Candidate set for the auto-promote sweep. Returns
+    /// `PendingConfirmation` rows whose:
+    /// - `capability_capsule_type` is in the allow-list `types`,
+    /// - `updated_at` is strictly before `cutoff_updated_at` (a
+    ///   20-digit ms timestamp; see `storage::current_timestamp`),
+    /// - `decay_score` is strictly below `max_decay_score`.
+    ///
+    /// Empty `types` short-circuits to `Ok(vec![])` — the caller's
+    /// allow-list is "promote nothing of any type", which is a valid
+    /// way to disable the sweep without flipping the master switch.
+    /// Ordered `created_at ASC` so oldest rows promote first (and
+    /// callers that cap N per sweep don't keep re-seeing the same
+    /// young rows).
+    pub async fn auto_promote_candidates(
+        &self,
+        tenant: &str,
+        cutoff_updated_at: &str,
+        types: &[CapabilityCapsuleType],
+        max_decay_score: f32,
+    ) -> Result<Vec<CapabilityCapsuleRecord>, StorageError> {
+        if types.is_empty() {
+            return Ok(Vec::new());
+        }
+        let conn = self.conn.clone();
+        let tenant = tenant.to_string();
+        let cutoff = cutoff_updated_at.to_string();
+        let status = enum_to_text(&CapabilityCapsuleStatus::PendingConfirmation)?;
+        let type_strs: Vec<String> = types
+            .iter()
+            .map(enum_to_text)
+            .collect::<Result<Vec<_>, _>>()?;
+        // `decay_score` is `FLOAT` (Float32) on the Lance side — cast
+        // the bind to `f64` here so duckdb-rs picks `REAL` and the
+        // comparison stays homogeneous (DuckDB auto-promotes f32→f64
+        // on the column side but we want to be explicit).
+        let max_decay = max_decay_score as f64;
+        spawn_blocking_storage(move || {
+            let conn = conn.lock().expect("duckdb_query mutex poisoned");
+            // ?1 tenant, ?2 status, ?3 cutoff_updated_at, ?4 max_decay,
+            // ?5..?(N+4) type allow-list.
+            let placeholders = (5..=type_strs.len() + 4)
+                .map(|i| format!("?{i}"))
+                .collect::<Vec<_>>()
+                .join(", ");
+            let sql = format!(
+                "SELECT {CAPABILITY_CAPSULE_COLS} FROM ns.main.capability_capsules \
+                 WHERE tenant = ?1 AND status = ?2 \
+                   AND updated_at < ?3 \
+                   AND decay_score < ?4 \
+                   AND capability_capsule_type IN ({placeholders}) \
+                 ORDER BY created_at ASC",
+                CAPABILITY_CAPSULE_COLS = CAPABILITY_CAPSULE_COLS,
+            );
+            let mut stmt = conn.prepare(&sql)?;
+            let mut params_vec: Vec<Box<dyn duckdb::ToSql>> = vec![
+                Box::new(tenant),
+                Box::new(status),
+                Box::new(cutoff),
+                Box::new(max_decay),
+            ];
+            for t in type_strs {
+                params_vec.push(Box::new(t));
+            }
+            let params_refs: Vec<&dyn duckdb::ToSql> =
+                params_vec.iter().map(|b| b.as_ref()).collect();
+            let rows = stmt.query_map(params_refs.as_slice(), row_to_capability_capsule_record)?;
+            collect_capability_capsules(rows)
+        })
+        .await
+    }
+
     pub async fn list_pending_review(
         &self,
         tenant: &str,

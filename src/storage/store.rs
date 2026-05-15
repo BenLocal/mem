@@ -488,6 +488,23 @@ impl Store {
         self.query.list_pending_review(tenant).await
     }
 
+    /// Auto-promote candidate set. Returns rows that match the
+    /// `(status=PendingConfirmation, type∈types, updated_at<cutoff,
+    /// decay_score<max_decay_score)` filter — see
+    /// `DuckDbQuery::auto_promote_candidates` for full semantics.
+    /// Sweep itself is in `crate::worker::auto_promote_worker`.
+    pub async fn auto_promote_candidates(
+        &self,
+        tenant: &str,
+        cutoff_updated_at: &str,
+        types: &[crate::domain::capability_capsule::CapabilityCapsuleType],
+        max_decay_score: f32,
+    ) -> Result<Vec<CapabilityCapsuleRecord>, StorageError> {
+        self.query
+            .auto_promote_candidates(tenant, cutoff_updated_at, types, max_decay_score)
+            .await
+    }
+
     pub async fn search_candidates(
         &self,
         tenant: &str,

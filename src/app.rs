@@ -65,6 +65,18 @@ impl AppState {
             crate::worker::decay_worker::start_decay_worker(store_decay).await;
         });
 
+        if config.auto_promote.enabled {
+            let store_promote = store.clone();
+            let promote_settings = config.auto_promote.clone();
+            // MVP single-tenant scope. See worker docs for the
+            // multi-tenant extension path.
+            let tenant = std::env::var("MEM_TENANT").unwrap_or_else(|_| "local".to_string());
+            tokio::spawn(async move {
+                crate::worker::auto_promote_worker::run(store_promote, promote_settings, tenant)
+                    .await;
+            });
+        }
+
         if !config.embedding.transcript_disabled {
             let provider_transcript = provider.clone();
             let store_transcript = store.clone();

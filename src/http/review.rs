@@ -4,7 +4,7 @@ use axum::{
     routing::{get, post},
     Json, Router,
 };
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 use crate::{app::AppState, domain::capability_capsule::EditPendingRequest, error::AppError};
 
@@ -17,6 +17,7 @@ pub fn router() -> Router<AppState> {
             "/reviews/pending/edit_accept",
             post(edit_and_accept_pending),
         )
+        .route("/reviews/auto_promote", post(auto_promote))
 }
 
 #[derive(Debug, Deserialize)]
@@ -105,6 +106,50 @@ impl From<HttpEditPendingRequest> for EditPendingRequest {
     }
 }
 
+/// Manual / cron trigger for the auto-promote sweep. Body shape:
+/// `{"tenant": "local", "dry_run": true}`.
+///
+/// `dry_run=true` (the default) only previews candidate ids; nothing
+/// is written. `dry_run=false` actually promotes — even when the
+/// background worker is disabled via `MEM_AUTO_PROMOTE_ENABLED=0`, so
+/// this endpoint doubles as a one-shot CLI hook for operators who
+/// want to run the sweep on demand without flipping the master switch.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "snake_case")]
+struct AutoPromoteRequest {
+    #[serde(default = "default_tenant")]
+    tenant: String,
+    #[serde(default = "default_true")]
+    dry_run: bool,
+}
+
+#[derive(Debug, Serialize)]
+struct AutoPromoteResponse {
+    dry_run: bool,
+    /// When `dry_run=true`, ids that *would* be promoted on the next
+    /// real sweep. When `dry_run=false`, ids that were actually
+    /// promoted in this call.
+    capability_capsule_ids: Vec<String>,
+}
+
+async fn auto_promote(
+    State(app): State<AppState>,
+    Json(request): Json<AutoPromoteRequest>,
+) -> Result<Json<AutoPromoteResponse>, AppError> {
+    let ids = app
+        .capability_capsule_service
+        .auto_promote_sweep(&request.tenant, &app.config.auto_promote, request.dry_run)
+        .await?;
+    Ok(Json(AutoPromoteResponse {
+        dry_run: request.dry_run,
+        capability_capsule_ids: ids,
+    }))
+}
+
 fn default_tenant() -> String {
     "local".to_string()
+}
+
+fn default_true() -> bool {
+    true
 }

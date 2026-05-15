@@ -9,7 +9,31 @@ are organized by feature wave (merge commit ranges on `master`).
 ## [Unreleased]
 
 ### Added
-- _Nothing yet — add new entries here as they land._
+
+- **Auto-promote sweep** (`src/worker/auto_promote_worker.rs`) — opt-in
+  background worker that moves long-idle `PendingConfirmation` capsules
+  to `Active` after they sit untouched past `MEM_AUTO_PROMOTE_AGE_DAYS`
+  (default 7). Audited via a `feedback_events` row with new
+  `feedback_kind = "auto_promoted"` (status side-effect → `Active`, no
+  confidence/decay delta). Default OFF; opt in with
+  `MEM_AUTO_PROMOTE_ENABLED=1`. Tunables: `_AGE_DAYS`,
+  `_INTERVAL_SECS`, `_TYPES` (CSV; default
+  `experience,implementation,episode,diary` — `preference` and
+  `workflow` deliberately excluded), `_DECAY_THRESHOLD` (default 0.5;
+  capsules already flagged stale by `outdated` /
+  `does_not_apply_here` feedback won't be auto-promoted). New HTTP
+  endpoint `POST /reviews/auto_promote` for manual / cron-driven runs,
+  supports `dry_run=true` (default) to preview candidate ids without
+  writing.
+
+### Changed
+
+- `FeedbackKind::archived_status() -> bool` replaced by
+  `FeedbackKind::status_after() -> Option<CapabilityCapsuleStatus>` so
+  the new `AutoPromoted` variant can map to `Active` alongside
+  `Incorrect`'s existing mapping to `Archived`. Internal API only —
+  no JSON shape change on `feedback_events` or
+  `POST /capability_capsules/feedback`.
 
 ---
 

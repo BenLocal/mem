@@ -5,6 +5,8 @@ use std::{
 
 use thiserror::Error;
 
+use crate::domain::capability_capsule::CapabilityCapsuleType;
+
 static APP_DB_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -54,11 +56,41 @@ pub struct EmbeddingSettings {
     pub transcript_search_oversample: usize,
 }
 
+/// Settings for the auto-promote sweep — promotes `PendingConfirmation`
+/// capsules to `Active` after they sit idle past `age_days`, audited
+/// via a `feedback_events` row with `kind=auto_promoted`. Default OFF;
+/// opt in with `MEM_AUTO_PROMOTE_ENABLED=1`.
+#[derive(Debug, Clone)]
+pub struct AutoPromoteSettings {
+    /// Master switch. Worker is not spawned and HTTP endpoint refuses
+    /// `dry_run=false` when this is false. Default `false`.
+    pub enabled: bool,
+    /// Minimum age (since `updated_at`) before a pending row qualifies.
+    /// Using `updated_at` rather than `created_at` keeps in-flight
+    /// human edits safe from being promoted out from under the
+    /// reviewer.
+    pub age_days: u64,
+    /// Sweep cadence in seconds. Worker sleeps this long between
+    /// passes.
+    pub interval_secs: u64,
+    /// Allowlist of capsule types eligible for auto-promote. Types
+    /// outside this set stay in pending until a human acts. Default
+    /// excludes Preference + Workflow because those embody durable
+    /// commitments that warrant a human read.
+    pub types: Vec<CapabilityCapsuleType>,
+    /// Maximum `decay_score` a candidate may have. A capsule already
+    /// flagged stale by feedback shouldn't be silently promoted; the
+    /// `outdated` / `does_not_apply_here` signals push decay above
+    /// this threshold.
+    pub decay_threshold: f32,
+}
+
 #[derive(Debug, Clone)]
 pub struct Config {
     pub bind_addr: String,
     pub db_path: PathBuf,
     pub embedding: EmbeddingSettings,
+    pub auto_promote: AutoPromoteSettings,
 }
 
 #[derive(Debug, Error)]
@@ -83,6 +115,14 @@ pub enum ConfigError {
     InvalidTranscriptVectorIndexFlushEvery(String),
     #[error("invalid MEM_TRANSCRIPT_OVERSAMPLE: {0}")]
     InvalidTranscriptOversample(String),
+    #[error("invalid MEM_AUTO_PROMOTE_AGE_DAYS: {0}")]
+    InvalidAutoPromoteAgeDays(String),
+    #[error("invalid MEM_AUTO_PROMOTE_INTERVAL_SECS: {0}")]
+    InvalidAutoPromoteIntervalSecs(String),
+    #[error("invalid MEM_AUTO_PROMOTE_DECAY_THRESHOLD: {0}")]
+    InvalidAutoPromoteDecayThreshold(String),
+    #[error("invalid MEM_AUTO_PROMOTE_TYPES entry: {0} (expected one of experience, implementation, episode, diary, preference, workflow)")]
+    InvalidAutoPromoteType(String),
 }
 
 impl EmbeddingSettings {
@@ -237,12 +277,95 @@ impl EmbeddingSettings {
     }
 }
 
+impl AutoPromoteSettings {
+    /// Development / test defaults: feature OFF. Production opts in
+    /// via `MEM_AUTO_PROMOTE_ENABLED=1` after observing the feature in
+    /// dry-run.
+    pub fn development_defaults() -> Self {
+        Self {
+            enabled: false,
+            age_days: 7,
+            interval_secs: 3600,
+            types: vec![
+                CapabilityCapsuleType::Experience,
+                CapabilityCapsuleType::Implementation,
+                CapabilityCapsuleType::Episode,
+                CapabilityCapsuleType::Diary,
+            ],
+            decay_threshold: 0.5,
+        }
+    }
+
+    pub fn from_env_vars(get: impl Fn(&str) -> Option<String>) -> Result<Self, ConfigError> {
+        let mut s = Self::development_defaults();
+
+        if let Some(raw) = get("MEM_AUTO_PROMOTE_ENABLED") {
+            s.enabled = matches!(raw.to_ascii_lowercase().as_str(), "1" | "true" | "yes");
+        }
+
+        if let Some(raw) = get("MEM_AUTO_PROMOTE_AGE_DAYS") {
+            let n: u64 = raw
+                .parse()
+                .map_err(|_| ConfigError::InvalidAutoPromoteAgeDays(raw.clone()))?;
+            // `0` would promote anything modified in the same tick the
+            // worker fires — surprising and useless. Reject loudly.
+            if n == 0 {
+                return Err(ConfigError::InvalidAutoPromoteAgeDays(raw));
+            }
+            s.age_days = n;
+        }
+
+        if let Some(raw) = get("MEM_AUTO_PROMOTE_INTERVAL_SECS") {
+            let n: u64 = raw
+                .parse()
+                .map_err(|_| ConfigError::InvalidAutoPromoteIntervalSecs(raw.clone()))?;
+            if n == 0 {
+                return Err(ConfigError::InvalidAutoPromoteIntervalSecs(raw));
+            }
+            s.interval_secs = n;
+        }
+
+        if let Some(raw) = get("MEM_AUTO_PROMOTE_DECAY_THRESHOLD") {
+            let v: f32 = raw
+                .parse()
+                .map_err(|_| ConfigError::InvalidAutoPromoteDecayThreshold(raw.clone()))?;
+            if !(0.0..=1.0).contains(&v) {
+                return Err(ConfigError::InvalidAutoPromoteDecayThreshold(raw));
+            }
+            s.decay_threshold = v;
+        }
+
+        if let Some(raw) = get("MEM_AUTO_PROMOTE_TYPES") {
+            let mut out = Vec::new();
+            for tok in raw.split(',').map(str::trim).filter(|t| !t.is_empty()) {
+                let kind = match tok.to_ascii_lowercase().as_str() {
+                    "experience" => CapabilityCapsuleType::Experience,
+                    "implementation" => CapabilityCapsuleType::Implementation,
+                    "episode" => CapabilityCapsuleType::Episode,
+                    "diary" => CapabilityCapsuleType::Diary,
+                    "preference" => CapabilityCapsuleType::Preference,
+                    "workflow" => CapabilityCapsuleType::Workflow,
+                    other => return Err(ConfigError::InvalidAutoPromoteType(other.to_string())),
+                };
+                out.push(kind);
+            }
+            // Empty list (e.g. `MEM_AUTO_PROMOTE_TYPES=""`) effectively
+            // disables promotion without touching the master switch.
+            // Honour that — don't silently fall back to defaults.
+            s.types = out;
+        }
+
+        Ok(s)
+    }
+}
+
 impl Config {
     pub fn local() -> Self {
         Self {
             bind_addr: "127.0.0.1:3000".to_string(),
             db_path: default_db_path(),
             embedding: EmbeddingSettings::development_defaults(),
+            auto_promote: AutoPromoteSettings::development_defaults(),
         }
     }
 
@@ -252,6 +375,7 @@ impl Config {
             bind_addr,
             db_path: default_db_path(),
             embedding: EmbeddingSettings::from_env_vars(|k| std::env::var(k).ok())?,
+            auto_promote: AutoPromoteSettings::from_env_vars(|k| std::env::var(k).ok())?,
         })
     }
 }
@@ -468,5 +592,100 @@ mod tests {
             err,
             ConfigError::InvalidTranscriptOversample(ref s) if s == "abc"
         ));
+    }
+
+    #[test]
+    fn auto_promote_defaults_off() {
+        let s = AutoPromoteSettings::from_env_vars(|_| None).unwrap();
+        assert!(!s.enabled);
+        assert_eq!(s.age_days, 7);
+        assert_eq!(s.interval_secs, 3600);
+        assert_eq!(s.decay_threshold, 0.5);
+        assert_eq!(
+            s.types,
+            vec![
+                CapabilityCapsuleType::Experience,
+                CapabilityCapsuleType::Implementation,
+                CapabilityCapsuleType::Episode,
+                CapabilityCapsuleType::Diary,
+            ],
+        );
+    }
+
+    #[test]
+    fn auto_promote_enable_via_env() {
+        for raw in ["1", "true", "yes", "TRUE"] {
+            let s = AutoPromoteSettings::from_env_vars(env(&[("MEM_AUTO_PROMOTE_ENABLED", raw)]))
+                .unwrap();
+            assert!(s.enabled, "expected {raw:?} to enable");
+        }
+        for raw in ["0", "false", "no", ""] {
+            let s = AutoPromoteSettings::from_env_vars(env(&[("MEM_AUTO_PROMOTE_ENABLED", raw)]))
+                .unwrap();
+            assert!(!s.enabled, "expected {raw:?} to leave disabled");
+        }
+    }
+
+    #[test]
+    fn auto_promote_age_zero_rejected() {
+        let err = AutoPromoteSettings::from_env_vars(env(&[("MEM_AUTO_PROMOTE_AGE_DAYS", "0")]))
+            .unwrap_err();
+        assert!(matches!(err, ConfigError::InvalidAutoPromoteAgeDays(ref s) if s == "0"));
+    }
+
+    #[test]
+    fn auto_promote_interval_zero_rejected() {
+        let err =
+            AutoPromoteSettings::from_env_vars(env(&[("MEM_AUTO_PROMOTE_INTERVAL_SECS", "0")]))
+                .unwrap_err();
+        assert!(matches!(
+            err,
+            ConfigError::InvalidAutoPromoteIntervalSecs(ref s) if s == "0"
+        ));
+    }
+
+    #[test]
+    fn auto_promote_decay_threshold_out_of_range_rejected() {
+        let err =
+            AutoPromoteSettings::from_env_vars(env(&[("MEM_AUTO_PROMOTE_DECAY_THRESHOLD", "1.5")]))
+                .unwrap_err();
+        assert!(matches!(
+            err,
+            ConfigError::InvalidAutoPromoteDecayThreshold(ref s) if s == "1.5"
+        ));
+    }
+
+    #[test]
+    fn auto_promote_types_csv_parses() {
+        let s = AutoPromoteSettings::from_env_vars(env(&[(
+            "MEM_AUTO_PROMOTE_TYPES",
+            "experience, workflow",
+        )]))
+        .unwrap();
+        assert_eq!(
+            s.types,
+            vec![
+                CapabilityCapsuleType::Experience,
+                CapabilityCapsuleType::Workflow,
+            ],
+        );
+    }
+
+    #[test]
+    fn auto_promote_types_empty_string_honoured() {
+        // Empty list is a valid "disable per-type without flipping the master
+        // switch" signal — don't quietly fall back to defaults.
+        let s = AutoPromoteSettings::from_env_vars(env(&[("MEM_AUTO_PROMOTE_TYPES", "")])).unwrap();
+        assert!(s.types.is_empty());
+    }
+
+    #[test]
+    fn auto_promote_types_unknown_rejected() {
+        let err = AutoPromoteSettings::from_env_vars(env(&[(
+            "MEM_AUTO_PROMOTE_TYPES",
+            "experience,bogus",
+        )]))
+        .unwrap_err();
+        assert!(matches!(err, ConfigError::InvalidAutoPromoteType(ref s) if s == "bogus"));
     }
 }
