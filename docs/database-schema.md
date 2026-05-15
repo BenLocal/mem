@@ -554,9 +554,9 @@ LanceDB 没有外置 migration 文件 —— schema 直接用 `Schema::new(vec![
 3. `record_batch_to_*()` parser 同步加 col 解析；**defensive 读** —— `column_by_name` + `as_any().downcast_ref()`，pre-existing 行没有该列时返回 None
 4. domain 类型加字段 + `#[serde(default, skip_serializing_if = "Option::is_none")]`
 
-**删列**：先把代码里的所有引用全删 + 在新插入时 `append_null`；旧行的列空间是浪费但不会错。需要真彻底删除时跑 `mem repair --rebuild`（重写所有数据）。
+**删列**：先把代码里的所有引用全删 + 在新插入时 `append_null`；旧行的列空间是浪费但不会错。需要真彻底删除时只能整表重写一遍（目前没有内置 CLI，直接 Lance API `Dataset::add_columns` / `drop_columns` 走脚本）。
 
-**改类型**：不能原地改。需要：① 加新列 ② 双写一段时间 ③ 切读到新列 ④ 后续 repair 重建去掉旧列。
+**改类型**：不能原地改。需要：① 加新列 ② 双写一段时间 ③ 切读到新列 ④ 后续整表重建去掉旧列。
 
 参考已落地的 schema 演进案例：
 
@@ -569,15 +569,4 @@ LanceDB 没有外置 migration 文件 —— schema 直接用 `Schema::new(vec![
 
 ## 6. 维护命令
 
-```bash
-# 诊断 vector 索引 sidecar 和 schema 一致性
-mem repair --check
-
-# 强制重建 sidecar（会停服）
-mem repair --rebuild
-
-# 重建 graph_edges（迁移用，topics → entity_id 解析）
-mem repair --rebuild-graph
-```
-
-详见 `src/cli/repair.rs`。
+当前没有内置的维护 CLI 子命令。HNSW sidecar 不一致时直接重启 `mem serve`——`LanceStore::open` 会在启动时比对 sidecar 与 Lance 表，自动重建。需要其他 schema 级运维操作（重建列、迁移历史 edge 等）走一次性脚本。

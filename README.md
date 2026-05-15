@@ -240,8 +240,6 @@ Response shape: `{ "windows": [{ "session_id": "...", "blocks": [...], "primary_
 | `MEM_TRANSCRIPT_EMBED_DISABLED` | unset | Set to `1` to stop the transcript embedding worker (e.g. when using OpenAI to avoid double provider spend). Blocks still archive verbatim. |
 | `MEM_TRANSCRIPT_VECTOR_INDEX_FLUSH_EVERY` | 256 | Flush cadence for the transcripts HNSW sidecar; lower than the memories sidecar because per-session bursts are larger. |
 
-`mem repair --check|--rebuild` covers both sidecars (memories and transcripts) in one pass.
-
 ## Benches: Two Different Tools, Different Questions
 
 Mem ships two benches that look similar (both use `tests/bench/` plumbing,
@@ -374,7 +372,7 @@ Tenant-scoped registry that canonicalizes alias strings (`"Rust"` = `"Rust langu
 
 After ingest, `graph_edges.to_node_id` is `"entity:<uuid>"` for every entity-typed edge. Memory→memory edges (`supersedes`) keep the `"memory:<id>"` prefix.
 
-**Migration**: existing `graph_edges` rows from before the registry shipped retain their legacy `"project:..."` / `"repo:..."` strings. Run `cargo run -- repair --rebuild-graph` to re-derive all memory-originating edges through the registry. Idempotent.
+**Legacy rows**: `graph_edges` rows written before the registry shipped retain their legacy `"project:..."` / `"repo:..."` strings on `to_node_id`. The one-shot `repair --rebuild-graph` migration that re-derived these has been removed; new writes go through the registry. Legacy rows are harmless — they just don't participate in entity-keyed lookups.
 
 **Aliases & normalization**: alias matching is lowercase + whitespace-collapsed; punctuation preserved (`C++` ≠ `c`). Caller's verbatim spelling lives on `entities.canonical_name`.
 

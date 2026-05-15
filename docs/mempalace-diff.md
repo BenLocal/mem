@@ -665,7 +665,7 @@ M（1.5 天，前提是 #11 完成）：
 
 ## 14. Conversation Archive（verbatim transcript 全量归档，与 memories 管道完全隔离）
 
-> **2026-04-30 落地**：✅ 在 §13 的 `mem mine` 之上加一条**全量原始对话归档**管道。新表 `conversation_messages`（每个 transcript block 一行，verbatim）+ 独立队列 `transcript_embedding_jobs` + 独立 HNSW sidecar `<MEM_DB_PATH>.transcripts.usearch`；与 `memories` 表 / 嵌入队列 / sidecar **完全不共享**任何状态或向量空间。`mem mine` 改为 dual-sink，单次扫描既写既有 memories 路径也写新 archive；`mem repair --check|--rebuild` 同时覆盖两个 sidecar。HTTP 路由 `POST /transcripts/messages` / `POST /transcripts/search` / `GET /transcripts?session_id=…&tenant=…`。**MCP 表面零变化**——transcript 搜索仅 HTTP，agent 走 `memory_search` → 命中后用 `session_id` 拉对应 transcript。
+> **2026-04-30 落地**：✅ 在 §13 的 `mem mine` 之上加一条**全量原始对话归档**管道。新表 `conversation_messages`（每个 transcript block 一行，verbatim）+ 独立队列 `transcript_embedding_jobs` + 独立 HNSW sidecar `<MEM_DB_PATH>.transcripts.usearch`；与 `memories` 表 / 嵌入队列 / sidecar **完全不共享**任何状态或向量空间。`mem mine` 改为 dual-sink，单次扫描既写既有 memories 路径也写新 archive。HTTP 路由 `POST /transcripts/messages` / `POST /transcripts/search` / `GET /transcripts?session_id=…&tenant=…`。**MCP 表面零变化**——transcript 搜索仅 HTTP，agent 走 `memory_search` → 命中后用 `session_id` 拉对应 transcript。
 
 ### 与既有路线的关系
 
@@ -699,7 +699,7 @@ M（1.5 天，前提是 #11 完成）：
 |---|---|---|---|
 | 时序图 `valid_from` / `valid_to` | `graph_edges` 表内置 | #4 | §5 |
 | HNSW ANN（消除全表扫 + `limit 2000` 隐式截断）| usearch sidecar | #2 | §3 / §4 |
-| HNSW 健康自检 + repair CLI | `mem repair --check / --rebuild` | #3 | §3 |
+| HNSW 健康自检 + repair CLI | ~~`mem repair --check / --rebuild`~~（CLI 已删；sidecar 健康检查保留在 `LanceStore::open` 启动路径里） | #3 | §3 |
 | BM25 + 向量 RRF | `pipeline/retrieve.rs` 两路 RRF（k=60） | #5 | §3 |
 | Entity registry（人/项目消歧） | `entities` + `entity_aliases` 表 | #8 | §2 |
 | Verbatim 纪律（token 计数 + summary 守护）| tiktoken-rs / ingest 校验 `summary != content` | #6 / #9 | §7 |

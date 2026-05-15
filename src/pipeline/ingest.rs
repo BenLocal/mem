@@ -156,8 +156,8 @@ pub struct GraphEdgeDraft {
 }
 
 /// Pure: produce drafts that downstream code resolves against an
-/// `EntityRegistry`. Used by both `service::capability_capsule_service::ingest`
-/// (live writes) and `cli::repair::rebuild_graph` (historical re-derive).
+/// `EntityRegistry`. Used by `service::capability_capsule_service::ingest`
+/// on live writes.
 ///
 /// Skips empty/whitespace-only field values.
 pub fn extract_graph_edge_drafts(memory: &CapabilityCapsuleRecord) -> Vec<GraphEdgeDraft> {

@@ -548,8 +548,9 @@ impl CapabilityCapsuleService {
     ///   2. Transactional DuckDB cascade
     ///      (`repository::delete_capability_capsule_hard`).
     ///   3. Best-effort HNSW sidecar removal — if the sidecar is missing or
-    ///      the remove fails, the DB delete still wins; an orphan vector
-    ///      gets cleaned by the next `mem repair --rebuild`.
+    ///      the remove fails, the DB delete still wins. An orphan vector
+    ///      in the sidecar is a known follow-up cost; Lance remains the
+    ///      authoritative source of truth.
     pub async fn delete_capability_capsule_hard(
         &self,
         tenant: &str,
