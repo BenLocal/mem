@@ -668,6 +668,20 @@ impl Store {
         self.query.get_transcript_embedding_job_status(job_id).await
     }
 
+    /// Prune Lance version manifests older than `older_than_days`
+    /// across every managed table. Issued through LanceStore's Rust
+    /// API (not DuckDB SQL), so a DuckDB-side `refresh()` is needed
+    /// afterwards to invalidate the snapshot cache — see the
+    /// `lance_write_then_refresh!` doc on this module. Driven by
+    /// `crate::worker::vacuum_worker` on a daily cadence and
+    /// exposed on-demand via `POST /admin/vacuum`.
+    pub async fn vacuum_old_versions(
+        &self,
+        older_than_days: i64,
+    ) -> Result<crate::storage::lance_store::VacuumStats, StorageError> {
+        lance_write_then_refresh!(self, self.lance.vacuum_old_versions(older_than_days).await)
+    }
+
     /// Bulk decay sweep over `memories.decay_score`. Routes to
     /// DuckDbQuery — issued as a single SQL UPDATE via the lance
     /// extension (per-row Rust iteration is not viable for this

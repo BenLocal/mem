@@ -10,6 +10,25 @@ are organized by feature wave (merge commit ranges on `master`).
 
 ### Added
 
+- **Vacuum worker** (`src/worker/vacuum_worker.rs`) — daily Lance
+  manifest pruning across every managed table. Lance is copy-on-write
+  so high-churn tables (`transcript_embedding_jobs`,
+  `conversation_message_embeddings`) accumulate gigabytes of historical
+  `_versions/` manifests within days even though the actual row data
+  is tens of MB. The worker calls `Table::optimize(OptimizeAction::Prune)`
+  via the new `LanceStore::vacuum_old_versions` and aggregates the
+  per-table `RemovalStats` into a `VacuumStats { bytes_removed,
+  old_versions_removed, tables_pruned, tables_skipped }`. Always-on
+  maintenance (matches `decay_worker`'s shape) — opt out with
+  `MEM_VACUUM_DISABLED=1`. Tunables: `_INTERVAL_SECS` (default 86_400),
+  `_OLDER_THAN_DAYS` (default 7; `0` rejected at worker config but
+  permitted via the HTTP override below). On-demand entry:
+  `POST /admin/vacuum` (new `src/http/maintenance.rs` module), optional
+  body `{"older_than_days": N}` overrides the configured cutoff for
+  one call. The Lance 7-day in-flight-transaction safety margin
+  (`delete_unverified=false`) is always applied, regardless of the
+  `older_than_days` override.
+
 - **Auto-promote sweep** (`src/worker/auto_promote_worker.rs`) — opt-in
   background worker that moves long-idle `PendingConfirmation` capsules
   to `Active` after they sit untouched past `MEM_AUTO_PROMOTE_AGE_DAYS`

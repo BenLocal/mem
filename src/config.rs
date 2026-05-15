@@ -85,12 +85,43 @@ pub struct AutoPromoteSettings {
     pub decay_threshold: f32,
 }
 
+/// Settings for the Lance vacuum sweep — periodically reclaims
+/// disk space by pruning old version manifests from every Lance
+/// dataset under the storage root. Default ON; opt out with
+/// `MEM_VACUUM_DISABLED=1`.
+///
+/// Why default ON: Lance is copy-on-write, so every UPDATE writes a
+/// new manifest and the old ones are never reclaimed automatically.
+/// High-churn tables (`transcript_embedding_jobs`,
+/// `conversation_message_embeddings`) accumulate gigabytes of
+/// historical manifests within days. Vacuum is pure maintenance —
+/// no semantic change to query results — so this worker mirrors
+/// `decay_worker`'s always-on shape rather than the opt-in shape of
+/// `auto_promote_worker`.
+#[derive(Debug, Clone)]
+pub struct VacuumSettings {
+    /// Worker is not spawned when true. Default false (worker is ON).
+    pub disabled: bool,
+    /// Sweep cadence in seconds. Default 86_400 (daily). The actual
+    /// vacuum call is fast on small DBs but can hold a write lock
+    /// for a few seconds on multi-GB Lance datasets, so don't
+    /// schedule it more aggressively than necessary.
+    pub interval_secs: u64,
+    /// Minimum age of a Lance manifest before it qualifies for
+    /// pruning. The Lance default is 7 days, which is the safety
+    /// margin against in-flight transactions when
+    /// `delete_unverified=false` (the default). Lower at your own
+    /// risk; never set to 0 in production.
+    pub older_than_days: u64,
+}
+
 #[derive(Debug, Clone)]
 pub struct Config {
     pub bind_addr: String,
     pub db_path: PathBuf,
     pub embedding: EmbeddingSettings,
     pub auto_promote: AutoPromoteSettings,
+    pub vacuum: VacuumSettings,
 }
 
 #[derive(Debug, Error)]
@@ -123,6 +154,10 @@ pub enum ConfigError {
     InvalidAutoPromoteDecayThreshold(String),
     #[error("invalid MEM_AUTO_PROMOTE_TYPES entry: {0} (expected one of experience, implementation, episode, diary, preference, workflow)")]
     InvalidAutoPromoteType(String),
+    #[error("invalid MEM_VACUUM_INTERVAL_SECS: {0}")]
+    InvalidVacuumIntervalSecs(String),
+    #[error("invalid MEM_VACUUM_OLDER_THAN_DAYS: {0}")]
+    InvalidVacuumOlderThanDays(String),
 }
 
 impl EmbeddingSettings {
@@ -359,6 +394,56 @@ impl AutoPromoteSettings {
     }
 }
 
+impl VacuumSettings {
+    /// Development / test defaults: worker ON, daily cadence, 7-day
+    /// safety margin. Matches `decay_worker`'s "always-on
+    /// maintenance" stance — only test-suite `Config::local()`
+    /// callers care about the worker spawning, and the worker is a
+    /// no-op on an empty store anyway.
+    pub fn development_defaults() -> Self {
+        Self {
+            disabled: false,
+            interval_secs: 86_400,
+            older_than_days: 7,
+        }
+    }
+
+    pub fn from_env_vars(get: impl Fn(&str) -> Option<String>) -> Result<Self, ConfigError> {
+        let mut s = Self::development_defaults();
+
+        if let Some(raw) = get("MEM_VACUUM_DISABLED") {
+            s.disabled = matches!(raw.to_ascii_lowercase().as_str(), "1" | "true" | "yes");
+        }
+
+        if let Some(raw) = get("MEM_VACUUM_INTERVAL_SECS") {
+            let n: u64 = raw
+                .parse()
+                .map_err(|_| ConfigError::InvalidVacuumIntervalSecs(raw.clone()))?;
+            if n == 0 {
+                return Err(ConfigError::InvalidVacuumIntervalSecs(raw));
+            }
+            s.interval_secs = n;
+        }
+
+        if let Some(raw) = get("MEM_VACUUM_OLDER_THAN_DAYS") {
+            let n: u64 = raw
+                .parse()
+                .map_err(|_| ConfigError::InvalidVacuumOlderThanDays(raw.clone()))?;
+            // `0` is allowed via the HTTP endpoint (operator-driven
+            // immediate-relief vacuum) but rejected as a worker
+            // configuration — a worker that prunes everything
+            // including 5-second-old manifests fights every in-flight
+            // write. The HTTP endpoint can override via its own param.
+            if n == 0 {
+                return Err(ConfigError::InvalidVacuumOlderThanDays(raw));
+            }
+            s.older_than_days = n;
+        }
+
+        Ok(s)
+    }
+}
+
 impl Config {
     pub fn local() -> Self {
         Self {
@@ -366,6 +451,7 @@ impl Config {
             db_path: default_db_path(),
             embedding: EmbeddingSettings::development_defaults(),
             auto_promote: AutoPromoteSettings::development_defaults(),
+            vacuum: VacuumSettings::development_defaults(),
         }
     }
 
@@ -376,6 +462,7 @@ impl Config {
             db_path: default_db_path(),
             embedding: EmbeddingSettings::from_env_vars(|k| std::env::var(k).ok())?,
             auto_promote: AutoPromoteSettings::from_env_vars(|k| std::env::var(k).ok())?,
+            vacuum: VacuumSettings::from_env_vars(|k| std::env::var(k).ok())?,
         })
     }
 }
@@ -687,5 +774,46 @@ mod tests {
         )]))
         .unwrap_err();
         assert!(matches!(err, ConfigError::InvalidAutoPromoteType(ref s) if s == "bogus"));
+    }
+
+    #[test]
+    fn vacuum_defaults_on() {
+        let s = VacuumSettings::from_env_vars(|_| None).unwrap();
+        assert!(!s.disabled);
+        assert_eq!(s.interval_secs, 86_400);
+        assert_eq!(s.older_than_days, 7);
+    }
+
+    #[test]
+    fn vacuum_disable_via_env() {
+        for raw in ["1", "true", "yes", "TRUE"] {
+            let s = VacuumSettings::from_env_vars(env(&[("MEM_VACUUM_DISABLED", raw)])).unwrap();
+            assert!(s.disabled, "{raw:?} should disable");
+        }
+        for raw in ["0", "false", "no", ""] {
+            let s = VacuumSettings::from_env_vars(env(&[("MEM_VACUUM_DISABLED", raw)])).unwrap();
+            assert!(!s.disabled, "{raw:?} should leave enabled");
+        }
+    }
+
+    #[test]
+    fn vacuum_interval_zero_rejected() {
+        let err =
+            VacuumSettings::from_env_vars(env(&[("MEM_VACUUM_INTERVAL_SECS", "0")])).unwrap_err();
+        assert!(matches!(err, ConfigError::InvalidVacuumIntervalSecs(ref s) if s == "0"));
+    }
+
+    #[test]
+    fn vacuum_older_than_zero_rejected() {
+        let err =
+            VacuumSettings::from_env_vars(env(&[("MEM_VACUUM_OLDER_THAN_DAYS", "0")])).unwrap_err();
+        assert!(matches!(err, ConfigError::InvalidVacuumOlderThanDays(ref s) if s == "0"));
+    }
+
+    #[test]
+    fn vacuum_older_than_non_numeric_rejected() {
+        let err = VacuumSettings::from_env_vars(env(&[("MEM_VACUUM_OLDER_THAN_DAYS", "soon")]))
+            .unwrap_err();
+        assert!(matches!(err, ConfigError::InvalidVacuumOlderThanDays(ref s) if s == "soon"));
     }
 }

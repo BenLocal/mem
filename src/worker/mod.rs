@@ -9,6 +9,9 @@
 //!   `PendingConfirmation` rows → `Active`, audited via a
 //!   `feedback_events` row with `kind=auto_promoted`. Opt-in via
 //!   `MEM_AUTO_PROMOTE_ENABLED=1`.
+//! - `vacuum_worker` — daily Lance manifest pruning across every
+//!   managed table. Always-on maintenance (reclaims accumulated
+//!   copy-on-write history); opt out with `MEM_VACUUM_DISABLED=1`.
 //! - `decay_worker` — bulk SQL UPDATE of `memories.decay_score`
 //!   (active rows only, capped at 1.0). Goes through
 //!   `Store::apply_time_decay` (DuckDB SQL via the lance extension).
@@ -28,3 +31,4 @@ pub mod auto_promote_worker;
 pub mod decay_worker;
 pub mod embedding_worker;
 pub mod transcript_embedding_worker;
+pub mod vacuum_worker;

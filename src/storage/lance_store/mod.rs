@@ -70,8 +70,11 @@ mod embedding;
 mod entities;
 mod episodes;
 mod graph;
+mod maintenance;
 mod sessions;
 mod transcripts;
+
+pub use maintenance::VacuumStats;
 
 use crate::domain::capability_capsule::{CapabilityCapsuleRecord, GraphEdge};
 use crate::domain::{BlockType, ConversationMessage, MessageRole};

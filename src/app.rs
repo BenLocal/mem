@@ -65,6 +65,14 @@ impl AppState {
             crate::worker::decay_worker::start_decay_worker(store_decay).await;
         });
 
+        if !config.vacuum.disabled {
+            let store_vacuum = store.clone();
+            let vacuum_settings = config.vacuum.clone();
+            tokio::spawn(async move {
+                crate::worker::vacuum_worker::run(store_vacuum, vacuum_settings).await;
+            });
+        }
+
         if config.auto_promote.enabled {
             let store_promote = store.clone();
             let promote_settings = config.auto_promote.clone();

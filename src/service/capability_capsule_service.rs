@@ -770,6 +770,20 @@ impl CapabilityCapsuleService {
             .map_err(ServiceError::Storage)
     }
 
+    /// Service entry point for the Lance vacuum sweep — delegates to
+    /// `Store::vacuum_old_versions` via the worker helper. Used by
+    /// `POST /admin/vacuum` for on-demand operator runs; the
+    /// background worker (when enabled) bypasses this and calls the
+    /// worker function directly.
+    pub async fn vacuum(
+        &self,
+        older_than_days: i64,
+    ) -> Result<crate::storage::lance_store::VacuumStats, ServiceError> {
+        crate::worker::vacuum_worker::sweep_once(&self.store, older_than_days)
+            .await
+            .map_err(ServiceError::Storage)
+    }
+
     /// Supersede flow: accept a pending memory by replacing it with an edited active version.
     ///
     /// After storage is updated, the graph is kept consistent:
