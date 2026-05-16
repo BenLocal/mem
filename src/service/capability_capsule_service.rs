@@ -540,17 +540,21 @@ impl CapabilityCapsuleService {
             .await?)
     }
 
-    /// Hard-delete a memory and all its references. **Irreversible.**
-    /// Backs `DELETE /capability_capsules/{id}` from the admin web page.
+    /// Hard-delete a memory. **Irreversible.** Backs
+    /// `DELETE /capability_capsules/{id}` from the admin web page.
     ///
     /// Order:
     ///   1. Verify the row exists for this tenant (clean 404 if not).
-    ///   2. Transactional DuckDB cascade
-    ///      (`repository::delete_capability_capsule_hard`).
-    ///   3. Best-effort HNSW sidecar removal — if the sidecar is missing or
-    ///      the remove fails, the DB delete still wins. An orphan vector
-    ///      in the sidecar is a known follow-up cost; Lance remains the
-    ///      authoritative source of truth.
+    ///   2. Issue `LanceStore::delete_capability_capsule_hard` — drops the
+    ///      `capability_capsules` row.
+    ///
+    /// **Cascade caveat**: the storage-layer call leaves a TODO for
+    /// cascade-deleting from `capability_capsule_embeddings`,
+    /// `embedding_jobs`, `feedback_events`, and `graph_edges`. Lance is
+    /// the authoritative source of truth for capsule existence; orphan
+    /// rows in those satellite tables don't surface in queries that
+    /// JOIN against the parent capsule (which is the read path for
+    /// every public surface). Closing that TODO is tracked separately.
     pub async fn delete_capability_capsule_hard(
         &self,
         tenant: &str,
@@ -564,9 +568,6 @@ impl CapabilityCapsuleService {
         self.store
             .delete_capability_capsule_hard(tenant, capability_capsule_id)
             .await?;
-        // Vector-index sidecar removal happens inside
-        // `DuckDbRepository::delete_capability_capsule_hard` itself; service code no
-        // longer needs to know the backend uses HNSW.
         Ok(())
     }
 

@@ -423,8 +423,8 @@ Phase 5 (持续, 收尾)
 
 ### 6.1 Phase 0 (1 天)
 
-- ✅ 本报告落盘
-- 🚧 修 `CLAUDE.md` / `README.md` 关于 HNSW sidecar 的 stale 描述
+- ✅ 本报告落盘 — `e3f8707`
+- ✅ 修 `CLAUDE.md` / `README.md` / `docs/api-data-flow.md` 关于 HNSW sidecar 的 stale 描述 + 源码 service 层 doc 同步 — 见本 commit
 - 🚧 给 `Store` 88 个方法的 doc 注释加上"LanceDB-specific" 或 "portable" 标记，方便后续 trait 化时机械分类
 
 ### 6.2 Phase 1 (1 周)

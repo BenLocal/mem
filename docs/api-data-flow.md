@@ -1,10 +1,12 @@
 # mem HTTP API — 数据流转 / 技术栈 / 优化方向
 
+> ⚠️ **本文档部分内容过期**（2026-05-16）：写于 DuckDB-as-storage 时期，多处仍引用已不存在的模块（`DuckDbRepository`、`src/storage/duckdb.rs`、`src/storage/vector_index.rs`、`src/storage/graph_store.rs`、`src/service/embedding_worker.rs` 等）。**当前架构**是 `LanceStore` 写 + `DuckDbQuery` 读 + `src/worker/*.rs`，详见 `AGENTS.md` 架构段与 `docs/backend-coupling.md`。HNSW sidecar 已不存在——向量索引由 Lance 内置。**完整重写本文档列在后续 docs 任务里**；在那之前以 `AGENTS.md` 和实际代码为准。
+>
 > **目的**：给一个真正能用上的"接口地图"——每条 HTTP 路由对应哪条服务/管线/存储调用链、用到的技术、可优化点。半年后回头改任何一条接口前先读这个。
 >
-> **同步源**：本文与 `src/http/*.rs` + `src/service/` + `src/pipeline/` + `src/storage/` 实际代码绑定；改架构时**先改代码、再来更新本文档**，commit 引用本文件章节号（`docs(api-flow): … (closes api-flow §X)`）。
+> **同步源**：本文应与 `src/http/*.rs` + `src/service/` + `src/pipeline/` + `src/storage/` 实际代码绑定；改架构时**先改代码、再来更新本文档**，commit 引用本文件章节号（`docs(api-flow): … (closes api-flow §X)`）。
 >
-> 设计原则与 mempalace 借鉴见 [`mempalace-diff.md`](./mempalace-diff.md)，路线图见 [`ROADMAP.MD`](./ROADMAP.MD)，本文档专注于"运行时"。
+> 设计原则与 mempalace 借鉴见 [`mempalace-diff.md`](./mempalace-diff.md) 与 [`mempalace-diff-v2.md`](./mempalace-diff-v2.md)，存储层耦合分析见 [`backend-coupling.md`](./backend-coupling.md)，路线图见 [`ROADMAP.MD`](./ROADMAP.MD)，本文档专注于"运行时"。
 
 ---
 
@@ -25,22 +27,22 @@ caller (codex/   │                                                            
               └────────┬─────────┘                              └───────────┬──────────┘
                        │                                                    │
               ┌────────▼─────────┐                              ┌───────────▼──────────┐
-              │ pipeline/        │   ingest / retrieve /        │ FTS BM25 +           │
-              │  ingest          │   compress / workflow        │ HNSW sidecar (read)  │
+              │ pipeline/        │   ingest / retrieve /        │ Lance FTS BM25 +     │
+              │  ingest          │   compress / workflow        │ Lance vector search  │
               │  retrieve(RRF)   │                              │ context window merge │
               │  compress(tok.)  │                              │                      │
               │  workflow        │                              │                      │
               └────────┬─────────┘                              └───────────┬──────────┘
                        │                                                    │
                   ┌────▼────────────────── storage ─────────────────────────▼────┐
-                  │  DuckDbRepository (Arc<Mutex<Connection>>)                    │
-                  │   ├ memories / memory_embeddings / embedding_jobs             │
-                  │   ├ episodes / feedback_events / sessions                     │
-                  │   ├ graph_edges (DuckDbGraphStore)                            │
-                  │   ├ entities / entity_aliases (EntityRegistry)                │
-                  │   └ conversation_messages / transcript_embedding_jobs         │
-                  │  VectorIndex (usearch HNSW) ×2: memories + transcripts        │
-                  │  FTS extension (BM25) on memories + conversation_messages     │
+                  │  Store (LanceStore writes + DuckDbQuery reads, same .lance/) │
+                  │   ├ capability_capsules / capability_capsule_embeddings      │
+                  │   ├ embedding_jobs / feedback_events / sessions / episodes   │
+                  │   ├ graph_edges (LanceStore + DuckDbQuery graph methods)     │
+                  │   ├ entities / entity_aliases (EntityRegistry)               │
+                  │   └ conversation_messages / conversation_message_embeddings  │
+                  │       / transcript_embedding_jobs                            │
+                  │  ANN & BM25 indexes: Lance native (no sidecar)               │
                   └──────────────────────────┬────────────────────────────────────┘
                                              │
                        ┌─────────────────────┴────────────────────┐
@@ -65,9 +67,9 @@ caller (codex/   │                                                            
 | HTTP | **axum 0.x** + **tokio** + tower middleware | `src/http/*.rs`, `src/main.rs` |
 | 序列化 | serde (snake_case) | `src/domain/*.rs` |
 | 错误 | `thiserror` + 自家 `AppError` (HTTP status mapping) | `src/error.rs` |
-| 存储 | **DuckDB** (bundled, single-file) via `duckdb` crate, `Arc<Mutex<Connection>>` | `src/storage/duckdb.rs` |
-| ANN | **usearch** (HNSW，cosine, F32, sidecar) | `src/storage/vector_index.rs` |
-| 词法 | **DuckDB FTS extension**（BM25, conjunctive=0） | `db/schema/005_fts.sql` + `ensure_fts_index_fresh` |
+| 存储 | **Lance** (列式，copy-on-write) + 进程内 **DuckDB** (lance extension `ATTACH ... TYPE LANCE`) | `src/storage/lance_store/` + `src/storage/duckdb_query/` + `src/storage/store.rs` |
+| ANN | **Lance native vector search**（`lance_vector_search()` SQL 表函数，无外部 sidecar） | `src/storage/lance_store/mod.rs` schemas |
+| 词法 | **Lance FTS index**（`lance_fts()` SQL 表函数，BM25） | `src/storage/lance_store/mod.rs::ensure_fts_index` |
 | 排序 | **RRF**（k=60，×1000 scale）+ **lifecycle 加性层**（intent×memory_type / scope / freshness / decay / graph_boost） | `src/pipeline/retrieve.rs::score_candidates_hybrid_rrf` + `apply_lifecycle_score` |
 | Tokenizer | **tiktoken-rs**（`o200k_base`，CJK 友好）用于压缩输出 | `src/pipeline/compress.rs` |
 | 哈希 | **sha2** SHA-256（content_hash 跨进程稳定，迁移自 SipHash） | `src/pipeline/ingest.rs::compute_content_hash` |
@@ -259,9 +261,10 @@ POST /transcripts {session_id, tenant, [limit, cursor, since, until]}
 
 每条写（ingest / edit_accept / feedback）`fts_dirty.store(true)`；下次 search 时 `ensure_fts_index_fresh` swap-and-rebuild：`drop_fts_index('memories')` → `create_fts_index('memories', 'memory_id', 'summary', 'content')`。**这是当前实测最痛的瓶颈**，详见 §4.1 / §5.1。
 
-### 3.4 HNSW sidecar 容量
+### 3.4 ~~HNSW sidecar 容量~~ ⚠️ 已废弃
 
-`upsert` 在写入前若 `size+1 > capacity` 会自动 ×2 grow（fix d49d49b）。flush 由 `MEM_VECTOR_INDEX_FLUSH_EVERY` 控制（默认 1024 / transcripts 256）。
+旧描述：sidecar `upsert` 容量增长 + `MEM_VECTOR_INDEX_FLUSH_EVERY` flush 控制。
+**当前**：Lance 接管 ANN 索引，无 sidecar、无容量/flush 概念；env 仍解析但无消费者，见 `backend-coupling.md` §4.4 QW-4。
 
 ### 3.5 RRF + lifecycle 双层评分
 

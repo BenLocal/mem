@@ -189,7 +189,7 @@ mem wake-up --token-budget 800
 
 ## Transcript Archive (conversation_messages)
 
-A second pipeline, fully isolated from `memories`, archives every Claude Code transcript block verbatim and exposes semantic search + ordered replay over those blocks. It exists alongside `memories` so the existing ranking / lifecycle / verbatim-guard surface is **untouched**: separate table (`conversation_messages`), separate embedding queue (`transcript_embedding_jobs`), and a separate HNSW sidecar at `<MEM_DB_PATH>.transcripts.usearch`. `mem mine` is now **dual-sink** — one transcript scan writes both extracted memories (existing path) and every block (text / tool_use / tool_result / thinking) to the archive.
+A second pipeline, fully isolated from `memories`, archives every Claude Code transcript block verbatim and exposes semantic search + ordered replay over those blocks. It exists alongside `memories` so the existing ranking / lifecycle / verbatim-guard surface is **untouched**: separate table (`conversation_messages`), separate embedding queue (`transcript_embedding_jobs`), and a separate Lance-native embedding table (`conversation_message_embeddings`). `mem mine` is now **dual-sink** — one transcript scan writes both extracted memories (existing path) and every block (text / tool_use / tool_result / thinking) to the archive.
 
 ```bash
 # Ingest a single block (internal — `mem mine` POSTs these for you).
@@ -238,7 +238,7 @@ Response shape: `{ "windows": [{ "session_id": "...", "blocks": [...], "primary_
 | Variable | Default | Meaning |
 |----------|---------|---------|
 | `MEM_TRANSCRIPT_EMBED_DISABLED` | unset | Set to `1` to stop the transcript embedding worker (e.g. when using OpenAI to avoid double provider spend). Blocks still archive verbatim. |
-| `MEM_TRANSCRIPT_VECTOR_INDEX_FLUSH_EVERY` | 256 | Flush cadence for the transcripts HNSW sidecar; lower than the memories sidecar because per-session bursts are larger. |
+| `MEM_TRANSCRIPT_VECTOR_INDEX_FLUSH_EVERY` | 256 | Vestigial — parsed into config but no current consumer post-Lance-0.27 native ANN. Slated for removal in `docs/backend-coupling.md` §4.4 QW-4. |
 
 ## Benches: Two Different Tools, Different Questions
 

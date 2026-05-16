@@ -1,16 +1,17 @@
 //! Transcript-archive service façade.
 //!
-//! Combines the transcript repository, the transcript HNSW sidecar
-//! (`Arc<VectorIndex>`), and an optional embedding provider into a single
-//! interface used by `http/transcripts.rs`. Mirrors `service/memory_service.rs`
+//! Wraps `Arc<Store>` (Lance-backed transcript reads + writes) and an
+//! optional embedding provider into a single interface used by
+//! `http/transcripts.rs`. Mirrors `service/capability_capsule_service.rs`
 //! in shape (struct holds `Clone`/`Arc`-wrapped collaborators; `Clone` is
 //! cheap so it can sit on `AppState`).
 //!
 //! The provider is `Option<Arc<dyn EmbeddingProvider>>` so unit/integration
 //! tests can construct a service with no provider; in that mode, non-empty
-//! semantic queries skip the HNSW channel (BM25 still works) and the empty-
-//! query path falls back to the recent-time SQL listing. With or without a
-//! provider, the response shape is `Vec<MergedWindow>`.
+//! semantic queries skip the vector-search channel (BM25 via the Lance FTS
+//! index still works) and the empty-query path falls back to the recent-time
+//! SQL listing. With or without a provider, the response shape is
+//! `Vec<MergedWindow>`.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
