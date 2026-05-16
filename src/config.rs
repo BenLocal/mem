@@ -25,35 +25,21 @@ pub struct EmbeddingSettings {
     pub max_retries: u32,
     pub batch_size: usize,
     pub openai_api_key: Option<String>,
-    pub vector_index_flush_every: usize,
-    /// Read directly via `std::env::var` in `DuckDbQuery::semantic_search_capability_capsules`.
-    /// This struct field is populated for diagnostic/logging visibility but is not the
-    /// source of truth at search time. See `mempalace-diff §8 #3` Task 14 carryover.
-    #[allow(dead_code)]
-    pub vector_index_oversample: usize,
-    /// Read directly via `std::env::var` in `DuckDbQuery::semantic_search_capability_capsules`.
-    /// This struct field is populated for diagnostic/logging visibility but is not the
-    /// source of truth at search time. See `mempalace-diff §8 #3` Task 14 carryover.
-    #[allow(dead_code)]
-    pub vector_index_use_legacy: bool,
     /// When `true`, `app.rs` skips spawning the transcript embedding worker.
     /// Set via `MEM_TRANSCRIPT_EMBED_DISABLED` (`"1"` or `"true"`,
     /// case-insensitive). Used by the cli/mine.rs offline pipeline and tests
     /// that want transcript ingest without a background worker.
     pub transcript_disabled: bool,
-    /// Sidecar flush cadence (writes between persists) for the transcript HNSW
-    /// index. Set via `MEM_TRANSCRIPT_VECTOR_INDEX_FLUSH_EVERY`. Defaults to
-    /// `256`; `0` is rejected at parse time and falls back to the default.
-    pub transcript_vector_index_flush_every: usize,
-    /// Oversample factor used by `TranscriptService::search` to widen the
-    /// BM25/HNSW/anchor candidate fan-out (`k = limit * oversample`). Set via
-    /// `MEM_TRANSCRIPT_OVERSAMPLE`. Defaults to `4`; `0` is rejected at parse
-    /// time. Read directly via `std::env::var` in `TranscriptService::search`,
-    /// mirroring the `MEM_VECTOR_INDEX_OVERSAMPLE` pattern on the memories
-    /// pipeline; this struct field is populated for diagnostic/logging
-    /// visibility but is not the source of truth at search time.
-    #[allow(dead_code)]
-    pub transcript_search_oversample: usize,
+    // Vestigial usearch sidecar tuning fields (`vector_index_flush_every`,
+    // `vector_index_oversample`, `vector_index_use_legacy`,
+    // `transcript_vector_index_flush_every`, `transcript_search_oversample`)
+    // and their `MEM_VECTOR_INDEX_*` / `MEM_TRANSCRIPT_VECTOR_INDEX_*` env vars
+    // were removed in QW-4 (closes backend-coupling §6 Phase 1 QW-4) — Lance
+    // 0.27 took over native ANN/FTS indexing and the sidecar code path is gone.
+    // `MEM_TRANSCRIPT_OVERSAMPLE` is still live (read directly via
+    // `std::env::var` in `TranscriptService::search`) but no longer round-trips
+    // through this struct; invalid values fall back to default 4 in the live
+    // read site instead of failing at startup.
 }
 
 /// Settings for the auto-promote sweep — promotes `PendingConfirmation`
@@ -138,14 +124,6 @@ pub enum ConfigError {
     InvalidMaxRetries(String),
     #[error("invalid EMBEDDING_BATCH_SIZE: {0}")]
     InvalidBatchSize(String),
-    #[error("invalid MEM_VECTOR_INDEX_FLUSH_EVERY: {0}")]
-    InvalidVectorIndexFlushEvery(String),
-    #[error("invalid MEM_VECTOR_INDEX_OVERSAMPLE: {0}")]
-    InvalidVectorIndexOversample(String),
-    #[error("invalid MEM_TRANSCRIPT_VECTOR_INDEX_FLUSH_EVERY: {0}")]
-    InvalidTranscriptVectorIndexFlushEvery(String),
-    #[error("invalid MEM_TRANSCRIPT_OVERSAMPLE: {0}")]
-    InvalidTranscriptOversample(String),
     #[error("invalid MEM_AUTO_PROMOTE_AGE_DAYS: {0}")]
     InvalidAutoPromoteAgeDays(String),
     #[error("invalid MEM_AUTO_PROMOTE_INTERVAL_SECS: {0}")]
@@ -171,12 +149,7 @@ impl EmbeddingSettings {
             max_retries: 4,
             batch_size: 1,
             openai_api_key: None,
-            vector_index_flush_every: 100,
-            vector_index_oversample: 4,
-            vector_index_use_legacy: false,
             transcript_disabled: false,
-            transcript_vector_index_flush_every: 256,
-            transcript_search_oversample: 4,
         }
     }
 
@@ -247,56 +220,9 @@ impl EmbeddingSettings {
             return Err(ConfigError::MissingOpenAiApiKey);
         }
 
-        if let Some(raw) = get("MEM_VECTOR_INDEX_FLUSH_EVERY") {
-            let n: usize = raw
-                .parse()
-                .map_err(|_| ConfigError::InvalidVectorIndexFlushEvery(raw.clone()))?;
-            if n == 0 {
-                return Err(ConfigError::InvalidVectorIndexFlushEvery(raw));
-            }
-            s.vector_index_flush_every = n;
-        }
-        if let Some(raw) = get("MEM_VECTOR_INDEX_OVERSAMPLE") {
-            let n: usize = raw
-                .parse()
-                .map_err(|_| ConfigError::InvalidVectorIndexOversample(raw.clone()))?;
-            if n == 0 {
-                return Err(ConfigError::InvalidVectorIndexOversample(raw));
-            }
-            s.vector_index_oversample = n;
-        }
-        if let Some(raw) = get("MEM_VECTOR_INDEX_USE_LEGACY") {
-            s.vector_index_use_legacy = matches!(raw.as_str(), "1" | "true" | "yes");
-        }
-
         if let Some(raw) = get("MEM_TRANSCRIPT_EMBED_DISABLED") {
             s.transcript_disabled =
                 matches!(raw.to_ascii_lowercase().as_str(), "1" | "true" | "yes");
-        }
-
-        if let Some(raw) = get("MEM_TRANSCRIPT_VECTOR_INDEX_FLUSH_EVERY") {
-            let n: usize = raw
-                .parse()
-                .map_err(|_| ConfigError::InvalidTranscriptVectorIndexFlushEvery(raw.clone()))?;
-            // `0` is meaningless (would flush on every write and never amortize
-            // disk I/O); reject loudly rather than silently falling back, to
-            // keep parity with `MEM_VECTOR_INDEX_FLUSH_EVERY`'s contract.
-            if n == 0 {
-                return Err(ConfigError::InvalidTranscriptVectorIndexFlushEvery(raw));
-            }
-            s.transcript_vector_index_flush_every = n;
-        }
-
-        if let Some(raw) = get("MEM_TRANSCRIPT_OVERSAMPLE") {
-            let n: usize = raw
-                .parse()
-                .map_err(|_| ConfigError::InvalidTranscriptOversample(raw.clone()))?;
-            // `0` would degenerate to `k = limit * 0` and produce no candidates;
-            // reject loudly to keep parity with `MEM_VECTOR_INDEX_OVERSAMPLE`.
-            if n == 0 {
-                return Err(ConfigError::InvalidTranscriptOversample(raw));
-            }
-            s.transcript_search_oversample = n;
         }
 
         Ok(s)
@@ -553,27 +479,6 @@ mod tests {
     }
 
     #[test]
-    fn vector_index_settings_have_defaults() {
-        let s = EmbeddingSettings::from_env_vars(|_| None).unwrap();
-        assert_eq!(s.vector_index_flush_every, 100);
-        assert_eq!(s.vector_index_oversample, 4);
-        assert!(!s.vector_index_use_legacy);
-    }
-
-    #[test]
-    fn vector_index_settings_read_from_env() {
-        let s = EmbeddingSettings::from_env_vars(env(&[
-            ("MEM_VECTOR_INDEX_FLUSH_EVERY", "50"),
-            ("MEM_VECTOR_INDEX_OVERSAMPLE", "8"),
-            ("MEM_VECTOR_INDEX_USE_LEGACY", "1"),
-        ]))
-        .unwrap();
-        assert_eq!(s.vector_index_flush_every, 50);
-        assert_eq!(s.vector_index_oversample, 8);
-        assert!(s.vector_index_use_legacy);
-    }
-
-    #[test]
     fn transcript_embed_disabled_default_false() {
         let s = EmbeddingSettings::from_env_vars(|_| None).unwrap();
         assert!(!s.transcript_disabled);
@@ -604,81 +509,6 @@ mod tests {
                 "expected MEM_TRANSCRIPT_EMBED_DISABLED={raw:?} to leave transcript_disabled=false"
             );
         }
-    }
-
-    #[test]
-    fn transcript_vector_index_flush_every_default_256() {
-        let s = EmbeddingSettings::from_env_vars(|_| None).unwrap();
-        assert_eq!(s.transcript_vector_index_flush_every, 256);
-    }
-
-    #[test]
-    fn transcript_vector_index_flush_every_parses_positive() {
-        let s = EmbeddingSettings::from_env_vars(env(&[(
-            "MEM_TRANSCRIPT_VECTOR_INDEX_FLUSH_EVERY",
-            "512",
-        )]))
-        .unwrap();
-        assert_eq!(s.transcript_vector_index_flush_every, 512);
-    }
-
-    #[test]
-    fn transcript_vector_index_flush_every_rejects_zero() {
-        let err = EmbeddingSettings::from_env_vars(env(&[(
-            "MEM_TRANSCRIPT_VECTOR_INDEX_FLUSH_EVERY",
-            "0",
-        )]))
-        .unwrap_err();
-        assert!(matches!(
-            err,
-            ConfigError::InvalidTranscriptVectorIndexFlushEvery(ref s) if s == "0"
-        ));
-    }
-
-    #[test]
-    fn transcript_vector_index_flush_every_rejects_non_numeric() {
-        let err = EmbeddingSettings::from_env_vars(env(&[(
-            "MEM_TRANSCRIPT_VECTOR_INDEX_FLUSH_EVERY",
-            "abc",
-        )]))
-        .unwrap_err();
-        assert!(matches!(
-            err,
-            ConfigError::InvalidTranscriptVectorIndexFlushEvery(ref s) if s == "abc"
-        ));
-    }
-
-    #[test]
-    fn transcript_oversample_default_4() {
-        let s = EmbeddingSettings::from_env_vars(|_| None).unwrap();
-        assert_eq!(s.transcript_search_oversample, 4);
-    }
-
-    #[test]
-    fn transcript_oversample_parses_positive() {
-        let s =
-            EmbeddingSettings::from_env_vars(env(&[("MEM_TRANSCRIPT_OVERSAMPLE", "8")])).unwrap();
-        assert_eq!(s.transcript_search_oversample, 8);
-    }
-
-    #[test]
-    fn transcript_oversample_rejects_zero() {
-        let err = EmbeddingSettings::from_env_vars(env(&[("MEM_TRANSCRIPT_OVERSAMPLE", "0")]))
-            .unwrap_err();
-        assert!(matches!(
-            err,
-            ConfigError::InvalidTranscriptOversample(ref s) if s == "0"
-        ));
-    }
-
-    #[test]
-    fn transcript_oversample_rejects_non_numeric() {
-        let err = EmbeddingSettings::from_env_vars(env(&[("MEM_TRANSCRIPT_OVERSAMPLE", "abc")]))
-            .unwrap_err();
-        assert!(matches!(
-            err,
-            ConfigError::InvalidTranscriptOversample(ref s) if s == "abc"
-        ));
     }
 
     #[test]

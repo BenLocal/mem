@@ -238,7 +238,7 @@ Response shape: `{ "windows": [{ "session_id": "...", "blocks": [...], "primary_
 | Variable | Default | Meaning |
 |----------|---------|---------|
 | `MEM_TRANSCRIPT_EMBED_DISABLED` | unset | Set to `1` to stop the transcript embedding worker (e.g. when using OpenAI to avoid double provider spend). Blocks still archive verbatim. |
-| `MEM_TRANSCRIPT_VECTOR_INDEX_FLUSH_EVERY` | 256 | Vestigial — parsed into config but no current consumer post-Lance-0.27 native ANN. Slated for removal in `docs/backend-coupling.md` §4.4 QW-4. |
+| `MEM_TRANSCRIPT_OVERSAMPLE` | 4 | Candidate fan-out factor for transcript search (`k = limit * factor`). Read live in `TranscriptService::search`; invalid values (non-numeric or 0) silently fall back to default. |
 
 ## Benches: Two Different Tools, Different Questions
 

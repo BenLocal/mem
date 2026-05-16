@@ -237,7 +237,7 @@ pub trait Backend:
 | QW-1 | `hybrid_candidates` 178 行 SQL 把 BM25+ANN+RRF 融在一起 | 拆成 `bm25_candidate_ids` / `ann_candidate_ids` / Rust 端 `rrf_merge` / `fetch_by_ids` 的 compose 路径 | 未来换 backend 时只需各自实现两个简单方法 | 多 round trip 真实存在（bench 测得 +14~29%），所以 **保留 fused-SQL 作为 LanceBackend default**，compose 作为 portable 参考路径 | ✅ — see commit ref in §4.1 below |
 | QW-2 | `lance_store/*.rs` 写方法 filter 用 `sql_quote` 字符串拼接 | ~~lancedb 0.27 `update().only_if()` 接 bound params，改一遍~~ ⚠️ **deferred** — lancedb 0.27 expr API 仅支持读路径，写/删仍只能传字符串；sql_quote 输入全是内部字段，injection 风险实质为零；部分迁移制造两种风格。Phase 2 trait 抽离时定义 mem-internal predicate IR 更干净 | 去掉一个 SQL-ish 拼装层 | API gap：覆盖率 ~30% (42/140 callsite)；不值得引入 datafusion_expr 依赖 | ⚠️ **deferred** — see §4.2 + §7.2 |
 | QW-3 | `decode_embedding_blob` / `f32_slice_to_blob` 在 `service::embedding_helpers` 但被 storage 调用 | 移到 `crate::embedding::wire`，明确"应用 ↔ 存储"wire format | wire 层显式，未来 backend 可选 native f32 数组而非 byte blob | 纯 refactor，无 | ✅ — see §4.3 |
-| QW-4 | `config.rs:142-285` 大量 `MEM_VECTOR_INDEX_*` env + `#[allow(dead_code)]` 字段；CLAUDE.md 还讲 usearch sidecar | 删字段 + 删配置 + 修文档 | 减 cognitive load，对齐代码现状 | 无 |
+| QW-4 | `config.rs:142-285` 大量 `MEM_VECTOR_INDEX_*` env + `#[allow(dead_code)]` 字段；CLAUDE.md 还讲 usearch sidecar | 删字段 + 删配置 + 修文档 | 减 cognitive load，对齐代码现状 | 失去 `MEM_TRANSCRIPT_OVERSAMPLE` 的 startup validation（live read 已自带 fallback） | ✅ — see §4.4 |
 | QW-5 | `pipeline/retrieve.rs:76 graph: &Store` 但实际只调几个 graph 方法 | 给 pipeline 定义 `trait GraphRead` 子集，retrieve 接 `&dyn GraphRead` | pipeline 层先 trait 化，是 Phase 2 的预演 | 无 |
 | QW-6 | `lance_write_then_refresh!` 宏在 store.rs，27 调用点 | 改成 `Store::commit_write<F, T>(write_fn) -> T` 显式 method | method 可被 LanceBackend 覆盖、TestBackend no-op、Postgres 不实现；宏没法这么干 | 27 处机械替换 |
 
@@ -332,16 +332,26 @@ pub fn decode_f32_blob(blob: &[u8], dim: usize) -> Result<Vec<f32>, &'static str
 
 **未来工作**：当其他 backend 选择 native vector 类型（pgvector 直接吃 `Vec<f32>`、外部 ANN 服务用 HTTP/protobuf）时，wire 层显式存在意味着只需在 wire.rs 加新 codec，或在 backend impl 内直接旁路 wire 层。lance_store 现在仍走 blob 路径，将来如果 Lance 暴露更原生的 vector 写接口可以再砍。
 
-### 4.4 QW-4: 清 usearch 残留
+### 4.4 QW-4: 清 usearch 残留 (✅ landed)
 
-`src/config.rs` 删除：
+实际清掉的东西：
 
-- `vector_index_flush_every` / `vector_index_oversample` / `vector_index_use_legacy` 字段
-- `transcript_vector_index_flush_every` / `transcript_search_oversample` 字段
-- 对应 `MEM_VECTOR_INDEX_*` env 解析
-- `ConfigError::InvalidVectorIndex*` 变体
+| 类别 | 数量 | 详情 |
+|---|---|---|
+| `EmbeddingSettings` 字段 | 5 | `vector_index_flush_every` / `vector_index_oversample` / `vector_index_use_legacy` / `transcript_vector_index_flush_every` / `transcript_search_oversample` |
+| env 解析块 | 5 | 上面对应的 `MEM_VECTOR_INDEX_*` / `MEM_TRANSCRIPT_VECTOR_INDEX_FLUSH_EVERY` / `MEM_TRANSCRIPT_OVERSAMPLE` |
+| `ConfigError` 变体 | 4 | `InvalidVectorIndexFlushEvery` / `InvalidVectorIndexOversample` / `InvalidTranscriptVectorIndexFlushEvery` / `InvalidTranscriptOversample` |
+| 单测 | 10 | `vector_index_settings_*` ×2 / `transcript_vector_index_flush_every_*` ×4 / `transcript_oversample_*` ×4 |
+| dead-code 传播 | 1 处 | `src/app.rs:92-93` 把 `transcript_vector_index_flush_every` 赋给 `vector_index_flush_every`（两边都没消费） |
 
-`CLAUDE.md` 删除"ANN sidecar lives in `vector_index.rs`"段（已不在）。`README.md` 同步。
+**Phase 0 第 2 条**已经清了所有 stale 描述（`AGENTS.md` / `README.md` / `docs/api-data-flow.md` / source comments），本 QW 跟着补一刀：
+
+- `AGENTS.md` env 列表删除"vestigial"备注，改写为：`MEM_TRANSCRIPT_OVERSAMPLE` 单独列出（live read），legacy 那批写成"已删除"
+- `README.md` env 表删 `MEM_TRANSCRIPT_VECTOR_INDEX_FLUSH_EVERY` 行，改加 `MEM_TRANSCRIPT_OVERSAMPLE` 行
+
+**关键 trade-off**：`MEM_TRANSCRIPT_OVERSAMPLE` 失去 startup validation —— 这个 env 仍然 live（`TranscriptService::search:285` 直接 `std::env::var`），但 invalid 值（非数字 / 0）现在 silently fall back to default 4 而非 mem serve 启动期报错。`transcript_service` 的 `.filter(|n| *n > 0).unwrap_or(4)` 兜底逻辑早就在那里——原 config parser 是冗余检查，删掉 = 一个 source of truth。
+
+实际上这种"live env read, no config-side parse"是项目里的既有模式（`MEM_DB_PATH` / `MEM_BASE_URL` / `MEM_TENANT` / `MEM_MIN_SCORE` / `MEM_SESSION_IDLE_MINUTES` 都是这样），`MEM_TRANSCRIPT_OVERSAMPLE` 现在跟齐了。
 
 ### 4.5 QW-5: pipeline 用子 trait
 

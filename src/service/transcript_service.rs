@@ -276,12 +276,11 @@ impl TranscriptService {
     ) -> Result<TranscriptSearchResult, StorageError> {
         let limit = limit.clamp(1, 100);
         // Oversample factor (`k = limit * factor`) is read directly from env at
-        // search time, mirroring the `MEM_VECTOR_INDEX_OVERSAMPLE` pattern in
-        // `DuckDbRepository::semantic_search_capability_capsules` (Option B): keeps the
-        // override flexible without plumbing config through the service. The
-        // parser in `config.rs` rejects 0 for `MEM_TRANSCRIPT_OVERSAMPLE`, but
-        // since this read bypasses the parser we apply the same `> 0` filter
-        // here defensively. Default 4 matches historical hardcoded behavior.
+        // search time — keeps the override flexible without plumbing config
+        // through the service. As of QW-4 there is no config-side parser; an
+        // invalid `MEM_TRANSCRIPT_OVERSAMPLE` value (non-numeric or 0) silently
+        // falls back to the default 4 below. Default 4 matches historical
+        // hardcoded behavior.
         let oversample_factor = std::env::var("MEM_TRANSCRIPT_OVERSAMPLE")
             .ok()
             .and_then(|s| s.parse::<usize>().ok())

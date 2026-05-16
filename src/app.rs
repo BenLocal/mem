@@ -88,9 +88,7 @@ impl AppState {
         if !config.embedding.transcript_disabled {
             let provider_transcript = provider.clone();
             let store_transcript = store.clone();
-            let mut transcript_settings = config.embedding.clone();
-            transcript_settings.vector_index_flush_every =
-                config.embedding.transcript_vector_index_flush_every;
+            let transcript_settings = config.embedding.clone();
             tokio::spawn(async move {
                 crate::worker::transcript_embedding_worker::run(
                     store_transcript,
