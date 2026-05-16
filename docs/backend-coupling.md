@@ -239,7 +239,7 @@ pub trait Backend:
 | QW-3 | `decode_embedding_blob` / `f32_slice_to_blob` 在 `service::embedding_helpers` 但被 storage 调用 | 移到 `crate::embedding::wire`，明确"应用 ↔ 存储"wire format | wire 层显式，未来 backend 可选 native f32 数组而非 byte blob | 纯 refactor，无 | ✅ — see §4.3 |
 | QW-4 | `config.rs:142-285` 大量 `MEM_VECTOR_INDEX_*` env + `#[allow(dead_code)]` 字段；CLAUDE.md 还讲 usearch sidecar | 删字段 + 删配置 + 修文档 | 减 cognitive load，对齐代码现状 | 失去 `MEM_TRANSCRIPT_OVERSAMPLE` 的 startup validation（live read 已自带 fallback） | ✅ — see §4.4 |
 | QW-5 | `pipeline/retrieve.rs:76 graph: &Store` 但实际只调几个 graph 方法（外加 `pipeline/session.rs:66 repo: &Store` 同形态） | 给 pipeline 定义 `trait GraphRead` + `trait SessionStore` 子集，pipeline 全部接 `&dyn _` | pipeline 层先 trait 化，是 Phase 2 的预演 | 无 | ✅ — see §4.5 |
-| QW-6 | `lance_write_then_refresh!` 宏在 store.rs，27 调用点 | 改成 `Store::commit_write<F, T>(write_fn) -> T` 显式 method | method 可被 LanceBackend 覆盖、TestBackend no-op、Postgres 不实现；宏没法这么干 | 27 处机械替换 |
+| QW-6 | `lance_write_then_refresh!` 宏在 store.rs，37 调用点 | 改成 `Store::commit_lance_write<T>(result) -> Result<T, _>` 显式 method（pre-computed-result 形态，非 closure；避 HRTB / AsyncFnOnce / BoxFuture 复杂） | method 可被 LanceBackend 覆盖、TestBackend no-op、Postgres 不实现；宏没法这么干 | 37 处机械替换；callsite 增 2 字符（额外 `.await`） | ✅ — see §4.6 |
 
 ### 4.1 QW-1: 拆 `hybrid_candidates` 成 Rust-compose (✅ landed)
 
@@ -391,21 +391,52 @@ Service 层 callsite (2 处 in `capability_capsule_service.rs`) 改 `&self.store
 - 当 Phase 2 把同样的模式应用到 88 个 Store 方法上时，对应 ~100 个 callsite 大致按相同手法机械重写
 - 任何新 backend 实现 `GraphRead` + `SessionStore` 后，pipeline 可不修改一行代码跑在新 backend 上
 
-### 4.6 QW-6: 宏 → 显式 method
+### 4.6 QW-6: 宏 → 显式 method (✅ landed)
 
-将 `lance_write_then_refresh!` 改为：
+将 `lance_write_then_refresh!` (37 个 callsite) 改成显式 method：
 
 ```rust
 impl Store {
-    async fn commit_write<F, T, Fut>(&self, f: F) -> Result<T, StorageError>
-    where F: FnOnce(&LanceStore) -> Fut, Fut: Future<Output = Result<T, StorageError>>
-    { ... }
+    pub(crate) async fn commit_lance_write<T>(
+        &self,
+        result: Result<T, StorageError>,
+    ) -> Result<T, StorageError> {
+        if let Err(refresh_err) = self.query.refresh().await {
+            return match result {
+                Ok(_) => Err(refresh_err),
+                Err(orig) => Err(orig),
+            };
+        }
+        result
+    }
 }
 ```
 
-将 27 个 call site 从 `lance_write_then_refresh!(self, self.lance.foo().await)` 改为 `self.commit_write(|lance| lance.foo()).await`。语义不变，但 trait 化时可以 override。
+Callsite 形态：
 
-QW-1 ~ QW-6 全做完约 **1-2 周**。完全不破任何现有 API。
+```rust
+// 之前
+lance_write_then_refresh!(self, self.lance.insert_capability_capsule(m).await)
+
+// 现在
+self.commit_lance_write(self.lance.insert_capability_capsule(m).await)
+    .await
+```
+
+**形态选择**：doc 原稿写 `commit_write<F, T>(write_fn)` (closure 形态)，但 Rust 的 "closure return future borrowing arg" 模式有 lifetime 复杂性：
+
+| 方案 | 代价 |
+|---|---|
+| `F: FnOnce(&LanceStore) -> Fut, Fut: Future` | `Fut` 不能借 `&LanceStore`，编译失败 |
+| `F: for<'a> FnOnce(&'a LanceStore) -> BoxFuture<'a, _>` | callsite 要 `Box::pin(...)`，每次堆分配 |
+| `F: AsyncFnOnce(&LanceStore) -> _` | 需 Rust 1.85+，MSRV 提升 |
+| **`fn commit_lance_write<T>(&self, result: Result<T, _>)`** | callsite 多 2 字符 `.await`，零堆分配，零 MSRV 提升 |
+
+选第 4 项。callsite 多敲一个 `.await`，语义/diff 大小跟 closure 形态等同。"看不到 `|lance|` 显式参数"不是损失——callsite 本来就写 `self.lance.foo(...)`。
+
+**Phase 2 含义**：未来当 storage 抽 trait 后，`commit_lance_write` 留在 `LanceBackend` 内部（不是 trait method），其他 backend 各自定义自己的 commit 仪式（Postgres 不需要、SQLite 同样不需要、内存 backend no-op）。Phase 2 trait 上是裸的 CRUD 方法签名；commit ceremony 是 backend impl 细节。
+
+**验证**：8 个 `storage::store::tests` round-trip + 全套 18 集成测试，0 failed。运行时行为零变化（只是把宏展开成了 method call）。
 
 ---
 
@@ -520,9 +551,20 @@ Phase 5 (持续, 收尾)
 - ✅ 修 `CLAUDE.md` / `README.md` / `docs/api-data-flow.md` 关于 HNSW sidecar 的 stale 描述 + 源码 service 层 doc 同步 — `fca52fa`
 - ✅ 给 `Store` 方法的 doc 注释加上 LANCE-SPECIFIC 标记 — module 注释声明 portable 是默认；只有真正绑 Lance 行为的 10 个方法（`claim_next_n_embedding_jobs` / `claim_next_n_transcript_embedding_jobs` / `upsert_capability_capsule_embedding` / `upsert_conversation_message_embedding` / `replace_pending_with_successor` / `apply_feedback` / `hybrid_candidates` / `semantic_search_transcripts` / `bm25_transcript_candidates` / `vacuum_old_versions`）被显式标记。这 10 个就是 Phase 2 trait 抽离时必须重新设计的方法。见本 commit
 
-### 6.2 Phase 1 (1 周)
+### 6.2 Phase 1 (1 周) — ✅ shipped
 
-按 §4 QW-1 ~ QW-6 顺序做。每条独立 commit，独立 review。完成后 storage 层"backend-specific 边界"明显收窄，但**对外 API 完全不变**——即便 Phase 2 决定"算了不抽 trait 了"，Phase 1 的清理也都是干净收益。
+按 §4 QW-1 ~ QW-6 顺序做完，每条独立 commit + push：
+
+| QW | Commit | 状态备注 |
+|---|---|---|
+| QW-1 hybrid 拆 portable 原语 | `60f3320` | ✅ + bench 驱动降级 |
+| QW-2 sql_quote → bound params | `99f3065` | ⚠️ deferred — lancedb 0.27 expr API 仅覆盖读路径 |
+| QW-3 embedding wire → crate::embedding | `0da0aa3` | ✅ |
+| QW-4 删 usearch 残留 config | `9b8b642` | ✅ (+36/-199) |
+| QW-5 pipeline GraphRead+SessionStore | `2b09cc6` | ✅ |
+| QW-6 lance_write_then_refresh! → method | (本次) | ✅ |
+
+完成后 storage 层"backend-specific 边界"明显收窄；**对外 API 完全不变**——即便 Phase 2 决定"算了不抽 trait 了"，Phase 1 的清理也都是干净收益。下一步 Phase 2 (§6.3) 是首个真 trait + alternate backend，是 decision point。
 
 ### 6.3 Phase 2 (2 周) — DECISION POINT
 

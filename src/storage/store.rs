@@ -31,8 +31,9 @@
 //!
 //! `Store` resolves this by calling [`DuckDbQuery::refresh`] —
 //! which swaps in a brand-new in-process DuckDB connection — after
-//! every mutating method. The `lance_write_then_refresh!` macro
-//! threads this through; reads are unaffected (they pay nothing).
+//! every mutating method. The [`Store::commit_lance_write`] helper
+//! threads this through (was the `lance_write_then_refresh!` macro
+//! pre-QW-6); reads are unaffected (they pay nothing).
 //! Cost: about a connection-setup's worth of milliseconds per write
 //! (extension load + ATTACH on the new conn). For mem's typical
 //! write/read ratio this is negligible.
@@ -124,36 +125,51 @@ impl Store {
     }
 }
 
-/// Internal helper: chain a `LanceStore` write and a `DuckDbQuery`
-/// refresh in the order the `Store` contract requires. Writes go to
-/// lance; reads after the call must see the new version, so the
-/// in-process DuckDB connection is reset (see
-/// [`DuckDbQuery::refresh`] for why).
-///
-/// Returns the underlying write's `T` on success. Refresh failures
-/// surface as `StorageError`; the write has already committed at
-/// that point, so the caller sees the value the write produced even
-/// if a future read from the same `Store` happens to see a stale
-/// version (it'll converge on the next mutation).
-macro_rules! lance_write_then_refresh {
-    ($self:ident, $expr:expr) => {{
-        let result = $expr;
+impl Store {
+    /// Chain a completed `LanceStore` write with the `DuckDbQuery`
+    /// refresh ceremony the `Store` contract requires. Writes go
+    /// to lance; reads after the call must see the new version, so
+    /// the in-process DuckDB connection is reset (see
+    /// [`DuckDbQuery::refresh`] for why).
+    ///
+    /// `result` is the **already-awaited** outcome of the lance
+    /// write — callers compute the value first, then hand it to
+    /// this method. The pre-computed-result shape avoids the
+    /// closure-of-borrowed-future lifetime gymnastics a
+    /// `commit_write(write_fn)` form would need, at the cost of
+    /// repeating `self.lance.foo(...).await` at the callsite (which
+    /// was already there inside the legacy `lance_write_then_refresh!`
+    /// macro this method replaced).
+    ///
+    /// Refresh failures surface as `StorageError`; the write has
+    /// already committed at that point, so the caller sees the
+    /// value the write produced even if a future read from the
+    /// same `Store` happens to see a stale version (it'll converge
+    /// on the next mutation).
+    ///
+    /// Closes `backend-coupling.md` §6 Phase 1 QW-6. In Phase 2,
+    /// this ceremony will live on the LanceBackend impl behind the
+    /// portable trait surface; other backends won't need it.
+    pub(crate) async fn commit_lance_write<T>(
+        &self,
+        result: Result<T, StorageError>,
+    ) -> Result<T, StorageError> {
         // Refresh whether or not the write succeeded — partial
         // commits in lance still bump the manifest version, so we
         // want a clean view either way.
-        if let Err(e) = $self.query.refresh().await {
+        if let Err(refresh_err) = self.query.refresh().await {
             // If we *did* have a successful write but the refresh
             // failed, prefer to surface the refresh error (the
             // caller should know the read view is stale). If the
             // write itself failed, that's the more interesting
             // error.
             return match result {
-                Ok(_) => Err(e),
+                Ok(_) => Err(refresh_err),
                 Err(orig) => Err(orig),
             };
         }
         result
-    }};
+    }
 }
 
 // ── Memory writes (LanceStore + DuckDbQuery refresh) ────────────────
@@ -162,7 +178,8 @@ impl Store {
         &self,
         m: CapabilityCapsuleRecord,
     ) -> Result<CapabilityCapsuleRecord, StorageError> {
-        lance_write_then_refresh!(self, self.lance.insert_capability_capsule(m).await)
+        self.commit_lance_write(self.lance.insert_capability_capsule(m).await)
+            .await
     }
 
     /// Multi-row insert. Single Lance write + single DuckDB refresh,
@@ -174,17 +191,16 @@ impl Store {
         if memories.is_empty() {
             return Ok(());
         }
-        lance_write_then_refresh!(
-            self,
-            self.lance.insert_capability_capsules_batch(memories).await
-        )
+        self.commit_lance_write(self.lance.insert_capability_capsules_batch(memories).await)
+            .await
     }
 
     pub async fn try_enqueue_embedding_job(
         &self,
         insert: EmbeddingJobInsert,
     ) -> Result<bool, StorageError> {
-        lance_write_then_refresh!(self, self.lance.try_enqueue_embedding_job(insert).await)
+        self.commit_lance_write(self.lance.try_enqueue_embedding_job(insert).await)
+            .await
     }
 
     /// Multi-row variant of [`Self::try_enqueue_embedding_job`]. Skips the
@@ -200,7 +216,8 @@ impl Store {
         if inserts.is_empty() {
             return Ok(());
         }
-        lance_write_then_refresh!(self, self.lance.enqueue_embedding_jobs_batch(inserts).await)
+        self.commit_lance_write(self.lance.enqueue_embedding_jobs_batch(inserts).await)
+            .await
     }
 
     /// **LANCE-SPECIFIC**: claim is an `update().only_if(...)` whose
@@ -215,12 +232,12 @@ impl Store {
         max_retries: u32,
         n: usize,
     ) -> Result<Vec<ClaimedEmbeddingJob>, StorageError> {
-        lance_write_then_refresh!(
-            self,
+        self.commit_lance_write(
             self.lance
                 .claim_next_n_embedding_jobs(now, max_retries, n)
-                .await
+                .await,
         )
+        .await
     }
 
     /// **LANCE-SPECIFIC**: `capability_capsule_embeddings` is
@@ -241,8 +258,7 @@ impl Store {
         source_updated_at: &str,
         now: &str,
     ) -> Result<(), StorageError> {
-        lance_write_then_refresh!(
-            self,
+        self.commit_lance_write(
             self.lance
                 .upsert_capability_capsule_embedding(
                     capability_capsule_id,
@@ -254,20 +270,21 @@ impl Store {
                     source_updated_at,
                     now,
                 )
-                .await
+                .await,
         )
+        .await
     }
 
     pub async fn delete_capability_capsule_embedding(
         &self,
         capability_capsule_id: &str,
     ) -> Result<(), StorageError> {
-        lance_write_then_refresh!(
-            self,
+        self.commit_lance_write(
             self.lance
                 .delete_capability_capsule_embedding(capability_capsule_id)
-                .await
+                .await,
         )
+        .await
     }
 
     pub async fn complete_embedding_job(
@@ -275,7 +292,8 @@ impl Store {
         job_id: &str,
         now: &str,
     ) -> Result<(), StorageError> {
-        lance_write_then_refresh!(self, self.lance.complete_embedding_job(job_id, now).await)
+        self.commit_lance_write(self.lance.complete_embedding_job(job_id, now).await)
+            .await
     }
 
     pub async fn mark_embedding_job_stale(
@@ -283,7 +301,8 @@ impl Store {
         job_id: &str,
         now: &str,
     ) -> Result<(), StorageError> {
-        lance_write_then_refresh!(self, self.lance.mark_embedding_job_stale(job_id, now).await)
+        self.commit_lance_write(self.lance.mark_embedding_job_stale(job_id, now).await)
+            .await
     }
 
     pub async fn reschedule_embedding_job_failure(
@@ -294,8 +313,7 @@ impl Store {
         available_at: &str,
         now: &str,
     ) -> Result<(), StorageError> {
-        lance_write_then_refresh!(
-            self,
+        self.commit_lance_write(
             self.lance
                 .reschedule_embedding_job_failure(
                     job_id,
@@ -304,8 +322,9 @@ impl Store {
                     available_at,
                     now,
                 )
-                .await
+                .await,
         )
+        .await
     }
 
     pub async fn permanently_fail_embedding_job(
@@ -315,24 +334,24 @@ impl Store {
         last_error: &str,
         now: &str,
     ) -> Result<(), StorageError> {
-        lance_write_then_refresh!(
-            self,
+        self.commit_lance_write(
             self.lance
                 .permanently_fail_embedding_job(job_id, new_attempt_count, last_error, now)
-                .await
+                .await,
         )
+        .await
     }
 
     pub async fn delete_embedding_jobs_by_capability_capsule_id(
         &self,
         capability_capsule_id: &str,
     ) -> Result<usize, StorageError> {
-        lance_write_then_refresh!(
-            self,
+        self.commit_lance_write(
             self.lance
                 .delete_embedding_jobs_by_capability_capsule_id(capability_capsule_id)
-                .await
+                .await,
         )
+        .await
     }
 
     pub async fn accept_pending(
@@ -340,12 +359,12 @@ impl Store {
         tenant: &str,
         capability_capsule_id: &str,
     ) -> Result<CapabilityCapsuleRecord, StorageError> {
-        lance_write_then_refresh!(
-            self,
+        self.commit_lance_write(
             self.lance
                 .accept_pending(tenant, capability_capsule_id)
-                .await
+                .await,
         )
+        .await
     }
 
     pub async fn reject_pending(
@@ -353,12 +372,12 @@ impl Store {
         tenant: &str,
         capability_capsule_id: &str,
     ) -> Result<CapabilityCapsuleRecord, StorageError> {
-        lance_write_then_refresh!(
-            self,
+        self.commit_lance_write(
             self.lance
                 .reject_pending(tenant, capability_capsule_id)
-                .await
+                .await,
         )
+        .await
     }
 
     /// **LANCE-SPECIFIC**: two-op sequence (archive old + insert
@@ -373,12 +392,12 @@ impl Store {
         original_memory_id: &str,
         successor: CapabilityCapsuleRecord,
     ) -> Result<CapabilityCapsuleRecord, StorageError> {
-        lance_write_then_refresh!(
-            self,
+        self.commit_lance_write(
             self.lance
                 .replace_pending_with_successor(tenant, original_memory_id, successor)
-                .await
+                .await,
         )
+        .await
     }
 
     /// **LANCE-SPECIFIC**: writes the `feedback_events` row first,
@@ -394,7 +413,8 @@ impl Store {
         memory: &CapabilityCapsuleRecord,
         feedback: FeedbackEvent,
     ) -> Result<CapabilityCapsuleRecord, StorageError> {
-        lance_write_then_refresh!(self, self.lance.apply_feedback(memory, feedback).await)
+        self.commit_lance_write(self.lance.apply_feedback(memory, feedback).await)
+            .await
     }
 
     pub async fn delete_capability_capsule_hard(
@@ -402,19 +422,20 @@ impl Store {
         tenant: &str,
         capability_capsule_id: &str,
     ) -> Result<(), StorageError> {
-        lance_write_then_refresh!(
-            self,
+        self.commit_lance_write(
             self.lance
                 .delete_capability_capsule_hard(tenant, capability_capsule_id)
-                .await
+                .await,
         )
+        .await
     }
 
     pub async fn insert_episode(
         &self,
         episode: EpisodeRecord,
     ) -> Result<EpisodeRecord, StorageError> {
-        lance_write_then_refresh!(self, self.lance.insert_episode(episode).await)
+        self.commit_lance_write(self.lance.insert_episode(episode).await)
+            .await
     }
 
     pub async fn stale_live_embedding_jobs_for_capability_capsule(
@@ -424,17 +445,17 @@ impl Store {
         provider: &str,
         now: &str,
     ) -> Result<usize, StorageError> {
-        lance_write_then_refresh!(
-            self,
+        self.commit_lance_write(
             self.lance
                 .stale_live_embedding_jobs_for_capability_capsule(
                     tenant,
                     capability_capsule_id,
                     provider,
-                    now
+                    now,
                 )
-                .await
+                .await,
         )
+        .await
     }
 }
 
@@ -854,8 +875,8 @@ impl Store {
     /// Prune Lance version manifests older than `older_than_days`
     /// across every managed table. Issued through LanceStore's Rust
     /// API (not DuckDB SQL), so a DuckDB-side `refresh()` is needed
-    /// afterwards to invalidate the snapshot cache — see the
-    /// `lance_write_then_refresh!` doc on this module. Driven by
+    /// afterwards to invalidate the snapshot cache — see
+    /// [`Self::commit_lance_write`]. Driven by
     /// `crate::worker::vacuum_worker` on a daily cadence and
     /// exposed on-demand via `POST /admin/vacuum`.
     ///
@@ -868,7 +889,8 @@ impl Store {
         &self,
         older_than_days: i64,
     ) -> Result<crate::storage::lance_store::VacuumStats, StorageError> {
-        lance_write_then_refresh!(self, self.lance.vacuum_old_versions(older_than_days).await)
+        self.commit_lance_write(self.lance.vacuum_old_versions(older_than_days).await)
+            .await
     }
 
     /// Bulk decay sweep over `memories.decay_score`. Routes to
@@ -895,10 +917,8 @@ impl Store {
         session_id: &str,
         last_active_at: &str,
     ) -> Result<(), StorageError> {
-        lance_write_then_refresh!(
-            self,
-            self.lance.touch_session(session_id, last_active_at).await
-        )
+        self.commit_lance_write(self.lance.touch_session(session_id, last_active_at).await)
+            .await
     }
 
     pub async fn open_session(
@@ -908,12 +928,12 @@ impl Store {
         caller_agent: &str,
         now: &str,
     ) -> Result<Session, StorageError> {
-        lance_write_then_refresh!(
-            self,
+        self.commit_lance_write(
             self.lance
                 .open_session(session_id, tenant, caller_agent, now)
-                .await
+                .await,
         )
+        .await
     }
 
     pub async fn close_session(
@@ -921,7 +941,8 @@ impl Store {
         session_id: &str,
         ended_at: &str,
     ) -> Result<(), StorageError> {
-        lance_write_then_refresh!(self, self.lance.close_session(session_id, ended_at).await)
+        self.commit_lance_write(self.lance.close_session(session_id, ended_at).await)
+            .await
     }
 }
 
@@ -941,7 +962,8 @@ impl Store {
         &self,
         msg: &ConversationMessage,
     ) -> Result<(), StorageError> {
-        lance_write_then_refresh!(self, self.lance.create_conversation_message(msg).await)
+        self.commit_lance_write(self.lance.create_conversation_message(msg).await)
+            .await
     }
 
     /// Multi-row variant of [`Self::create_conversation_message`]. One
@@ -957,10 +979,8 @@ impl Store {
         if msgs.is_empty() {
             return Ok(0);
         }
-        lance_write_then_refresh!(
-            self,
-            self.lance.create_conversation_messages_batch(msgs).await
-        )
+        self.commit_lance_write(self.lance.create_conversation_messages_batch(msgs).await)
+            .await
     }
 
     /// **LANCE-SPECIFIC**: same shape as
@@ -974,12 +994,12 @@ impl Store {
         max_retries: u32,
         n: usize,
     ) -> Result<Vec<ClaimedTranscriptEmbeddingJob>, StorageError> {
-        lance_write_then_refresh!(
-            self,
+        self.commit_lance_write(
             self.lance
                 .claim_next_n_transcript_embedding_jobs(now, max_retries, n)
-                .await
+                .await,
         )
+        .await
     }
 
     pub async fn complete_transcript_embedding_job(
@@ -987,12 +1007,12 @@ impl Store {
         job_id: &str,
         now: &str,
     ) -> Result<(), StorageError> {
-        lance_write_then_refresh!(
-            self,
+        self.commit_lance_write(
             self.lance
                 .complete_transcript_embedding_job(job_id, now)
-                .await
+                .await,
         )
+        .await
     }
 
     pub async fn mark_transcript_embedding_job_stale(
@@ -1000,12 +1020,12 @@ impl Store {
         job_id: &str,
         now: &str,
     ) -> Result<(), StorageError> {
-        lance_write_then_refresh!(
-            self,
+        self.commit_lance_write(
             self.lance
                 .mark_transcript_embedding_job_stale(job_id, now)
-                .await
+                .await,
         )
+        .await
     }
 
     pub async fn reschedule_transcript_embedding_job_failure(
@@ -1016,8 +1036,7 @@ impl Store {
         available_at: &str,
         now: &str,
     ) -> Result<(), StorageError> {
-        lance_write_then_refresh!(
-            self,
+        self.commit_lance_write(
             self.lance
                 .reschedule_transcript_embedding_job_failure(
                     job_id,
@@ -1026,8 +1045,9 @@ impl Store {
                     available_at,
                     now,
                 )
-                .await
+                .await,
         )
+        .await
     }
 
     pub async fn permanently_fail_transcript_embedding_job(
@@ -1037,17 +1057,17 @@ impl Store {
         last_error: &str,
         now: &str,
     ) -> Result<(), StorageError> {
-        lance_write_then_refresh!(
-            self,
+        self.commit_lance_write(
             self.lance
                 .permanently_fail_transcript_embedding_job(
                     job_id,
                     new_attempt_count,
                     last_error,
-                    now
+                    now,
                 )
-                .await
+                .await,
         )
+        .await
     }
 
     /// Upsert a transcript-block embedding (transcript embedding
@@ -1068,8 +1088,7 @@ impl Store {
         source_updated_at: &str,
         now: &str,
     ) -> Result<(), StorageError> {
-        lance_write_then_refresh!(
-            self,
+        self.commit_lance_write(
             self.lance
                 .upsert_conversation_message_embedding(
                     message_block_id,
@@ -1081,20 +1100,21 @@ impl Store {
                     source_updated_at,
                     now,
                 )
-                .await
+                .await,
         )
+        .await
     }
 
     pub async fn delete_conversation_message_embedding(
         &self,
         message_block_id: &str,
     ) -> Result<(), StorageError> {
-        lance_write_then_refresh!(
-            self,
+        self.commit_lance_write(
             self.lance
                 .delete_conversation_message_embedding(message_block_id)
-                .await
+                .await,
         )
+        .await
     }
 
     /// Semantic recall over transcript blocks. Routes to DuckDbQuery
@@ -1365,10 +1385,8 @@ impl Store {
         kind: EntityKind,
         now: &str,
     ) -> Result<String, StorageError> {
-        lance_write_then_refresh!(
-            self,
-            self.lance.resolve_or_create(tenant, alias, kind, now).await
-        )
+        self.commit_lance_write(self.lance.resolve_or_create(tenant, alias, kind, now).await)
+            .await
     }
 
     pub async fn add_alias(
@@ -1378,10 +1396,8 @@ impl Store {
         alias: &str,
         now: &str,
     ) -> Result<AddAliasOutcome, StorageError> {
-        lance_write_then_refresh!(
-            self,
-            self.lance.add_alias(tenant, entity_id, alias, now).await
-        )
+        self.commit_lance_write(self.lance.add_alias(tenant, entity_id, alias, now).await)
+            .await
     }
 
     pub async fn get_entity(
@@ -1458,8 +1474,8 @@ mod tests {
     /// because every `Store` write triggers a `DuckDbQuery::refresh`
     /// (rebuild of the in-process DuckDB connection). Without that
     /// refresh the lance extension's snapshot cache would hide
-    /// post-attach lance writes — see the
-    /// `lance_write_then_refresh!` macro doc for the gory details.
+    /// post-attach lance writes — see [`Store::commit_lance_write`]
+    /// for the gory details.
     #[tokio::test(flavor = "multi_thread")]
     async fn store_open_write_read_round_trip() {
         let dir = tempdir().unwrap();
