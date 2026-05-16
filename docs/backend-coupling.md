@@ -424,8 +424,8 @@ Phase 5 (持续, 收尾)
 ### 6.1 Phase 0 (1 天)
 
 - ✅ 本报告落盘 — `e3f8707`
-- ✅ 修 `CLAUDE.md` / `README.md` / `docs/api-data-flow.md` 关于 HNSW sidecar 的 stale 描述 + 源码 service 层 doc 同步 — 见本 commit
-- 🚧 给 `Store` 88 个方法的 doc 注释加上"LanceDB-specific" 或 "portable" 标记，方便后续 trait 化时机械分类
+- ✅ 修 `CLAUDE.md` / `README.md` / `docs/api-data-flow.md` 关于 HNSW sidecar 的 stale 描述 + 源码 service 层 doc 同步 — `fca52fa`
+- ✅ 给 `Store` 方法的 doc 注释加上 LANCE-SPECIFIC 标记 — module 注释声明 portable 是默认；只有真正绑 Lance 行为的 10 个方法（`claim_next_n_embedding_jobs` / `claim_next_n_transcript_embedding_jobs` / `upsert_capability_capsule_embedding` / `upsert_conversation_message_embedding` / `replace_pending_with_successor` / `apply_feedback` / `hybrid_candidates` / `semantic_search_transcripts` / `bm25_transcript_candidates` / `vacuum_old_versions`）被显式标记。这 10 个就是 Phase 2 trait 抽离时必须重新设计的方法。见本 commit
 
 ### 6.2 Phase 1 (1 周)
 

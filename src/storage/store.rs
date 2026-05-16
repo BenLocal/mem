@@ -37,6 +37,21 @@
 //! (extension load + ATTACH on the new conn). For mem's typical
 //! write/read ratio this is negligible.
 //!
+//! ### Portability annotation
+//!
+//! The method surface is **mostly portable across backends** — pure
+//! CRUD over typed records that any reasonable storage engine could
+//! re-implement. The handful of methods that bind to LanceDB-specific
+//! behavior (Lance manifest pruning, lazy-create embedding tables,
+//! `update().only_if()` optimistic-claim semantics, fused
+//! `lance_fts` + `lance_vector_search` SQL, non-atomic two-op
+//! writes that exploit Lance's no-transactions stance) are marked
+//! **LANCE-SPECIFIC** in their doc comments. The unmarked default is
+//! portable. This labelling is the input to the
+//! `docs/backend-coupling.md` Phase 2+ trait extraction — anything
+//! marked LANCE-SPECIFIC has to be re-shaped before it can land on a
+//! trait that a Postgres / SQLite / in-memory backend can implement.
+//!
 //! Method surface mirrors the legacy `Repository` super-trait 1:1 so
 //! the upcoming service-layer cutover is a method-call swap, not a
 //! type swap. Every read maps to `DuckDbQuery`; every write maps to
@@ -188,6 +203,12 @@ impl Store {
         lance_write_then_refresh!(self, self.lance.enqueue_embedding_jobs_batch(inserts).await)
     }
 
+    /// **LANCE-SPECIFIC**: claim is an `update().only_if(...)` whose
+    /// `rows_updated == 0` branch is what we read as "another worker
+    /// got there first." Portable equivalent is Postgres `SELECT FOR
+    /// UPDATE SKIP LOCKED` or Redis `BLPOP` — different shape, same
+    /// outcome. Trait extraction has to abstract the claim primitive,
+    /// not lift this signature.
     pub async fn claim_next_n_embedding_jobs(
         &self,
         now: &str,
@@ -202,6 +223,12 @@ impl Store {
         )
     }
 
+    /// **LANCE-SPECIFIC**: `capability_capsule_embeddings` is
+    /// lazy-created on first call because the vector dim is
+    /// provider-dependent and unknown at `Store::open` time. Portable
+    /// backends would either ALTER on dim change (pgvector) or build
+    /// a separate vector store; the lazy-table-create dance must move
+    /// into backend-specific bootstrap, not stay on the trait.
     #[allow(clippy::too_many_arguments)]
     pub async fn upsert_capability_capsule_embedding(
         &self,
@@ -334,6 +361,12 @@ impl Store {
         )
     }
 
+    /// **LANCE-SPECIFIC**: two-op sequence (archive old + insert
+    /// successor) with no transactional boundary — Lance doesn't
+    /// have multi-row transactions, so a crash between the two ops
+    /// leaves the old row archived without a successor. Portable
+    /// backends could wrap in BEGIN/COMMIT; the trait should expose
+    /// a single `supersede` primitive rather than this 2-step shape.
     pub async fn replace_pending_with_successor(
         &self,
         tenant: &str,
@@ -348,6 +381,14 @@ impl Store {
         )
     }
 
+    /// **LANCE-SPECIFIC**: writes the `feedback_events` row first,
+    /// then updates the parent capsule's
+    /// `confidence` / `decay_score` / `status` / `last_validated_at`
+    /// in a separate Lance call. No transactional boundary — partial
+    /// commits are possible (audit row exists but parent didn't move).
+    /// Portable backends should expose `apply_feedback` as a single
+    /// atomic operation; the current contract is leaking Lance's
+    /// no-transactions stance.
     pub async fn apply_feedback(
         &self,
         memory: &CapabilityCapsuleRecord,
@@ -554,6 +595,15 @@ impl Store {
     /// Cross-table BM25 + vector + RRF, fused inline in DuckDB SQL.
     /// See `DuckDbQuery::hybrid_candidates` for the full contract;
     /// validated by `examples/hybrid_sql_poc.rs`.
+    ///
+    /// **LANCE-SPECIFIC**: the implementation uses the lance DuckDB
+    /// extension's `lance_fts(...)` + `lance_vector_search(...)` SQL
+    /// table functions in a single `WITH fts ... vec ... fused`
+    /// statement. Portable backends have to compose BM25 + ANN +
+    /// RRF in Rust (see `backend-coupling.md` §4.1 QW-1). Trait
+    /// extraction should split this into `top_k_bm25_candidates` +
+    /// `top_k_vector_candidates` + Rust-side RRF rather than lift the
+    /// fused-SQL signature.
     pub async fn hybrid_candidates(
         &self,
         tenant: &str,
@@ -675,6 +725,12 @@ impl Store {
     /// `lance_write_then_refresh!` doc on this module. Driven by
     /// `crate::worker::vacuum_worker` on a daily cadence and
     /// exposed on-demand via `POST /admin/vacuum`.
+    ///
+    /// **LANCE-SPECIFIC**: Lance is copy-on-write, every UPDATE
+    /// writes a new manifest, old ones accumulate. Postgres has
+    /// autovacuum; SQLite has no equivalent concept. `MaintenanceStore`
+    /// trait (if it survives) should be capability-style — "if backend
+    /// supports prune, it has this method" — not a uniform interface.
     pub async fn vacuum_old_versions(
         &self,
         older_than_days: i64,
@@ -774,6 +830,11 @@ impl Store {
         )
     }
 
+    /// **LANCE-SPECIFIC**: same shape as
+    /// [`Self::claim_next_n_embedding_jobs`] — Lance
+    /// `update().only_if()` + `rows_updated` optimistic claim. Same
+    /// portability caveat: the trait should abstract the claim
+    /// primitive, not lift this signature.
     pub async fn claim_next_n_transcript_embedding_jobs(
         &self,
         now: &str,
@@ -858,6 +919,10 @@ impl Store {
 
     /// Upsert a transcript-block embedding (transcript embedding
     /// worker's hot path). Routes to LanceStore + DuckDbQuery refresh.
+    ///
+    /// **LANCE-SPECIFIC**: `conversation_message_embeddings` is
+    /// lazy-created on first call (provider-dependent dim) — same
+    /// caveat as [`Self::upsert_capability_capsule_embedding`].
     #[allow(clippy::too_many_arguments)]
     pub async fn upsert_conversation_message_embedding(
         &self,
@@ -902,6 +967,11 @@ impl Store {
     /// Semantic recall over transcript blocks. Routes to DuckDbQuery
     /// (lance_vector_search SQL + JOIN conversation_messages, cosine
     /// similarity via `1 - L²/2` for normalized embeddings).
+    ///
+    /// **LANCE-SPECIFIC**: depends on the lance DuckDB extension's
+    /// `lance_vector_search(...)` SQL table function. Trait
+    /// extraction should expose a portable `top_k_vector_candidates`
+    /// primitive that each backend implements with its own ANN path.
     pub async fn semantic_search_transcripts(
         &self,
         tenant: &str,
@@ -1012,6 +1082,11 @@ impl Store {
         self.query.recent_conversation_messages(tenant, limit).await
     }
 
+    /// **LANCE-SPECIFIC**: uses `lance_fts(...)` SQL table function
+    /// from the lance DuckDB extension. Trait extraction should
+    /// expose a `top_k_bm25_candidates` primitive — each backend can
+    /// implement via its native FTS (Postgres tsvector + GIN, SQLite
+    /// FTS5, Tantivy, etc).
     pub async fn bm25_transcript_candidates(
         &self,
         tenant: &str,
