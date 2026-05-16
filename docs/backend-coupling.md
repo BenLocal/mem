@@ -235,7 +235,7 @@ pub trait Backend:
 | # | 现状 | 改法 | 收益 | 风险 | 状态 |
 |---|---|---|---|---|---|
 | QW-1 | `hybrid_candidates` 178 行 SQL 把 BM25+ANN+RRF 融在一起 | 拆成 `bm25_candidate_ids` / `ann_candidate_ids` / Rust 端 `rrf_merge` / `fetch_by_ids` 的 compose 路径 | 未来换 backend 时只需各自实现两个简单方法 | 多 round trip 真实存在（bench 测得 +14~29%），所以 **保留 fused-SQL 作为 LanceBackend default**，compose 作为 portable 参考路径 | ✅ — see commit ref in §4.1 below |
-| QW-2 | `lance_store/*.rs` 写方法 filter 用 `sql_quote` 字符串拼接 | lancedb 0.27 `update().only_if()` 接 bound params，改一遍 | 去掉一个 SQL-ish 拼装层 | 取决于 lancedb 接口完整性（§7.2） |
+| QW-2 | `lance_store/*.rs` 写方法 filter 用 `sql_quote` 字符串拼接 | ~~lancedb 0.27 `update().only_if()` 接 bound params，改一遍~~ ⚠️ **deferred** — lancedb 0.27 expr API 仅支持读路径，写/删仍只能传字符串；sql_quote 输入全是内部字段，injection 风险实质为零；部分迁移制造两种风格。Phase 2 trait 抽离时定义 mem-internal predicate IR 更干净 | 去掉一个 SQL-ish 拼装层 | API gap：覆盖率 ~30% (42/140 callsite)；不值得引入 datafusion_expr 依赖 | ⚠️ **deferred** — see §4.2 + §7.2 |
 | QW-3 | `decode_embedding_blob` / `f32_slice_to_blob` 在 `service::embedding_helpers` 但被 storage 调用 | 移到 `crate::embedding::wire`，明确"应用 ↔ 存储"wire format | wire 层显式，未来 backend 可选 native f32 数组而非 byte blob | 纯 refactor，无 |
 | QW-4 | `config.rs:142-285` 大量 `MEM_VECTOR_INDEX_*` env + `#[allow(dead_code)]` 字段；CLAUDE.md 还讲 usearch sidecar | 删字段 + 删配置 + 修文档 | 减 cognitive load，对齐代码现状 | 无 |
 | QW-5 | `pipeline/retrieve.rs:76 graph: &Store` 但实际只调几个 graph 方法 | 给 pipeline 定义 `trait GraphRead` 子集，retrieve 接 `&dyn GraphRead` | pipeline 层先 trait 化，是 Phase 2 的预演 | 无 |
@@ -274,9 +274,37 @@ hybrid_candidates_compose(tenant, text, vec, k)
 - Phase 2 抽 trait 时 `hybrid_candidates_compose` 就是 default trait method body
 - Phase 4 Postgres spike 时直接复用 compose 路径（实现 `bm25_candidate_ids` via pg_trgm，`ann_candidate_ids` via pgvector），不用从零写 fused SQL
 
-### 4.2 QW-2: `sql_quote` → 参数化绑定
+### 4.2 QW-2: `sql_quote` → 参数化绑定 (⚠️ deferred, 2026-05-16)
 
-需先验证 lancedb 0.27 `update().only_if()` 接 bound params 的完整性（见 §7.2）。如果完整支持，全替换；如果只部分支持，先替换支持的那部分，剩下保留 `sql_quote` 但加 deprecation comment。
+§7.2 标的不确定性现在 resolved（见 §7.2 详细）。结论是 **lancedb 0.27 的 expr API 不覆盖写路径**：
+
+| 操作 | 字符串 filter | `datafusion_expr::Expr` |
+|---|---|---|
+| `query().only_if()`（读） | ✅ | ✅ `only_if_expr(...)` |
+| `UpdateBuilder::only_if()`（写） | ✅ | ❌ 不支持 |
+| `Table::delete(predicate)`（删） | ✅ | ❌ 不支持 |
+
+`sql_quote` 在 `src/storage/lance_store/` 的分布（实测 grep）：
+
+| 文件 | 总用 | 写/删（必留 string） | 读（可换 expr） |
+|---|---|---|---|
+| `capability_capsules.rs` | 67 | ~50 | ~17 |
+| `transcripts.rs` | 39 | ~30 | ~9 |
+| `graph.rs` | 15 | ~9 | ~6 |
+| `entities.rs` | 10 | ~3 | ~7 |
+| `sessions.rs` | 7 | 6 | 1 |
+| `episodes.rs` | 2 | 0 | 2 |
+| **合计** | **140** | **~98 (70%)** | **~42 (30%)** |
+
+**决策：deferred 不动代码**。原因：
+1. **API 覆盖不全** —— 写/删 70% 的 callsite 必须保留 sql_quote，部分迁移制造两种风格让未来维护者犹豫该用哪个
+2. **风险实质为零** —— sql_quote 的输入全是内部字段（`capsule_id` / `tenant` / `job_id` / 时间戳），不接用户输入；SQL injection 不是现实威胁
+3. **依赖代价** —— 部分迁移要加 `datafusion_expr` 直接依赖（lancedb 是间接传过来的），换 30% callsite 的"epsilon-better 转义"不值
+4. **Phase 2 有更干净的方案** —— trait 抽离时定义 mem-internal predicate IR（`Predicate::Eq(Column, Value)` 之类），各 backend 自己翻译；不依赖 lancedb 任何 expr 形态
+
+**Phase 2 含义**：trait 上的 query/update/delete 方法暴露的是**结构化 predicate**，不是 raw string 或 datafusion_expr。LanceBackend impl 内部把 predicate 翻译成 lancedb 的 `only_if(String)` 或未来更宽的 expr 形态；其他 backend impl 翻译成自家 SQL / RESP / KV scan。
+
+**追溯路径**：如果 lancedb 后续版本（≥0.30？）把 expr API 扩展到写/删，QW-2 可以从 deferred 升级回 actionable —— 那时整个 storage 层切到 expr 是干净的，不必先做部分迁移。盯 lancedb changelog 即可。
 
 ### 4.3 QW-3: embedding 编码搬出 storage
 
@@ -490,9 +518,16 @@ CapsuleStore 验证通过后，并行扩展剩余 sub-trait：
 
 实测 `examples/hybrid_compose_vs_fused_bench.rs`：compose 比 fused-SQL 慢 **14% (k=10) / 24% (k=50) / 29% (k=100)**。幅度随 k 增长，原因是 compose 路径多 1~2 次 DuckDB round trip 且失去 SQL engine 的 join pushdown。**结论已落地在 §4.1**：保留 fused-SQL 作为 LanceBackend default、暴露 compose 路径作为 portable 参考，原子原语 (`bm25_candidate_ids` / `ann_candidate_ids` / `rrf_merge`) 单独 ship 作为 trait 抽离 enabler。
 
-### 7.2 lancedb `update().only_if()` 参数绑定完整性
+### 7.2 ~~lancedb `update().only_if()` 参数绑定完整性~~ ✅ resolved (2026-05-16)
 
-QW-2 的前提。看了 `examples/` 有 bound params 用法，但没确认接口完整支持所有谓词形态。如果不支持全集，QW-2 降级为 "epsilon-better 转义"，价值有限。
+实测 lancedb 0.27.2 源码（`/root/.cargo/registry/src/.../lancedb-0.27.2/src/`）：
+
+- `src/query.rs:402` — `QueryBase::only_if(filter: impl AsRef<str>)` 字符串 filter
+- `src/query.rs:424` — `QueryBase::only_if_expr(filter: datafusion_expr::Expr)` ✅ type-safe，但**仅读路径**
+- `src/table/update.rs:43` — `UpdateBuilder::only_if(filter: impl Into<String>)` **字符串 only**
+- `src/table.rs:646` — `Table::delete(predicate: &str)` **字符串 only**
+
+也就是说写 `update()` / `delete()` API 在 lancedb 0.27 没有 expr 形态。**QW-2 落入"epsilon-better 转义"档**——只能换 30% 的 read 路径，写/删 70% 必须保留 sql_quote。结论已落地 §4.2：**deferred**，等 lancedb 把 expr API 扩展到写路径再重启，或在 Phase 2 trait 抽离时定义 mem-internal predicate IR 统一替代 sql_quote。
 
 ### 7.3 Postgres 端 RRF SQL 难度
 
