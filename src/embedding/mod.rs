@@ -3,6 +3,7 @@ mod fake;
 mod instance;
 mod openai;
 mod provider;
+pub mod wire;
 
 pub use embed_anything::EmbedAnythingEmbeddingProvider;
 pub use fake::{deterministic_embedding, FakeEmbeddingProvider};

@@ -236,7 +236,7 @@ pub trait Backend:
 |---|---|---|---|---|---|
 | QW-1 | `hybrid_candidates` 178 行 SQL 把 BM25+ANN+RRF 融在一起 | 拆成 `bm25_candidate_ids` / `ann_candidate_ids` / Rust 端 `rrf_merge` / `fetch_by_ids` 的 compose 路径 | 未来换 backend 时只需各自实现两个简单方法 | 多 round trip 真实存在（bench 测得 +14~29%），所以 **保留 fused-SQL 作为 LanceBackend default**，compose 作为 portable 参考路径 | ✅ — see commit ref in §4.1 below |
 | QW-2 | `lance_store/*.rs` 写方法 filter 用 `sql_quote` 字符串拼接 | ~~lancedb 0.27 `update().only_if()` 接 bound params，改一遍~~ ⚠️ **deferred** — lancedb 0.27 expr API 仅支持读路径，写/删仍只能传字符串；sql_quote 输入全是内部字段，injection 风险实质为零；部分迁移制造两种风格。Phase 2 trait 抽离时定义 mem-internal predicate IR 更干净 | 去掉一个 SQL-ish 拼装层 | API gap：覆盖率 ~30% (42/140 callsite)；不值得引入 datafusion_expr 依赖 | ⚠️ **deferred** — see §4.2 + §7.2 |
-| QW-3 | `decode_embedding_blob` / `f32_slice_to_blob` 在 `service::embedding_helpers` 但被 storage 调用 | 移到 `crate::embedding::wire`，明确"应用 ↔ 存储"wire format | wire 层显式，未来 backend 可选 native f32 数组而非 byte blob | 纯 refactor，无 |
+| QW-3 | `decode_embedding_blob` / `f32_slice_to_blob` 在 `service::embedding_helpers` 但被 storage 调用 | 移到 `crate::embedding::wire`，明确"应用 ↔ 存储"wire format | wire 层显式，未来 backend 可选 native f32 数组而非 byte blob | 纯 refactor，无 | ✅ — see §4.3 |
 | QW-4 | `config.rs:142-285` 大量 `MEM_VECTOR_INDEX_*` env + `#[allow(dead_code)]` 字段；CLAUDE.md 还讲 usearch sidecar | 删字段 + 删配置 + 修文档 | 减 cognitive load，对齐代码现状 | 无 |
 | QW-5 | `pipeline/retrieve.rs:76 graph: &Store` 但实际只调几个 graph 方法 | 给 pipeline 定义 `trait GraphRead` 子集，retrieve 接 `&dyn GraphRead` | pipeline 层先 trait 化，是 Phase 2 的预演 | 无 |
 | QW-6 | `lance_write_then_refresh!` 宏在 store.rs，27 调用点 | 改成 `Store::commit_write<F, T>(write_fn) -> T` 显式 method | method 可被 LanceBackend 覆盖、TestBackend no-op、Postgres 不实现；宏没法这么干 | 27 处机械替换 |
@@ -306,16 +306,31 @@ hybrid_candidates_compose(tenant, text, vec, k)
 
 **追溯路径**：如果 lancedb 后续版本（≥0.30？）把 expr API 扩展到写/删，QW-2 可以从 deferred 升级回 actionable —— 那时整个 storage 层切到 expr 是干净的，不必先做部分迁移。盯 lancedb changelog 即可。
 
-### 4.3 QW-3: embedding 编码搬出 storage
+### 4.3 QW-3: embedding 编码搬出 storage (✅ landed)
 
-新建 `src/embedding/wire.rs`：
+新模块 `src/embedding/wire.rs` 暴露：
 
 ```rust
-pub fn encode_f32_blob(vector: &[f32]) -> Vec<u8> { ... }
-pub fn decode_f32_blob(blob: &[u8], dim: usize) -> Result<Vec<f32>, ...> { ... }
+pub fn encode_f32_blob(values: &[f32]) -> Vec<u8>
+pub fn decode_f32_blob(blob: &[u8], dim: usize) -> Result<Vec<f32>, &'static str>
 ```
 
-`lance_store` 这一侧之后可以选择继续走 blob，或者直接 `FixedSizeList<Float32>`；其他 backend 可以走 native pgvector / 外部 store。
+**搬迁前后**：
+
+| 函数 | 之前 | 现在 |
+|---|---|---|
+| encode (`f32_slice_to_blob` → `encode_f32_blob`) | `src/service/embedding_helpers.rs` | `src/embedding/wire.rs` |
+| decode (`decode_embedding_blob` → `decode_f32_blob`) | `src/storage/lance_store/mod.rs` (`pub(super)`) | `src/embedding/wire.rs` (`pub`) |
+
+7 个 callsite 迁移完毕：2 workers (`embedding_worker`, `transcript_embedding_worker`) + 1 bench example + 2 storage decode sites + 移除 service/embedding_helpers 与 lance_store/mod 的原定义。
+
+**设计点**：
+- decode 返回 `Result<Vec<f32>, &'static str>` 而非具体 error type——`'static` 字符串保持 wire 模块零依赖；callers 用 `.map_err(StorageError::InvalidData)` 自行包装
+- 依赖方向从 `storage → service`（倒挂）改成 `application → embedding ← storage`（正常）
+- 命名对称：`encode_f32_blob` / `decode_f32_blob`，比旧的 `f32_slice_to_blob` / `decode_embedding_blob` 更明显是 codec 对子
+- 3 个单测：round-trip 保值（含 `INFINITY`）、空 vec、长度不匹配 reject
+
+**未来工作**：当其他 backend 选择 native vector 类型（pgvector 直接吃 `Vec<f32>`、外部 ANN 服务用 HTTP/protobuf）时，wire 层显式存在意味着只需在 wire.rs 加新 codec，或在 backend impl 内直接旁路 wire 层。lance_store 现在仍走 blob 路径，将来如果 Lance 暴露更原生的 vector 写接口可以再砍。
 
 ### 4.4 QW-4: 清 usearch 残留
 

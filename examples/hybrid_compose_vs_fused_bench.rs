@@ -22,7 +22,7 @@ use std::time::{Duration, Instant};
 use mem::domain::capability_capsule::{
     CapabilityCapsuleRecord, CapabilityCapsuleStatus, CapabilityCapsuleType, Scope, Visibility,
 };
-use mem::service::embedding_helpers::f32_slice_to_blob;
+use mem::embedding::wire::encode_f32_blob;
 use mem::storage::{current_timestamp, Store};
 use tempfile::TempDir;
 
@@ -160,7 +160,7 @@ async fn seed(store: &Store, n: usize, dim: usize) -> anyhow::Result<()> {
     store.insert_capability_capsules(&capsules).await?;
     for (i, cap) in capsules.iter().enumerate() {
         let vec = synth_vec(i, dim);
-        let blob = f32_slice_to_blob(&vec);
+        let blob = encode_f32_blob(&vec);
         store
             .upsert_capability_capsule_embedding(
                 &cap.capability_capsule_id,

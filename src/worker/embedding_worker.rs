@@ -1,8 +1,9 @@
 use std::sync::Arc;
 
 use crate::config::EmbeddingSettings;
+use crate::embedding::wire::encode_f32_blob;
 use crate::embedding::EmbeddingProvider;
-use crate::service::embedding_helpers::{f32_slice_to_blob, failure_backoff_ms, truncate_error};
+use crate::service::embedding_helpers::{failure_backoff_ms, truncate_error};
 use crate::storage::{current_timestamp, timestamp_add_ms, StorageError, Store};
 use tracing::{error, info, warn};
 
@@ -212,7 +213,7 @@ async fn post_embed(
         return Ok(());
     }
 
-    let blob = f32_slice_to_blob(embedding);
+    let blob = encode_f32_blob(embedding);
     let now = current_timestamp();
     store
         .upsert_capability_capsule_embedding(

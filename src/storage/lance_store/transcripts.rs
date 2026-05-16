@@ -9,12 +9,13 @@ use lancedb::query::{ExecutableQuery, QueryBase};
 
 use super::{
     conversation_message_embedding_to_record_batch, conversation_messages_to_record_batch,
-    decode_embedding_blob, ensure_conversation_message_embeddings_table, lancedb_err,
+    ensure_conversation_message_embeddings_table, lancedb_err,
     record_batch_to_conversation_messages, record_batch_to_transcript_embedding_job_rows,
     sort_messages_chronological_asc, sql_quote, transcript_embedding_job_row_to_record_batch,
     transcript_embedding_job_rows_to_record_batch, LanceStore, TranscriptEmbeddingJobRow,
 };
 use crate::domain::{BlockType, ConversationMessage};
+use crate::embedding::wire::decode_f32_blob;
 use crate::storage::types::{
     ClaimedTranscriptEmbeddingJob, ContextWindow, StorageError, TranscriptSessionSummary,
 };
@@ -283,7 +284,8 @@ impl LanceStore {
     ) -> Result<(), StorageError> {
         let dim_i32 = i32::try_from(embedding_dim)
             .map_err(|_| StorageError::InvalidData("embedding_dim does not fit in i32"))?;
-        let vector = decode_embedding_blob(embedding_blob, embedding_dim as usize)?;
+        let vector = decode_f32_blob(embedding_blob, embedding_dim as usize)
+            .map_err(StorageError::InvalidData)?;
 
         ensure_conversation_message_embeddings_table(&self.conn, dim_i32).await?;
         let table = self

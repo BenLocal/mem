@@ -552,26 +552,9 @@ fn capability_capsule_embeddings_schema(dim: i32) -> Schema {
     ])
 }
 
-/// Decode a native-endian `[f32]` blob into a `Vec<f32>` of length
-/// `expected_dim`. Mirrors the DuckDB backend's
-/// `f32::from_ne_bytes`-chunking — every embedding row in mem (DuckDB or
-/// LanceDB) ultimately came from the same `EmbeddingProvider`, which
-/// produces native-endian f32 bytes.
-pub(super) fn decode_embedding_blob(
-    blob: &[u8],
-    expected_dim: usize,
-) -> Result<Vec<f32>, StorageError> {
-    if blob.len() != expected_dim * 4 {
-        return Err(StorageError::InvalidData(
-            "embedding blob length mismatch (expected dim * 4 bytes)",
-        ));
-    }
-    let mut out = Vec::with_capacity(expected_dim);
-    for chunk in blob.chunks_exact(4) {
-        out.push(f32::from_ne_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]));
-    }
-    Ok(out)
-}
+// `decode_embedding_blob` moved to `crate::embedding::wire::decode_f32_blob`
+// in QW-3; see `docs/backend-coupling.md` §4.3. Callers wrap the
+// `&'static str` result into `StorageError::InvalidData` at use site.
 
 /// Build a one-row `RecordBatch` for `capability_capsule_embeddings`. `embedding`
 /// must already be the decoded `Vec<f32>` of length `dim`.

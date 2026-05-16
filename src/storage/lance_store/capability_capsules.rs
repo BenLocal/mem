@@ -10,7 +10,7 @@ use lancedb::query::{ExecutableQuery, QueryBase};
 
 use super::{
     capability_capsule_embedding_to_record_batch, capability_capsules_to_record_batch,
-    decode_embedding_blob, embedding_job_row_to_record_batch, embedding_job_rows_to_record_batch,
+    embedding_job_row_to_record_batch, embedding_job_rows_to_record_batch,
     ensure_capability_capsule_embeddings_table, enum_to_str, feedback_adjustments,
     feedback_events_to_record_batch, lancedb_err, record_batch_to_capability_capsules,
     record_batch_to_embedding_job_rows, record_batch_to_feedback_events, sql_quote,
@@ -20,6 +20,7 @@ use crate::domain::capability_capsule::{
     CapabilityCapsuleRecord, CapabilityCapsuleVersionLink, FeedbackSummary,
 };
 use crate::domain::embeddings::EmbeddingJobInfo;
+use crate::embedding::wire::decode_f32_blob;
 use crate::storage::types::{ClaimedEmbeddingJob, EmbeddingJobInsert, FeedbackEvent, StorageError};
 
 impl LanceStore {
@@ -352,7 +353,8 @@ impl LanceStore {
     ) -> Result<(), StorageError> {
         let dim_i32 = i32::try_from(embedding_dim)
             .map_err(|_| StorageError::InvalidData("embedding_dim does not fit in i32"))?;
-        let vector = decode_embedding_blob(embedding_blob, embedding_dim as usize)?;
+        let vector = decode_f32_blob(embedding_blob, embedding_dim as usize)
+            .map_err(StorageError::InvalidData)?;
 
         ensure_capability_capsule_embeddings_table(&self.conn, dim_i32).await?;
 
