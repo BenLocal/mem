@@ -232,29 +232,47 @@ pub trait Backend:
 
 每条 1-3 个 commit，不破任何现有测试，独立 ship。
 
-| # | 现状 | 改法 | 收益 | 风险 |
-|---|---|---|---|---|
-| QW-1 | `hybrid_candidates` 178 行 SQL 把 BM25+ANN+RRF 融在一起 | 拆成 `bm25_candidate_ids` / `ann_candidate_ids` / Rust 端 RRF / `fetch_by_ids` | 未来换 backend 时只需各自实现两个简单方法 | 可能多 1 次 round trip，需 bench |
+| # | 现状 | 改法 | 收益 | 风险 | 状态 |
+|---|---|---|---|---|---|
+| QW-1 | `hybrid_candidates` 178 行 SQL 把 BM25+ANN+RRF 融在一起 | 拆成 `bm25_candidate_ids` / `ann_candidate_ids` / Rust 端 `rrf_merge` / `fetch_by_ids` 的 compose 路径 | 未来换 backend 时只需各自实现两个简单方法 | 多 round trip 真实存在（bench 测得 +14~29%），所以 **保留 fused-SQL 作为 LanceBackend default**，compose 作为 portable 参考路径 | ✅ — see commit ref in §4.1 below |
 | QW-2 | `lance_store/*.rs` 写方法 filter 用 `sql_quote` 字符串拼接 | lancedb 0.27 `update().only_if()` 接 bound params，改一遍 | 去掉一个 SQL-ish 拼装层 | 取决于 lancedb 接口完整性（§7.2） |
 | QW-3 | `decode_embedding_blob` / `f32_slice_to_blob` 在 `service::embedding_helpers` 但被 storage 调用 | 移到 `crate::embedding::wire`，明确"应用 ↔ 存储"wire format | wire 层显式，未来 backend 可选 native f32 数组而非 byte blob | 纯 refactor，无 |
 | QW-4 | `config.rs:142-285` 大量 `MEM_VECTOR_INDEX_*` env + `#[allow(dead_code)]` 字段；CLAUDE.md 还讲 usearch sidecar | 删字段 + 删配置 + 修文档 | 减 cognitive load，对齐代码现状 | 无 |
 | QW-5 | `pipeline/retrieve.rs:76 graph: &Store` 但实际只调几个 graph 方法 | 给 pipeline 定义 `trait GraphRead` 子集，retrieve 接 `&dyn GraphRead` | pipeline 层先 trait 化，是 Phase 2 的预演 | 无 |
 | QW-6 | `lance_write_then_refresh!` 宏在 store.rs，27 调用点 | 改成 `Store::commit_write<F, T>(write_fn) -> T` 显式 method | method 可被 LanceBackend 覆盖、TestBackend no-op、Postgres 不实现；宏没法这么干 | 27 处机械替换 |
 
-### 4.1 QW-1: 拆 `hybrid_candidates` 成 Rust-compose
+### 4.1 QW-1: 拆 `hybrid_candidates` 成 Rust-compose (✅ landed)
 
 现状是 178 行 SQL inline 做 BM25+ANN+RRF。拆法：
 
 ```text
-hybrid_candidates(tenant, text, vec, k)
+hybrid_candidates_compose(tenant, text, vec, k)
   ├─ bm25_candidate_ids(tenant, text, k*2)  → Vec<(id, rank_lex)>
   ├─ ann_candidate_ids(tenant, vec, k*2)    → Vec<(id, rank_sem)>
-  ├─ rrf_merge(bm25, ann, k=60)             → Vec<(id, score)>  // Rust HashMap, 5 行
+  ├─ ranking::rrf_merge(bm25, ann)          → Vec<(id, score)>  (Rust HashMap)
   └─ fetch_capability_capsules_by_ids(top_k_ids) + 重排
 ```
 
-**收益**：每个 backend 只需实现 `bm25_candidate_ids` + `ann_candidate_ids` 两个简单方法即可；RRF 和最终筛选完全 backend-agnostic。
-**风险**：可能多 1 次 round trip。需要先 bench（见 §7.1）。
+**Bench 结果** — `examples/hybrid_compose_vs_fused_bench.rs`，N=500 capsules，dim=64，M=30 iter / cell：
+
+| k | compose mean | fused mean | Δ % | compose p99 | fused p99 |
+|---|---|---|---|---|---|
+| 10 | 68.41 ms | 60.01 ms | **+14.0%** | 112.35 ms | 96.19 ms |
+| 50 | 90.96 ms | 73.39 ms | **+23.9%** | 152.21 ms | 101.16 ms |
+| 100 | 118.23 ms | 91.85 ms | **+28.7%** | 169.53 ms | 122.56 ms |
+
+**结论**：fused-SQL 一致快 14–29%，幅度随 k 增大。这不是噪声——多 1~2 次 DuckDB round trip + 缺少 SQL engine 的 join pushdown 是真实代价。
+
+**降级方案 shipped**：
+- `Store::hybrid_candidates` 仍走**fused-SQL**（性能保持，零回归），标记 `LANCE-SPECIFIC`
+- 新增 `Store::hybrid_candidates_compose` 走 Rust 端组合路径，是 Phase 2 trait 抽离时其他 backend 的参考形态
+- 新增的两个原子原语 `Store::bm25_candidate_ids` + `Store::ann_candidate_ids` + `pipeline::ranking::rrf_merge` **是 QW-1 的核心交付**——这些是 trait 抽象的 enabler，无论 Lance 默认走哪条路径都已经备齐
+
+**关于 trait 形状**：Phase 2 抽 `CapsuleSearchStore` trait 时，`hybrid_candidates` 是 trait method；LanceBackend impl 直接调 fused-SQL（继承当前 perf）；其他 backend 用 compose 默认（或自家 fusion）。trait 的"边界"通过两个原语暴露，不通过 fused-SQL 的 178 行 SQL 暴露。
+
+**对后续 Phase 的影响**：
+- Phase 2 抽 trait 时 `hybrid_candidates_compose` 就是 default trait method body
+- Phase 4 Postgres spike 时直接复用 compose 路径（实现 `bm25_candidate_ids` via pg_trgm，`ann_candidate_ids` via pgvector），不用从零写 fused SQL
 
 ### 4.2 QW-2: `sql_quote` → 参数化绑定
 
@@ -468,9 +486,9 @@ CapsuleStore 验证通过后，并行扩展剩余 sub-trait：
 
 每条都是后续验证项，落实之前不应该当事实写进设计文档。
 
-### 7.1 QW-1 拆 `hybrid_candidates` 的真实性能开销
+### 7.1 ~~QW-1 拆 `hybrid_candidates` 的真实性能开销~~ ✅ resolved (2026-05-16)
 
-现在 178 行 SQL 在 DuckDB 内部已经 fan-out + 合并，Rust-compose 多 1 次 round trip 还是只是多 2 个 fetch by id？得 bench 一下才能下结论"对延迟影响小"。
+实测 `examples/hybrid_compose_vs_fused_bench.rs`：compose 比 fused-SQL 慢 **14% (k=10) / 24% (k=50) / 29% (k=100)**。幅度随 k 增长，原因是 compose 路径多 1~2 次 DuckDB round trip 且失去 SQL engine 的 join pushdown。**结论已落地在 §4.1**：保留 fused-SQL 作为 LanceBackend default、暴露 compose 路径作为 portable 参考，原子原语 (`bm25_candidate_ids` / `ann_candidate_ids` / `rrf_merge`) 单独 ship 作为 trait 抽离 enabler。
 
 ### 7.2 lancedb `update().only_if()` 参数绑定完整性
 

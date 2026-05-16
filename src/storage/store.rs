@@ -592,18 +592,26 @@ impl Store {
             .await
     }
 
-    /// Cross-table BM25 + vector + RRF, fused inline in DuckDB SQL.
-    /// See `DuckDbQuery::hybrid_candidates` for the full contract;
-    /// validated by `examples/hybrid_sql_poc.rs`.
+    /// Cross-table hybrid recall: BM25 + vector + RRF fused inline
+    /// in DuckDB SQL. Returns `(record, rrf_score)` ordered by
+    /// `(rrf_score DESC, updated_at DESC, capability_capsule_id ASC)`.
+    /// See `DuckDbQuery::hybrid_candidates` for the full contract.
     ///
-    /// **LANCE-SPECIFIC**: the implementation uses the lance DuckDB
-    /// extension's `lance_fts(...)` + `lance_vector_search(...)` SQL
-    /// table functions in a single `WITH fts ... vec ... fused`
-    /// statement. Portable backends have to compose BM25 + ANN +
-    /// RRF in Rust (see `backend-coupling.md` §4.1 QW-1). Trait
-    /// extraction should split this into `top_k_bm25_candidates` +
-    /// `top_k_vector_candidates` + Rust-side RRF rather than lift the
-    /// fused-SQL signature.
+    /// **LANCE-SPECIFIC** (kept as a LanceBackend optimization): the
+    /// implementation fuses `lance_fts(...)` and `lance_vector_search(...)`
+    /// in a single statement, which the QW-1 bench
+    /// (`examples/hybrid_compose_vs_fused_bench.rs`) measured at
+    /// **14–29% faster** than the equivalent Rust-compose form at
+    /// `k ∈ {10, 50, 100}` over N=500 capsules.
+    ///
+    /// **Portable equivalent**: [`Self::hybrid_candidates_compose`]
+    /// produces the same scores and orderings via
+    /// [`Self::bm25_candidate_ids`] + [`Self::ann_candidate_ids`] +
+    /// `pipeline::ranking::rrf_merge` + the existing
+    /// `fetch_capability_capsules_by_ids`. That's the path future
+    /// backends (Postgres, SQLite, in-memory) will compose; their
+    /// `hybrid_candidates` impl can either route to the portable
+    /// compose path or wire up a backend-specific fusion.
     pub async fn hybrid_candidates(
         &self,
         tenant: &str,
@@ -613,6 +621,131 @@ impl Store {
     ) -> Result<Vec<(CapabilityCapsuleRecord, f32)>, StorageError> {
         self.query
             .hybrid_candidates(tenant, query_text, query_embedding, k)
+            .await
+    }
+
+    /// Backend-portable compose form of [`Self::hybrid_candidates`]:
+    /// `bm25_candidate_ids` + `ann_candidate_ids` + `rrf_merge` +
+    /// `fetch_capability_capsules_by_ids` + final sort. Produces the
+    /// same scores and orderings as the fused-SQL default to within
+    /// f32 rounding noise.
+    ///
+    /// Used by `examples/hybrid_compose_vs_fused_bench.rs` and serves
+    /// as the reference shape for the Phase 2 trait — backends that
+    /// can't fuse BM25 + ANN in a single SQL statement should route
+    /// their `hybrid_candidates` impl through compose. On LanceBackend
+    /// this path is currently slower (see the fused-SQL doc above);
+    /// don't use it in hot paths.
+    pub async fn hybrid_candidates_compose(
+        &self,
+        tenant: &str,
+        query_text: &str,
+        query_embedding: &[f32],
+        k: usize,
+    ) -> Result<Vec<(CapabilityCapsuleRecord, f32)>, StorageError> {
+        let has_text = !query_text.trim().is_empty();
+        let has_vec = !query_embedding.is_empty();
+        if (!has_text && !has_vec) || k == 0 {
+            return Ok(Vec::new());
+        }
+
+        // Oversample each candidate set so the post-filter (status /
+        // capsule_type) doesn't truncate the merged result below k.
+        // Same `k * 2` posture the fused-SQL query carries inside its
+        // CTE definitions.
+        let oversample = k.saturating_mul(2);
+        let bm25 = if has_text {
+            self.bm25_candidate_ids(tenant, query_text, oversample)
+                .await?
+        } else {
+            Vec::new()
+        };
+        let ann = if has_vec {
+            self.ann_candidate_ids(tenant, query_embedding, oversample)
+                .await?
+        } else {
+            Vec::new()
+        };
+
+        let merged = crate::pipeline::ranking::rrf_merge(&bm25, &ann);
+        if merged.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        // Hydrate full capsule rows. Oversample again (3x k, bounded
+        // by merged length) so post-fetch status/diary filtering
+        // doesn't drop us under k. `fetch_capability_capsules_by_ids`
+        // doesn't filter status/type, so we re-check in Rust below.
+        let fetch_n = (k.saturating_mul(3)).min(merged.len());
+        let top_ids: Vec<&str> = merged
+            .iter()
+            .take(fetch_n)
+            .map(|(id, _)| id.as_str())
+            .collect();
+        let records = self
+            .fetch_capability_capsules_by_ids(tenant, &top_ids)
+            .await?;
+
+        // Rebuild (record, score) pairs, dropping archived/rejected/diary.
+        let score_by_id: std::collections::HashMap<&str, f32> =
+            merged.iter().map(|(id, s)| (id.as_str(), *s)).collect();
+        let mut out: Vec<(CapabilityCapsuleRecord, f32)> = records
+            .into_iter()
+            .filter(|r| {
+                !matches!(
+                    r.status,
+                    crate::domain::capability_capsule::CapabilityCapsuleStatus::Archived
+                        | crate::domain::capability_capsule::CapabilityCapsuleStatus::Rejected,
+                ) && !matches!(
+                    r.capability_capsule_type,
+                    crate::domain::capability_capsule::CapabilityCapsuleType::Diary,
+                )
+            })
+            .map(|r| {
+                let s = *score_by_id
+                    .get(r.capability_capsule_id.as_str())
+                    .unwrap_or(&0.0);
+                (r, s)
+            })
+            .collect();
+
+        // Final ordering: rrf_score DESC, updated_at DESC, id ASC —
+        // matches the fused-SQL outer ORDER BY.
+        out.sort_by(|a, b| {
+            b.1.partial_cmp(&a.1)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| b.0.updated_at.cmp(&a.0.updated_at))
+                .then_with(|| a.0.capability_capsule_id.cmp(&b.0.capability_capsule_id))
+        });
+        out.truncate(k);
+        Ok(out)
+    }
+
+    /// **LANCE-SPECIFIC** (see `DuckDbQuery::bm25_candidate_ids`).
+    /// Backend-portable callers shouldn't reach for this directly —
+    /// they should use [`Self::hybrid_candidates`] which composes
+    /// BM25 + ANN behind a backend-agnostic shell.
+    pub async fn bm25_candidate_ids(
+        &self,
+        tenant: &str,
+        query_text: &str,
+        k: usize,
+    ) -> Result<Vec<(String, i64)>, StorageError> {
+        self.query.bm25_candidate_ids(tenant, query_text, k).await
+    }
+
+    /// **LANCE-SPECIFIC** (see `DuckDbQuery::ann_candidate_ids`).
+    /// Returns an empty Vec when the lazy-created embeddings table
+    /// doesn't exist yet. Backend-portable callers should reach for
+    /// [`Self::hybrid_candidates`] instead.
+    pub async fn ann_candidate_ids(
+        &self,
+        tenant: &str,
+        query_embedding: &[f32],
+        k: usize,
+    ) -> Result<Vec<(String, i64)>, StorageError> {
+        self.query
+            .ann_candidate_ids(tenant, query_embedding, k)
             .await
     }
 }

@@ -680,6 +680,136 @@ impl DuckDbQuery {
         .await
     }
 
+    /// Top-K BM25 candidate ids over `capability_capsules.content` for
+    /// `tenant`. Filters out `rejected` / `archived` status and `diary`
+    /// type in the CTE so the caller doesn't have to re-filter at
+    /// hydration time. Returns `(capability_capsule_id, rank_lex)` where
+    /// rank_lex is 1-based and ordered by `_score DESC, capability_capsule_id ASC`
+    /// — matches the ordering the legacy fused query used inside its
+    /// `fts` CTE.
+    ///
+    /// `k` is clamped at the SQL boundary (`lance_fts(... k => k)`)
+    /// and additionally clamped to `[1, 1024]`. Empty `query_text`
+    /// returns `Ok(vec![])` without touching DuckDB.
+    ///
+    /// **LANCE-SPECIFIC**: depends on the lance DuckDB extension's
+    /// `lance_fts(...)` SQL table function — see
+    /// `docs/backend-coupling.md` §2.3. Trait extraction should
+    /// expose this as the abstract `top_k_bm25_candidates` primitive
+    /// each backend implements with its own FTS engine.
+    pub async fn bm25_candidate_ids(
+        &self,
+        tenant: &str,
+        query_text: &str,
+        k: usize,
+    ) -> Result<Vec<(String, i64)>, StorageError> {
+        if query_text.trim().is_empty() || k == 0 {
+            return Ok(Vec::new());
+        }
+        let conn = self.conn.clone();
+        let tenant = tenant.to_string();
+        let query_text = query_text.to_string();
+        let k_i = i64::try_from(k).unwrap_or(64).clamp(1, 1024);
+        let rejected = enum_to_text(&CapabilityCapsuleStatus::Rejected)?;
+        let archived = enum_to_text(&CapabilityCapsuleStatus::Archived)?;
+        spawn_blocking_storage(move || {
+            let conn = conn.lock().expect("duckdb_query mutex poisoned");
+            let sql = "SELECT capability_capsule_id, \
+                              ROW_NUMBER() OVER (ORDER BY _score DESC, capability_capsule_id ASC) AS rank_lex \
+                       FROM lance_fts('ns.main.capability_capsules', 'content', ?1, k => ?2) \
+                       WHERE tenant = ?3 AND status NOT IN (?4, ?5) AND capability_capsule_type != 'diary'";
+            let mut stmt = conn.prepare(sql)?;
+            let rows = stmt.query_map(
+                params![query_text, k_i, tenant, rejected, archived],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)),
+            )?;
+            let mut out = Vec::new();
+            for r in rows {
+                out.push(r.map_err(StorageError::DuckDb)?);
+            }
+            Ok(out)
+        })
+        .await
+    }
+
+    /// Top-K vector candidate ids over
+    /// `capability_capsule_embeddings.embedding` for `tenant`. Returns
+    /// `(capability_capsule_id, rank_sem)` 1-based, ordered by
+    /// `_distance ASC, capability_capsule_id ASC` — same ordering the
+    /// legacy fused query's `vec` CTE used.
+    ///
+    /// **No status / capsule-type filter** in the SQL — the
+    /// embeddings table doesn't carry those columns. Callers that
+    /// care must filter at hydration / merge time (e.g. by re-checking
+    /// `status` / `capability_capsule_type` after
+    /// `fetch_capability_capsules_by_ids`).
+    ///
+    /// Empty `query_embedding` or `k == 0` short-circuits to
+    /// `Ok(vec![])`. If the embeddings table doesn't exist yet (lazy-
+    /// created on first upsert; brand-new store before any embed
+    /// completes), returns `Ok(vec![])` rather than erroring — same
+    /// resilience the legacy fused query carried inline.
+    ///
+    /// **LANCE-SPECIFIC**: depends on the lance DuckDB extension's
+    /// `lance_vector_search(...)` SQL table function. Trait
+    /// extraction should expose this as the abstract
+    /// `top_k_vector_candidates` primitive — each backend implements
+    /// with its own ANN path (pgvector HNSW, external service, etc).
+    pub async fn ann_candidate_ids(
+        &self,
+        tenant: &str,
+        query_embedding: &[f32],
+        k: usize,
+    ) -> Result<Vec<(String, i64)>, StorageError> {
+        if query_embedding.is_empty() || k == 0 {
+            return Ok(Vec::new());
+        }
+        let conn = self.conn.clone();
+        let tenant = tenant.to_string();
+        let k_i = i64::try_from(k).unwrap_or(64).clamp(1, 1024);
+        // Vector literal interpolated into SQL — duckdb-rs has no
+        // FLOAT[] bind path. Same approach as the legacy fused query.
+        let vector_lit = format!(
+            "[{}]::FLOAT[]",
+            query_embedding
+                .iter()
+                .map(|x| x.to_string())
+                .collect::<Vec<_>>()
+                .join(", "),
+        );
+        spawn_blocking_storage(move || {
+            let conn = conn.lock().expect("duckdb_query mutex poisoned");
+            let sql = format!(
+                "SELECT e.capability_capsule_id, \
+                        ROW_NUMBER() OVER (ORDER BY e._distance ASC, e.capability_capsule_id ASC) AS rank_sem \
+                 FROM lance_vector_search('ns.main.capability_capsule_embeddings', 'embedding', {vector_lit}, k => ?1) AS e \
+                 WHERE e.tenant = ?2",
+            );
+            let mut stmt = match conn.prepare(&sql) {
+                Ok(s) => s,
+                Err(e) if is_capability_capsule_embeddings_missing(&e) => return Ok(Vec::new()),
+                Err(e) => return Err(StorageError::DuckDb(e)),
+            };
+            let rows = match stmt.query_map(params![k_i, tenant], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+            }) {
+                Ok(r) => r,
+                Err(e) if is_capability_capsule_embeddings_missing(&e) => return Ok(Vec::new()),
+                Err(e) => return Err(StorageError::DuckDb(e)),
+            };
+            let mut out = Vec::new();
+            for r in rows {
+                match r {
+                    Ok(pair) => out.push(pair),
+                    Err(e) if is_capability_capsule_embeddings_missing(&e) => return Ok(Vec::new()),
+                    Err(e) => return Err(StorageError::DuckDb(e)),
+                }
+            }
+            Ok(out)
+        })
+        .await
+    }
+
     /// Cross-table hybrid recall: BM25 over `capability_capsules.content`
     /// joined with ANN over `capability_capsule_embeddings.embedding`,
     /// fused with Reciprocal Rank Fusion (RRF, k=60) inline in DuckDB

@@ -37,6 +37,53 @@ pub fn rrf_contribution(rank: usize) -> i64 {
     ((RRF_SCALE / (RRF_K as f64 + rank as f64)).round()) as i64
 }
 
+/// Float-valued RRF merge for two ranked candidate lists. Matches the
+/// `1.0 / (60.0 + rank_lex) + 1.0 / (60.0 + rank_sem)` formula the
+/// legacy fused-SQL `hybrid_candidates` used inline, so swapping the
+/// implementation from SQL to Rust-compose doesn't change the scores
+/// downstream rankers see.
+///
+/// Different from [`rrf_contribution`] (which is the scaled `i64`
+/// form the memories `score_candidates_hybrid_rrf` pipeline uses).
+/// Both forms coexist on purpose:
+///
+///   - `rrf_merge` matches what the fused SQL produced (`f32`, no
+///     scale factor) — used by the storage layer's `hybrid_candidates`
+///     compose path.
+///   - `rrf_contribution` matches what the higher-level memories
+///     pipeline produced (`i64`, ×1000 scale) — used by
+///     `pipeline::retrieve::score_candidates_hybrid_rrf`.
+///
+/// They differ by a factor of `RRF_SCALE = 1000.0`. Don't unify
+/// without a migration of every downstream test that hard-codes the
+/// old magnitudes.
+///
+/// Returns `Vec<(id, score)>` sorted by score descending, ties broken
+/// by id ascending — matches the legacy fused SQL's
+/// `ORDER BY rrf_score DESC, ..., capability_capsule_id ASC` (the
+/// `updated_at DESC` tiebreaker requires the full record and lives at
+/// the hydration layer, not here).
+pub fn rrf_merge(bm25: &[(String, i64)], ann: &[(String, i64)]) -> Vec<(String, f32)> {
+    use std::collections::HashMap;
+    let mut scores: HashMap<&str, f32> = HashMap::new();
+    for (id, rank) in bm25 {
+        *scores.entry(id.as_str()).or_insert(0.0) += 1.0 / (RRF_K as f32 + *rank as f32);
+    }
+    for (id, rank) in ann {
+        *scores.entry(id.as_str()).or_insert(0.0) += 1.0 / (RRF_K as f32 + *rank as f32);
+    }
+    let mut out: Vec<(String, f32)> = scores
+        .into_iter()
+        .map(|(id, score)| (id.to_string(), score))
+        .collect();
+    out.sort_by(|a, b| {
+        b.1.partial_cmp(&a.1)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| a.0.cmp(&b.0))
+    });
+    out
+}
+
 /// Freshness curve: how much to credit a candidate based on how close its
 /// timestamp is to the newest in the candidate pool. Range `[-14, 6]`:
 /// returns `6` when `current >= newest` (i.e., this candidate is the newest
@@ -89,6 +136,50 @@ mod tests {
         assert!(r1 > r10);
         assert!(r10 > r100);
         assert!(r100 >= 0);
+    }
+
+    #[test]
+    fn rrf_merge_items_in_both_outrank_one_sided() {
+        let bm25 = vec![("a".to_string(), 1), ("b".to_string(), 2)];
+        let ann = vec![("a".to_string(), 1), ("c".to_string(), 1)];
+        let merged = rrf_merge(&bm25, &ann);
+        // `a` hits both channels at rank 1 → highest score.
+        assert_eq!(merged[0].0, "a");
+        // `c` (vec only, rank 1) and `b` (lex only, rank 2): `c`
+        // outranks `b` because 1/61 > 1/62.
+        assert_eq!(merged[1].0, "c");
+        assert_eq!(merged[2].0, "b");
+    }
+
+    #[test]
+    fn rrf_merge_score_matches_legacy_sql_formula() {
+        // The legacy fused SQL computed
+        //   1.0/(60.0+rank_lex) + 1.0/(60.0+rank_sem)
+        // in DOUBLE then cast to FLOAT. We reproduce that in f32; the
+        // magnitude must match to within float rounding so swapping
+        // from fused-SQL to Rust-compose doesn't shift relative
+        // rankings downstream.
+        let bm25 = vec![("x".to_string(), 1)];
+        let ann = vec![("x".to_string(), 1)];
+        let merged = rrf_merge(&bm25, &ann);
+        let expected = 1.0_f32 / 61.0 + 1.0_f32 / 61.0;
+        assert!((merged[0].1 - expected).abs() < 1e-6);
+    }
+
+    #[test]
+    fn rrf_merge_ties_broken_by_id_ascending() {
+        // Two ids with identical scores → ascending id order.
+        let bm25 = vec![("zebra".to_string(), 1), ("apple".to_string(), 1)];
+        let ann = vec![];
+        let merged = rrf_merge(&bm25, &ann);
+        assert_eq!(merged[0].0, "apple");
+        assert_eq!(merged[1].0, "zebra");
+    }
+
+    #[test]
+    fn rrf_merge_empty_inputs_returns_empty() {
+        let merged = rrf_merge(&[], &[]);
+        assert!(merged.is_empty());
     }
 
     #[test]
