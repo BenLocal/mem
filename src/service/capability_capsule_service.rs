@@ -178,7 +178,7 @@ impl CapabilityCapsuleService {
             .unwrap_or_else(|| summarize(&request.content));
 
         let session_id = crate::pipeline::session::resolve_session(
-            &self.store,
+            self.store.as_ref(),
             &request.tenant,
             &request.source_agent,
             &now,
@@ -366,7 +366,7 @@ impl CapabilityCapsuleService {
             .map(|s| s.to_string())
             .unwrap_or_else(|| summarize(&request.content));
         let session_id = crate::pipeline::session::resolve_session(
-            &self.store,
+            self.store.as_ref(),
             &request.tenant,
             &request.source_agent,
             now,

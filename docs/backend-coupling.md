@@ -238,7 +238,7 @@ pub trait Backend:
 | QW-2 | `lance_store/*.rs` 写方法 filter 用 `sql_quote` 字符串拼接 | ~~lancedb 0.27 `update().only_if()` 接 bound params，改一遍~~ ⚠️ **deferred** — lancedb 0.27 expr API 仅支持读路径，写/删仍只能传字符串；sql_quote 输入全是内部字段，injection 风险实质为零；部分迁移制造两种风格。Phase 2 trait 抽离时定义 mem-internal predicate IR 更干净 | 去掉一个 SQL-ish 拼装层 | API gap：覆盖率 ~30% (42/140 callsite)；不值得引入 datafusion_expr 依赖 | ⚠️ **deferred** — see §4.2 + §7.2 |
 | QW-3 | `decode_embedding_blob` / `f32_slice_to_blob` 在 `service::embedding_helpers` 但被 storage 调用 | 移到 `crate::embedding::wire`，明确"应用 ↔ 存储"wire format | wire 层显式，未来 backend 可选 native f32 数组而非 byte blob | 纯 refactor，无 | ✅ — see §4.3 |
 | QW-4 | `config.rs:142-285` 大量 `MEM_VECTOR_INDEX_*` env + `#[allow(dead_code)]` 字段；CLAUDE.md 还讲 usearch sidecar | 删字段 + 删配置 + 修文档 | 减 cognitive load，对齐代码现状 | 失去 `MEM_TRANSCRIPT_OVERSAMPLE` 的 startup validation（live read 已自带 fallback） | ✅ — see §4.4 |
-| QW-5 | `pipeline/retrieve.rs:76 graph: &Store` 但实际只调几个 graph 方法 | 给 pipeline 定义 `trait GraphRead` 子集，retrieve 接 `&dyn GraphRead` | pipeline 层先 trait 化，是 Phase 2 的预演 | 无 |
+| QW-5 | `pipeline/retrieve.rs:76 graph: &Store` 但实际只调几个 graph 方法（外加 `pipeline/session.rs:66 repo: &Store` 同形态） | 给 pipeline 定义 `trait GraphRead` + `trait SessionStore` 子集，pipeline 全部接 `&dyn _` | pipeline 层先 trait 化，是 Phase 2 的预演 | 无 | ✅ — see §4.5 |
 | QW-6 | `lance_write_then_refresh!` 宏在 store.rs，27 调用点 | 改成 `Store::commit_write<F, T>(write_fn) -> T` 显式 method | method 可被 LanceBackend 覆盖、TestBackend no-op、Postgres 不实现；宏没法这么干 | 27 处机械替换 |
 
 ### 4.1 QW-1: 拆 `hybrid_candidates` 成 Rust-compose (✅ landed)
@@ -353,21 +353,43 @@ pub fn decode_f32_blob(blob: &[u8], dim: usize) -> Result<Vec<f32>, &'static str
 
 实际上这种"live env read, no config-side parse"是项目里的既有模式（`MEM_DB_PATH` / `MEM_BASE_URL` / `MEM_TENANT` / `MEM_MIN_SCORE` / `MEM_SESSION_IDLE_MINUTES` 都是这样），`MEM_TRANSCRIPT_OVERSAMPLE` 现在跟齐了。
 
-### 4.5 QW-5: pipeline 用子 trait
+### 4.5 QW-5: pipeline 用子 trait (✅ landed)
 
-定义最小 read trait（不放在 storage 层，放 pipeline 层，**仅 pipeline 内部用**）：
+新模块 `src/pipeline/store_traits.rs` 定义两个 `#[async_trait]` 窄 trait：
 
 ```rust
-// src/pipeline/store_traits.rs
 pub trait GraphRead: Send + Sync {
-    async fn neighbors_within(&self, node_id: &str, max_hops: u32, as_of: Option<&str>) -> Result<Vec<GraphEdge>, GraphError>;
-    async fn related_capability_capsule_ids(...) -> ...;
+    async fn related_capability_capsule_ids(&self, anchors: &[String])
+        -> Result<Vec<String>, GraphError>;
 }
 
-impl GraphRead for Store { /* delegate */ }
+pub trait SessionStore: Send + Sync {
+    async fn latest_active_session(&self, tenant: &str, caller_agent: &str)
+        -> Result<Option<Session>, StorageError>;
+    async fn open_session(&self, session_id: &str, tenant: &str, caller_agent: &str, now: &str)
+        -> Result<Session, StorageError>;
+    async fn close_session(&self, session_id: &str, ended_at: &str)
+        -> Result<(), StorageError>;
+}
+
+impl GraphRead   for Store { /* delegate */ }
+impl SessionStore for Store { /* delegate */ }
 ```
 
-`retrieve.rs` 签名改 `graph: &dyn GraphRead`。这是为 Phase 2 的 mechanical sweep 预演。
+签名替换：
+- `pipeline::retrieve::rank_with_hybrid_and_graph(graph: &Store)` → `&dyn GraphRead`
+- `pipeline::session::resolve_session(repo: &Store)` → `&dyn SessionStore`
+
+Service 层 callsite (2 处 in `capability_capsule_service.rs`) 改 `&self.store` → `self.store.as_ref()`，因为 `Arc<Store>: !SessionStore`（trait 没给 Arc 加 blanket impl，避免 trait-on-wrapper 的脆弱性）。
+
+**Scope 注**：doc 原文只点了 GraphRead；实际 pipeline 还有 session.rs 取 `&Store`，**同形态、不做完会留半截**。一并 trait 化把 pipeline 100% 解耦，避免 Phase 2 mechanical sweep 时还要回头补。
+
+**验证**：4 个 `sessions_integration` 测试 + 81 个 `pipeline::` 单测全绿。`hybrid_search` 集成测试同样过——`&Store` → `&dyn GraphRead` 是隐式 deref coercion，运行时行为零变化。
+
+**对 Phase 2 trait 抽离的意义**：
+- 验证了"窄 trait + Store blanket impl + 调用方 `as_ref()`"这个 pattern 在该项目可行（不撞 Arc-of-trait 问题）
+- 当 Phase 2 把同样的模式应用到 88 个 Store 方法上时，对应 ~100 个 callsite 大致按相同手法机械重写
+- 任何新 backend 实现 `GraphRead` + `SessionStore` 后，pipeline 可不修改一行代码跑在新 backend 上
 
 ### 4.6 QW-6: 宏 → 显式 method
 
