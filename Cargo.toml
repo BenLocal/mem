@@ -7,7 +7,18 @@ default-run = "mem"
 [lib]
 doctest = false
 
+[features]
+default = []
+# Phase 4 (backend-coupling §6.5) Postgres spike — opt-in. Adds sqlx
+# + PostgresCapsuleStore behind `cargo build --features postgres`.
+# Default build is unaffected; no sqlx pulled into the dep graph
+# unless the feature is on. See `docs/backend-coupling.md` §6.5.
+postgres = ["dep:sqlx"]
+
 [dependencies]
+# Optional: Phase 4 Postgres spike. Gated behind the `postgres`
+# feature so the default build doesn't pull sqlx + libpq machinery.
+sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "tls-rustls", "postgres", "uuid"], optional = true }
 # LanceDB is the storage backend (on-disk Lance datasets) and DuckDB
 # is the SQL query engine on top via the `lance` core extension. Both
 # are unconditional dependencies — there's only one storage path now.

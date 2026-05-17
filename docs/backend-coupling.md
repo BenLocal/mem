@@ -657,11 +657,76 @@ trait 没有需要改 signature 的——**Phase 2 验证通过，Phase 3 可以
 
 每个 sub-trait 都在 LanceBackend 上验证通过——通过 18 个集成测试 suite 全绿 + 0 callsite 改动证明（trait extraction 在 runtime 完全透明）。
 
-### 6.5 Phase 4 (4-6 周) — Postgres spike
+### 6.5 Phase 4 — ⚠️ scaffold landed, integration validation deferred (2026-05-17)
 
-先做 `PostgresCapsuleStore`（最干净的子集），跑一个集成测试 suite 看痛点。可能要回头微调 1-2 个 sub-trait 的边界，但**不应该**动主架构。
+**Scope-B 落地**（per user decision）：写完 `PostgresCapsuleStore` 全套 15 个方法 + SQL migration，**未跑端到端测试**——session 内没有 Docker / Postgres infra 来满足"跑集成测试 suite"的 doc 原意。`cargo build --features postgres` + `cargo clippy --all-targets --features postgres` 都干净，code 形态可以代码 review，但 SQL 语句没有真实 RDBMS 验证过。完整 Phase 4 验证要部署到有 Postgres 的环境后跑 `tests/postgres_capsule_store_parity.rs`（still 待写）。
 
-如果发现要动主架构，说明 Phase 2 验证不够彻底——这一步前的预算要重新审视。
+**交付物**：
+- `src/storage/postgres_capsule_store.rs` (~600 行) — sqlx-based impl，behind `[features] postgres`，default build 不动
+- `migrations/postgres/0001_capsule_store.sql` — CREATE TABLE + indexes + CHECK 约束
+- `Cargo.toml` 加 sqlx 作为 optional dep（runtime-tokio + tls-rustls + postgres + uuid）
+
+**编写过程发现的 5 个 trait 与现实 gap**（这是 Phase 4 的真核心交付）：
+
+#### Pain #1: `version: u64` ↔ Postgres BIGINT (signed i64)
+
+`CapabilityCapsuleRecord.version` 是 `u64`。Postgres 没有原生无符号 64-bit 整数；最近的是 BIGINT (i64)。每次 read / write 都要做 `i64::try_from(u64)` 双向转换，溢出走 `StorageError::InvalidData("version overflow")`。**对未来的影响**：domain 类型应该把 `version` 改成 `i64`——u64 不是个真有用的范围（versions 不会超过 2^63），改了之后 storage 层全部干净。Phase 5 cleanup 候选。
+
+#### Pain #2: `insert_capability_capsules` (batch) 没有真正的批量路径
+
+trait 方法签名是 `&[CapabilityCapsuleRecord]`。Lance 用一个 `RecordBatch` 一次写完。sqlx 没有"接 Vec<Record> 走一个 statement"的批量 helper——要么手动构 multi-VALUES SQL（27 列 × N 行的 binding 体操），要么用 `COPY FROM STDIN`，要么 fall back 到事务循环。
+
+Phase 4 spike **选 fall back**（事务里 for 循环 N 次 INSERT）：简单、对，但 N 次 round trip。**production 实现要走 `COPY FROM STDIN`**（sqlx `copy_in_raw` API）才能达到 Lance 的批量性能。这是 trait surface 本身没问题，但实现策略差异显著的例子。
+
+#### Pain #3: `apply_feedback` 需要动态 SET 子句
+
+trait 方法 `apply_feedback(memory, feedback) -> Record` 要根据 `FeedbackKind` 决定更新哪些字段：
+- 总是更新 `confidence` + `decay_score` + `updated_at`
+- `status_after()` 返回 `Some(_)` 才更新 `status`（仅 `incorrect` / `auto_promoted`）
+- `marks_validated()` 才更新 `last_validated_at`（仅 `useful` / `applies_here`）
+
+Lance 实现用 fluent builder (`.column("status", ...).column("last_validated_at", ...)`) 按需链。sqlx 是静态 SQL string——没有 builder。**Phase 4 spike 写了 4 个 SQL string variant**（status × validated_at 二元组合）。
+
+更干净的做法：用 `COALESCE` 占位符（`SET last_validated_at = COALESCE($N, last_validated_at)`），永远 bind 但 bind `NULL` 表示"不动"。这一改未来 Postgres 实现会做。**trait 接口本身没问题**，只是 storage 层要发明小套路。
+
+#### Pain #4: 没有 trait spec'd 在事务里发生
+
+`replace_pending_with_successor` 和 `apply_feedback` 在 Lance 里都是"两步操作、无事务保护"（Phase 2 capsule `mem_019e336c` §3.2 已记录）。Postgres 里有真事务，**可以**用 BEGIN/COMMIT 把两步包成原子。但 trait 没有 spec 这一点是 invariant 还是 implementation detail。
+
+Phase 4 spike 选**用事务**（更安全），但行为差异对 caller 可见：在 Lance 里 crash window 内的 caller 可能看到"audit row 已写但 parent 没更新"的中间态；Postgres caller 永远看不到。
+
+**这是真该回头改 trait spec 的地方**：要么 trait 显式承诺原子（强制 Lance 加 retry/rollback 逻辑），要么显式说"非原子，crash 可能留中间态"（Postgres impl 也照办，浪费事务能力）。doc §3.3 决议"不加 transaction() 方法"是对的，但这两个具体方法需要单独标注 atomicity 契约。**Phase 5 trait-spec 化时优先处理**。
+
+#### Pain #5: `feedback_summary` 的 `FeedbackKind::AutoPromoted` 没在聚合里
+
+`FeedbackSummary` struct 有 `total / useful / outdated / incorrect / applies_here / does_not_apply_here` 6 个 u64 字段，**没有 `auto_promoted` 槽**。但 `feedback_events` 表里存的是 6 种 kind（auto_promoted 是 Phase 1 vacuum + auto_promote 加进来的）。
+
+Lance impl 实测下面这种已 archived 的 auto_promoted 事件不会进任何 specific counter，但 `total` 会涨。Postgres impl 跟齐了（按 kind 字符串 match，auto_promoted 落到 `_` 分支）。**这是 domain struct 滞后于 enum 演进的 bug**——`FeedbackSummary` 应该加 `auto_promoted: u64` 字段。Phase 5 修。
+
+#### 验证 Phase 2 trait 是否够用
+
+doc 验证标准：「如果发现要动主架构，说明 Phase 2 验证不够彻底」。**结论：trait 形状基本够**——
+
+| Phase 4 发现 | 性质 | 处理 |
+|---|---|---|
+| Pain #1 version u64→i64 | Domain 类型 issue | 改 domain (Phase 5) |
+| Pain #2 batch insert | 实现策略差异 | 各 backend 自己优化 (production work) |
+| Pain #3 dynamic SET | sqlx ergonomics | 实现技巧 (no trait change) |
+| Pain #4 transactional contract | **trait 需要 spec atomicity** | 改 trait doc (Phase 5) |
+| Pain #5 FeedbackSummary 缺槽 | Domain struct issue | 改 domain (Phase 5) |
+
+**只 1 项需要改 trait（pain #4），3 项是 domain / 实现层 fix**。trait 形状本身没崩。doc 原文「不应该动主架构」**成立**——`CapsuleStore` 15 方法的 signature 完全照搬，没有一个需要 reshape。
+
+### 6.5.1 完成 Phase 4 验证需要的环境
+
+要把 Phase 4 从 "scaffold" 转到 "validated"，**需要**：
+
+1. **Docker** 跑 Postgres 16+（或者裸机 Postgres instance）
+2. **testcontainers-rs** 当 dev-dependency（hermetic test setup；spawn/teardown 每 test 一个 Postgres container）
+3. **`tests/postgres_capsule_store_parity.rs`** —— 复用 `tests/capsule_store_parity.rs` 的 13 个 scenario，对 PostgresCapsuleStore 全跑。期望 26 个 Lance/InMemory 测试加 13 个 Postgres 测试 = 39 个 parity test。
+4. **CI 配置**：CI runner 要有 Docker。GitHub Actions 直接支持；自建 runner 要装。
+
+这一阶段需要协调外部环境，不在 code 范畴。**Phase 4 spike 落地到此打住**——Phase 5 (umbrella + service migration) 可以独立推进，不依赖 Phase 4 端到端验证。
 
 ### 6.6 Phase 5 (持续)
 
