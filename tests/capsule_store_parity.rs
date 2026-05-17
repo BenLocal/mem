@@ -194,6 +194,55 @@ async fn apply_feedback_incorrect_archives(backend: Arc<dyn CapsuleStore>) {
     assert_eq!(updated.status, CapabilityCapsuleStatus::Archived);
 }
 
+async fn feedback_summary_counts_auto_promoted(backend: Arc<dyn CapsuleStore>) {
+    // Phase 5 pain #5: `FeedbackKind::AutoPromoted` (from the
+    // auto-promote sweep added in Phase 1) used to fall into the
+    // catch-all branch of every backend's aggregator, so the kind
+    // only bumped `total` and not a specific counter. Parity test:
+    // apply useful + auto_promoted events, summary must surface both
+    // counts on both backends.
+    let original = fixture("ap", CapabilityCapsuleStatus::Provisional);
+    backend
+        .insert_capability_capsule(original.clone())
+        .await
+        .unwrap();
+    backend
+        .apply_feedback(
+            &original,
+            FeedbackEvent {
+                feedback_id: "fb_u".into(),
+                capability_capsule_id: "ap".into(),
+                feedback_kind: FeedbackKind::Useful.as_str().to_string(),
+                created_at: current_timestamp(),
+                note: None,
+            },
+        )
+        .await
+        .unwrap();
+    let after_useful = backend
+        .get_capability_capsule_for_tenant("t", "ap")
+        .await
+        .unwrap()
+        .unwrap();
+    backend
+        .apply_feedback(
+            &after_useful,
+            FeedbackEvent {
+                feedback_id: "fb_ap".into(),
+                capability_capsule_id: "ap".into(),
+                feedback_kind: FeedbackKind::AutoPromoted.as_str().to_string(),
+                created_at: current_timestamp(),
+                note: None,
+            },
+        )
+        .await
+        .unwrap();
+    let summary = backend.feedback_summary("ap").await.unwrap();
+    assert_eq!(summary.total, 2, "two events recorded");
+    assert_eq!(summary.useful, 1);
+    assert_eq!(summary.auto_promoted, 1, "auto_promoted now counted");
+}
+
 async fn delete_hard_removes_row(backend: Arc<dyn CapsuleStore>) {
     backend
         .insert_capability_capsule(fixture("a", CapabilityCapsuleStatus::Active))
@@ -311,6 +360,7 @@ parity!(find_by_idempotency_dedups_on_key);
 parity!(find_by_idempotency_dedups_on_hash);
 parity!(apply_feedback_useful_raises_confidence);
 parity!(apply_feedback_incorrect_archives);
+parity!(feedback_summary_counts_auto_promoted);
 parity!(delete_hard_removes_row);
 parity!(fetch_by_ids_returns_only_requested);
 parity!(fetch_by_ids_empty_short_circuits);

@@ -596,34 +596,23 @@ impl CapsuleStore for InMemoryCapsuleStore {
         capability_capsule_id: &str,
     ) -> Result<FeedbackSummary, StorageError> {
         Ok(self.with_state(|s| {
-            let mut total = 0u64;
-            let mut useful = 0u64;
-            let mut outdated = 0u64;
-            let mut incorrect = 0u64;
-            let mut applies_here = 0u64;
-            let mut does_not_apply_here = 0u64;
+            let mut summary = FeedbackSummary::default();
             for ev in &s.feedback {
                 if ev.capability_capsule_id != capability_capsule_id {
                     continue;
                 }
-                total += 1;
+                summary.total += 1;
                 match ev.feedback_kind.as_str() {
-                    "useful" => useful += 1,
-                    "outdated" => outdated += 1,
-                    "incorrect" => incorrect += 1,
-                    "applies_here" => applies_here += 1,
-                    "does_not_apply_here" => does_not_apply_here += 1,
+                    "useful" => summary.useful += 1,
+                    "outdated" => summary.outdated += 1,
+                    "incorrect" => summary.incorrect += 1,
+                    "applies_here" => summary.applies_here += 1,
+                    "does_not_apply_here" => summary.does_not_apply_here += 1,
+                    "auto_promoted" => summary.auto_promoted += 1,
                     _ => {}
                 }
             }
-            FeedbackSummary {
-                total,
-                useful,
-                outdated,
-                incorrect,
-                applies_here,
-                does_not_apply_here,
-            }
+            summary
         }))
     }
 }

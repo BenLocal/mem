@@ -219,6 +219,7 @@ fn _removed_duckdb_repository_summarizes_feedback_by_kind() {
         incorrect: 0,
         applies_here: 0,
         does_not_apply_here: 0,
+        auto_promoted: 0,
     };
 }
 

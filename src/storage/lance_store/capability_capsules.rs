@@ -922,7 +922,8 @@ impl LanceStore {
                 "incorrect" => summary.incorrect += 1,
                 "applies_here" => summary.applies_here += 1,
                 "does_not_apply_here" => summary.does_not_apply_here += 1,
-                _ => {} // unknown kind — counted in `total` only
+                "auto_promoted" => summary.auto_promoted += 1,
+                _ => {} // future kinds — counted in `total` only
             }
         }
         Ok(summary)

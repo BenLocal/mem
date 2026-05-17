@@ -341,6 +341,14 @@ pub struct FeedbackSummary {
     pub incorrect: u64,
     pub applies_here: u64,
     pub does_not_apply_here: u64,
+    /// Counter for `FeedbackKind::AutoPromoted` events. Added in
+    /// Phase 5 pain #5: the kind has existed since Phase 1's
+    /// auto-promote sweep, but `FeedbackSummary` had no slot for it,
+    /// so backends silently dropped the count into `total` only. Old
+    /// payloads that lack the field deserialize as `0` (serde
+    /// `Default`), so this is backward-compatible.
+    #[serde(default)]
+    pub auto_promoted: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]

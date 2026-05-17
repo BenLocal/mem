@@ -699,11 +699,13 @@ Phase 4 spike 选**用事务**（更安全），但行为差异对 caller 可见
 
 **这是真该回头改 trait spec 的地方**：要么 trait 显式承诺原子（强制 Lance 加 retry/rollback 逻辑），要么显式说"非原子，crash 可能留中间态"（Postgres impl 也照办，浪费事务能力）。doc §3.3 决议"不加 transaction() 方法"是对的，但这两个具体方法需要单独标注 atomicity 契约。**Phase 5 trait-spec 化时优先处理**。
 
-#### Pain #5: `feedback_summary` 的 `FeedbackKind::AutoPromoted` 没在聚合里
+#### Pain #5: ~~`feedback_summary` 的 `FeedbackKind::AutoPromoted` 没在聚合里~~ ✅ resolved (Phase 5, 2026-05-17)
 
 `FeedbackSummary` struct 有 `total / useful / outdated / incorrect / applies_here / does_not_apply_here` 6 个 u64 字段，**没有 `auto_promoted` 槽**。但 `feedback_events` 表里存的是 6 种 kind（auto_promoted 是 Phase 1 vacuum + auto_promote 加进来的）。
 
 Lance impl 实测下面这种已 archived 的 auto_promoted 事件不会进任何 specific counter，但 `total` 会涨。Postgres impl 跟齐了（按 kind 字符串 match，auto_promoted 落到 `_` 分支）。**这是 domain struct 滞后于 enum 演进的 bug**——`FeedbackSummary` 应该加 `auto_promoted: u64` 字段。Phase 5 修。
+
+**Fixed**: `FeedbackSummary` 加 `#[serde(default)] auto_promoted: u64`（向后兼容旧 payload，反序列化为 0）；3 个 backend 的 aggregator 全加 `"auto_promoted" => summary.auto_promoted += ...` 分支；新增 parity test `feedback_summary_counts_auto_promoted` 验证两个 backend 一致（28/28 绿）。
 
 #### 验证 Phase 2 trait 是否够用
 
@@ -736,8 +738,8 @@ Two parallel tracks: **(a)** the 4 non-trait pain fixes from Phase 4 §6.5 (pain
 
 | Sub-step | Scope | Status |
 |---|---|---|
-| Pain #1 — `version: u64` → `i64` | domain + Lance schema (`UInt64` → `Int64`) + DuckDB reads + Postgres bind drops `try_from`; tests + parity green | ✅ (this commit) |
-| Pain #5 — `FeedbackSummary.auto_promoted` slot | add field + route AutoPromoted events in 3 backends | ⏳ |
+| Pain #1 — `version: u64` → `i64` | domain + Lance schema (`UInt64` → `Int64`) + DuckDB reads + Postgres bind drops `try_from`; tests + parity green | ✅ `45c65f4` |
+| Pain #5 — `FeedbackSummary.auto_promoted` slot | add field + route AutoPromoted events in 3 backends + parity test | ✅ (this commit) |
 | Pain #3 — postgres `apply_feedback` COALESCE | collapse 4 SQL variants into one `SET col = COALESCE($N, col)` statement | ⏳ |
 | Pain #4 — atomicity contract on trait doc | spec non-atomic on `apply_feedback` + `replace_pending_with_successor`, callers may observe partial state on Lance crash | ⏳ |
 | LT-1 umbrella `Backend` trait | aggregate 9 sub-traits behind `pub trait Backend`; blanket `impl Backend for Store` | ⏳ |

@@ -684,7 +684,8 @@ impl CapsuleStore for PostgresCapsuleStore {
                 "incorrect" => summary.incorrect += cnt,
                 "applies_here" => summary.applies_here += cnt,
                 "does_not_apply_here" => summary.does_not_apply_here += cnt,
-                _ => {} // auto_promoted etc. don't have a count slot on FeedbackSummary
+                "auto_promoted" => summary.auto_promoted += cnt,
+                _ => {} // future kinds — counted in `total` only
             }
         }
         Ok(summary)
