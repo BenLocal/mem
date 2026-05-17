@@ -20,6 +20,8 @@
 
 pub mod capsule_store;
 pub mod duckdb_query;
+pub mod embedding_job_store;
+pub mod embedding_vector_store;
 pub mod entity_registry;
 pub mod graph_store;
 pub mod lance_store;
@@ -30,6 +32,8 @@ pub mod time;
 pub mod types;
 
 pub use capsule_store::{CapsuleStore, InMemoryCapsuleStore};
+pub use embedding_job_store::EmbeddingJobStore;
+pub use embedding_vector_store::EmbeddingVectorStore;
 pub use entity_registry::EntityRegistry;
 pub use graph_store::GraphStore;
 pub use maintenance_store::MaintenanceStore;
