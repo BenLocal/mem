@@ -20,12 +20,20 @@
 
 pub mod capsule_store;
 pub mod duckdb_query;
+pub mod entity_registry;
+pub mod graph_store;
 pub mod lance_store;
+pub mod maintenance_store;
+pub mod session_store;
 pub mod store;
 pub mod time;
 pub mod types;
 
 pub use capsule_store::{CapsuleStore, InMemoryCapsuleStore};
+pub use entity_registry::EntityRegistry;
+pub use graph_store::GraphStore;
+pub use maintenance_store::MaintenanceStore;
+pub use session_store::SessionStore;
 pub use store::Store;
 pub use time::{current_timestamp, timestamp_add_ms};
 pub use types::{
