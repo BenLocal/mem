@@ -29,7 +29,7 @@ lancedb = "0.27"
 # across the Table::add boundary. (lancedb re-exports `arrow_schema`
 # via `lancedb::arrow::arrow_schema`, so we don't need a direct dep
 # on that.)
-arrow-array = "57"
+arrow-array = "58"
 # `futures::TryStreamExt::try_collect` collapses LanceDB's
 # `SendableRecordBatchStream` into a `Vec<RecordBatch>`. lancedb
 # already pulls futures transitively, but cargo doesn't expose
