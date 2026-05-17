@@ -566,13 +566,65 @@ Phase 5 (持续, 收尾)
 
 完成后 storage 层"backend-specific 边界"明显收窄；**对外 API 完全不变**——即便 Phase 2 决定"算了不抽 trait 了"，Phase 1 的清理也都是干净收益。下一步 Phase 2 (§6.3) 是首个真 trait + alternate backend，是 decision point。
 
-### 6.3 Phase 2 (2 周) — DECISION POINT
+### 6.3 Phase 2 — ✅ trait validated, scope deliberately narrowed (2026-05-17)
 
-抽 `CapsuleStore` trait（§3.1 第一行那个最小子集）+ 一个 in-memory HashMap backend。把 `capability_capsule_service` 改吃 `Arc<dyn CapsuleStore>`。
+抽 `CapsuleStore` trait（§3.1 第一行那个最小子集）+ 一个 in-memory HashMap backend。
 
-**验证标准**：所有现有 capsule CRUD 测试在 LanceCapsuleStore 和 InMemoryCapsuleStore 两个后端下都过；trait 不需要回头改 method 签名。
+**Scope 决策**：doc 原稿写「把 `capability_capsule_service` 改吃 `Arc<dyn CapsuleStore>`」，但 service 还要调 ~15 个非 CapsuleStore 的 Store 方法（search、embedding_jobs、graph、entity、transcript、maintenance），强制只持 `Arc<dyn CapsuleStore>` 会让 service 大量调用编译失败。三个选项里选 **A**：抽 trait + 2 backend + parity 测试，**不动 service**。Service 仍然持 `Arc<Store>`，trait 通过 `Store: CapsuleStore` 自动可用。Phase 3 sub-trait 全套抽完后再做 service migration（届时 service 持 `Arc<dyn Backend>` umbrella）。
 
-**如果验证失败**（trait 形状不对、抽象漏点多），**先回头改 §3.3 的边界取舍**，不要硬推 Phase 3。
+**Trait surface**: 15 个方法（`src/storage/capsule_store.rs`）：
+
+```rust
+#[async_trait]
+pub trait CapsuleStore: Send + Sync {
+    async fn insert_capability_capsule(...) -> Result<Record, _>;
+    async fn insert_capability_capsules(...) -> Result<(), _>;
+    async fn get_capability_capsule(...) -> Result<Option<Record>, _>;
+    async fn get_capability_capsule_for_tenant(...) -> Result<Option<Record>, _>;
+    async fn get_pending(...) -> Result<Option<Record>, _>;
+    async fn find_by_idempotency_or_hash(...) -> Result<Option<Record>, _>;
+    async fn list_capability_capsules_for_tenant(...) -> Result<Vec<Record>, _>;
+    async fn list_pending_review(...) -> Result<Vec<Record>, _>;
+    async fn fetch_capability_capsules_by_ids(...) -> Result<Vec<Record>, _>;
+    async fn accept_pending(...) -> Result<Record, _>;
+    async fn reject_pending(...) -> Result<Record, _>;
+    async fn replace_pending_with_successor(...) -> Result<Record, _>;
+    async fn apply_feedback(...) -> Result<Record, _>;
+    async fn delete_capability_capsule_hard(...) -> Result<(), _>;
+    async fn feedback_summary(...) -> Result<FeedbackSummary, _>;
+}
+```
+
+设计取舍：
+- 没用 default methods（in-memory backend ~200 行手写够小，default 反而不如直接写清楚）
+- 错误统一 `StorageError`（§3.3 决议）
+- 两个 impl：`Store`（delegate）+ `InMemoryCapsuleStore`（HashMap-based，dev/test only）
+
+**验证标准**（doc 原版）：所有 capsule CRUD 测试在两个 backend 下都过；trait 不需要回头改 method 签名。
+
+**实际验证**：`tests/capsule_store_parity.rs` 写了 13 个场景，每个场景两个 backend 各跑一遍 → **26/26 passed**：
+
+```
+insert_and_get_round_trip           — 两 backend OK
+get_for_other_tenant_returns_none   — tenant isolation 两 backend OK
+accept_pending_transitions_status   — 状态转移 两 backend OK
+reject_pending_transitions_status   — 同上
+list_pending_review_filters_status  — 过滤 两 backend OK
+find_by_idempotency_dedups_on_key   — idempotency dedup 两 backend OK
+find_by_idempotency_dedups_on_hash  — content-hash dedup 两 backend OK
+apply_feedback_useful_raises_confidence  — 反馈→confidence 两 backend OK
+apply_feedback_incorrect_archives    — 反馈→archived 两 backend OK
+delete_hard_removes_row              — 硬删 两 backend OK
+fetch_by_ids_returns_only_requested  — 批量 fetch 两 backend OK
+fetch_by_ids_empty_short_circuits    — 空 fetch 两 backend OK
+replace_pending_with_successor_chains — supersede chain 两 backend OK
+```
+
+trait 没有需要改 signature 的——**Phase 2 验证通过，Phase 3 可以推进**。
+
+**意外发现 / 待留意**：
+- InMemoryCapsuleStore 实现 `apply_feedback` 时需要 re-derive feedback adjustments，因为 lance backend 用的 `feedback_adjustments` helper 是 `pub(super)` 不可见。这暴露了 [#`FeedbackKind` 是 domain-level abstraction 但 adjustment lookup 是 storage-level helper] 的层级模糊——Phase 3 应该把 adjustment lookup 推到 domain 层（`FeedbackKind` 自带的 helper 已经够用，重复 string match 是冗余的）。
+- `replace_pending_with_successor` 在两 backend 的"原 capsule 终态"一致：都设为 `Rejected`（lance 内部 `update_status` 的行为，in-memory 跟随）。trait 没强制 archived vs rejected——这是个隐式约定，Phase 3 trait spec 化时要写明。
 
 ### 6.4 Phase 3 (3 周)
 

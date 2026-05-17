@@ -18,12 +18,14 @@
 //!   service / worker / HTTP layer carries.
 //! - `types` — shared row payloads + `StorageError` + `GraphError`.
 
+pub mod capsule_store;
 pub mod duckdb_query;
 pub mod lance_store;
 pub mod store;
 pub mod time;
 pub mod types;
 
+pub use capsule_store::{CapsuleStore, InMemoryCapsuleStore};
 pub use store::Store;
 pub use time::{current_timestamp, timestamp_add_ms};
 pub use types::{
