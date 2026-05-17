@@ -550,78 +550,43 @@ impl CapsuleStore for PostgresCapsuleStore {
         .await
         .map_err(sqlx_err)?;
 
-        // 2. Update parent capsule. Build the SET list dynamically
-        // based on which deltas are non-zero — keeps the SQL
-        // straightforward without dynamic-binding tricks.
+        // 2. Update parent capsule via a single COALESCE statement.
+        // Optional fields (`status`, `last_validated_at`) bind
+        // `Option<String>` directly — `NULL` means "don't change",
+        // `Some(v)` means "set to v". This replaces the four SQL
+        // variants the Phase 4 spike shipped (per backend-coupling
+        // §6.5 pain #3): one static statement, always the same
+        // 6 binds, no dispatch on which combo of fields needs
+        // updating. The `::TEXT` casts on the optional params give
+        // Postgres an explicit type so a NULL bind doesn't trip
+        // "could not determine data type of parameter".
         let new_confidence = (memory.confidence + kind.confidence_delta()).clamp(0.0, 1.0);
         let new_decay = (memory.decay_score + kind.decay_delta()).clamp(0.0, 1.0);
-        let new_status = kind.status_after();
-        let new_validated_at = if kind.marks_validated() {
-            Some(feedback.created_at.clone())
-        } else {
-            None
+        let new_status: Option<String> = match kind.status_after() {
+            Some(s) => Some(enum_to_str(&s)?),
+            None => None,
         };
+        let new_validated_at: Option<String> =
+            kind.marks_validated().then(|| feedback.created_at.clone());
 
-        // Always-set: confidence, decay_score, updated_at.
-        // Conditional: status (if status_after returns Some),
-        // last_validated_at (if marks_validated).
-        if let (Some(status_after), Some(validated_at)) = (&new_status, &new_validated_at) {
-            sqlx::query(
-                "UPDATE capability_capsules SET confidence = $1, decay_score = $2, \
-                 updated_at = $3, status = $4, last_validated_at = $5 \
-                 WHERE capability_capsule_id = $6",
-            )
-            .bind(new_confidence)
-            .bind(new_decay)
-            .bind(&feedback.created_at)
-            .bind(enum_to_str(status_after)?)
-            .bind(validated_at)
-            .bind(&memory.capability_capsule_id)
-            .execute(&mut *tx)
-            .await
-            .map_err(sqlx_err)?;
-        } else if let Some(status_after) = &new_status {
-            sqlx::query(
-                "UPDATE capability_capsules SET confidence = $1, decay_score = $2, \
-                 updated_at = $3, status = $4 \
-                 WHERE capability_capsule_id = $5",
-            )
-            .bind(new_confidence)
-            .bind(new_decay)
-            .bind(&feedback.created_at)
-            .bind(enum_to_str(status_after)?)
-            .bind(&memory.capability_capsule_id)
-            .execute(&mut *tx)
-            .await
-            .map_err(sqlx_err)?;
-        } else if let Some(validated_at) = &new_validated_at {
-            sqlx::query(
-                "UPDATE capability_capsules SET confidence = $1, decay_score = $2, \
-                 updated_at = $3, last_validated_at = $4 \
-                 WHERE capability_capsule_id = $5",
-            )
-            .bind(new_confidence)
-            .bind(new_decay)
-            .bind(&feedback.created_at)
-            .bind(validated_at)
-            .bind(&memory.capability_capsule_id)
-            .execute(&mut *tx)
-            .await
-            .map_err(sqlx_err)?;
-        } else {
-            sqlx::query(
-                "UPDATE capability_capsules SET confidence = $1, decay_score = $2, \
-                 updated_at = $3 \
-                 WHERE capability_capsule_id = $4",
-            )
-            .bind(new_confidence)
-            .bind(new_decay)
-            .bind(&feedback.created_at)
-            .bind(&memory.capability_capsule_id)
-            .execute(&mut *tx)
-            .await
-            .map_err(sqlx_err)?;
-        }
+        sqlx::query(
+            "UPDATE capability_capsules SET \
+                confidence = $1, \
+                decay_score = $2, \
+                updated_at = $3, \
+                status = COALESCE($4::TEXT, status), \
+                last_validated_at = COALESCE($5::TEXT, last_validated_at) \
+             WHERE capability_capsule_id = $6",
+        )
+        .bind(new_confidence)
+        .bind(new_decay)
+        .bind(&feedback.created_at)
+        .bind(new_status)
+        .bind(new_validated_at)
+        .bind(&memory.capability_capsule_id)
+        .execute(&mut *tx)
+        .await
+        .map_err(sqlx_err)?;
         tx.commit().await.map_err(sqlx_err)?;
 
         // Return the updated row by re-fetching. The Lance backend

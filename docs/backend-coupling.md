@@ -680,7 +680,7 @@ trait 方法签名是 `&[CapabilityCapsuleRecord]`。Lance 用一个 `RecordBatc
 
 Phase 4 spike **选 fall back**（事务里 for 循环 N 次 INSERT）：简单、对，但 N 次 round trip。**production 实现要走 `COPY FROM STDIN`**（sqlx `copy_in_raw` API）才能达到 Lance 的批量性能。这是 trait surface 本身没问题，但实现策略差异显著的例子。
 
-#### Pain #3: `apply_feedback` 需要动态 SET 子句
+#### Pain #3: ~~`apply_feedback` 需要动态 SET 子句~~ ✅ resolved (Phase 5, 2026-05-17)
 
 trait 方法 `apply_feedback(memory, feedback) -> Record` 要根据 `FeedbackKind` 决定更新哪些字段：
 - 总是更新 `confidence` + `decay_score` + `updated_at`
@@ -690,6 +690,8 @@ trait 方法 `apply_feedback(memory, feedback) -> Record` 要根据 `FeedbackKin
 Lance 实现用 fluent builder (`.column("status", ...).column("last_validated_at", ...)`) 按需链。sqlx 是静态 SQL string——没有 builder。**Phase 4 spike 写了 4 个 SQL string variant**（status × validated_at 二元组合）。
 
 更干净的做法：用 `COALESCE` 占位符（`SET last_validated_at = COALESCE($N, last_validated_at)`），永远 bind 但 bind `NULL` 表示"不动"。这一改未来 Postgres 实现会做。**trait 接口本身没问题**，只是 storage 层要发明小套路。
+
+**Fixed**: 4 个 SQL variant 合并成一条 COALESCE 语句：`status = COALESCE($4::TEXT, status)` + `last_validated_at = COALESCE($5::TEXT, last_validated_at)`。两个 optional bind 永远是 `Option<String>`，`None` ↔ NULL ↔ "不改"。`::TEXT` 显式 cast 是给 Postgres 类型推断兜底（NULL bind 无法独立确定类型）。固定 6 binds，删了 ~50 行 dispatch 体操；clippy --features postgres 干净。SQL 没在真 Postgres 上跑过——Phase 4 §6.5.1 列的 testcontainers 还没接，留给 validation 阶段。
 
 #### Pain #4: 没有 trait spec'd 在事务里发生
 
@@ -739,8 +741,8 @@ Two parallel tracks: **(a)** the 4 non-trait pain fixes from Phase 4 §6.5 (pain
 | Sub-step | Scope | Status |
 |---|---|---|
 | Pain #1 — `version: u64` → `i64` | domain + Lance schema (`UInt64` → `Int64`) + DuckDB reads + Postgres bind drops `try_from`; tests + parity green | ✅ `45c65f4` |
-| Pain #5 — `FeedbackSummary.auto_promoted` slot | add field + route AutoPromoted events in 3 backends + parity test | ✅ (this commit) |
-| Pain #3 — postgres `apply_feedback` COALESCE | collapse 4 SQL variants into one `SET col = COALESCE($N, col)` statement | ⏳ |
+| Pain #5 — `FeedbackSummary.auto_promoted` slot | add field + route AutoPromoted events in 3 backends + parity test | ✅ `1d75431` |
+| Pain #3 — postgres `apply_feedback` COALESCE | collapse 4 SQL variants into one `SET col = COALESCE($N, col)` statement | ✅ (this commit) |
 | Pain #4 — atomicity contract on trait doc | spec non-atomic on `apply_feedback` + `replace_pending_with_successor`, callers may observe partial state on Lance crash | ⏳ |
 | LT-1 umbrella `Backend` trait | aggregate 9 sub-traits behind `pub trait Backend`; blanket `impl Backend for Store` | ⏳ |
 | LT-1 service migration | services consume `Arc<dyn Backend>` (or generic `<B: Backend>`) instead of `Arc<Store>` | ⏳ |
