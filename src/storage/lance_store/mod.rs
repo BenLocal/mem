@@ -1318,34 +1318,13 @@ pub(super) fn record_batch_to_conversation_messages(
     Ok(out)
 }
 
-/// Mirror of DuckDB's private `feedback_adjustments` helper. Resolves a
-/// raw `feedback_kind` string to the deltas that `apply_feedback` must
-/// apply to the parent memory's confidence / decay / status fields.
-pub(super) fn feedback_adjustments(
-    feedback_kind: &str,
-) -> Option<(
-    f32,
-    f32,
-    Option<crate::domain::capability_capsule::CapabilityCapsuleStatus>,
-    bool,
-)> {
-    use crate::domain::capability_capsule::FeedbackKind;
-    let kind = match feedback_kind {
-        "useful" => FeedbackKind::Useful,
-        "outdated" => FeedbackKind::Outdated,
-        "incorrect" => FeedbackKind::Incorrect,
-        "applies_here" => FeedbackKind::AppliesHere,
-        "does_not_apply_here" => FeedbackKind::DoesNotApplyHere,
-        "auto_promoted" => FeedbackKind::AutoPromoted,
-        _ => return None,
-    };
-    Some((
-        kind.confidence_delta(),
-        kind.decay_delta(),
-        kind.status_after(),
-        kind.marks_validated(),
-    ))
-}
+// `feedback_adjustments` helper removed Phase 2 side-finding cleanup
+// (2026-05-17): callers (storage backends) now use
+// `crate::domain::capability_capsule::FeedbackKind::from_db_str()`
+// + the domain `confidence_delta` / `decay_delta` / `status_after` /
+// `marks_validated` helpers directly. The string→kind parser lived in
+// storage by accident; pushing it to domain removes the cross-backend
+// duplication.
 
 /// Mirror of the DuckDB `encode_text` helper: serialize a snake_case-encoded
 /// enum (e.g. `CapabilityCapsuleType`, `CapabilityCapsuleStatus`) to its plain JSON string token.

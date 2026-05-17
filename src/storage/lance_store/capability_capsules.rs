@@ -11,10 +11,9 @@ use lancedb::query::{ExecutableQuery, QueryBase};
 use super::{
     capability_capsule_embedding_to_record_batch, capability_capsules_to_record_batch,
     embedding_job_row_to_record_batch, embedding_job_rows_to_record_batch,
-    ensure_capability_capsule_embeddings_table, enum_to_str, feedback_adjustments,
-    feedback_events_to_record_batch, lancedb_err, record_batch_to_capability_capsules,
-    record_batch_to_embedding_job_rows, record_batch_to_feedback_events, sql_quote,
-    EmbeddingJobRow, LanceStore,
+    ensure_capability_capsule_embeddings_table, enum_to_str, feedback_events_to_record_batch,
+    lancedb_err, record_batch_to_capability_capsules, record_batch_to_embedding_job_rows,
+    record_batch_to_feedback_events, sql_quote, EmbeddingJobRow, LanceStore,
 };
 use crate::domain::capability_capsule::{
     CapabilityCapsuleRecord, CapabilityCapsuleVersionLink, FeedbackSummary,
@@ -773,18 +772,19 @@ impl LanceStore {
         memory: &CapabilityCapsuleRecord,
         feedback: FeedbackEvent,
     ) -> Result<CapabilityCapsuleRecord, StorageError> {
-        let (conf_delta, decay_delta, status_after, mark_validated) =
-            feedback_adjustments(&feedback.feedback_kind)
+        let kind =
+            crate::domain::capability_capsule::FeedbackKind::from_db_str(&feedback.feedback_kind)
                 .ok_or(StorageError::InvalidData("invalid feedback kind"))?;
+        let status_after = kind.status_after();
         let updated_at = feedback.created_at.clone();
         let mut updated = memory.clone();
         updated.updated_at = updated_at.clone();
-        updated.confidence = (updated.confidence + conf_delta).clamp(0.0, 1.0);
-        updated.decay_score = (updated.decay_score + decay_delta).clamp(0.0, 1.0);
+        updated.confidence = (updated.confidence + kind.confidence_delta()).clamp(0.0, 1.0);
+        updated.decay_score = (updated.decay_score + kind.decay_delta()).clamp(0.0, 1.0);
         if let Some(ref s) = status_after {
             updated.status = s.clone();
         }
-        if mark_validated {
+        if kind.marks_validated() {
             updated.last_validated_at = Some(updated_at.clone());
         }
 
@@ -820,7 +820,7 @@ impl LanceStore {
         if let Some(s) = status_after {
             update = update.column("status", sql_quote(&enum_to_str(&s)?));
         }
-        if mark_validated {
+        if kind.marks_validated() {
             update = update.column("last_validated_at", sql_quote(&updated_at));
         }
         update.execute().await.map_err(lancedb_err)?;

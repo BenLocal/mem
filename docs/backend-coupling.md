@@ -622,9 +622,9 @@ replace_pending_with_successor_chains — supersede chain 两 backend OK
 
 trait 没有需要改 signature 的——**Phase 2 验证通过，Phase 3 可以推进**。
 
-**意外发现 / 待留意**：
-- InMemoryCapsuleStore 实现 `apply_feedback` 时需要 re-derive feedback adjustments，因为 lance backend 用的 `feedback_adjustments` helper 是 `pub(super)` 不可见。这暴露了 [#`FeedbackKind` 是 domain-level abstraction 但 adjustment lookup 是 storage-level helper] 的层级模糊——Phase 3 应该把 adjustment lookup 推到 domain 层（`FeedbackKind` 自带的 helper 已经够用，重复 string match 是冗余的）。
-- `replace_pending_with_successor` 在两 backend 的"原 capsule 终态"一致：都设为 `Rejected`（lance 内部 `update_status` 的行为，in-memory 跟随）。trait 没强制 archived vs rejected——这是个隐式约定，Phase 3 trait spec 化时要写明。
+**意外发现 / 待留意** ✅ resolved (2026-05-17, Phase 2 side-findings cleanup):
+- ~~InMemoryCapsuleStore 实现 `apply_feedback` 时需要 re-derive feedback adjustments~~ → fix: domain 层加 `FeedbackKind::from_db_str(&str) -> Option<Self>`，两个 backend 都用它；删 lance 内部 `pub(super) fn feedback_adjustments(...)` helper。string→enum 解析现在只有一份，在 domain 层。
+- ~~`replace_pending_with_successor` 终态没在 trait 里 spec~~ → fix: trait doc 显式写明"原 capsule 终态 MUST be `Rejected`"，理由是 service 层 `edit_and_accept_pending` 和 version-chain walk 区分 `Rejected` vs `Archived`。parity test 从 `assert_ne!(.., Active)` 收紧成 `assert_eq!(.., Rejected)`——契约现在 trait spec 和 test 双重锁定。
 
 ### 6.4 Phase 3 (3 周)
 

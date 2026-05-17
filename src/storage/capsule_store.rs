@@ -124,8 +124,23 @@ pub trait CapsuleStore: Send + Sync {
     ) -> Result<CapabilityCapsuleRecord, StorageError>;
 
     /// Supersede a pending row with an edited active successor.
-    /// Two-op semantics (archive old + insert new) — see the
+    /// Two-op semantics (mark old + insert new) — see the
     /// LANCE-SPECIFIC note on [`Store::replace_pending_with_successor`].
+    ///
+    /// **Trait contract — terminal state of the original**: the
+    /// original capsule's status MUST end up as
+    /// [`CapabilityCapsuleStatus::Rejected`] after this call. The
+    /// `Rejected` choice (vs. `Archived`) is load-bearing — callers
+    /// (`capability_capsule_service::edit_and_accept_pending`,
+    /// version-chain walks, ranking exclusion lists) treat the two
+    /// terminal statuses differently. Backend implementations that
+    /// would naturally prefer `Archived` (e.g. a future Postgres
+    /// backend with stricter audit semantics) must still write
+    /// `Rejected` on this path.
+    ///
+    /// The successor is returned post-insert; its
+    /// `supersedes_capability_capsule_id` is expected to point at
+    /// `original_memory_id` (caller-supplied via the input record).
     async fn replace_pending_with_successor(
         &self,
         tenant: &str,
@@ -531,21 +546,11 @@ impl CapsuleStore for InMemoryCapsuleStore {
         memory: &CapabilityCapsuleRecord,
         feedback: FeedbackEvent,
     ) -> Result<CapabilityCapsuleRecord, StorageError> {
-        // Resolve the feedback kind to its deltas + status side
-        // effect. Mirrors the Lance backend's
-        // `feedback_adjustments` helper, which is `pub(super)` and
-        // not reachable from here — re-derive via the domain
-        // enum's helpers.
-        use crate::domain::capability_capsule::FeedbackKind;
-        let kind = match feedback.feedback_kind.as_str() {
-            "useful" => FeedbackKind::Useful,
-            "outdated" => FeedbackKind::Outdated,
-            "incorrect" => FeedbackKind::Incorrect,
-            "applies_here" => FeedbackKind::AppliesHere,
-            "does_not_apply_here" => FeedbackKind::DoesNotApplyHere,
-            "auto_promoted" => FeedbackKind::AutoPromoted,
-            _ => return Err(StorageError::InvalidData("invalid feedback kind")),
-        };
+        // String→kind parsing lives on the domain enum (since the
+        // Phase 2 side-findings fix); both backends share it.
+        let kind =
+            crate::domain::capability_capsule::FeedbackKind::from_db_str(&feedback.feedback_kind)
+                .ok_or(StorageError::InvalidData("invalid feedback kind"))?;
 
         self.with_state(|s| {
             // Always log the event (audit), even if the row is missing.

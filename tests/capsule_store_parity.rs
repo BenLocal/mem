@@ -267,14 +267,17 @@ async fn replace_pending_with_successor_chains(backend: Arc<dyn CapsuleStore>) {
         .get_capability_capsule_for_tenant("t", "v2")
         .await
         .unwrap();
-    // Backend-specific: Lance archives v1 to `Rejected`; in-memory
-    // matches that. Both must end up not-active. v2 must be the
-    // new active row carrying the supersedes link.
-    assert!(v1.is_some());
-    assert_ne!(v1.unwrap().status, CapabilityCapsuleStatus::Active);
+    // Trait contract (see `CapsuleStore::replace_pending_with_successor`):
+    // original capsule's terminal status MUST be `Rejected`. v2 is
+    // the new active row carrying the supersedes link.
+    assert_eq!(
+        v1.expect("original must still be readable").status,
+        CapabilityCapsuleStatus::Rejected,
+        "trait contract: original capsule must end up as Rejected",
+    );
     let v2 = v2.expect("successor must be readable");
     assert_eq!(v2.status, CapabilityCapsuleStatus::Active);
-    assert_eq!(v2.supersedes_capability_capsule_id.as_deref(), Some("v1"),);
+    assert_eq!(v2.supersedes_capability_capsule_id.as_deref(), Some("v1"));
 }
 
 // ── Test fanout: one #[tokio::test] per (scenario, backend) pair ────

@@ -93,6 +93,25 @@ impl FeedbackKind {
         }
     }
 
+    /// Parse the wire / DB form (snake_case string) back into the
+    /// enum. Inverse of [`Self::as_str`]. Returns `None` for any
+    /// string that doesn't match a known kind — callers in storage
+    /// backends typically surface that as
+    /// `StorageError::InvalidData("invalid feedback kind")`.
+    ///
+    /// Matches the `EntityKind::from_db_str` naming convention.
+    pub fn from_db_str(s: &str) -> Option<Self> {
+        Some(match s {
+            "useful" => Self::Useful,
+            "outdated" => Self::Outdated,
+            "incorrect" => Self::Incorrect,
+            "applies_here" => Self::AppliesHere,
+            "does_not_apply_here" => Self::DoesNotApplyHere,
+            "auto_promoted" => Self::AutoPromoted,
+            _ => return None,
+        })
+    }
+
     pub fn confidence_delta(&self) -> f32 {
         match self {
             Self::Useful => 0.1,
