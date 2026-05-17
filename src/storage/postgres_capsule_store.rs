@@ -99,9 +99,6 @@ fn enum_to_str<T: serde::Serialize>(v: &T) -> Result<String, StorageError> {
 /// Project the 27-column row into a `CapabilityCapsuleRecord`.
 /// Column order matches `select_columns()` below.
 fn row_to_record(row: &sqlx::postgres::PgRow) -> Result<CapabilityCapsuleRecord, StorageError> {
-    let version_i64: i64 = row.try_get("version").map_err(sqlx_err)?;
-    let version = u64::try_from(version_i64)
-        .map_err(|_| StorageError::InvalidData("version overflow when reading from postgres"))?;
     Ok(CapabilityCapsuleRecord {
         capability_capsule_id: row.try_get("capability_capsule_id").map_err(sqlx_err)?,
         tenant: row.try_get("tenant").map_err(sqlx_err)?,
@@ -112,7 +109,7 @@ fn row_to_record(row: &sqlx::postgres::PgRow) -> Result<CapabilityCapsuleRecord,
         status: parse_status(&row.try_get::<String, _>("status").map_err(sqlx_err)?)?,
         scope: parse_scope(&row.try_get::<String, _>("scope").map_err(sqlx_err)?)?,
         visibility: parse_visibility(&row.try_get::<String, _>("visibility").map_err(sqlx_err)?)?,
-        version,
+        version: row.try_get("version").map_err(sqlx_err)?,
         summary: row.try_get("summary").map_err(sqlx_err)?,
         content: row.try_get("content").map_err(sqlx_err)?,
         evidence: try_get_string_list(row, "evidence")?,
@@ -149,8 +146,6 @@ impl CapsuleStore for PostgresCapsuleStore {
         &self,
         memory: CapabilityCapsuleRecord,
     ) -> Result<CapabilityCapsuleRecord, StorageError> {
-        let version_i64 = i64::try_from(memory.version)
-            .map_err(|_| StorageError::InvalidData("version overflow when writing to postgres"))?;
         let sql = "INSERT INTO capability_capsules (\
             capability_capsule_id, tenant, capability_capsule_type, status, scope, visibility, \
             version, summary, content, evidence, code_refs, project, repo, module, task_type, \
@@ -166,7 +161,7 @@ impl CapsuleStore for PostgresCapsuleStore {
             .bind(enum_to_str(&memory.status)?)
             .bind(enum_to_str(&memory.scope)?)
             .bind(enum_to_str(&memory.visibility)?)
-            .bind(version_i64)
+            .bind(memory.version)
             .bind(&memory.summary)
             .bind(&memory.content)
             .bind(&memory.evidence)
@@ -209,9 +204,6 @@ impl CapsuleStore for PostgresCapsuleStore {
         }
         let mut tx = self.pool.begin().await.map_err(sqlx_err)?;
         for m in memories {
-            let version_i64 = i64::try_from(m.version).map_err(|_| {
-                StorageError::InvalidData("version overflow when writing to postgres")
-            })?;
             sqlx::query(
                 "INSERT INTO capability_capsules (\
                     capability_capsule_id, tenant, capability_capsule_type, status, scope, \
@@ -228,7 +220,7 @@ impl CapsuleStore for PostgresCapsuleStore {
             .bind(enum_to_str(&m.status)?)
             .bind(enum_to_str(&m.scope)?)
             .bind(enum_to_str(&m.visibility)?)
-            .bind(version_i64)
+            .bind(m.version)
             .bind(&m.summary)
             .bind(&m.content)
             .bind(&m.evidence)
@@ -485,8 +477,6 @@ impl CapsuleStore for PostgresCapsuleStore {
             return Err(StorageError::InvalidData("memory not found"));
         }
 
-        let version_i64 = i64::try_from(successor.version)
-            .map_err(|_| StorageError::InvalidData("version overflow when writing to postgres"))?;
         sqlx::query(
             "INSERT INTO capability_capsules (\
                 capability_capsule_id, tenant, capability_capsule_type, status, scope, \
@@ -503,7 +493,7 @@ impl CapsuleStore for PostgresCapsuleStore {
         .bind(enum_to_str(&successor.status)?)
         .bind(enum_to_str(&successor.scope)?)
         .bind(enum_to_str(&successor.visibility)?)
-        .bind(version_i64)
+        .bind(successor.version)
         .bind(&successor.summary)
         .bind(&successor.content)
         .bind(&successor.evidence)

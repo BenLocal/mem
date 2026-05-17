@@ -21,11 +21,12 @@
 --    validation guarantee at insert/update time without the binding
 --    cost.
 --
--- 3. `version` is BIGINT (i64). The domain `CapabilityCapsuleRecord`
---    holds `version: u64`; Postgres has no native u64 so binding
---    requires an `i64::try_from(u64)` cast at the impl boundary.
---    Phase 4 §6.5 records this as a real pain point worth a domain
---    rewidening to i64 in a future cleanup.
+-- 3. `version` is BIGINT (i64), matching the domain
+--    `CapabilityCapsuleRecord.version: i64`. The domain type was
+--    `u64` during the Phase 4 spike and required an
+--    `i64::try_from(u64)` cast at every bind / fetch; Phase 5
+--    pain #1 rewidened to `i64` so the impl boundary is
+--    `.bind(memory.version)` with no conversion.
 --
 -- 4. List columns (evidence, code_refs, tags, topics) use TEXT[].
 --    sqlx maps `Vec<String>` ↔ TEXT[] natively (sqlx `postgres`

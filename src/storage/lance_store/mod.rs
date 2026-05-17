@@ -267,7 +267,7 @@ fn capability_capsules_schema() -> Schema {
         Field::new("status", DataType::Utf8, false),
         Field::new("scope", DataType::Utf8, false),
         Field::new("visibility", DataType::Utf8, false),
-        Field::new("version", DataType::UInt64, false),
+        Field::new("version", DataType::Int64, false),
         Field::new("summary", DataType::Utf8, false),
         Field::new("content", DataType::Utf8, false),
         Field::new("evidence", str_list.clone(), false),
@@ -1356,7 +1356,7 @@ pub(super) fn capability_capsules_to_record_batch(
     let mut status = StringBuilder::new();
     let mut scope = StringBuilder::new();
     let mut visibility = StringBuilder::new();
-    let mut version = UInt64Builder::new();
+    let mut version = Int64Builder::new();
     let mut summary = StringBuilder::new();
     let mut content = StringBuilder::new();
     let mut evidence = ListBuilder::new(StringBuilder::new());
@@ -1483,6 +1483,7 @@ pub(super) fn capability_capsules_to_record_batch(
 pub(super) fn record_batch_to_capability_capsules(
     batch: &RecordBatch,
 ) -> Result<Vec<CapabilityCapsuleRecord>, StorageError> {
+    use arrow_array::Int64Array;
     fn col<'a, T: 'static>(
         batch: &'a RecordBatch,
         name: &'static str,
@@ -1500,7 +1501,7 @@ pub(super) fn record_batch_to_capability_capsules(
     let status = col::<StringArray>(batch, "status")?;
     let scope = col::<StringArray>(batch, "scope")?;
     let visibility = col::<StringArray>(batch, "visibility")?;
-    let version = col::<UInt64Array>(batch, "version")?;
+    let version = col::<Int64Array>(batch, "version")?;
     let summary = col::<StringArray>(batch, "summary")?;
     let content = col::<StringArray>(batch, "content")?;
     let evidence = col::<ListArray>(batch, "evidence")?;

@@ -103,7 +103,7 @@ async fn test_app() -> TestApp {
 fn sample_memory(
     capability_capsule_id: &str,
     tenant: &str,
-    version: u64,
+    version: i64,
     supersedes_capability_capsule_id: Option<&str>,
 ) -> CapabilityCapsuleRecord {
     CapabilityCapsuleRecord {

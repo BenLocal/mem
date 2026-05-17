@@ -54,7 +54,7 @@ fn row_to_capability_capsule_record(
         status: parse_enum(&row.get::<_, String>(3)?)?,
         scope: parse_enum(&row.get::<_, String>(4)?)?,
         visibility: parse_enum(&row.get::<_, String>(5)?)?,
-        version: row.get::<_, u64>(6)?,
+        version: row.get::<_, i64>(6)?,
         summary: row.get(7)?,
         content: row.get(8)?,
         evidence: get_string_list(row, 9)?,
@@ -1057,7 +1057,7 @@ impl DuckDbQuery {
             let rows = stmt.query_map(params![tenant], |row| {
                 Ok(CapabilityCapsuleVersionLink {
                     capability_capsule_id: row.get(0)?,
-                    version: row.get::<_, u64>(1)?,
+                    version: row.get::<_, i64>(1)?,
                     status: parse_enum(&row.get::<_, String>(2)?)?,
                     updated_at: row.get(3)?,
                     supersedes_capability_capsule_id: row.get(4)?,
@@ -1152,7 +1152,7 @@ mod tests {
         assert_eq!(a[0].code_refs, vec!["foo::bar()"]);
         assert_eq!(a[0].tags, vec!["tooling"]);
         assert_eq!(a[0].topics, vec!["bun"]);
-        assert_eq!(a[0].version, 1u64);
+        assert_eq!(a[0].version, 1i64);
         assert!((a[0].confidence - 0.7).abs() < 1e-6);
         assert_eq!(a[0].project.as_deref(), Some("mem"));
         assert!(a[0].module.is_none());

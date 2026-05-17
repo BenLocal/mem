@@ -191,7 +191,12 @@ pub struct CapabilityCapsuleRecord {
     pub status: CapabilityCapsuleStatus,
     pub scope: Scope,
     pub visibility: Visibility,
-    pub version: u64,
+    /// Monotonic chain version (1-based). Stored as `i64` so every
+    /// backend with a signed-integer column type (Postgres BIGINT,
+    /// DuckDB BIGINT, sqlite INTEGER) maps cleanly without a
+    /// per-call `try_from` guard. `u64` would have been wider than
+    /// any realistic version chain — see backend-coupling §6.5 pain #1.
+    pub version: i64,
     pub summary: String,
     pub content: String,
     pub evidence: Vec<String>,
@@ -278,7 +283,7 @@ pub struct EditPendingResponse {
 #[serde(rename_all = "snake_case")]
 pub struct CapabilityCapsuleVersionLink {
     pub capability_capsule_id: String,
-    pub version: u64,
+    pub version: i64,
     pub status: CapabilityCapsuleStatus,
     pub updated_at: String,
     #[serde(skip_serializing_if = "skip_none")]
