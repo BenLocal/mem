@@ -626,15 +626,36 @@ trait 没有需要改 signature 的——**Phase 2 验证通过，Phase 3 可以
 - ~~InMemoryCapsuleStore 实现 `apply_feedback` 时需要 re-derive feedback adjustments~~ → fix: domain 层加 `FeedbackKind::from_db_str(&str) -> Option<Self>`，两个 backend 都用它；删 lance 内部 `pub(super) fn feedback_adjustments(...)` helper。string→enum 解析现在只有一份，在 domain 层。
 - ~~`replace_pending_with_successor` 终态没在 trait 里 spec~~ → fix: trait doc 显式写明"原 capsule 终态 MUST be `Rejected`"，理由是 service 层 `edit_and_accept_pending` 和 version-chain walk 区分 `Rejected` vs `Archived`。parity test 从 `assert_ne!(.., Active)` 收紧成 `assert_eq!(.., Rejected)`——契约现在 trait spec 和 test 双重锁定。
 
-### 6.4 Phase 3 (3 周)
+### 6.4 Phase 3 — ✅ shipped (2026-05-17)
 
-CapsuleStore 验证通过后，并行扩展剩余 sub-trait：
+8 个 sub-trait 抽出，每个都有 `impl X for Store` 的 delegating impl，pattern 完全复用 Phase 2 的 4 步模板（capsule `mem_019e336c` 已记录）。**Service 仍持 `Arc<Store>`，零调用方改动**——和 Phase 2 一致的 scope-A 策略。所有 8 个 trait 都在 `src/storage/<name>.rs` 单文件里，Phase 5 cleanup 可统一搬进 `backend/` 目录。
 
-- 容易的（GraphStore / EntityRegistry / SessionStore / MaintenanceStore）2 人天/个
-- 中等的（EmbeddingJobStore / EmbeddingVectorStore）4 人天/个
-- 难的（CapsuleSearchStore / TranscriptStore）1-2 周/个
+| 组 | Sub-trait | 方法数 | Commit |
+|---|---|---|---|
+| 容易 | GraphStore | 12 | `5016809` |
+| 容易 | EntityRegistry | 5 | `5016809` |
+| 容易 | SessionStore (含 episodes) | 6 | `5016809` |
+| 容易 | MaintenanceStore | 3 | `5016809` |
+| 中等 | EmbeddingJobStore | 18 | `636020c` |
+| 中等 | EmbeddingVectorStore | 5 | `636020c` |
+| 难 | CapsuleSearchStore | 9 | (本次) |
+| 难 | TranscriptStore | 13 | (本次) |
+| | **合计** | **71** | 3 commits |
 
-每个 sub-trait 都在 LanceBackend 上验证通过才下一个。
+**Phase 3 总成本**：约 1500 行新代码（trait 定义 + delegating impl），分 3 个 commit，全程 0 个 service callsite 改动、0 个测试需要改动（trait extraction 在 runtime 完全透明）。Phase 2 的 trait-extraction 模板规模化下来稳定可复用。
+
+**对 Phase 4 (Postgres spike) 的影响**：
+- 现在 LanceBackend 是 9 个 sub-trait（CapsuleStore + 上面 8 个）的具体 impl，整个 backend surface 已 trait-化
+- PostgresBackend 只需实现这 9 个 sub-trait，不需要重新设计 trait 形状
+- LANCE-SPECIFIC 标记已经把"需要重新设计"的方法点出来了：`claim_next_n_*` (optimistic claim → SKIP LOCKED)、`upsert_*_embedding` (lazy-create 表 → ALTER pgvector)、`vacuum_old_versions` (Lance manifest → autovacuum)、`hybrid_candidates` (fused-SQL → compose)
+- Service 持 `Arc<Store>` 不动是 Phase 4 的优势——Postgres impl 不需要修 service，只需要提供 `PostgresStore` 然后通过 `Arc<dyn Backend umbrella>` 替换。这个 umbrella 由 Phase 5 引入。
+
+**意外发现 / 待留意**：
+- `SessionStore` 命名跟 `pipeline::store_traits::SessionStore` 撞——两个 trait 在不同模块路径，code 层面无冲突，但 import 时要写完整路径。Phase 5 可考虑把 pipeline trait 改成 `storage::SessionStore` 的 type alias 或直接删除。
+- `MaintenanceStore::vacuum_old_versions` 在非-Lance backend 上没意义。Doc §7.5 已经标过这个 trait 应该是 capability-style，Phase 4 spike Postgres 时确认这点。
+- `CapsuleSearchStore` 同时暴露 `hybrid_candidates` (Lance 端 fused-SQL) 和 `hybrid_candidates_compose` (portable)——backend 自己选哪条。Phase 4 Postgres 直接走 compose 路径。
+
+每个 sub-trait 都在 LanceBackend 上验证通过——通过 18 个集成测试 suite 全绿 + 0 callsite 改动证明（trait extraction 在 runtime 完全透明）。
 
 ### 6.5 Phase 4 (4-6 周) — Postgres spike
 
