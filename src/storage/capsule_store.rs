@@ -138,6 +138,25 @@ pub trait CapsuleStore: Send + Sync {
     /// backend with stricter audit semantics) must still write
     /// `Rejected` on this path.
     ///
+    /// **Atomicity contract — NOT atomic across backends**. The trait
+    /// makes NO guarantee that the "mark old as Rejected" and "insert
+    /// successor" writes commit together. On a backend with
+    /// transactions (Postgres) the implementation MAY wrap both in
+    /// `BEGIN/COMMIT` so the window does not exist for that backend's
+    /// callers — but the trait surface is the lowest common
+    /// denominator. Concretely on the Lance backend a process crash
+    /// between the two writes can leave the database with the
+    /// original marked Rejected and no successor row (or, less
+    /// commonly, the successor inserted with the original still
+    /// PendingConfirmation). Callers MUST treat the two writes as
+    /// independently observable on crash recovery and MUST NOT
+    /// assume that reading `original` post-crash implies the
+    /// successor is also visible. Per doc §3.3 (no `transaction()`
+    /// method on the trait), upgrading this to a true atomic
+    /// guarantee is rejected — it would force Lance to emulate
+    /// rollback at the application layer, which the codebase has
+    /// deliberately chosen not to do.
+    ///
     /// The successor is returned post-insert; its
     /// `supersedes_capability_capsule_id` is expected to point at
     /// `original_memory_id` (caller-supplied via the input record).
@@ -151,6 +170,19 @@ pub trait CapsuleStore: Send + Sync {
     /// Apply a feedback event — writes the audit row and mutates
     /// the parent capsule's `confidence` / `decay_score` / `status`
     /// per the feedback kind.
+    ///
+    /// **Atomicity contract — NOT atomic across backends**. Same
+    /// shape as [`Self::replace_pending_with_successor`]: this is a
+    /// two-op operation (`INSERT INTO feedback_events` then
+    /// `UPDATE capability_capsules`) and the trait makes NO guarantee
+    /// they commit together. A backend MAY use a real transaction
+    /// (the Postgres backend does); the Lance backend cannot. On
+    /// crash recovery the caller MUST be prepared for: audit row
+    /// present without the parent confidence / decay / status delta
+    /// applied — or, less commonly, the parent delta applied without
+    /// a corresponding audit row. Repeated `apply_feedback` calls
+    /// with the same `feedback_id` are not deduplicated at this
+    /// layer; idempotency, if needed, lives upstream.
     async fn apply_feedback(
         &self,
         memory: &CapabilityCapsuleRecord,

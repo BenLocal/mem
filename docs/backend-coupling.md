@@ -693,13 +693,15 @@ Lance 实现用 fluent builder (`.column("status", ...).column("last_validated_a
 
 **Fixed**: 4 个 SQL variant 合并成一条 COALESCE 语句：`status = COALESCE($4::TEXT, status)` + `last_validated_at = COALESCE($5::TEXT, last_validated_at)`。两个 optional bind 永远是 `Option<String>`，`None` ↔ NULL ↔ "不改"。`::TEXT` 显式 cast 是给 Postgres 类型推断兜底（NULL bind 无法独立确定类型）。固定 6 binds，删了 ~50 行 dispatch 体操；clippy --features postgres 干净。SQL 没在真 Postgres 上跑过——Phase 4 §6.5.1 列的 testcontainers 还没接，留给 validation 阶段。
 
-#### Pain #4: 没有 trait spec'd 在事务里发生
+#### Pain #4: ~~没有 trait spec'd 在事务里发生~~ ✅ resolved (Phase 5, 2026-05-17)
 
 `replace_pending_with_successor` 和 `apply_feedback` 在 Lance 里都是"两步操作、无事务保护"（Phase 2 capsule `mem_019e336c` §3.2 已记录）。Postgres 里有真事务，**可以**用 BEGIN/COMMIT 把两步包成原子。但 trait 没有 spec 这一点是 invariant 还是 implementation detail。
 
 Phase 4 spike 选**用事务**（更安全），但行为差异对 caller 可见：在 Lance 里 crash window 内的 caller 可能看到"audit row 已写但 parent 没更新"的中间态；Postgres caller 永远看不到。
 
 **这是真该回头改 trait spec 的地方**：要么 trait 显式承诺原子（强制 Lance 加 retry/rollback 逻辑），要么显式说"非原子，crash 可能留中间态"（Postgres impl 也照办，浪费事务能力）。doc §3.3 决议"不加 transaction() 方法"是对的，但这两个具体方法需要单独标注 atomicity 契约。**Phase 5 trait-spec 化时优先处理**。
+
+**Fixed**: trait doc 在 `CapsuleStore::replace_pending_with_successor` 和 `CapsuleStore::apply_feedback` 上**显式 spec "NOT atomic across backends"**——backend 可以用真事务（Postgres 实测如此），但 caller 必须按 Lance 的非原子语义写：crash 后可能只看到 audit row 没有 parent 更新（或反过来）。这一决策选项是 §3.3 "不加 transaction() 方法" 的延伸：caller 容忍弱保证，backend 凭实力选择是否额外加固。Phase 5 选 spec 这条而非强制原子，因为强制原子会逼 Lance 在应用层模拟 rollback，本仓显式拒绝过这条路。
 
 #### Pain #5: ~~`feedback_summary` 的 `FeedbackKind::AutoPromoted` 没在聚合里~~ ✅ resolved (Phase 5, 2026-05-17)
 
@@ -742,8 +744,8 @@ Two parallel tracks: **(a)** the 4 non-trait pain fixes from Phase 4 §6.5 (pain
 |---|---|---|
 | Pain #1 — `version: u64` → `i64` | domain + Lance schema (`UInt64` → `Int64`) + DuckDB reads + Postgres bind drops `try_from`; tests + parity green | ✅ `45c65f4` |
 | Pain #5 — `FeedbackSummary.auto_promoted` slot | add field + route AutoPromoted events in 3 backends + parity test | ✅ `1d75431` |
-| Pain #3 — postgres `apply_feedback` COALESCE | collapse 4 SQL variants into one `SET col = COALESCE($N, col)` statement | ✅ (this commit) |
-| Pain #4 — atomicity contract on trait doc | spec non-atomic on `apply_feedback` + `replace_pending_with_successor`, callers may observe partial state on Lance crash | ⏳ |
+| Pain #3 — postgres `apply_feedback` COALESCE | collapse 4 SQL variants into one `SET col = COALESCE($N, col)` statement | ✅ `02a199a` |
+| Pain #4 — atomicity contract on trait doc | spec non-atomic on `apply_feedback` + `replace_pending_with_successor`, callers may observe partial state on Lance crash | ✅ (this commit) |
 | LT-1 umbrella `Backend` trait | aggregate 9 sub-traits behind `pub trait Backend`; blanket `impl Backend for Store` | ⏳ |
 | LT-1 service migration | services consume `Arc<dyn Backend>` (or generic `<B: Backend>`) instead of `Arc<Store>` | ⏳ |
 
