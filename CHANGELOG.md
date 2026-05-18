@@ -54,6 +54,137 @@ are organized by feature wave (merge commit ranges on `master`).
   no JSON shape change on `feedback_events` or
   `POST /capability_capsules/feedback`.
 
+### Backend abstraction — Phase 5 (`docs/backend-coupling.md` §6)
+
+Phase 5 closed the backend-abstraction roadmap: services / workers /
+pipeline no longer touch `Store` directly. The composition `Store =
+LanceStore + DuckDbQuery` is now an implementation detail.
+
+#### Added
+
+- **`Backend` umbrella trait** (`src/storage/backend.rs`) — supertrait
+  aggregating the 9 sub-traits extracted in Phases 2 + 3 (`CapsuleStore
+  + CapsuleSearchStore + EmbeddingJobStore + EmbeddingVectorStore +
+  GraphStore + TranscriptStore + EntityRegistry + SessionStore +
+  MaintenanceStore + Send + Sync + 'static`). Blanket
+  `impl<T> Backend for T where T: <9 sub-traits>` so `Store`
+  automatically satisfies it; any future single-backend type that
+  wires the same 9 traits (e.g. a hypothetical `PostgresBackend`)
+  drops in without touching the umbrella.
+- **`CapsuleStore` extended with 4 capsule-pool read methods**
+  (`list_wings`, `capsule_stats`, `get_taxonomy`,
+  `list_capability_capsules_in_scope`) that services used directly
+  off `Store` but weren't on any trait. Implemented on all 3
+  backends (Store / InMemoryCapsuleStore / PostgresCapsuleStore).
+- **Parity test for `FeedbackSummary.auto_promoted`**
+  (`feedback_summary_counts_auto_promoted`) — 28/28 capsule_store_parity
+  scenarios across Lance + InMemory.
+- `storage::VacuumStats` re-export so external callers don't reach
+  into `storage::lance_store::`.
+
+#### Changed
+
+- **All service constructors take `Arc<dyn Backend>` instead of
+  `Arc<Store>`**: `CapabilityCapsuleService::{new, new_with_settings,
+  with_providers}`, `EntityService::new`, `TranscriptService::new`.
+  Same for the 5 worker `run` / `tick` / `sweep_once` entry points
+  (`embedding`, `transcript_embedding`, `vacuum`, `decay`,
+  `auto_promote`). `app.rs::from_config` upcasts at construction —
+  the concrete `Arc<Store>` only lives for the one Lance-only call
+  (`set_transcript_job_provider`).
+- **`CapabilityCapsuleRecord.version`: `u64 → i64`** (Phase 5 pain #1).
+  Lance schema `DataType::UInt64 → Int64`, DuckDB read
+  `row.get::<_, i64>(N)`, Postgres bind direct `.bind(memory.version)`
+  (no more `try_from(u64)` guards). Aligns with every signed-integer
+  column type across backends (Postgres BIGINT, DuckDB BIGINT, sqlite
+  INTEGER). Lance schema change requires existing dev DBs to be
+  rebuilt — acceptable for the local-first posture.
+- **`FeedbackSummary.auto_promoted: u64` slot added** (pain #5).
+  Routes `AutoPromoted` events through all 3 backend aggregators
+  instead of dropping them into the catch-all. `#[serde(default)]`
+  keeps old wire payloads valid.
+- **`CapsuleStore` trait doc**: explicit atomicity contracts on
+  `apply_feedback` + `replace_pending_with_successor` (pain #4) —
+  both spec'd as **NOT atomic across backends**. Backends MAY use
+  real transactions (Postgres does); the Lance backend cannot.
+  Callers MUST be prepared for partial-state observation on crash.
+  Per §3.3 rejection of trait-level `transaction()`.
+- **Postgres `apply_feedback`** (`src/storage/postgres_capsule_store.rs`)
+  collapsed from 4 SQL string variants to 1 statement using
+  `SET col = COALESCE($N::TEXT, col)` with `Option<String>` binds
+  (pain #3). Always 6 bindings, no dispatch on which combination of
+  optional fields is being updated.
+- **Pipeline narrow traits unified with storage sub-traits**:
+  `pipeline::store_traits::{GraphRead, SessionStore}` (QW-5 era)
+  deleted. Rust 1.86+ trait upcasting lets `&dyn Backend` coerce
+  directly to `&dyn storage::GraphStore` / `&dyn storage::SessionStore`
+  via supertrait bounds, so the pipeline now consumes the canonical
+  storage-layer sub-traits without the indirection.
+- **`lance_store` / `duckdb_query` modules: `pub` → `pub(crate)`**.
+  External callers cannot reach the concrete halves; all access goes
+  through `Backend` or one of the 9 sub-traits.
+
+#### Removed
+
+- **~22 LanceStore READ methods that were orphaned** when DuckDbQuery
+  took over reads — discovered when the `pub(crate)` flip let
+  clippy's dead-code lint finally fire. Deleted from
+  `lance_store/capability_capsules.rs` (9 readers:
+  `list_capability_capsules_for_tenant`, `get_pending`,
+  `find_by_idempotency_or_hash`, `list_pending_review`,
+  `search_candidates`, `recent_active_capability_capsules`,
+  `fetch_capability_capsules_by_ids`,
+  `list_capability_capsule_versions_for_tenant`,
+  `list_capability_capsule_ids_for_tenant`),
+  `lance_store/entities.rs` (2: `get_entity`, `list_entities`),
+  `lance_store/graph.rs` (3: `neighbors`,
+  `related_capability_capsule_ids`, `query_graph_edges`),
+  `lance_store/transcripts.rs` (8: `get_conversation_messages_by_session`,
+  `get_conversation_messages_by_session_paged`,
+  `list_transcript_sessions`, `fetch_conversation_messages_by_ids`,
+  `context_window_for_block`, `anchor_session_candidates`,
+  `recent_conversation_messages`, `bm25_transcript_candidates`).
+- Now-dead helpers in `lance_store/mod.rs`:
+  `record_batch_to_graph_edges`, `record_batch_to_entities`,
+  `sort_messages_chronological_asc`.
+- **3 lance-side round-trip integration tests** that exercised only
+  the deleted readers: `lancedb_graph_store_round_trip`,
+  `lancedb_filter_methods_round_trip`,
+  `lancedb_transcript_repository_round_trip`. The write+read
+  invariant is canonically tested in `duckdb_query/*/tests`, which
+  seeds with the same `lance.write_*` calls and asserts through the
+  canonical DuckDB read path.
+- `pipeline/store_traits.rs` (deleted module): the narrow `GraphRead`
+  + `SessionStore` traits from QW-5 are obsolete now that the
+  storage-layer canonical traits are used directly.
+
+Net: ~+580 lines (umbrella trait + new CapsuleStore method impls +
+sqlx queries + 4 pain-fix capsules) vs ~−1430 lines (dead lance reads
++ dead helpers + dead tests). cargo fmt --check + cargo clippy
+--all-targets clean on both default and `--features postgres`. 179
+lib unit tests + 125 integration tests across 17 suites green
+(capsule_store_parity now 28/28 across Lance + InMemory).
+
+#### Docs
+
+- `docs/backend-coupling.md` — Phase 5 closeout: §6.6 marked ✅,
+  §5.1 LT-1 ✅, all 5 Phase 4 pain points marked resolved with
+  commit hashes, tail-item table updated through the `pub(crate)`
+  flip.
+- `docs/database-schema.md` — §0 architecture diagram updated for
+  the Backend umbrella; §1 table list tags each table with its
+  sub-trait; capability_capsules.version: UInt64 → Int64;
+  feedback_kind: 5 → 6 (with auto_promoted row); §6 maintenance
+  cleaned of stale HNSW / `mem repair` references.
+- `docs/ROADMAP.MD` — status date bumped to 2026-05-18; #2/#3
+  marked superseded; #16/#17 planning rows updated to not assume
+  `mem repair` CLI exists; cross-reference added to
+  `backend-coupling.md` as parallel workstream.
+- `docs/mempalace-diff.md` — new §15.6 documents the Backend
+  abstraction as a parallel workstream; §15.2 + §14 conversation
+  archive section updated to reflect LanceDB-native ANN replacing
+  the old usearch sidecar.
+
 ---
 
 ## 2026-05-07 — `0.1.1`
