@@ -1,66 +1,36 @@
-//! DuckDB SQL query layer over Lance datasets.
+//! DuckDB SQL read half of the storage stack.
 //!
-//! Reads-only client. Pairs with [`crate::storage::lance_store::LanceStore`]
-//! (the writer) — both point at the same on-disk lance directory; rows
-//! written through `LanceStore`'s Rust API are immediately visible to
-//! SQL here without any DETACH/re-ATTACH ceremony (verified by
-//! `examples/lance_duckdb_poc.rs`).
+//! Pairs with [`super::lance_store::LanceStore`] (the writer) — both
+//! point at the same on-disk lance directory. Rows written through
+//! `LanceStore`'s Rust API are visible here as soon as
+//! [`Self::refresh`] swaps a fresh DuckDB connection (handled
+//! automatically by [`super::Store::commit_lance_write`]).
 //!
 //! Architecture: in-process DuckDB connection. `INSTALL lance; LOAD
 //! lance;` resolves the core extension; `ATTACH '<path>' AS ns (TYPE
 //! LANCE)` exposes every dataset under the directory as
 //! `ns.main.<table>`. From there, all reads are plain SQL — including
-//! GROUP BY / window functions / subqueries that the LanceDB native
-//! query API doesn't expose. ANN and FTS go through the extension's
-//! `lance_vector_search()` / `lance_fts()` table functions.
+//! GROUP BY / window functions / subqueries / recursive CTEs that the
+//! LanceDB native query API doesn't expose. ANN goes through the
+//! extension's `lance_vector_search()` table function; BM25 goes
+//! through `lance_fts()` (LanceDB 0.27 native FTS, indexed at
+//! table-open time in `LanceStore::open` — see `ensure_fts_index`).
 //!
 //! Concurrency: DuckDB is single-writer. We hold the connection in an
 //! `Arc<Mutex<Connection>>` so concurrent reads serialize through one
 //! mutex. Methods are `async fn` for ergonomic call sites — bodies use
 //! `tokio::task::spawn_blocking` to run the blocking SQL on the thread
-//! pool, so the runtime worker thread isn't pinned. This mirrors the
-//! pattern the legacy `DuckDbRepository` used (and is the only
-//! reasonable way to bridge sync `duckdb-rs` 1.x into an async service
-//! layer).
+//! pool, so the runtime worker thread isn't pinned.
 //!
-//! **Coverage so far** (memories table):
-//!   - `list_capability_capsules_for_tenant`
-//!   - `get_capability_capsule_for_tenant`
-//!   - `get_pending`
-//!   - `find_by_idempotency_or_hash`
-//!   - `list_pending_review`
-//!   - `recent_active_capability_capsules`
-//!   - `search_candidates`
-//!   - `fetch_capability_capsules_by_ids`
-//!   - `list_capability_capsule_ids_for_tenant`
-//!   - `list_capability_capsule_versions_for_tenant`
-//!   - `bm25_candidates` (via `lance_fts`)
-//!   - `semantic_search_capability_capsules` (via `lance_vector_search`)
-//!
-//! **Coverage so far** (conversation_messages table — transcript reads):
-//!   - `get_conversation_messages_by_session`
-//!   - `get_conversation_messages_by_session_paged`
-//!   - `list_transcript_sessions` (`GROUP BY session_id` — the
-//!     canonical example of what the DuckDB-as-query layer buys us
-//!     over the LanceDB native API, which has no GROUP BY)
-//!   - `fetch_conversation_messages_by_ids`
-//!   - `context_window_for_block`
-//!   - `anchor_session_candidates`
-//!   - `recent_conversation_messages`
-//!   - `bm25_transcript_candidates` (via `lance_fts`)
-//!
-//! **Coverage so far** (graph_edges table — graph reads):
-//!   - `neighbors`
-//!   - `related_capability_capsule_ids`
-//!
-//! **Coverage so far** (entities + entity_aliases — entity-registry reads):
-//!   - `get_entity`
-//!   - `lookup_alias`
-//!   - `list_entities`
-//!
-//! All trait read methods are now backed by SQL. The next commit
-//! introduces the `Store` composition layer (writes via LanceStore,
-//! reads via DuckDbQuery) and starts the service-layer cutover.
+//! Like `LanceStore`, this module is `pub(crate)` since Phase 5+ —
+//! external callers reach reads through the `Backend` umbrella trait
+//! or one of the 9 sub-traits in `src/storage/*.rs`. The split
+//! between WHICH read sits here vs on `LanceStore` is canonically
+//! tracked by `Store`'s delegate methods (`Store::method_x` → either
+//! `self.query.method_x` here or, for a handful of write-hot-path
+//! reads, `self.lance.method_x`). Adding a new read method: prefer
+//! this module unless the caller absolutely cannot afford a DuckDB
+//! round-trip.
 
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -196,8 +166,7 @@ where
 /// `spawn_blocking_storage` analogue for graph methods, which
 /// surface `GraphError` instead of `StorageError`. Returns
 /// `GraphError::Backend` for both spawn-join failures and per-row
-/// `duckdb::Error`s — same shape the legacy backend's
-/// `From<duckdb::Error> for GraphError` produced.
+/// `duckdb::Error`s.
 pub(super) async fn spawn_blocking_graph<T, F>(f: F) -> Result<T, GraphError>
 where
     F: FnOnce() -> Result<T, GraphError> + Send + 'static,
@@ -222,10 +191,10 @@ pub(super) fn row_to_graph_edge(row: &duckdb::Row<'_>) -> duckdb::Result<GraphEd
 }
 
 /// Decode an `entities` row into an [`Entity`]. The `kind` column is
-/// stored as a snake_case Utf8 string (mirrors LanceStore's encoding);
-/// we go through `EntityKind::from_db_str` rather than a serde round
-/// trip because the domain type already exposes that helper for the
-/// legacy DuckDB-as-storage code path.
+/// stored as a snake_case Utf8 string (matches LanceStore's writer
+/// encoding); we go through `EntityKind::from_db_str` rather than a
+/// serde round trip because the domain type already exposes that
+/// helper and it's cheaper than the serde detour.
 pub(super) fn row_to_entity(row: &duckdb::Row<'_>) -> duckdb::Result<Entity> {
     let kind: String = row.get(3)?;
     Ok(Entity {

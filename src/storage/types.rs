@@ -86,11 +86,10 @@ pub struct ContextWindow {
 /// data-validation flavors plus a `NotFound(&'static str)` for
 /// internal-consistency lookup misses.
 ///
-/// Removed in this round: the `DuckDb(duckdb::Error)` variant — the
-/// legacy DuckDB-as-storage backend was deleted in this commit. The
-/// remaining `DuckDbQuery` SQL layer surfaces `duckdb::Error` only
-/// at row-decode boundaries, where it's converted to
-/// `InvalidInput`.
+/// `DuckDb` variant carries SQL errors surfaced from the
+/// `DuckDbQuery` read layer (mostly row-decode mismatches at the
+/// `lance` extension boundary). Lance-side errors flow through
+/// `InvalidInput(String)` via `lancedb_err`.
 #[derive(Debug, Error)]
 pub enum StorageError {
     #[error("duckdb error: {0}")]

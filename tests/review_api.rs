@@ -10,7 +10,7 @@ use mem::{
         Scope, Visibility,
     },
     http,
-    storage::{EmbeddingJobInsert, Store},
+    storage::{CapsuleStore, EmbeddingJobInsert, Store},
 };
 use serde_json::{json, Value};
 use tempfile::{tempdir, TempDir};

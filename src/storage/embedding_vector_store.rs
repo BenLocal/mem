@@ -113,7 +113,9 @@ impl EmbeddingVectorStore for Store {
         &self,
         capability_capsule_id: &str,
     ) -> Result<Option<(String, String, String)>, StorageError> {
-        Store::get_capability_capsule_embedding_row(self, capability_capsule_id).await
+        self.lance
+            .get_capability_capsule_embedding_row(capability_capsule_id)
+            .await
     }
 
     async fn upsert_conversation_message_embedding(

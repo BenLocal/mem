@@ -626,10 +626,12 @@ impl LanceStore {
     ) -> Result<CapabilityCapsuleRecord, StorageError> {
         // Two-step supersede: archive the old row, then insert the new
         // one. LanceDB has no transaction semantics across these calls,
-        // so a crash between them leaves the old archived without a
-        // successor — same risk profile as the DuckDB backend's
-        // non-tx'd version (see `replace_pending_with_successor` in
-        // duckdb/mod.rs).
+        // so a crash between them can leave the old archived without
+        // a successor. The atomicity contract is documented on the
+        // trait (see `CapsuleStore::replace_pending_with_successor`
+        // — Phase 5 pain #4): backends MAY use real transactions
+        // (Postgres does), but the trait does NOT guarantee atomic
+        // commit. Callers are spec'd to tolerate partial state.
         let table = self
             .conn
             .open_table("capability_capsules")
@@ -795,10 +797,13 @@ impl LanceStore {
         if result.num_deleted_rows == 0 {
             return Err(StorageError::InvalidData("memory not found"));
         }
-        // TODO: cascade-delete from embedding_jobs / capability_capsule_embeddings /
-        // feedback_events / graph_edges once those tables exist on the
-        // LanceDB side. The DuckDB backend handles this in
-        // `DuckDbRepository::delete_capability_capsule_hard` (see ./duckdb/mod.rs).
+        // TODO: cascade-delete from `embedding_jobs` /
+        // `capability_capsule_embeddings` / `feedback_events` /
+        // `graph_edges` — these satellite tables all exist on the
+        // Lance side now but hard-delete doesn't reach into them, so
+        // the capsule row goes away and its embedding job / vector /
+        // feedback events / outgoing graph edges become orphans.
+        // Tracked in `docs/backend-coupling.md` followups.
         Ok(())
     }
 

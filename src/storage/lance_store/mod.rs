@@ -1,54 +1,43 @@
-//! LanceDB backend (skeleton).
+//! LanceDB write half of the storage stack.
 //!
-//! `LanceStore` is the alternate backend to [`crate::storage::DuckDbRepository`].
-//! It implements the same four traits — `MemoryRepository`,
-//! `TranscriptRepository`, `EntityRegistry`, `GraphStore` — so all upper
-//! layers (services, HTTP handlers) work against it interchangeably.
+//! `LanceStore` holds a `lancedb::Connection` and owns every WRITE
+//! against the on-disk lance dataset directory (12 managed tables —
+//! see `mod` declarations below + `ALL_TABLES` in `maintenance.rs`).
+//! It's `pub(crate)` since Phase 5+; external callers reach it
+//! through the `Backend` umbrella trait or one of the 9 sub-traits
+//! in `src/storage/*.rs`, never directly. Reads route through
+//! [`super::duckdb_query::DuckDbQuery`] instead — same on-disk lance
+//! directory, attached as a DuckDB schema via the `lance` extension.
 //!
-//! **Status:** the read path on the `memories` table is fully working —
-//! `open` creates the table, `insert_capability_capsule` writes a row, and 11
-//! filter/lookup methods read back (`get_capability_capsule`, `get_capability_capsule_for_tenant`,
-//! `get_pending`, `find_by_idempotency_or_hash`, `list_capability_capsules_for_tenant`,
-//! `list_capability_capsule_ids_for_tenant`, `list_pending_review`, `search_candidates`,
-//! `recent_active_capability_capsules`, `fetch_capability_capsules_by_ids`). Round-trip is
-//! end-to-end verified by two tests in this module's `#[cfg(test)] mod
-//! tests`. Mutating methods (accept/reject/supersede/apply_feedback) and
-//! all non-`memories`-table methods are still `unimplemented!()` —
-//! each future implementation:
+//! What survives in this file after Phase 5+ dead-code cleanup is
+//! exclusively WRITE methods plus a small read surface that's
+//! load-bearing for write paths:
 //!
-//!   1. add `ensure_<table>_table` to `open()` for the table the method touches
-//!   2. extend the `*_to_record_batch` / `record_batch_to_*` helpers
-//!      (or write new ones for new tables)
-//!   3. write the method body using `Connection::open_table` + `Table::add` /
-//!      `Table::query().only_if(...)` / `Table::vector_search(...)`
-//!   4. add a parity test against DuckDB
+//! - Bulk Arrow `RecordBatch` builders (`*_to_record_batch`).
+//! - `Connection::open_table` + `.add()` / `.update().only_if(...)` /
+//!   `.delete()` driven writes, one method per CRUD operation.
+//! - Inline `lookup_alias` used by `resolve_or_create` / `add_alias`
+//!   as a precondition (sole entity read kept here).
+//! - `record_batch_to_capability_capsules` parser for cross-tenant
+//!   `get_capability_capsule` (the one read still hosted here per
+//!   `Store::get_capability_capsule`).
+//! - `query_capability_capsules` / `query_conversation_messages` /
+//!   `query_embedding_jobs` shared helpers — surviving callers are
+//!   inside-this-module writes (supersede idempotency, batch dedup).
 //!
-//! Helpers `capability_capsules_to_record_batch` / `record_batch_to_capability_capsules` /
-//! `enum_to_str` / `enum_from_str` / `sql_quote` are reusable across
-//! upcoming methods.
+//! The bulk of the lance-side READ methods (`list_capability_capsules_for_tenant`,
+//! `neighbors`, `get_entity`, `bm25_transcript_candidates`, …) were
+//! deleted in commit 908ce91 when reads canonically routed through
+//! `DuckDbQuery`. If you find yourself adding a read method here,
+//! first check that the equivalent doesn't already exist in
+//! `duckdb_query/` — adding it back here only makes sense if the
+//! call is on a write hot-path that can't afford a DuckDB
+//! round-trip (e.g. embedding-job claim).
 //!
-//! **Schema mapping** (planned, not yet enforced):
-//!
-//! | mem table                          | LanceDB table                  |
-//! |------------------------------------|--------------------------------|
-//! | memories                           | `memories`                     |
-//! | embedding_jobs                     | `embedding_jobs`               |
-//! | capability_capsule_embeddings                  | `capability_capsule_embeddings` (vector col)|
-//! | conversation_messages              | `conversation_messages`        |
-//! | conversation_message_embeddings    | `conversation_message_embeddings` (vector col) |
-//! | transcript_embedding_jobs          | `transcript_embedding_jobs`    |
-//! | feedback_events                    | `feedback_events`              |
-//! | episodes                           | `episodes`                     |
-//! | sessions                           | `sessions`                     |
-//! | entities                           | `entities`                     |
-//! | entity_aliases                     | `entity_aliases`               |
-//! | graph_edges                        | `graph_edges`                  |
-//!
-//! Vector columns use LanceDB's native vector type — no separate HNSW
-//! sidecar; ANN is built-in.
-//!
-//! **Compile-time:** behind a `lancedb` Cargo feature. The default mem
-//! build does not pull in lance/arrow.
+//! ANN and FTS indexes are built into LanceDB 0.27 natively — no
+//! external sidecar. FTS index is built at table-open time
+//! (`ensure_fts_index`); ANN is auto-maintained on writes to the
+//! vector column.
 
 use std::path::Path;
 use std::sync::Arc;
@@ -97,8 +86,7 @@ pub struct LanceStore {
     /// `None` when a transcript row is inserted with
     /// `embed_eligible == true`, `create_conversation_message`
     /// errors loudly rather than silently substituting a default
-    /// that may diverge from the configured provider. Mirrors the
-    /// legacy `DuckDbRepository` field of the same name.
+    /// that may diverge from the configured provider.
     transcript_job_provider: Arc<std::sync::RwLock<Option<String>>>,
 }
 
@@ -376,10 +364,10 @@ pub(super) async fn ensure_episodes_table(conn: &Connection) -> Result<(), Stora
     ensure_table(conn, "episodes", episodes_schema()).await
 }
 
-/// Arrow schema for the `sessions` table. Mirrors the legacy DuckDB
-/// schema 1:1: session_id PK, tenant + caller_agent for identity,
-/// started_at + last_seen_at + ended_at (nullable) for lifecycle, goal
-/// (nullable string), memory_count (uint32) for usage stats.
+/// Arrow schema for the `sessions` table. Layout: session_id PK,
+/// tenant + caller_agent for identity, started_at + last_seen_at +
+/// ended_at (nullable) for lifecycle, goal (nullable string),
+/// memory_count (uint32) for usage stats.
 fn sessions_schema() -> Schema {
     Schema::new(vec![
         Field::new("session_id", DataType::Utf8, false),

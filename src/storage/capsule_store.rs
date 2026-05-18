@@ -276,7 +276,9 @@ impl CapsuleStore for Store {
         &self,
         capability_capsule_id: String,
     ) -> Result<Option<CapabilityCapsuleRecord>, StorageError> {
-        Store::get_capability_capsule(self, capability_capsule_id).await
+        self.lance
+            .get_capability_capsule(capability_capsule_id)
+            .await
     }
 
     async fn get_capability_capsule_for_tenant(
@@ -371,7 +373,7 @@ impl CapsuleStore for Store {
         &self,
         capability_capsule_id: &str,
     ) -> Result<FeedbackSummary, StorageError> {
-        Store::feedback_summary(self, capability_capsule_id).await
+        self.lance.feedback_summary(capability_capsule_id).await
     }
 
     async fn list_wings(&self, tenant: &str) -> Result<Vec<String>, StorageError> {

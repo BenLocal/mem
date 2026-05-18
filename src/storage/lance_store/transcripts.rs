@@ -388,7 +388,8 @@ impl LanceStore {
         // When the row is freshly written and `embed_eligible`, also
         // enqueue a transcript_embedding_jobs row so the worker
         // picks it up. Idempotent re-inserts (existing row) skip
-        // enqueue, matching the DuckDB-as-storage contract.
+        // enqueue — caller can call this on every replay without
+        // duplicating jobs.
         let table = self
             .conn
             .open_table("conversation_messages")

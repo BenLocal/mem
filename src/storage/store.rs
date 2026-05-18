@@ -49,19 +49,18 @@
 //! writes that exploit Lance's no-transactions stance) are marked
 //! **LANCE-SPECIFIC** in their doc comments. The unmarked default is
 //! portable. This labelling is the input to the
-//! `docs/backend-coupling.md` Phase 2+ trait extraction — anything
-//! marked LANCE-SPECIFIC has to be re-shaped before it can land on a
-//! trait that a Postgres / SQLite / in-memory backend can implement.
+//! `docs/backend-coupling.md` §6 Phase 2+ trait extraction —
+//! anything marked LANCE-SPECIFIC has to be re-shaped before it can
+//! land on a trait that a Postgres / SQLite / in-memory backend can
+//! implement.
 //!
-//! Method surface mirrors the legacy `Repository` super-trait 1:1 so
-//! the upcoming service-layer cutover is a method-call swap, not a
-//! type swap. Every read maps to `DuckDbQuery`; every write maps to
-//! `LanceStore`. The handful of reads that don't yet have a
-//! `DuckDbQuery` SQL implementation route to `LanceStore`'s native
-//! query path (these are flagged with a `// TODO: route to
-//! DuckDbQuery once added` comment); they're equivalent in result
-//! shape, just slower because LanceStore reads do client-side sort /
-//! aggregate where SQL would push to the engine.
+//! Phase 5 (2026-05-18) made `Store` an implementation detail behind
+//! the `Backend` umbrella trait — services / workers hold
+//! `Arc<dyn Backend>`. The 9 sub-traits in `src/storage/*.rs`
+//! delegate to either `self.lance.xxx` (writes; a handful of reads
+//! kept here for write hot-paths) or `self.query.xxx` (reads,
+//! canonical). Both halves are `pub(crate)` since Phase 5+ — the
+//! concrete types only appear inside this file and `app.rs`.
 
 use std::path::Path;
 use std::sync::Arc;
@@ -73,9 +72,8 @@ use super::{
     FeedbackEvent, GraphError, StorageError, TranscriptSessionSummary,
 };
 use crate::domain::capability_capsule::{
-    CapabilityCapsuleRecord, CapabilityCapsuleVersionLink, FeedbackSummary, GraphEdge,
+    CapabilityCapsuleRecord, CapabilityCapsuleVersionLink, GraphEdge,
 };
-use crate::domain::embeddings::EmbeddingJobInfo;
 use crate::domain::episode::EpisodeRecord;
 use crate::domain::session::Session;
 use crate::domain::{AddAliasOutcome, ConversationMessage, Entity, EntityKind, EntityWithAliases};
@@ -771,88 +769,27 @@ impl Store {
     }
 }
 
-// ── Memory reads with no DuckDbQuery counterpart yet (LanceStore) ──
+// The 7 lance-side reads previously routed through inherent Store
+// methods (with stale "TODO: route to DuckDbQuery once added" markers
+// inviting a future SQL-port that never came and isn't needed now)
+// got inlined into the trait impls directly:
 //
-// These reads route to the LanceStore native-query path until a SQL
-// counterpart lands in `duckdb_query`. They produce the same result
-// shape; the only cost of going through LanceStore is that some do
-// in-Rust sort / aggregate where DuckDB SQL would push to the engine.
-// Marked individually with `// TODO: route to DuckDbQuery once added`.
+//   CapsuleStore::feedback_summary           → self.lance.feedback_summary
+//   CapsuleStore::get_capability_capsule     → self.lance.get_capability_capsule
+//   SessionStore::latest_active_session      → self.lance.latest_active_session
+//   SessionStore::list_successful_episodes_for_tenant
+//                                            → self.lance.list_successful_episodes_for_tenant
+//   EmbeddingJobStore::list_embedding_jobs   → self.lance.list_embedding_jobs
+//   EmbeddingJobStore::latest_embedding_job_status_for_hash
+//                                            → self.lance.latest_embedding_job_status_for_hash
+//   EmbeddingVectorStore::get_capability_capsule_embedding_row
+//                                            → self.lance.get_capability_capsule_embedding_row
+//
+// Service / worker callers use `Arc<dyn Backend>` (Phase 5) so the
+// trait method is the only reachable entry point — the inherent
+// middleman was scaffolding from before Phase 5.
+
 impl Store {
-    /// TODO: route to DuckDbQuery once added.
-    pub async fn feedback_summary(
-        &self,
-        capability_capsule_id: &str,
-    ) -> Result<FeedbackSummary, StorageError> {
-        self.lance.feedback_summary(capability_capsule_id).await
-    }
-
-    /// TODO: route to DuckDbQuery once added.
-    pub async fn get_capability_capsule(
-        &self,
-        capability_capsule_id: String,
-    ) -> Result<Option<CapabilityCapsuleRecord>, StorageError> {
-        self.lance
-            .get_capability_capsule(capability_capsule_id)
-            .await
-    }
-
-    /// TODO: route to DuckDbQuery once added.
-    pub async fn latest_active_session(
-        &self,
-        tenant: &str,
-        caller_agent: &str,
-    ) -> Result<Option<Session>, StorageError> {
-        self.lance.latest_active_session(tenant, caller_agent).await
-    }
-
-    /// TODO: route to DuckDbQuery once added.
-    pub async fn list_successful_episodes_for_tenant(
-        &self,
-        tenant: &str,
-    ) -> Result<Vec<EpisodeRecord>, StorageError> {
-        self.lance.list_successful_episodes_for_tenant(tenant).await
-    }
-
-    /// TODO: route to DuckDbQuery once added.
-    pub async fn list_embedding_jobs(
-        &self,
-        tenant: &str,
-        status_filter: Option<&str>,
-        memory_id_filter: Option<&str>,
-        limit: usize,
-    ) -> Result<Vec<EmbeddingJobInfo>, StorageError> {
-        self.lance
-            .list_embedding_jobs(tenant, status_filter, memory_id_filter, limit)
-            .await
-    }
-
-    /// TODO: route to DuckDbQuery once added.
-    pub async fn get_capability_capsule_embedding_row(
-        &self,
-        capability_capsule_id: &str,
-    ) -> Result<Option<(String, String, String)>, StorageError> {
-        self.lance
-            .get_capability_capsule_embedding_row(capability_capsule_id)
-            .await
-    }
-
-    /// TODO: route to DuckDbQuery once added.
-    pub async fn latest_embedding_job_status_for_hash(
-        &self,
-        tenant: &str,
-        capability_capsule_id: &str,
-        target_content_hash: &str,
-    ) -> Result<Option<String>, StorageError> {
-        self.lance
-            .latest_embedding_job_status_for_hash(
-                tenant,
-                capability_capsule_id,
-                target_content_hash,
-            )
-            .await
-    }
-
     /// Read embedding-job status by id. Used by the embedding worker
     /// to skip mid-flight processing when a concurrent caller has
     /// already marked the job stale. Routes to DuckDbQuery (SQL).

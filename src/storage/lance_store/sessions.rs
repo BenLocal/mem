@@ -1,5 +1,7 @@
 //! Sessions table: opens/closes/touches and `latest_active_session`.
-//! Mirrors the legacy DuckDB `sessions` schema 1:1.
+//! Schema: session_id PK, tenant + caller_agent for identity,
+//! started_at + last_seen_at + ended_at (nullable) for lifecycle,
+//! goal (nullable string), memory_count (uint32) for usage stats.
 
 use std::sync::Arc;
 

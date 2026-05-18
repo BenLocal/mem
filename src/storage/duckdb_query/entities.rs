@@ -87,10 +87,9 @@ impl DuckDbQuery {
     ///
     /// The `LIKE` pattern is parameterised — wrap the query in
     /// `%...%` so substring match works without the caller knowing
-    /// about SQL wildcards. (DuckDB `LIKE` is case-sensitive; the
-    /// legacy backend was the same — kept for parity. A future
-    /// follow-up could swap to `ILIKE` for case-insensitive
-    /// search.)
+    /// about SQL wildcards. DuckDB `LIKE` is case-sensitive; a
+    /// future follow-up could swap to `ILIKE` for case-insensitive
+    /// search.
     pub async fn list_entities(
         &self,
         tenant: &str,
@@ -320,8 +319,7 @@ mod tests {
         assert_eq!(topics.len(), 1);
         assert_eq!(topics[0].entity_id, id_rust);
 
-        // LIKE filter on canonical_name (case-sensitive, mirrors
-        // legacy backend).
+        // LIKE filter on canonical_name (case-sensitive).
         let like = q
             .list_entities("tenant-a", None, Some("Rust"), 10)
             .await

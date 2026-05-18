@@ -275,13 +275,13 @@ impl EmbeddingJobStore for Store {
         capability_capsule_id: &str,
         target_content_hash: &str,
     ) -> Result<Option<String>, StorageError> {
-        Store::latest_embedding_job_status_for_hash(
-            self,
-            tenant,
-            capability_capsule_id,
-            target_content_hash,
-        )
-        .await
+        self.lance
+            .latest_embedding_job_status_for_hash(
+                tenant,
+                capability_capsule_id,
+                target_content_hash,
+            )
+            .await
     }
 
     async fn list_embedding_jobs(
@@ -291,7 +291,9 @@ impl EmbeddingJobStore for Store {
         memory_id_filter: Option<&str>,
         limit: usize,
     ) -> Result<Vec<EmbeddingJobInfo>, StorageError> {
-        Store::list_embedding_jobs(self, tenant, status_filter, memory_id_filter, limit).await
+        self.lance
+            .list_embedding_jobs(tenant, status_filter, memory_id_filter, limit)
+            .await
     }
 
     async fn claim_next_n_transcript_embedding_jobs(

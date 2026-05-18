@@ -1301,8 +1301,9 @@ mod tests {
         assert_eq!(recent_b.len(), 1);
         assert_eq!(recent_b[0].capability_capsule_id, "m_other");
 
-        // limit clamps to >=1 even when caller passes 0 (mirrors the
-        // legacy DuckDB-as-storage clamp).
+        // limit clamps to >=1 even when caller passes 0 — caller
+        // ergonomics, so `recent_active_capability_capsules(_, 0)`
+        // doesn't surprise with an empty result.
         let recent_clamped = q
             .recent_active_capability_capsules("tenant-a", 0)
             .await

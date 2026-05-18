@@ -70,7 +70,7 @@ impl DuckDbQuery {
 
     /// All conversation blocks for `(tenant, session_id)`, ordered
     /// chronologically `(created_at ASC, line_number ASC,
-    /// block_index ASC)`. Mirrors the legacy backend 1:1.
+    /// block_index ASC)`.
     pub async fn get_conversation_messages_by_session(
         &self,
         tenant: &str,
@@ -98,8 +98,8 @@ impl DuckDbQuery {
     /// line_number, block_index)` lets the caller resume strictly
     /// after the last row they saw using row-tuple comparison
     /// (DuckDB supports tuple comparison, but we expand it
-    /// explicitly for compatibility — same shape the legacy backend
-    /// used). `since` / `until` apply to `created_at` only
+    /// explicitly because it transports to other SQL dialects
+    /// cleanly). `since` / `until` apply to `created_at` only
     /// (inclusive lower, exclusive upper) and stack on top of the
     /// cursor.
     ///
@@ -282,12 +282,12 @@ impl DuckDbQuery {
         .await
     }
 
-    /// Per-session aggregate. Replaces the legacy backend's hand-
-    /// written aggregation (count + min + max in Rust over a full
-    /// scan) with one DuckDB `GROUP BY` — the canonical example of
-    /// what the DuckDB-as-query layer buys us over the LanceDB
-    /// native query API. Tenant-scoped; null-session rows excluded.
-    /// Ordered `last_at DESC`.
+    /// Per-session aggregate (count + first_at + last_at +
+    /// caller_agent) computed via one DuckDB `GROUP BY session_id` —
+    /// the canonical example of what the DuckDB-as-query layer buys
+    /// us over the LanceDB native query API (no GROUP BY support
+    /// there). Tenant-scoped; null-session rows excluded. Ordered
+    /// `last_at DESC`.
     pub async fn list_transcript_sessions(
         &self,
         tenant: &str,
@@ -445,10 +445,10 @@ impl DuckDbQuery {
             // 4. Predecessors. Strict tuple comparison
             // `(created_at, line_number, block_index) <
             // (primary.created_at, primary.line_number,
-            // primary.block_index)`, expanded explicitly for
-            // compatibility with non-DuckDB SQL dialects (we don't
-            // need the portability here, but the shape is shared
-            // with the legacy backend so the cutover is mechanical).
+            // primary.block_index)`, expanded explicitly because the
+            // shape transports to non-DuckDB SQL dialects cleanly
+            // (Postgres / SQLite — useful when this read is
+            // re-implemented for another backend).
             let before_sql = format!(
                 "SELECT {CONVERSATION_COLS} FROM ns.main.conversation_messages \
                  WHERE tenant = ?1 \

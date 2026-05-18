@@ -1,6 +1,6 @@
-//! Episodes table: insert + list-successful. Mirrors the legacy DuckDB
-//! `episodes` schema 1:1 with `workflow_candidate` JSON-encoded as a
-//! nullable string column.
+//! Episodes table: insert + list-successful. `workflow_candidate` is
+//! JSON-encoded as a nullable string column (Arrow doesn't have a
+//! native sum type; serde to/from on the field boundary).
 
 use std::sync::Arc;
 

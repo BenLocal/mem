@@ -90,7 +90,7 @@ impl SessionStore for Store {
         tenant: &str,
         caller_agent: &str,
     ) -> Result<Option<Session>, StorageError> {
-        Store::latest_active_session(self, tenant, caller_agent).await
+        self.lance.latest_active_session(tenant, caller_agent).await
     }
 
     async fn insert_episode(&self, episode: EpisodeRecord) -> Result<EpisodeRecord, StorageError> {
@@ -101,6 +101,6 @@ impl SessionStore for Store {
         &self,
         tenant: &str,
     ) -> Result<Vec<EpisodeRecord>, StorageError> {
-        Store::list_successful_episodes_for_tenant(self, tenant).await
+        self.lance.list_successful_episodes_for_tenant(tenant).await
     }
 }
