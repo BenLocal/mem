@@ -3,7 +3,7 @@
 > 本文件是 [`mempalace-diff.md`](./mempalace-diff.md) 抽取出来的执行面板，便于单独维护与外发。
 > **新增 / 调整路线图项请先回 `mempalace-diff.md` 改对应章节，再同步更新本文件。** 设计原则、每项的论证、不做的事见原文档对应章节号（§5、§7、§8、§11、§12、§13、§14 等）。"现在差异快照"看 [§15](./mempalace-diff.md#15-当前差异快照2026-05-06)。
 >
-> **状态（2026-05-18）**：#1–#15 全部 ✅；#16–#20 仍待办（KG 入图入口拓宽，触发条件：实测 KG 稀薄，平均每条 memory 仅 ~3 条边，tags / code_refs / supersedes / transcript-session 都没入图。详见 [§5.1](./mempalace-diff.md#51-实测-kg-不够稠密2026-05-07-抽样)）。
+> **状态（2026-05-18）**：#1–#18 全部 ✅；#19/#20 仍待办（#19 = code_refs → entity(kind=file)；#20 = 内容自动抽取实体，需要单独决策）。批 H 三条 Quick Wins 落地——#16 (tags) + #17 (supersedes，审计发现早已 shipped) + #18 (transcript session)。
 >
 > **平行工作线**：MemPalace 对齐之外，**Backend 存储抽象**走独立 workstream，路线图见 [`backend-coupling.md`](./backend-coupling.md) §6（Phase 0–5 已 shipped；DuckDbQuery / LanceStore 已收窄 `pub(crate)`）。两条线 commit message 用各自的 close 引用（`closes ROADMAP #N` vs `closes backend-coupling §6 Phase N`），不互相阻塞。
 
@@ -25,9 +25,9 @@
 | 12 | 🔍 | ✅ **Claude Code / Codex 无感集成包**（Stop/PreCompact/SessionStart hooks + `mem mine` 离线 miner + `mem wake-up`；`138eb2e` feat(integration): Claude Code seamless integration、`fd07564` feat(hooks)、`7c4860c` feat(mine)、`a013a77` feat(wake-up)、`d374b86` feat(transcripts): mem mine writes every block to /transcripts/messages） | 🟠 用户体验代际升级 | M（1.5 天） | 中（hook 脚本跨平台、跨 agent runtime） | 新增 `hooks/`、`src/cli/{mine,wake_up}.rs`、`README.md` 集成章节，详见 [§13](./mempalace-diff.md#13-claude-code--codex-无感集成包让用户毫无察觉成为产品特性) |
 | 14 | 🔍 | ✅ **Recall quality bench (transcripts)**（10-rung ablation, synthetic+real fixtures, oracle-rerank upper bound; closes spec `2026-05-03-transcript-recall-bench-design`） | 🟡 决策基础设施 | M（半天） | 低 | `src/pipeline/eval_metrics.rs`, `tests/bench/`, `tests/recall_bench.rs` |
 | 15 | 🔍 | ✅ **MemPalace LongMemEval parity bench** (Rust port of `longmemeval_bench.py`; 3 rungs map to mempalace `raw / rooms / full`; output mirrors `results_*.json` shape; closes spec `2026-05-05-mempalace-bench-parity-design`) | 🟡 横向对比基础设施 | M（半天） | 低 | `src/pipeline/eval_metrics.rs`, `tests/bench/longmemeval*.rs`, `tests/mempalace_bench.rs` |
-| 16 | 🔍 | 🚧 **`tags` → `entity(kind=tag)` + `tagged` edge**（沿用 #8 entity registry 模式；ingest 时把 `tags[]` 路由通过 `EntityRegistry::resolve_or_create`）。预期 KG 边密度 3–5×，"找同 tag 的 memory" / "找同类 bug" 直接图遍历。**注**：`mem repair --rebuild-graph` 已下架（随 sidecar 一并清理），历史 tag 的回溯吸收需要新写一个一次性脚本或 admin endpoint。新增 `EntityKind::Tag` variant。 | 🟠 入图入口扩展 | M（4h+一次性回溯工具） | 低（沿现有模式） | `domain/entity.rs::EntityKind`、`pipeline/ingest.rs::extract_graph_edge_drafts`、`service::resolve_drafts_to_edges`、回溯脚本 |
-| 17 | 🔍 | 🚧 **`memories.supersedes_memory_id` → `supersedes` graph edge**（数据已在 `memories` 列上，只是从未写到 `graph_edges`。新建 memory→memory 边的同时关闭被 supersede 旧 memory 的活动边——本来 #4 启示就提到这条，但只实现了"关闭旧边"，没建"指向旧 memory 的 supersedes 边"）。 | 🟢 数据已有，只缺一条边 | S（2h） | 低 | `service::sync_memory_edges` 调用点、`storage::graph_store.rs`、历史回溯脚本（`mem repair --rebuild-graph` 已删） |
-| 18 | 🔍 | 🚧 **transcript session → memory edge `extracted_from_session`**（`mem mine` 抽出 memory 后，建一条 `entity:session:<id>` → `memory:<id>` 边。反查"这次会话产出了哪些 memory"一次图遍历，不再 SQL 回查 session_id 字段；同时为 §11 sessions 视图打底）。 | 🟢 transcripts ↔ memories 之间唯一桥梁 | S（3h） | 低 | `cli/mine.rs`（POST 成功后多发一条 entity 边 / 或服务端 ingest 自动建）、`domain/memory.rs::extract_graph_edge_drafts` |
+| 16 | 🔍 | ✅ **`tags` → `entity(kind=tag)` + `tagged` edge**（沿用 #8 entity registry 模式；ingest 时把 `tags[]` 路由通过 `EntityRegistry::resolve_or_create`）。预期 KG 边密度 3–5×，"找同 tag 的 memory" / "找同类 bug" 直接图遍历。新增 `EntityKind::Tag` variant；`contradicts:` 前缀的 tag 跳过（历史 artifact，不是真 tag）。历史数据回溯（吸收已有 capsules 的 tags）暂未做，需要时再写一次性脚本。 | 🟠 入图入口扩展 | M（实际 ~2h） | 低（沿现有模式） | `domain/entity.rs::EntityKind`、`pipeline/ingest.rs::extract_graph_edge_drafts`、`service::resolve_drafts_to_edges` |
+| 17 | 🔍 | ✅ **`memories.supersedes_memory_id` → `supersedes` graph edge**（数据已在 `memories` 列上）。**审计发现已 shipped**——`extract_graph_edge_drafts` lines 236-246 emit `ToNodeKind::LiteralMemory` with relation `supersedes` when `supersedes_capability_capsule_id` is set；wired through `edit_and_accept_pending`；unit test `extract_graph_edge_drafts_emits_literal_memory_for_supersedes` 覆盖。原 ROADMAP 文本是陈年误判。 | 🟢 数据已有，只缺一条边 | S（已落地） | 低 | `pipeline/ingest.rs` |
+| 18 | 🔍 | ✅ **transcript session → memory edge `extracted_from`**（每次 ingest 都 auto-bucket 进 session 并落一条 `memory:<id> --extracted_from--> session:<sid>` 边）。方向选 memory→session（不是 ROADMAP 原文的 session→memory）让 `close_edges_for_capability_capsule` 在 hard-delete 时自动 close 边，避免悬挂 edge。Session_id bypass entity registry——session_id 已是 canonical UUIDv7，无 alias 化需求，所以引入 `ToNodeKind::LiteralSession` 直写 `session:<id>` 节点。`mem mine` 路径无改动：ingest 的 auto-bucketing 已经把 session_id 设上去。 | 🟢 transcripts ↔ memories 之间唯一桥梁 | S（实际 ~1.5h） | 低 | `pipeline/ingest.rs`（`ToNodeKind::LiteralSession`、`session_node_id`、draft extraction）、`service::resolve_drafts_to_edges` |
 | 19 | 🔍 | 🚧 **`code_refs[]` → `entity(kind=file)` + `mentions_file` edge**（路径归一化：相对仓库根 / 跨 repo 用 `repo:<r>:file:<path>` 复合 alias）。"查所有提到 `src/storage/duckdb.rs` 的 memory" 走图。 | 🟠 代码定位入图 | M（半天） | 中（路径归一化坑：trailing slash / 大小写 / OS 差异） | `domain/entity.rs` 加 `EntityKind::File`、`pipeline/ingest.rs`、`storage/entity_registry.rs` |
 | 20 | 🔍 | 🚧（LATER）**内容自动抽取实体**（regex 起步：commit hash `[0-9a-f]{7,40}`、Rust 函数名 `fn ([a-z_]+)`、文件路径、错误码；进 entity registry 时打 `auto_extracted=true` 标，便于审计 / 关闭）。opt-in `MEM_EXTRACT_ENTITIES=1`，避免给所有 caller 强加噪声。 | 🟡 KG 自动化扩展，长期天花板提升 | L（1–2 天） | 高（误抽 / 噪声 / Verbatim 边界） | 新 `pipeline/extractors.rs`、`service/memory_service.rs::ingest` 加 hook、entity 加 `auto_extracted` 列 |
 
@@ -43,13 +43,13 @@
 > - **批 E（生命周期 / 卫生）** ✅ #7 + #8（decay worker + entity registry）。
 > - **批 F（无感集成）** ✅ #12（hooks + `mem mine` + `mem wake-up`）。
 > - **批 G（评估基础设施）** ✅ #14 + #15（recall ablation bench + LongMemEval parity bench）。
-> - **批 H（KG 入图入口拓宽）** 🚧 #16–#20。先做 #16 (tags) + #17 (supersedes) + #18 (transcript-session) 这三条 Quick Wins（合计 ~9h，复用现有 entity registry / repair 路径）；#19 (code_refs) 另起；#20 (内容抽取) 单独决策。
+> - **批 H（KG 入图入口拓宽，Quick Wins）** ✅ #16 + #17 + #18。实际 ~3.5h（远低于估的 ~9h），#17 审计发现早已 shipped。`#19` (code_refs) 另起；`#20` (内容抽取) 单独决策。
 
 ---
 
 ## 下一阶段
 
-#1–#15 已完成；#16–#20 待办，触发条件按性质分两条：
+#1–#18 已完成；#19/#20 待办，触发条件按性质分两条：
 
 - **本质形态差异** — `mempalace-diff §15.1` 列举（HTTP vs MCP / DuckDB vs Chroma / lifecycle vs verbatim）。这些**不会主动消除**；改变只能在哲学路线整体重定义时讨论。
 - **新对齐项 / 实测 gap** — 当 mempalace 主仓有新设计或 mem 实测出新 gap 时：先回 `mempalace-diff.md` 加 / 改章节做论证，再回本文件追加新行号（#21+），同时更新 `mempalace-diff §15.2/15.3/15.4` 三张映射表保持一致。#16–#20 的论证沉在 [§5.1](./mempalace-diff.md#51-实测-kg-不够稠密2026-05-07-抽样)。

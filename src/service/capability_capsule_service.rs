@@ -1161,6 +1161,9 @@ pub(crate) async fn resolve_drafts_to_edges(
             ToNodeKind::LiteralMemory(capability_capsule_id) => {
                 format!("capability_capsule:{capability_capsule_id}")
             }
+            ToNodeKind::LiteralSession(session_id) => {
+                format!("session:{session_id}")
+            }
             ToNodeKind::EntityRef { kind, alias } => {
                 let id = registry
                     .resolve_or_create(tenant, &alias, kind, now)

@@ -433,7 +433,30 @@ async fn get_memory_returns_full_record() {
     );
     assert!(response.json()["capability_capsule"]["content_hash"].is_string());
     assert!(response.json()["version_chain"].is_array());
-    assert_eq!(response.json()["graph_links"], json!([]));
+    // Since ROADMAP #18 every ingest auto-buckets the new capsule
+    // into a session and writes a memory→session `extracted_from`
+    // edge. So `graph_links` is non-empty even when the capsule
+    // sets no project/repo/topic/tag fields.
+    let graph_links = response.json()["graph_links"]
+        .as_array()
+        .expect("graph_links should be a JSON array")
+        .clone();
+    let session_edges: Vec<_> = graph_links
+        .iter()
+        .filter(|e| e["relation"] == "extracted_from")
+        .collect();
+    assert_eq!(
+        session_edges.len(),
+        1,
+        "exactly one session edge expected; got graph_links={graph_links:?}",
+    );
+    assert!(
+        session_edges[0]["to_node_id"]
+            .as_str()
+            .is_some_and(|s| s.starts_with("session:")),
+        "session edge to_node_id must use session:<id> prefix; got {:?}",
+        session_edges[0]["to_node_id"],
+    );
     assert_eq!(response.json()["feedback_summary"]["total"], 0);
 }
 

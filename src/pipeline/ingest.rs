@@ -138,11 +138,27 @@ pub fn topic_node_id(topic: &str) -> String {
     format!("topic:{topic}")
 }
 
+pub fn tag_node_id(tag: &str) -> String {
+    format!("tag:{tag}")
+}
+
+pub fn session_node_id(session_id: &str) -> String {
+    format!("session:{session_id}")
+}
+
 /// Structured description of the target node in a draft edge.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ToNodeKind {
-    EntityRef { kind: EntityKind, alias: String },
+    EntityRef {
+        kind: EntityKind,
+        alias: String,
+    },
     LiteralMemory(String),
+    /// Verbatim `session:<session_id>` node — session ids are already
+    /// canonical UUIDv7 strings, so we bypass `EntityRegistry`
+    /// (which exists for alias normalization the session_id doesn't
+    /// need) and write the node id directly. Added in ROADMAP #18.
+    LiteralSession(String),
 }
 
 /// A draft graph edge whose target has not yet been resolved against an
@@ -233,6 +249,29 @@ pub fn extract_graph_edge_drafts(memory: &CapabilityCapsuleRecord) -> Vec<GraphE
             relation: "discusses".into(),
         });
     }
+    // ROADMAP #16: tags route through `EntityRegistry` the same way
+    // topics do — dedup variants ("Rust" / "rust" / " RUST ") to one
+    // canonical entity_id, then write a `tagged` edge. The
+    // `contradicts:<other_id>` tag prefix is the one special case:
+    // it's a memory→memory pointer encoded in tag space, not a real
+    // tag. Skip it here (legacy `extract_graph_edges` handled it; new
+    // pipeline drops it because no live caller emits this prefix on
+    // ingest paths — it's a historical artifact).
+    for tag in memory
+        .tags
+        .iter()
+        .filter(|v| !v.trim().is_empty())
+        .filter(|v| !v.starts_with("contradicts:"))
+    {
+        drafts.push(GraphEdgeDraft {
+            from_node_id: from_node_id.clone(),
+            to_kind: ToNodeKind::EntityRef {
+                kind: EntityKind::Tag,
+                alias: tag.clone(),
+            },
+            relation: "tagged".into(),
+        });
+    }
     if let Some(prev) = memory
         .supersedes_capability_capsule_id
         .as_deref()
@@ -244,12 +283,34 @@ pub fn extract_graph_edge_drafts(memory: &CapabilityCapsuleRecord) -> Vec<GraphE
             relation: "supersedes".into(),
         });
     }
+    // ROADMAP #18: every memory derived from a transcript session
+    // (the `mem mine` path stamps `session_id`) gets a
+    // `memory:<id> --extracted_from--> session:<sid>` edge. Direction
+    // is memory→session (NOT session→memory) so the graph cleanup
+    // mechanism `close_edges_for_capability_capsule` still
+    // auto-closes the edge when the memory is hard-deleted —
+    // session→memory would leave a dangling edge pointing at a
+    // deleted node. Reverse-direction reads ("which memories came
+    // from this session") still work via `neighbors`, which already
+    // matches `from_node_id = X OR to_node_id = X`.
+    if let Some(sid) = memory
+        .session_id
+        .as_deref()
+        .filter(|v| !v.trim().is_empty())
+    {
+        drafts.push(GraphEdgeDraft {
+            from_node_id: from_node_id.clone(),
+            to_kind: ToNodeKind::LiteralSession(sid.to_string()),
+            relation: "extracted_from".into(),
+        });
+    }
     drafts
 }
 
 fn legacy_to_node_id(kind: &ToNodeKind) -> String {
     match kind {
         ToNodeKind::LiteralMemory(id) => memory_node_id(id),
+        ToNodeKind::LiteralSession(id) => session_node_id(id),
         ToNodeKind::EntityRef {
             kind: EntityKind::Project,
             alias,
@@ -277,6 +338,10 @@ fn legacy_to_node_id(kind: &ToNodeKind) -> String {
             kind: EntityKind::Topic,
             alias,
         } => topic_node_id(alias),
+        ToNodeKind::EntityRef {
+            kind: EntityKind::Tag,
+            alias,
+        } => tag_node_id(alias),
     }
 }
 
@@ -385,6 +450,53 @@ mod tests {
     }
 
     #[test]
+    fn extract_graph_edge_drafts_emits_literal_session_when_session_id_set() {
+        // ROADMAP #18: memory carrying a session_id (e.g. from
+        // `mem mine`) emits a `memory:<id> --extracted_from--> session:<sid>`
+        // edge so the reverse lookup "which memories came from this
+        // session" is one graph hop instead of an SQL scan.
+        let memory = CapabilityCapsuleRecord {
+            capability_capsule_id: "m_sess".to_string(),
+            session_id: Some("019e3900-aaaa-bbbb-cccc-dddd".to_string()),
+            ..baseline_memory("m_sess")
+        };
+        let drafts = extract_graph_edge_drafts(&memory);
+        let session_drafts: Vec<_> = drafts
+            .iter()
+            .filter(|d| matches!(d.to_kind, ToNodeKind::LiteralSession(_)))
+            .collect();
+        assert_eq!(session_drafts.len(), 1);
+        assert_eq!(session_drafts[0].relation, "extracted_from");
+        assert_eq!(
+            session_drafts[0].from_node_id,
+            "capability_capsule:m_sess",
+            "edge direction is memory → session so close_edges_for_capability_capsule cleans it on hard-delete",
+        );
+        assert_eq!(
+            session_drafts[0].to_kind,
+            ToNodeKind::LiteralSession("019e3900-aaaa-bbbb-cccc-dddd".to_string()),
+        );
+    }
+
+    #[test]
+    fn extract_graph_edge_drafts_skips_blank_session_id() {
+        for sid in ["", "   "] {
+            let memory = CapabilityCapsuleRecord {
+                capability_capsule_id: "m_blank".to_string(),
+                session_id: Some(sid.to_string()),
+                ..baseline_memory("m_blank")
+            };
+            let drafts = extract_graph_edge_drafts(&memory);
+            assert!(
+                !drafts
+                    .iter()
+                    .any(|d| matches!(d.to_kind, ToNodeKind::LiteralSession(_))),
+                "blank session_id {sid:?} must not emit an edge",
+            );
+        }
+    }
+
+    #[test]
     fn extract_graph_edge_drafts_emits_literal_memory_for_supersedes() {
         let memory = CapabilityCapsuleRecord {
             capability_capsule_id: "m2".to_string(),
@@ -396,6 +508,54 @@ mod tests {
             &d.to_kind,
             ToNodeKind::LiteralMemory(id) if id == "m1"
         )));
+    }
+
+    #[test]
+    fn extract_graph_edge_drafts_emits_tagged_edges_for_tags() {
+        // ROADMAP #16: each non-empty, non-`contradicts:`-prefixed tag
+        // becomes a `tagged` edge through `EntityKind::Tag`.
+        let memory = CapabilityCapsuleRecord {
+            capability_capsule_id: "m_tag".to_string(),
+            tags: vec![
+                "rust".to_string(),
+                "lifecycle".to_string(),
+                "".to_string(),
+                "  ".to_string(),
+                "contradicts:m_old".to_string(),
+            ],
+            ..baseline_memory("m_tag")
+        };
+        let drafts = extract_graph_edge_drafts(&memory);
+        let tag_drafts: Vec<_> = drafts
+            .iter()
+            .filter(|d| {
+                matches!(
+                    &d.to_kind,
+                    ToNodeKind::EntityRef {
+                        kind: EntityKind::Tag,
+                        ..
+                    }
+                )
+            })
+            .collect();
+        assert_eq!(
+            tag_drafts.len(),
+            2,
+            "empty / whitespace tags skipped; `contradicts:` prefix skipped (not a real tag)",
+        );
+        let aliases: Vec<&str> = tag_drafts
+            .iter()
+            .filter_map(|d| match &d.to_kind {
+                ToNodeKind::EntityRef { alias, .. } => Some(alias.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert!(aliases.contains(&"rust"));
+        assert!(aliases.contains(&"lifecycle"));
+        assert!(tag_drafts.iter().all(|d| d.relation == "tagged"));
+        assert!(tag_drafts
+            .iter()
+            .all(|d| d.from_node_id == "capability_capsule:m_tag"));
     }
 
     #[test]

@@ -17,6 +17,12 @@ pub enum EntityKind {
     Repo,
     Module,
     Workflow,
+    /// User-supplied tag from `CapabilityCapsuleRecord.tags`. Added
+    /// in ROADMAP #16 — routing tags through the entity registry
+    /// dedups variants ("Rust", "rust", " rust ") to one canonical
+    /// entity_id and lets `tagged` edges power "find all memories
+    /// with this tag" via graph traversal instead of `tags @> array`.
+    Tag,
 }
 
 impl EntityKind {
@@ -27,6 +33,7 @@ impl EntityKind {
             EntityKind::Repo => "repo",
             EntityKind::Module => "module",
             EntityKind::Workflow => "workflow",
+            EntityKind::Tag => "tag",
         }
     }
 
@@ -37,6 +44,7 @@ impl EntityKind {
             "repo" => Some(EntityKind::Repo),
             "module" => Some(EntityKind::Module),
             "workflow" => Some(EntityKind::Workflow),
+            "tag" => Some(EntityKind::Tag),
             _ => None,
         }
     }
@@ -71,6 +79,7 @@ mod tests {
             EntityKind::Repo,
             EntityKind::Module,
             EntityKind::Workflow,
+            EntityKind::Tag,
         ] {
             assert_eq!(EntityKind::from_db_str(k.as_db_str()), Some(k));
         }
