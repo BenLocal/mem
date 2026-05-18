@@ -19,8 +19,7 @@ use tokio::time::sleep;
 use tracing::{info, warn};
 
 use crate::config::VacuumSettings;
-use crate::storage::lance_store::VacuumStats;
-use crate::storage::Backend;
+use crate::storage::{Backend, VacuumStats};
 
 /// Long-running loop. Returns immediately when
 /// `settings.disabled == true`, so callers can spawn unconditionally

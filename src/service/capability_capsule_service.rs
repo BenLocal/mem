@@ -781,7 +781,7 @@ impl CapabilityCapsuleService {
     pub async fn vacuum(
         &self,
         older_than_days: i64,
-    ) -> Result<crate::storage::lance_store::VacuumStats, ServiceError> {
+    ) -> Result<crate::storage::VacuumStats, ServiceError> {
         crate::worker::vacuum_worker::sweep_once(&*self.store, older_than_days)
             .await
             .map_err(ServiceError::Storage)

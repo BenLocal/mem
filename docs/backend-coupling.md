@@ -755,7 +755,7 @@ Two parallel tracks both landed: **(a)** the 4 non-trait pain fixes from Phase 4
 
 **What's left for Phase 5+ tail items** (parked, no longer blocking):
 
-- `DuckDbQuery` / `LanceStore` → `pub(crate)` (now safe — no callers outside `storage/` rely on the concrete types)
+- `DuckDbQuery` / `LanceStore` → `pub(crate)`. **Partial progress**: external callers are all clean (`http/maintenance.rs`, `worker/vacuum_worker.rs`, `service/capability_capsule_service.rs` now use `storage::VacuumStats` re-export — the only Lance-layer type that crossed `storage/`). The module-hiding itself is gated on a separate dead-code cleanup: flipping `pub mod lance_store` → `pub(crate)` exposes ~20 LanceStore READ methods (e.g. `list_capability_capsules_for_tenant`, `get_entity`, `query_graph_edges`) that became orphaned when DuckDbQuery took over reads. Each `lance.xxx` read is dead; only `query.xxx` is called. Delete-then-flip is a clean refactor commit on its own.
 - `MEM_BACKEND=lance|postgres|...` env factory (waits for a second backend that satisfies all 9 sub-traits — `PostgresCapsuleStore` only covers `CapsuleStore` today)
 - Schema IR (LT-2) — Phase 4 spike showed sqlx + raw SQL is fine for the Postgres case; not yet forced
 - Queue module spinout (LT-5) — `EmbeddingJobStore` trait already extracted, full extraction would be cosmetic

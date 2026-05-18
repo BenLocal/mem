@@ -10,7 +10,7 @@
 use axum::{extract::State, routing::post, Json, Router};
 use serde::Deserialize;
 
-use crate::{app::AppState, error::AppError, storage::lance_store::VacuumStats};
+use crate::{app::AppState, error::AppError, storage::VacuumStats};
 
 pub fn router() -> Router<AppState> {
     Router::new().route("/admin/vacuum", post(vacuum))
