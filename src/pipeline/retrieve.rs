@@ -7,10 +7,8 @@ use crate::{
         },
         query::SearchCapabilityCapsuleRequest,
     },
-    pipeline::{
-        ranking::{freshness_score, timestamp_score, RRF_SCALE},
-        store_traits::GraphRead,
-    },
+    pipeline::ranking::{freshness_score, timestamp_score, RRF_SCALE},
+    storage::GraphStore,
 };
 
 #[derive(Debug, Clone)]
@@ -75,7 +73,7 @@ pub async fn rank_with_hybrid_and_graph(
     pool: Vec<CapabilityCapsuleRecord>,
     hybrid_hits: Vec<(CapabilityCapsuleRecord, f32)>,
     query: &SearchCapabilityCapsuleRequest,
-    graph: &dyn GraphRead,
+    graph: &dyn GraphStore,
 ) -> Result<Vec<CapabilityCapsuleRecord>, crate::storage::GraphError> {
     let hybrid_scores: HashMap<String, f32> = hybrid_hits
         .iter()

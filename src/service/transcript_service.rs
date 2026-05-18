@@ -21,7 +21,7 @@ use crate::embedding::EmbeddingProvider;
 use crate::pipeline::transcript_recall::{
     merge_windows, score_candidates, MergedWindow, PrimaryWithContext, ScoringOpts,
 };
-use crate::storage::{ContextWindow, StorageError, Store};
+use crate::storage::{Backend, ContextWindow, StorageError};
 
 /// Optional filters layered on top of the candidate set returned by
 /// scoring. All fields are AND-ed.
@@ -73,11 +73,11 @@ pub struct RecentSession {
 
 #[derive(Clone)]
 pub struct TranscriptService {
-    /// Shared storage handle. Writes flow to LanceStore (incl.
-    /// `transcript_embedding_jobs` enqueue inside
-    /// `create_conversation_message`); reads (BM25 + semantic) flow
-    /// to DuckDbQuery.
-    store: Arc<Store>,
+    /// Shared storage handle. Phase 5: erased to `Arc<dyn Backend>`
+    /// (umbrella supertrait over the 9 storage sub-traits, including
+    /// `TranscriptStore`). Writes / BM25 / semantic search all
+    /// route through the trait surface.
+    store: Arc<dyn Backend>,
     /// Optional embedding provider for the **query** vector — the
     /// transcript embedding *worker* writes vectors out-of-band; this
     /// provider only embeds the search query at request time. When
@@ -87,7 +87,7 @@ pub struct TranscriptService {
 }
 
 impl TranscriptService {
-    pub fn new(store: Arc<Store>, provider: Option<Arc<dyn EmbeddingProvider>>) -> Self {
+    pub fn new(store: Arc<dyn Backend>, provider: Option<Arc<dyn EmbeddingProvider>>) -> Self {
         Self { store, provider }
     }
 

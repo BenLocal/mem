@@ -27,8 +27,8 @@ use sqlx::{PgPool, Row};
 
 use super::CapsuleStore;
 use crate::domain::capability_capsule::{
-    CapabilityCapsuleRecord, CapabilityCapsuleStatus, CapabilityCapsuleType, FeedbackKind,
-    FeedbackSummary, Scope, Visibility,
+    CapabilityCapsuleRecord, CapabilityCapsuleStatus, CapabilityCapsuleType, CapsuleStats,
+    FeedbackKind, FeedbackSummary, Scope, Visibility,
 };
 use crate::storage::types::{FeedbackEvent, StorageError};
 
@@ -654,5 +654,133 @@ impl CapsuleStore for PostgresCapsuleStore {
             }
         }
         Ok(summary)
+    }
+
+    async fn list_wings(&self, tenant: &str) -> Result<Vec<String>, StorageError> {
+        let rows = sqlx::query(
+            "SELECT DISTINCT project FROM capability_capsules \
+             WHERE tenant = $1 AND project IS NOT NULL \
+             ORDER BY project ASC",
+        )
+        .bind(tenant)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(sqlx_err)?;
+        rows.iter()
+            .map(|r| r.try_get::<String, _>("project").map_err(sqlx_err))
+            .collect()
+    }
+
+    async fn capsule_stats(&self, tenant: &str) -> Result<CapsuleStats, StorageError> {
+        let rows = sqlx::query(
+            "SELECT status, COUNT(*) AS cnt FROM capability_capsules \
+             WHERE tenant = $1 \
+             GROUP BY status",
+        )
+        .bind(tenant)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(sqlx_err)?;
+        let mut stats = CapsuleStats::default();
+        for row in &rows {
+            let status: String = row.try_get("status").map_err(sqlx_err)?;
+            let cnt: i64 = row.try_get("cnt").map_err(sqlx_err)?;
+            stats.total += cnt;
+            match status.as_str() {
+                "pending_confirmation" => stats.pending_confirmation += cnt,
+                "provisional" => stats.provisional += cnt,
+                "active" => stats.active += cnt,
+                "archived" => stats.archived += cnt,
+                "rejected" => stats.rejected += cnt,
+                _ => {}
+            }
+        }
+        Ok(stats)
+    }
+
+    async fn get_taxonomy(&self, tenant: &str) -> Result<Vec<(String, Vec<String>)>, StorageError> {
+        // One round-trip: project + repo pairs (repo nullable);
+        // Rust does the project → repos folding.
+        let rows = sqlx::query(
+            "SELECT DISTINCT project, repo FROM capability_capsules \
+             WHERE tenant = $1 AND project IS NOT NULL \
+             ORDER BY project ASC, repo ASC NULLS FIRST",
+        )
+        .bind(tenant)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(sqlx_err)?;
+        use std::collections::BTreeMap;
+        let mut map: BTreeMap<String, std::collections::BTreeSet<String>> = BTreeMap::new();
+        for row in &rows {
+            let project: String = row.try_get("project").map_err(sqlx_err)?;
+            let repo: Option<String> = row.try_get("repo").map_err(sqlx_err)?;
+            let entry = map.entry(project).or_default();
+            if let Some(r) = repo {
+                entry.insert(r);
+            }
+        }
+        Ok(map
+            .into_iter()
+            .map(|(p, repos)| (p, repos.into_iter().collect()))
+            .collect())
+    }
+
+    async fn list_capability_capsules_in_scope(
+        &self,
+        tenant: &str,
+        project: Option<&str>,
+        repo: Option<&str>,
+        module: Option<&str>,
+        capsule_type: Option<&str>,
+        status: Option<&str>,
+        source_agent: Option<&str>,
+        cursor: Option<(&str, &str)>,
+        limit: usize,
+    ) -> Result<(Vec<CapabilityCapsuleRecord>, bool), StorageError> {
+        // Static SQL with COALESCE-style optional filters: every
+        // optional bind goes through `($N::TEXT IS NULL OR col = $N)`
+        // so we don't have to fragment-build the query. Same shape as
+        // Phase 5 pain #3's apply_feedback rewrite.
+        let lim = i64::try_from(limit.clamp(1, 200)).unwrap_or(50);
+        let fetch = lim.saturating_add(1);
+        let cur_updated = cursor.map(|(u, _)| u.to_string());
+        let cur_id = cursor.map(|(_, id)| id.to_string());
+        let sql = format!(
+            "SELECT {SELECT_COLUMNS} FROM capability_capsules \
+             WHERE tenant = $1 \
+               AND ($2::TEXT IS NULL OR project = $2) \
+               AND ($3::TEXT IS NULL OR repo = $3) \
+               AND ($4::TEXT IS NULL OR module = $4) \
+               AND ($5::TEXT IS NULL OR capability_capsule_type = $5) \
+               AND ($6::TEXT IS NULL OR status = $6) \
+               AND ($7::TEXT IS NULL OR source_agent = $7) \
+               AND ($8::TEXT IS NULL \
+                    OR updated_at < $8 \
+                    OR (updated_at = $8 AND capability_capsule_id > $9)) \
+             ORDER BY updated_at DESC, capability_capsule_id ASC \
+             LIMIT $10"
+        );
+        let rows = sqlx::query(&sql)
+            .bind(tenant)
+            .bind(project)
+            .bind(repo)
+            .bind(module)
+            .bind(capsule_type)
+            .bind(status)
+            .bind(source_agent)
+            .bind(cur_updated)
+            .bind(cur_id)
+            .bind(fetch)
+            .fetch_all(&self.pool)
+            .await
+            .map_err(sqlx_err)?;
+        let mut out: Vec<CapabilityCapsuleRecord> =
+            rows.iter().map(row_to_record).collect::<Result<_, _>>()?;
+        let has_more = out.len() as i64 == fetch;
+        if has_more {
+            out.pop();
+        }
+        Ok((out, has_more))
     }
 }

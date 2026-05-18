@@ -20,12 +20,12 @@ use tracing::{info, warn};
 
 use crate::config::VacuumSettings;
 use crate::storage::lance_store::VacuumStats;
-use crate::storage::Store;
+use crate::storage::Backend;
 
 /// Long-running loop. Returns immediately when
 /// `settings.disabled == true`, so callers can spawn unconditionally
 /// and let the gate live in one place.
-pub async fn run(store: Arc<Store>, settings: VacuumSettings) {
+pub async fn run(store: Arc<dyn Backend>, settings: VacuumSettings) {
     if settings.disabled {
         return;
     }
@@ -37,7 +37,7 @@ pub async fn run(store: Arc<Store>, settings: VacuumSettings) {
     );
     loop {
         sleep(interval).await;
-        match sweep_once(&store, settings.older_than_days as i64).await {
+        match sweep_once(&*store, settings.older_than_days as i64).await {
             Ok(stats) if stats.bytes_removed > 0 => {
                 info!(
                     bytes_removed = stats.bytes_removed,
@@ -59,7 +59,7 @@ pub async fn run(store: Arc<Store>, settings: VacuumSettings) {
 /// integration tests can drive the same logic without spinning up
 /// the loop.
 pub async fn sweep_once(
-    store: &Store,
+    store: &dyn Backend,
     older_than_days: i64,
 ) -> Result<VacuumStats, crate::storage::StorageError> {
     store.vacuum_old_versions(older_than_days).await
@@ -71,6 +71,7 @@ mod tests {
     use crate::domain::capability_capsule::{
         CapabilityCapsuleRecord, CapabilityCapsuleStatus, CapabilityCapsuleType,
     };
+    use crate::storage::Store;
     use tempfile::tempdir;
 
     fn fixture(id: &str) -> CapabilityCapsuleRecord {

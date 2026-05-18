@@ -1,6 +1,5 @@
 use crate::domain::session::Session;
-use crate::pipeline::store_traits::SessionStore;
-use crate::storage::StorageError;
+use crate::storage::{SessionStore, StorageError};
 
 /// Read `MEM_SESSION_IDLE_MINUTES` from the environment.  Returns 30 if unset or invalid.
 pub fn idle_minutes_from_env() -> u64 {

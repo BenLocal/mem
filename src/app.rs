@@ -9,7 +9,7 @@ use tracing::info;
 use crate::{
     http,
     service::{CapabilityCapsuleService, EntityService, TranscriptService},
-    storage::Store,
+    storage::{Backend, Store},
 };
 
 #[derive(Clone)]
@@ -38,7 +38,12 @@ impl AppState {
 
         // Open the unified storage handle. LanceStore creates the
         // schema + FTS indexes; DuckDbQuery ATTACHes the lance dir.
-        let store = Arc::new(
+        // We hold a concrete `Arc<Store>` here so we can call
+        // `set_transcript_job_provider` (Lance-only configuration —
+        // not on any sub-trait); services / workers get the
+        // upcast `Arc<dyn Backend>` so the concrete type never
+        // appears below this line.
+        let store_concrete = Arc::new(
             Store::open_with_provider(&config.db_path, provider.clone())
                 .await
                 .map_err(|e| anyhow::anyhow!("storage open: {e}"))?,
@@ -49,7 +54,12 @@ impl AppState {
         // before any transcript writes happen (writes that are
         // embed_eligible enqueue a transcript_embedding_jobs row, and
         // the row's provider column comes from this setter).
-        store.set_transcript_job_provider(config.embedding.job_provider_id());
+        store_concrete.set_transcript_job_provider(config.embedding.job_provider_id());
+
+        // Erase to the umbrella trait. Every service / worker below
+        // works through `Arc<dyn Backend>` — swap in a different
+        // backend by changing this one binding.
+        let store: Arc<dyn Backend> = store_concrete;
 
         // ── Workers ─────────────────────────────────────────────
         let provider_worker = provider.clone();

@@ -22,7 +22,7 @@ use crate::{
     },
     pipeline::workflow,
     pipeline::{compress, retrieve},
-    storage::{current_timestamp, EmbeddingJobInsert, GraphError, StorageError, Store},
+    storage::{current_timestamp, Backend, EmbeddingJobInsert, GraphError, StorageError},
 };
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
@@ -75,12 +75,14 @@ impl From<CapabilityCapsuleRecord> for IngestCapabilityCapsuleResponse {
 
 #[derive(Clone)]
 pub struct CapabilityCapsuleService {
-    /// Shared storage handle. Writes flow to LanceStore; reads
-    /// (incl. graph reads via `pipeline::retrieve::rank_with_graph_*`)
-    /// flow to DuckDbQuery. The graph surface lives on `Store`'s
-    /// `GraphStore` trait impl — passed as `&dyn GraphStore` to the
-    /// pipeline.
-    store: Arc<Store>,
+    /// Shared storage handle. Phase 5: erased to `Arc<dyn Backend>`
+    /// (umbrella supertrait over all 9 storage sub-traits). The
+    /// service holds the umbrella, not the concrete `Store`, so a
+    /// future Postgres backend that implements the same 9 traits
+    /// drops in without touching this file. The graph surface lives
+    /// on the `GraphStore` sub-trait — passed to the pipeline via
+    /// trait upcasting (`&*self.store as &dyn GraphRead`).
+    store: Arc<dyn Backend>,
     /// Value stored on `embedding_jobs.provider` (e.g. `fake`, `openai`).
     embedding_job_provider: String,
     /// When set, search runs hybrid lexical + semantic retrieval.
@@ -98,7 +100,7 @@ impl CapabilityCapsuleService {
     /// Primary constructor. `embedding_job_provider` defaults to
     /// `"fake"` (legacy compat); search provider is `None` (BM25-only
     /// recall). Use [`Self::with_providers`] to override.
-    pub fn new(store: Arc<Store>) -> Self {
+    pub fn new(store: Arc<dyn Backend>) -> Self {
         Self {
             store,
             embedding_job_provider: "fake".to_string(),
@@ -112,7 +114,7 @@ impl CapabilityCapsuleService {
     /// check (`embedding_worker::tick`) succeeds against jobs this
     /// service enqueues.
     pub fn new_with_settings(
-        store: Arc<Store>,
+        store: Arc<dyn Backend>,
         settings: &crate::config::EmbeddingSettings,
     ) -> Self {
         Self {
@@ -127,7 +129,7 @@ impl CapabilityCapsuleService {
     /// `embedding_jobs.provider` stamp and the search-time embedding
     /// provider (so semantic recall is enabled).
     pub fn with_providers(
-        store: Arc<Store>,
+        store: Arc<dyn Backend>,
         embedding_job_provider: String,
         embedding_search_provider: Option<Arc<dyn EmbeddingProvider>>,
     ) -> Self {
@@ -219,7 +221,7 @@ impl CapabilityCapsuleService {
 
         let stored = self.store.insert_capability_capsule(memory).await?;
         let drafts = crate::pipeline::ingest::extract_graph_edge_drafts(&stored);
-        let edges = resolve_drafts_to_edges(drafts, &self.store, &stored.tenant, &now).await?;
+        let edges = resolve_drafts_to_edges(drafts, &*self.store, &stored.tenant, &now).await?;
         self.store.sync_memory_edges(&edges, &now).await?;
         self.enqueue_embedding_job_for_memory(&stored).await?;
         self.store
@@ -279,7 +281,7 @@ impl CapabilityCapsuleService {
             for stored in &to_insert {
                 let drafts = crate::pipeline::ingest::extract_graph_edge_drafts(stored);
                 let edges =
-                    resolve_drafts_to_edges(drafts, &self.store, &stored.tenant, &now).await?;
+                    resolve_drafts_to_edges(drafts, &*self.store, &stored.tenant, &now).await?;
                 all_edges.extend(edges);
             }
             self.store.sync_memory_edges(&all_edges, &now).await?;
@@ -766,7 +768,7 @@ impl CapabilityCapsuleService {
         settings: &crate::config::AutoPromoteSettings,
         dry_run: bool,
     ) -> Result<Vec<String>, ServiceError> {
-        crate::worker::auto_promote_worker::sweep_once(&self.store, settings, tenant, dry_run)
+        crate::worker::auto_promote_worker::sweep_once(&*self.store, settings, tenant, dry_run)
             .await
             .map_err(ServiceError::Storage)
     }
@@ -780,7 +782,7 @@ impl CapabilityCapsuleService {
         &self,
         older_than_days: i64,
     ) -> Result<crate::storage::lance_store::VacuumStats, ServiceError> {
-        crate::worker::vacuum_worker::sweep_once(&self.store, older_than_days)
+        crate::worker::vacuum_worker::sweep_once(&*self.store, older_than_days)
             .await
             .map_err(ServiceError::Storage)
     }
@@ -817,7 +819,8 @@ impl CapabilityCapsuleService {
             .await?;
         let now = current_timestamp();
         let drafts = crate::pipeline::ingest::extract_graph_edge_drafts(&superseding);
-        let edges = resolve_drafts_to_edges(drafts, &self.store, &superseding.tenant, &now).await?;
+        let edges =
+            resolve_drafts_to_edges(drafts, &*self.store, &superseding.tenant, &now).await?;
         self.store.sync_memory_edges(&edges, &now).await?;
 
         self.enqueue_embedding_job_for_memory(&superseding).await?;
@@ -1148,7 +1151,7 @@ impl CapabilityCapsuleService {
 /// of the entity-registry roadmap.
 pub(crate) async fn resolve_drafts_to_edges(
     drafts: Vec<GraphEdgeDraft>,
-    registry: &Store,
+    registry: &dyn crate::storage::EntityRegistry,
     tenant: &str,
     now: &str,
 ) -> Result<Vec<GraphEdge>, StorageError> {

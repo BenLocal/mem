@@ -4,11 +4,11 @@ use crate::config::EmbeddingSettings;
 use crate::embedding::wire::encode_f32_blob;
 use crate::embedding::EmbeddingProvider;
 use crate::service::embedding_helpers::{failure_backoff_ms, truncate_error};
-use crate::storage::{current_timestamp, timestamp_add_ms, StorageError, Store};
+use crate::storage::{current_timestamp, timestamp_add_ms, Backend, StorageError};
 use tracing::{error, info, warn};
 
 pub async fn run(
-    store: Arc<Store>,
+    store: Arc<dyn Backend>,
     provider: Arc<dyn EmbeddingProvider>,
     settings: EmbeddingSettings,
 ) {
@@ -24,14 +24,14 @@ pub async fn run(
     ));
     loop {
         interval.tick().await;
-        if let Err(err) = tick(&store, provider.as_ref(), &settings).await {
+        if let Err(err) = tick(&*store, provider.as_ref(), &settings).await {
             error!(error = %err, "embedding worker tick failed");
         }
     }
 }
 
 pub async fn tick(
-    store: &Store,
+    store: &dyn Backend,
     provider: &dyn EmbeddingProvider,
     settings: &EmbeddingSettings,
 ) -> Result<(), StorageError> {
@@ -115,7 +115,7 @@ struct PendingEmbed {
 /// Per-job pre-embed validation. Returns the embed-input text on
 /// success; `None` if the job was resolved inline.
 async fn pre_embed(
-    store: &Store,
+    store: &dyn Backend,
     job: &crate::storage::ClaimedEmbeddingJob,
     settings: &EmbeddingSettings,
 ) -> Result<Option<String>, StorageError> {
@@ -161,7 +161,7 @@ async fn pre_embed(
 /// upsert embedding row (lance handles vector indexing internally —
 /// no separate sidecar to update), complete the job.
 async fn post_embed(
-    store: &Store,
+    store: &dyn Backend,
     job: &crate::storage::ClaimedEmbeddingJob,
     embedding: &[f32],
     provider: &dyn EmbeddingProvider,
@@ -244,7 +244,7 @@ async fn post_embed(
 }
 
 async fn record_failure(
-    store: &Store,
+    store: &dyn Backend,
     job: &crate::storage::ClaimedEmbeddingJob,
     settings: &EmbeddingSettings,
     message: &str,

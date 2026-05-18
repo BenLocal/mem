@@ -20,11 +20,11 @@ use tracing::{info, warn};
 use crate::config::AutoPromoteSettings;
 use crate::domain::capability_capsule::{CapabilityCapsuleRecord, FeedbackKind};
 use crate::storage::types::StorageError;
-use crate::storage::{current_timestamp, FeedbackEvent, Store};
+use crate::storage::{current_timestamp, Backend, FeedbackEvent};
 
 /// Long-running loop. `tenant` is the namespace the sweep operates on
 /// — for the local single-tenant setup this is just `"local"`.
-pub async fn run(store: Arc<Store>, settings: AutoPromoteSettings, tenant: String) {
+pub async fn run(store: Arc<dyn Backend>, settings: AutoPromoteSettings, tenant: String) {
     if !settings.enabled {
         return;
     }
@@ -39,7 +39,7 @@ pub async fn run(store: Arc<Store>, settings: AutoPromoteSettings, tenant: Strin
     );
     loop {
         sleep(interval).await;
-        match sweep_once(&store, &settings, &tenant, /* dry_run */ false).await {
+        match sweep_once(&*store, &settings, &tenant, /* dry_run */ false).await {
             Ok(promoted) => {
                 if !promoted.is_empty() {
                     info!(
@@ -62,7 +62,7 @@ pub async fn run(store: Arc<Store>, settings: AutoPromoteSettings, tenant: Strin
 /// only side effect is a candidate query. Callers (the HTTP
 /// endpoint) use this to preview "what would tomorrow's tick touch."
 pub async fn sweep_once(
-    store: &Store,
+    store: &dyn Backend,
     settings: &AutoPromoteSettings,
     tenant: &str,
     dry_run: bool,
@@ -93,7 +93,10 @@ pub async fn sweep_once(
     Ok(promoted)
 }
 
-async fn promote_one(store: &Store, capsule: &CapabilityCapsuleRecord) -> Result<(), StorageError> {
+async fn promote_one(
+    store: &dyn Backend,
+    capsule: &CapabilityCapsuleRecord,
+) -> Result<(), StorageError> {
     let event = FeedbackEvent {
         feedback_id: format!("fb_{}", uuid::Uuid::now_v7()),
         capability_capsule_id: capsule.capability_capsule_id.clone(),
@@ -124,6 +127,7 @@ fn cutoff_timestamp(age_days: u64) -> String {
 mod tests {
     use super::*;
     use crate::domain::capability_capsule::{CapabilityCapsuleStatus, CapabilityCapsuleType};
+    use crate::storage::Store;
     use tempfile::tempdir;
 
     fn ms_string(ms: u128) -> String {

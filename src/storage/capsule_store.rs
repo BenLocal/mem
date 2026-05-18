@@ -15,10 +15,9 @@
 //!   a status filter) were considered but deferred — the in-memory
 //!   backend is small enough that hand-writing each method is
 //!   clearer than wiring default impls.
-//! - **Service is not migrated** (per the Phase 2 scope-A decision):
-//!   `capability_capsule_service` still holds `Arc<Store>`. The
-//!   trait exists so Phase 3 can do the service-layer migration
-//!   incrementally; `Store: CapsuleStore` is the bridge.
+//! - **Service migrated in Phase 5**: `capability_capsule_service`
+//!   now holds `Arc<dyn Backend>` (umbrella supertrait); this trait
+//!   is one of the nine that compose it.
 //! - **Error type**: shared [`StorageError`]. The doc §3.3 mentions
 //!   future `BackendError(Box<...>)` transparency; today's
 //!   `StorageError` variants suffice.
@@ -29,7 +28,7 @@ use std::sync::Mutex;
 use async_trait::async_trait;
 
 use crate::domain::capability_capsule::{
-    CapabilityCapsuleRecord, CapabilityCapsuleStatus, FeedbackSummary,
+    CapabilityCapsuleRecord, CapabilityCapsuleStatus, CapsuleStats, FeedbackSummary,
 };
 use crate::storage::types::{FeedbackEvent, StorageError};
 use crate::storage::Store;
@@ -203,6 +202,49 @@ pub trait CapsuleStore: Send + Sync {
         &self,
         capability_capsule_id: &str,
     ) -> Result<FeedbackSummary, StorageError>;
+
+    /// Distinct `project` names for the tenant, sorted ascending.
+    /// Capsules with `NULL` project are dropped from the list (every
+    /// entry is a real project name). Powers the navigation sidebar
+    /// in MCP / HTTP clients (`capability_capsule_list_wings`).
+    async fn list_wings(&self, tenant: &str) -> Result<Vec<String>, StorageError>;
+
+    /// Capsule-pool snapshot: total + per-status counts for the
+    /// tenant. Status names that don't map to a `CapabilityCapsuleStatus`
+    /// variant (forward-compat with future enum additions) are
+    /// silently dropped — `pending_confirmation + provisional +
+    /// active + archived + rejected != total` is the caller's
+    /// detection signal.
+    async fn capsule_stats(&self, tenant: &str) -> Result<CapsuleStats, StorageError>;
+
+    /// Two-level `(project, repos)` taxonomy for the tenant. Sorted
+    /// by project then repo. A project with no recorded repos appears
+    /// as `(project, vec![])`. Powers `capability_capsule_get_taxonomy`
+    /// in MCP / HTTP — lets clients render a project → repo tree in
+    /// one round trip.
+    async fn get_taxonomy(&self, tenant: &str) -> Result<Vec<(String, Vec<String>)>, StorageError>;
+
+    /// Tenant-scoped capsule list with optional filters and cursor
+    /// pagination. Each `Option<&str>` filter is independently
+    /// no-op'd (None = don't restrict, not "must be NULL"). Returns
+    /// `(rows, has_more)` — `has_more` uses the standard `LIMIT N+1`
+    /// trick so the caller can decide whether to paginate. `cursor`
+    /// is `(updated_at, capability_capsule_id)` for after-cursor
+    /// resumption; rows ordered `updated_at DESC, capability_capsule_id
+    /// ASC` to match the cursor invariant.
+    #[allow(clippy::too_many_arguments)]
+    async fn list_capability_capsules_in_scope(
+        &self,
+        tenant: &str,
+        project: Option<&str>,
+        repo: Option<&str>,
+        module: Option<&str>,
+        capsule_type: Option<&str>,
+        status: Option<&str>,
+        source_agent: Option<&str>,
+        cursor: Option<(&str, &str)>,
+        limit: usize,
+    ) -> Result<(Vec<CapabilityCapsuleRecord>, bool), StorageError>;
 }
 
 // ── Lance-backed impl: pure delegation through Store ───────────────
@@ -330,6 +372,45 @@ impl CapsuleStore for Store {
         capability_capsule_id: &str,
     ) -> Result<FeedbackSummary, StorageError> {
         Store::feedback_summary(self, capability_capsule_id).await
+    }
+
+    async fn list_wings(&self, tenant: &str) -> Result<Vec<String>, StorageError> {
+        Store::list_wings(self, tenant).await
+    }
+
+    async fn capsule_stats(&self, tenant: &str) -> Result<CapsuleStats, StorageError> {
+        Store::capsule_stats(self, tenant).await
+    }
+
+    async fn get_taxonomy(&self, tenant: &str) -> Result<Vec<(String, Vec<String>)>, StorageError> {
+        Store::get_taxonomy(self, tenant).await
+    }
+
+    async fn list_capability_capsules_in_scope(
+        &self,
+        tenant: &str,
+        project: Option<&str>,
+        repo: Option<&str>,
+        module: Option<&str>,
+        capsule_type: Option<&str>,
+        status: Option<&str>,
+        source_agent: Option<&str>,
+        cursor: Option<(&str, &str)>,
+        limit: usize,
+    ) -> Result<(Vec<CapabilityCapsuleRecord>, bool), StorageError> {
+        Store::list_capability_capsules_in_scope(
+            self,
+            tenant,
+            project,
+            repo,
+            module,
+            capsule_type,
+            status,
+            source_agent,
+            cursor,
+            limit,
+        )
+        .await
     }
 }
 
@@ -645,6 +726,116 @@ impl CapsuleStore for InMemoryCapsuleStore {
                 }
             }
             summary
+        }))
+    }
+
+    async fn list_wings(&self, tenant: &str) -> Result<Vec<String>, StorageError> {
+        Ok(self.with_state(|s| {
+            let mut wings: Vec<String> = s
+                .capsules
+                .values()
+                .filter(|r| r.tenant == tenant)
+                .filter_map(|r| r.project.clone())
+                .collect();
+            wings.sort();
+            wings.dedup();
+            wings
+        }))
+    }
+
+    async fn capsule_stats(&self, tenant: &str) -> Result<CapsuleStats, StorageError> {
+        Ok(self.with_state(|s| {
+            let mut stats = CapsuleStats::default();
+            for r in s.capsules.values().filter(|r| r.tenant == tenant) {
+                stats.total += 1;
+                match r.status {
+                    CapabilityCapsuleStatus::PendingConfirmation => stats.pending_confirmation += 1,
+                    CapabilityCapsuleStatus::Provisional => stats.provisional += 1,
+                    CapabilityCapsuleStatus::Active => stats.active += 1,
+                    CapabilityCapsuleStatus::Archived => stats.archived += 1,
+                    CapabilityCapsuleStatus::Rejected => stats.rejected += 1,
+                }
+            }
+            stats
+        }))
+    }
+
+    async fn get_taxonomy(&self, tenant: &str) -> Result<Vec<(String, Vec<String>)>, StorageError> {
+        Ok(self.with_state(|s| {
+            use std::collections::BTreeMap;
+            let mut map: BTreeMap<String, std::collections::BTreeSet<String>> = BTreeMap::new();
+            for r in s.capsules.values().filter(|r| r.tenant == tenant) {
+                if let Some(p) = &r.project {
+                    let entry = map.entry(p.clone()).or_default();
+                    if let Some(repo) = &r.repo {
+                        entry.insert(repo.clone());
+                    }
+                }
+            }
+            map.into_iter()
+                .map(|(p, repos)| (p, repos.into_iter().collect()))
+                .collect()
+        }))
+    }
+
+    async fn list_capability_capsules_in_scope(
+        &self,
+        tenant: &str,
+        project: Option<&str>,
+        repo: Option<&str>,
+        module: Option<&str>,
+        capsule_type: Option<&str>,
+        status: Option<&str>,
+        source_agent: Option<&str>,
+        cursor: Option<(&str, &str)>,
+        limit: usize,
+    ) -> Result<(Vec<CapabilityCapsuleRecord>, bool), StorageError> {
+        let lim = limit.clamp(1, 200);
+        Ok(self.with_state(|s| {
+            let mut rows: Vec<CapabilityCapsuleRecord> = s
+                .capsules
+                .values()
+                .filter(|r| r.tenant == tenant)
+                .filter(|r| project.is_none_or(|v| r.project.as_deref() == Some(v)))
+                .filter(|r| repo.is_none_or(|v| r.repo.as_deref() == Some(v)))
+                .filter(|r| module.is_none_or(|v| r.module.as_deref() == Some(v)))
+                .filter(|r| {
+                    capsule_type.is_none_or(|v| {
+                        serde_json::to_value(&r.capability_capsule_type)
+                            .ok()
+                            .and_then(|s| s.as_str().map(str::to_owned))
+                            .as_deref()
+                            == Some(v)
+                    })
+                })
+                .filter(|r| {
+                    status.is_none_or(|v| {
+                        serde_json::to_value(&r.status)
+                            .ok()
+                            .and_then(|s| s.as_str().map(str::to_owned))
+                            .as_deref()
+                            == Some(v)
+                    })
+                })
+                .filter(|r| source_agent.is_none_or(|v| r.source_agent == v))
+                .filter(|r| match cursor {
+                    None => true,
+                    Some((cur_updated, cur_id)) => {
+                        r.updated_at.as_str() < cur_updated
+                            || (r.updated_at.as_str() == cur_updated
+                                && r.capability_capsule_id.as_str() > cur_id)
+                    }
+                })
+                .cloned()
+                .collect();
+            rows.sort_by(|a, b| {
+                b.updated_at
+                    .cmp(&a.updated_at)
+                    .then_with(|| a.capability_capsule_id.cmp(&b.capability_capsule_id))
+            });
+            let has_more = rows.len() > lim;
+            rows.truncate(lim);
+            (rows, has_more)
         }))
     }
 }

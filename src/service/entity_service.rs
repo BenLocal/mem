@@ -11,7 +11,7 @@
 use crate::domain::{AddAliasOutcome, Entity, EntityKind, EntityWithAliases};
 use std::sync::Arc;
 
-use crate::storage::{StorageError, Store};
+use crate::storage::{Backend, StorageError};
 
 /// Error variants returned by [`EntityService::create_with_aliases`].
 ///
@@ -31,15 +31,15 @@ pub enum CreateWithAliasesError {
 
 #[derive(Clone)]
 pub struct EntityService {
-    /// Shared storage handle. The single `Store` exposes the full
-    /// entity surface (`resolve_or_create`, `add_alias`,
-    /// `lookup_alias`, `get_entity`, `list_entities`) — writes flow
-    /// to LanceStore and reads flow to DuckDbQuery internally.
-    store: Arc<Store>,
+    /// Shared storage handle. Phase 5: erased to `Arc<dyn Backend>`
+    /// (umbrella supertrait over the 9 storage sub-traits, including
+    /// `EntityRegistry`). The HTTP layer never touches `LanceStore`
+    /// or `DuckDbQuery` directly.
+    store: Arc<dyn Backend>,
 }
 
 impl EntityService {
-    pub fn new(store: Arc<Store>) -> Self {
+    pub fn new(store: Arc<dyn Backend>) -> Self {
         Self { store }
     }
 

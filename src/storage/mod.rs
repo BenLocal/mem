@@ -18,6 +18,7 @@
 //!   service / worker / HTTP layer carries.
 //! - `types` — shared row payloads + `StorageError` + `GraphError`.
 
+pub mod backend;
 pub mod capsule_search_store;
 pub mod capsule_store;
 pub mod duckdb_query;
@@ -35,6 +36,7 @@ pub mod time;
 pub mod transcript_store;
 pub mod types;
 
+pub use backend::Backend;
 pub use capsule_search_store::CapsuleSearchStore;
 pub use capsule_store::{CapsuleStore, InMemoryCapsuleStore};
 pub use embedding_job_store::EmbeddingJobStore;

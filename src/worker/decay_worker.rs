@@ -2,22 +2,22 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::time::sleep;
 
-use crate::storage::Store;
+use crate::storage::Backend;
 
 const DECAY_INTERVAL_SECS: u64 = 3600;
 const DECAY_RATE_PER_DAY: f64 = 0.01;
 const MS_PER_DAY: f64 = 86_400_000.0;
 
-pub async fn start_decay_worker(store: Arc<Store>) {
+pub async fn start_decay_worker(store: Arc<dyn Backend>) {
     loop {
         sleep(Duration::from_secs(DECAY_INTERVAL_SECS)).await;
-        if let Err(e) = apply_time_decay(&store).await {
+        if let Err(e) = apply_time_decay(&*store).await {
             eprintln!("decay_worker error: {e}");
         }
     }
 }
 
-async fn apply_time_decay(store: &Store) -> Result<(), Box<dyn std::error::Error>> {
+async fn apply_time_decay(store: &dyn Backend) -> Result<(), Box<dyn std::error::Error>> {
     // `memories.updated_at` is a 20-digit zero-padded ms-since-epoch
     // string (see `storage::current_timestamp`). Same encoding here.
     let now_ms = SystemTime::now().duration_since(UNIX_EPOCH)?.as_millis();
@@ -32,6 +32,7 @@ async fn apply_time_decay(store: &Store) -> Result<(), Box<dyn std::error::Error
 mod tests {
     use super::*;
     use crate::domain::capability_capsule::{CapabilityCapsuleRecord, CapabilityCapsuleStatus};
+    use crate::storage::Store;
     use tempfile::tempdir;
 
     fn ms_string(ms: u128) -> String {
