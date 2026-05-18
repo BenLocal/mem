@@ -3,7 +3,7 @@
 > 本文件是 [`mempalace-diff.md`](./mempalace-diff.md) 抽取出来的执行面板，便于单独维护与外发。
 > **新增 / 调整路线图项请先回 `mempalace-diff.md` 改对应章节，再同步更新本文件。** 设计原则、每项的论证、不做的事见原文档对应章节号（§5、§7、§8、§11、§12、§13、§14 等）。"现在差异快照"看 [§15](./mempalace-diff.md#15-当前差异快照2026-05-06)。
 >
-> **状态（2026-05-18）**：#1–#18 全部 ✅；#19/#20 仍待办（#19 = code_refs → entity(kind=file)；#20 = 内容自动抽取实体，需要单独决策）。批 H 三条 Quick Wins 落地——#16 (tags) + #17 (supersedes，审计发现早已 shipped) + #18 (transcript session)。
+> **状态（2026-05-18）**：#1–#19 全部 ✅；#20 仍待办（内容自动抽取实体，opt-in regex 路径，需要单独决策）。批 H 全 4 条（#16 tags / #17 supersedes / #18 session / #19 file）已落地，KG 入图入口扩展完工。
 >
 > **平行工作线**：MemPalace 对齐之外，**Backend 存储抽象**走独立 workstream，路线图见 [`backend-coupling.md`](./backend-coupling.md) §6（Phase 0–5 已 shipped；DuckDbQuery / LanceStore 已收窄 `pub(crate)`）。两条线 commit message 用各自的 close 引用（`closes ROADMAP #N` vs `closes backend-coupling §6 Phase N`），不互相阻塞。
 
@@ -28,7 +28,7 @@
 | 16 | 🔍 | ✅ **`tags` → `entity(kind=tag)` + `tagged` edge**（沿用 #8 entity registry 模式；ingest 时把 `tags[]` 路由通过 `EntityRegistry::resolve_or_create`）。预期 KG 边密度 3–5×，"找同 tag 的 memory" / "找同类 bug" 直接图遍历。新增 `EntityKind::Tag` variant；`contradicts:` 前缀的 tag 跳过（历史 artifact，不是真 tag）。历史数据回溯（吸收已有 capsules 的 tags）暂未做，需要时再写一次性脚本。 | 🟠 入图入口扩展 | M（实际 ~2h） | 低（沿现有模式） | `domain/entity.rs::EntityKind`、`pipeline/ingest.rs::extract_graph_edge_drafts`、`service::resolve_drafts_to_edges` |
 | 17 | 🔍 | ✅ **`memories.supersedes_memory_id` → `supersedes` graph edge**（数据已在 `memories` 列上）。**审计发现已 shipped**——`extract_graph_edge_drafts` lines 236-246 emit `ToNodeKind::LiteralMemory` with relation `supersedes` when `supersedes_capability_capsule_id` is set；wired through `edit_and_accept_pending`；unit test `extract_graph_edge_drafts_emits_literal_memory_for_supersedes` 覆盖。原 ROADMAP 文本是陈年误判。 | 🟢 数据已有，只缺一条边 | S（已落地） | 低 | `pipeline/ingest.rs` |
 | 18 | 🔍 | ✅ **transcript session → memory edge `extracted_from`**（每次 ingest 都 auto-bucket 进 session 并落一条 `memory:<id> --extracted_from--> session:<sid>` 边）。方向选 memory→session（不是 ROADMAP 原文的 session→memory）让 `close_edges_for_capability_capsule` 在 hard-delete 时自动 close 边，避免悬挂 edge。Session_id bypass entity registry——session_id 已是 canonical UUIDv7，无 alias 化需求，所以引入 `ToNodeKind::LiteralSession` 直写 `session:<id>` 节点。`mem mine` 路径无改动：ingest 的 auto-bucketing 已经把 session_id 设上去。 | 🟢 transcripts ↔ memories 之间唯一桥梁 | S（实际 ~1.5h） | 低 | `pipeline/ingest.rs`（`ToNodeKind::LiteralSession`、`session_node_id`、draft extraction）、`service::resolve_drafts_to_edges` |
-| 19 | 🔍 | 🚧 **`code_refs[]` → `entity(kind=file)` + `mentions_file` edge**（路径归一化：相对仓库根 / 跨 repo 用 `repo:<r>:file:<path>` 复合 alias）。"查所有提到 `src/storage/duckdb.rs` 的 memory" 走图。 | 🟠 代码定位入图 | M（半天） | 中（路径归一化坑：trailing slash / 大小写 / OS 差异） | `domain/entity.rs` 加 `EntityKind::File`、`pipeline/ingest.rs`、`storage/entity_registry.rs` |
+| 19 | 🔍 | ✅ **`code_refs[]` → `entity(kind=file)` + `mentions_file` edge**。新增 `EntityKind::File` + `normalize_file_ref` (剥 `:line` 后缀、剥 trailing `/`、保留 Windows 盘符) + `file_alias` 复合 (`<repo>:<path>` 或 bare path)。重复 ref 在 draft 层不去重——`sync_memory_edges` 的 `(from, to, relation)` idempotency check 收口。大小写归一化故意没做（Linux/macOS 大小写敏感，跨 OS 走 normalization 反而错）。 | 🟠 代码定位入图 | M（实际 ~1.5h） | 低（路径归一化只做无歧义的部分） | `domain/entity.rs::EntityKind`、`pipeline/ingest.rs`（`normalize_file_ref` / `file_alias` / `file_node_id`）、`service::resolve_drafts_to_edges` |
 | 20 | 🔍 | 🚧（LATER）**内容自动抽取实体**（regex 起步：commit hash `[0-9a-f]{7,40}`、Rust 函数名 `fn ([a-z_]+)`、文件路径、错误码；进 entity registry 时打 `auto_extracted=true` 标，便于审计 / 关闭）。opt-in `MEM_EXTRACT_ENTITIES=1`，避免给所有 caller 强加噪声。 | 🟡 KG 自动化扩展，长期天花板提升 | L（1–2 天） | 高（误抽 / 噪声 / Verbatim 边界） | 新 `pipeline/extractors.rs`、`service/memory_service.rs::ingest` 加 hook、entity 加 `auto_extracted` 列 |
 
 > **层（Layer）**：📦 = Verbatim 存储/输出纪律；🔍 = Structured 检索/排序/元数据；⚙️ = 基础设施 / 修 bug。
@@ -43,13 +43,13 @@
 > - **批 E（生命周期 / 卫生）** ✅ #7 + #8（decay worker + entity registry）。
 > - **批 F（无感集成）** ✅ #12（hooks + `mem mine` + `mem wake-up`）。
 > - **批 G（评估基础设施）** ✅ #14 + #15（recall ablation bench + LongMemEval parity bench）。
-> - **批 H（KG 入图入口拓宽，Quick Wins）** ✅ #16 + #17 + #18。实际 ~3.5h（远低于估的 ~9h），#17 审计发现早已 shipped。`#19` (code_refs) 另起；`#20` (内容抽取) 单独决策。
+> - **批 H（KG 入图入口拓宽）** ✅ #16 + #17 + #18 + #19。实际 ~5h（vs 估 ~13h），#17 审计发现早已 shipped；#19 路径归一化故意只做无歧义的部分（剥 `:line` / `/`，保留 Windows 盘符 + 大小写）。`#20` (内容抽取) 单独决策——风险高，需要先定 Verbatim 边界。
 
 ---
 
 ## 下一阶段
 
-#1–#18 已完成；#19/#20 待办，触发条件按性质分两条：
+#1–#19 已完成；#20 待办，触发条件按性质分两条：
 
 - **本质形态差异** — `mempalace-diff §15.1` 列举（HTTP vs MCP / DuckDB vs Chroma / lifecycle vs verbatim）。这些**不会主动消除**；改变只能在哲学路线整体重定义时讨论。
 - **新对齐项 / 实测 gap** — 当 mempalace 主仓有新设计或 mem 实测出新 gap 时：先回 `mempalace-diff.md` 加 / 改章节做论证，再回本文件追加新行号（#21+），同时更新 `mempalace-diff §15.2/15.3/15.4` 三张映射表保持一致。#16–#20 的论证沉在 [§5.1](./mempalace-diff.md#51-实测-kg-不够稠密2026-05-07-抽样)。

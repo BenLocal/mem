@@ -23,6 +23,17 @@ pub enum EntityKind {
     /// entity_id and lets `tagged` edges power "find all memories
     /// with this tag" via graph traversal instead of `tags @> array`.
     Tag,
+    /// Source-file path from `CapabilityCapsuleRecord.code_refs`.
+    /// Added in ROADMAP #19 — routing file refs through the entity
+    /// registry dedups variants ("src/foo.rs", "src/foo.rs:42")
+    /// to one canonical file entity and lets `mentions_file` edges
+    /// power "find all memories that touched this file" via graph
+    /// traversal instead of `code_refs @> array`. The alias uses
+    /// the composite `<repo>:<path>` form when the memory carries
+    /// a `repo` field (so `src/foo.rs` in repo `mem` is a distinct
+    /// entity from `src/foo.rs` in repo `other`); bare `<path>` when
+    /// no repo is set.
+    File,
 }
 
 impl EntityKind {
@@ -34,6 +45,7 @@ impl EntityKind {
             EntityKind::Module => "module",
             EntityKind::Workflow => "workflow",
             EntityKind::Tag => "tag",
+            EntityKind::File => "file",
         }
     }
 
@@ -45,6 +57,7 @@ impl EntityKind {
             "module" => Some(EntityKind::Module),
             "workflow" => Some(EntityKind::Workflow),
             "tag" => Some(EntityKind::Tag),
+            "file" => Some(EntityKind::File),
             _ => None,
         }
     }
@@ -80,6 +93,7 @@ mod tests {
             EntityKind::Module,
             EntityKind::Workflow,
             EntityKind::Tag,
+            EntityKind::File,
         ] {
             assert_eq!(EntityKind::from_db_str(k.as_db_str()), Some(k));
         }

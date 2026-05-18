@@ -146,6 +146,57 @@ pub fn session_node_id(session_id: &str) -> String {
     format!("session:{session_id}")
 }
 
+/// Node id for a file entity. Composite when `repo` is provided so
+/// `src/foo.rs` in repo `mem` is a distinct node from the same path
+/// in another repo. ROADMAP #19.
+pub fn file_node_id(repo: Option<&str>, path: &str) -> String {
+    match repo {
+        Some(r) => format!("file:{r}:{path}"),
+        None => format!("file:{path}"),
+    }
+}
+
+/// Normalize a `code_refs` entry into a file path suitable for use
+/// as an `EntityKind::File` alias. Strips:
+///
+/// 1. Leading / trailing whitespace.
+/// 2. A trailing `:<digits>` suffix (the `path:line_number` convention
+///    documented in `database-schema.md`). Detection uses the last `:`
+///    so Windows drive letters like `C:\foo\bar.rs` are preserved
+///    (their suffix is `\foo\bar.rs`, not digits).
+/// 3. Trailing `/`.
+///
+/// Returns `None` when the result is empty.
+pub fn normalize_file_ref(raw: &str) -> Option<String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let path = match trimmed.rsplit_once(':') {
+        Some((prefix, suffix))
+            if !suffix.is_empty() && suffix.chars().all(|c| c.is_ascii_digit()) =>
+        {
+            prefix
+        }
+        _ => trimmed,
+    };
+    let path = path.trim_end_matches('/');
+    if path.is_empty() {
+        None
+    } else {
+        Some(path.to_string())
+    }
+}
+
+/// Composite alias for the `EntityKind::File` entity registry — same
+/// shape as `Module`'s `<repo>:<module>`. ROADMAP #19.
+pub(crate) fn file_alias(repo: Option<&str>, path: &str) -> String {
+    match repo {
+        Some(r) => format!("{r}:{path}"),
+        None => path.to_string(),
+    }
+}
+
 /// Structured description of the target node in a draft edge.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ToNodeKind {
@@ -283,6 +334,27 @@ pub fn extract_graph_edge_drafts(memory: &CapabilityCapsuleRecord) -> Vec<GraphE
             relation: "supersedes".into(),
         });
     }
+    // ROADMAP #19: each `code_refs[]` entry becomes a
+    // `mentions_file` edge through `EntityKind::File`. Normalization
+    // drops the `path:line_number` suffix so `src/foo.rs:42` and
+    // `src/foo.rs` collapse to one file entity. When the memory has
+    // a `repo` field, the alias is composite (`<repo>:<path>`) so
+    // the same path in different repos is distinct — matches the
+    // `Module` entity's `<repo>:<module>` shape.
+    let repo_for_file_alias = memory.repo.as_deref().filter(|v| !v.trim().is_empty());
+    for raw_ref in memory.code_refs.iter() {
+        let Some(path) = normalize_file_ref(raw_ref) else {
+            continue;
+        };
+        drafts.push(GraphEdgeDraft {
+            from_node_id: from_node_id.clone(),
+            to_kind: ToNodeKind::EntityRef {
+                kind: EntityKind::File,
+                alias: file_alias(repo_for_file_alias, &path),
+            },
+            relation: "mentions_file".into(),
+        });
+    }
     // ROADMAP #18: every memory derived from a transcript session
     // (the `mem mine` path stamps `session_id`) gets a
     // `memory:<id> --extracted_from--> session:<sid>` edge. Direction
@@ -342,6 +414,19 @@ fn legacy_to_node_id(kind: &ToNodeKind) -> String {
             kind: EntityKind::Tag,
             alias,
         } => tag_node_id(alias),
+        ToNodeKind::EntityRef {
+            kind: EntityKind::File,
+            alias,
+        } => {
+            // Same composite-alias split as Module: first `:` splits
+            // the repo prefix from the path. Bare paths (no-repo case)
+            // become `file:<path>` without a repo component.
+            if let Some((r, p)) = alias.split_once(':') {
+                file_node_id(Some(r), p)
+            } else {
+                file_node_id(None, alias)
+            }
+        }
     }
 }
 
@@ -508,6 +593,112 @@ mod tests {
             &d.to_kind,
             ToNodeKind::LiteralMemory(id) if id == "m1"
         )));
+    }
+
+    #[test]
+    fn normalize_file_ref_strips_line_suffix_and_whitespace() {
+        assert_eq!(
+            normalize_file_ref("src/foo.rs:42"),
+            Some("src/foo.rs".into()),
+        );
+        assert_eq!(
+            normalize_file_ref("  src/foo.rs:42  "),
+            Some("src/foo.rs".into()),
+        );
+        assert_eq!(normalize_file_ref("src/foo.rs"), Some("src/foo.rs".into()));
+        assert_eq!(normalize_file_ref("src/"), Some("src".into()));
+        // Windows-style drive letter — last `:` suffix is `\foo.rs`,
+        // not digits, so the path is preserved verbatim.
+        assert_eq!(normalize_file_ref(r"C:\foo.rs"), Some(r"C:\foo.rs".into()),);
+        // Empty / whitespace input.
+        assert_eq!(normalize_file_ref(""), None);
+        assert_eq!(normalize_file_ref("   "), None);
+        assert_eq!(normalize_file_ref("/"), None);
+        // Only `:line` (no path) is normalized away too — a degenerate
+        // input that strips to empty string.
+        assert_eq!(normalize_file_ref(":42"), None);
+    }
+
+    #[test]
+    fn extract_graph_edge_drafts_emits_mentions_file_edges_with_repo_composite() {
+        // ROADMAP #19: each code_refs entry becomes a `mentions_file`
+        // edge through `EntityKind::File`. Composite alias prefixed
+        // with repo so the same path in different repos is distinct.
+        let memory = CapabilityCapsuleRecord {
+            capability_capsule_id: "m_file".to_string(),
+            repo: Some("mem".to_string()),
+            code_refs: vec![
+                "src/storage/lance_store/mod.rs".to_string(),
+                "src/storage/lance_store/mod.rs:1359".to_string(), // same file, line-stripped
+                "src/cache.rs".to_string(),
+                "".to_string(),    // skipped
+                "   ".to_string(), // skipped
+            ],
+            ..baseline_memory("m_file")
+        };
+        let drafts = extract_graph_edge_drafts(&memory);
+        let file_drafts: Vec<_> = drafts
+            .iter()
+            .filter(|d| {
+                matches!(
+                    &d.to_kind,
+                    ToNodeKind::EntityRef {
+                        kind: EntityKind::File,
+                        ..
+                    }
+                )
+            })
+            .collect();
+        // 3 drafts: src/storage/lance_store/mod.rs (×2 emitted, but
+        // both normalize to same alias), src/cache.rs. Note we emit
+        // duplicates at draft level — sync_memory_edges dedupes at
+        // insert time via the (from, to, relation) existence check.
+        assert_eq!(
+            file_drafts.len(),
+            3,
+            "empty / whitespace skipped, duplicates allowed at draft level",
+        );
+        let aliases: Vec<&str> = file_drafts
+            .iter()
+            .filter_map(|d| match &d.to_kind {
+                ToNodeKind::EntityRef { alias, .. } => Some(alias.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            aliases,
+            vec![
+                "mem:src/storage/lance_store/mod.rs",
+                "mem:src/storage/lance_store/mod.rs", // line-stripped → same alias
+                "mem:src/cache.rs",
+            ],
+        );
+        assert!(file_drafts.iter().all(|d| d.relation == "mentions_file"));
+        assert!(file_drafts
+            .iter()
+            .all(|d| d.from_node_id == "capability_capsule:m_file"));
+    }
+
+    #[test]
+    fn extract_graph_edge_drafts_mentions_file_bare_alias_when_no_repo() {
+        let memory = CapabilityCapsuleRecord {
+            capability_capsule_id: "m_no_repo".to_string(),
+            repo: None,
+            code_refs: vec!["docs/README.md".to_string()],
+            ..baseline_memory("m_no_repo")
+        };
+        let drafts = extract_graph_edge_drafts(&memory);
+        let file_alias_only: Vec<&str> = drafts
+            .iter()
+            .filter_map(|d| match &d.to_kind {
+                ToNodeKind::EntityRef {
+                    kind: EntityKind::File,
+                    alias,
+                } => Some(alias.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(file_alias_only, vec!["docs/README.md"]);
     }
 
     #[test]
