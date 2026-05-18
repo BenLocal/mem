@@ -185,6 +185,158 @@ lib unit tests + 125 integration tests across 17 suites green
   archive section updated to reflect LanceDB-native ANN replacing
   the old usearch sidecar.
 
+### KG ingestion expansion (ROADMAP #16 + #17 + #18 + #19)
+
+Batch H of the MemPalace-alignment ROADMAP — wires more sources of
+graph edges into ingest. Net result: knowledge-graph edge density
+3-5× higher per memory, lookups like "find all memories with this
+tag / from this session / that touched this file" become single
+graph traversals instead of array-scan SQL.
+
+#### Added
+
+- **`EntityKind::Tag`** + new `pipeline::ingest::tag_node_id`
+  helper. Every non-empty `tags[]` entry on a capsule emits a
+  `memory:<id> --tagged--> entity:<uuid>` edge through
+  `EntityRegistry::resolve_or_create`, so casing / whitespace
+  variants ("Rust" / " rust " / "RUST") collapse to one canonical
+  entity. `contradicts:` prefixed tags are skipped (historical
+  artifact, never produced by live ingest paths).
+- **`EntityKind::File`** + new helpers `file_node_id`,
+  `file_alias`, `normalize_file_ref` in `pipeline::ingest`. Every
+  `code_refs[]` entry emits a `memory:<id> --mentions_file-->
+  entity:<uuid>` edge. The normalizer strips `:<digits>` line
+  suffixes (last-`:` based — Windows drive letters like `C:\foo.rs`
+  survive verbatim because their suffix is `\foo.rs`, not digits)
+  and trims trailing slashes. Composite alias `<repo>:<path>` when
+  the memory has a `repo` field so the same path in different
+  repos is distinct; bare `<path>` otherwise.
+- **`ToNodeKind::LiteralSession(String)`** variant + new
+  `pipeline::ingest::session_node_id` helper. Every memory carrying
+  a non-blank `session_id` (every ingest auto-buckets into a
+  session via `pipeline::session::resolve_session`) emits a
+  `memory:<id> --extracted_from--> session:<sid>` edge. Direction
+  is memory→session (not session→memory) so
+  `close_edges_for_capability_capsule` auto-closes the edge on
+  capsule hard-delete instead of leaving a dangling pointer.
+  Session ids bypass `EntityRegistry` because they're already
+  canonical UUIDv7 — no alias normalization needed.
+- Three new unit tests in `pipeline::ingest::tests` covering
+  tagged + mentions_file + extracted_from edges, plus a path
+  normalization unit test covering line-suffix stripping, Windows
+  paths, trailing slashes, empty inputs.
+
+#### Audit
+
+- **ROADMAP #17 (`supersedes` graph edge)** was already shipped at
+  `pipeline/ingest.rs:236-246` — emits the edge through
+  `ToNodeKind::LiteralMemory` when `supersedes_capability_capsule_id`
+  is set. ROADMAP row was stale; marked ✅ retroactively.
+
+#### Changed
+
+- `tests/ingest_api.rs::get_memory_returns_full_record` —
+  previously asserted `graph_links == []` for a fresh capsule with
+  no scope fields. With #18 every ingest auto-buckets into a
+  session and writes the `extracted_from` edge, so the assertion
+  loosened to "exactly one `extracted_from` edge whose target
+  starts with `session:`".
+
+### Storage cleanup pass (audit A + B + C + D1 + D2)
+
+Targeted sweep across `src/storage/` after the Phase 5+
+`pub(crate)` flip surfaced accumulated cruft. Two doc-only / pure
+refactor commits + two real bug fixes.
+
+#### Added
+
+- `LanceStore::delete_feedback_events_by_capability_capsule_id` —
+  cascade helper mirroring the existing
+  `delete_embedding_jobs_by_capability_capsule_id`. Used by the
+  D2 cascade fix below.
+
+#### Changed
+
+- **`CapsuleStore::delete_capability_capsule_hard`** trait doc
+  now specs cascade contract explicitly: implementations MUST
+  cascade to `feedback_events` / `embedding_jobs` /
+  `capability_capsule_embeddings`; `graph_edges` SHOULD be
+  CLOSED (`valid_to = now`) not deleted, preserving the
+  time-travel `valid_from / valid_to` schema. Atomicity contract
+  inherited from Phase 5 pain #4 — NOT atomic across backends,
+  callers MUST be prepared for partial state, retry is safe
+  because every cascade helper is idempotent on empty-set input.
+- Lance, Postgres, and InMemory backends all updated to honor the
+  new cascade contract. Postgres wraps the entire cascade in
+  `BEGIN/COMMIT` (real transaction, tightens guarantee on that
+  backend without changing the caller surface).
+- **`Store` inherent methods** — 7 pure-delegate methods that
+  carried stale "TODO: route to DuckDbQuery once added" comments
+  (`feedback_summary`, `get_capability_capsule`,
+  `latest_active_session`, `list_successful_episodes_for_tenant`,
+  `list_embedding_jobs`, `get_capability_capsule_embedding_row`,
+  `latest_embedding_job_status_for_hash`) inlined into their
+  corresponding trait impl bodies and removed from the inherent
+  surface. Phase 5 made the routing decision moot (services
+  dispatch through traits, not inherent methods) so the TODO was
+  inviting work that wouldn't change observable behavior.
+- **Module-level doc blocks** rewritten in
+  `src/storage/lance_store/mod.rs` (50 lines of "skeleton",
+  "alternate backend to DuckDbRepository", "Status: read path
+  fully working", "Mutating methods are still
+  `unimplemented!()`", "Schema mapping planned, not yet
+  enforced", "behind a `lancedb` Cargo feature") and
+  `src/storage/duckdb_query/mod.rs` (60 lines of "Coverage so
+  far" lists + "The next commit introduces the Store composition
+  layer") to reflect current architecture: implementation halves
+  behind the `Backend` umbrella, write/read split documented, no
+  more "in progress" framing.
+- **11 `DuckDbRepository` / "legacy DuckDB" comment references**
+  scrubbed across `types.rs`, `lance_store/{episodes,sessions,
+  transcripts,capability_capsules,mod}.rs`, and
+  `duckdb_query/{mod,transcripts,entities}.rs`. The
+  `DuckDbRepository` type was deleted months ago; comments
+  describing the code as "mirroring" it were misleading. Updated
+  to describe the code's current shape directly.
+
+#### Fixed
+
+- **`DuckDbQuery::list_capability_capsule_versions_for_tenant`
+  (D1)** — took `capability_capsule_id` as a parameter but
+  ignored it (`let _ = capability_capsule_id;` at the top of the
+  body), returning version links for EVERY capsule in the tenant.
+  Service-layer `get_memory_detail` expected the chain rooted at
+  the requested id, so callers got over-broad results when the
+  tenant had more than one chain. The bug hid behind a passing
+  integration test (`get_memory_returns_full_version_chain_for_successor_ids`)
+  whose fixture happened to seed a tenant with only one chain —
+  broken impl and correct impl returned the same set. Rewrote as
+  a single recursive CTE that anchors on `(tenant, id)` and
+  recurses both directions of the supersedes link with the tenant
+  filter applied at every step. New unit tests assert chain
+  isolation from unrelated rows in the same tenant + cross-tenant
+  isolation.
+- **`*::delete_capability_capsule_hard` cascade (D2)** —
+  previously deleted only the `capability_capsules` row,
+  leaving orphans in `feedback_events`, `embedding_jobs`,
+  `capability_capsule_embeddings`, and outgoing `graph_edges`.
+  Because capsule ids are uuidv7 (never reused), orphan rows
+  accumulated monotonically — no future capsule could ever
+  collide with a deleted id to incidentally clean up. Lance
+  impl now sequences DELETE on the 3 satellites + CLOSE on
+  outgoing graph_edges; Postgres wraps the cascade in
+  `BEGIN/COMMIT`; InMemory clears the matching feedback events
+  from the state vec. New parity test
+  `delete_hard_cascades_feedback_events` runs against both Lance
+  and InMemory.
+
+Net storage-cleanup diff: -94 lines (A+B+C, pure refactor) +
+~250 lines / -33 lines (D1 + D2, real bug fixes with new tests).
+185 lib unit tests + 30 capsule_store_parity tests (+2 cascade)
++ 95 other integration tests across 19 suites green. `cargo fmt
+--check` + `cargo clippy --all-targets` clean on both default and
+`--features postgres`.
+
 ---
 
 ## 2026-05-07 — `0.1.1`
