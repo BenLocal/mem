@@ -88,17 +88,29 @@ pub struct AutoPromoteSettings {
 pub struct VacuumSettings {
     /// Worker is not spawned when true. Default false (worker is ON).
     pub disabled: bool,
-    /// Sweep cadence in seconds. Default 86_400 (daily). The actual
-    /// vacuum call is fast on small DBs but can hold a write lock
-    /// for a few seconds on multi-GB Lance datasets, so don't
-    /// schedule it more aggressively than necessary.
+    /// Sweep cadence in seconds. Default 3_600 (hourly). High-churn
+    /// tables (`transcript_embedding_jobs`,
+    /// `conversation_message_embeddings`) accumulate manifest bloat
+    /// in single-digit-GB / day for active users, so hourly tick
+    /// keeps the `_versions/` directory bounded. The vacuum call
+    /// itself is fast on small DBs and ~seconds on multi-GB Lance
+    /// datasets — well within an hour.
     pub interval_secs: u64,
     /// Minimum age of a Lance manifest before it qualifies for
-    /// pruning. The Lance default is 7 days, which is the safety
-    /// margin against in-flight transactions when
-    /// `delete_unverified=false` (the default). Lower at your own
-    /// risk; never set to 0 in production.
+    /// pruning. Default 0 — vacuum every manifest that LanceDB's
+    /// pruner deems removable. Combined with [`Self::aggressive`]
+    /// (true by default), this clears every old version including
+    /// the last 7 days.
     pub older_than_days: u64,
+    /// When true, vacuum calls `Prune` with `delete_unverified=true`,
+    /// bypassing Lance's hard 7-day floor for in-flight transactions.
+    /// Default true — mem is single-writer (one `mem serve` per DB
+    /// path), so the floor that protects multi-writer crash recovery
+    /// is over-conservative for the local-first deployment shape.
+    /// Set `MEM_VACUUM_PRESERVE_UNVERIFIED=1` to opt OUT and restore
+    /// the 7-day floor (useful when running mem on top of a shared
+    /// lance dataset that another writer touches concurrently).
+    pub aggressive: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -321,16 +333,19 @@ impl AutoPromoteSettings {
 }
 
 impl VacuumSettings {
-    /// Development / test defaults: worker ON, daily cadence, 7-day
-    /// safety margin. Matches `decay_worker`'s "always-on
-    /// maintenance" stance — only test-suite `Config::local()`
-    /// callers care about the worker spawning, and the worker is a
-    /// no-op on an empty store anyway.
+    /// Development / test defaults: worker ON, **hourly** cadence,
+    /// **aggressive** prune (0-day cutoff + `delete_unverified=true`).
+    /// These defaults assume the single-writer local-first
+    /// deployment shape — one `mem serve` per DB path, no other
+    /// process touching the lance dir. For shared deployments set
+    /// `MEM_VACUUM_PRESERVE_UNVERIFIED=1` to restore the 7-day
+    /// in-flight safety floor.
     pub fn development_defaults() -> Self {
         Self {
             disabled: false,
-            interval_secs: 86_400,
-            older_than_days: 7,
+            interval_secs: 3_600,
+            older_than_days: 0,
+            aggressive: true,
         }
     }
 
@@ -355,15 +370,21 @@ impl VacuumSettings {
             let n: u64 = raw
                 .parse()
                 .map_err(|_| ConfigError::InvalidVacuumOlderThanDays(raw.clone()))?;
-            // `0` is allowed via the HTTP endpoint (operator-driven
-            // immediate-relief vacuum) but rejected as a worker
-            // configuration — a worker that prunes everything
-            // including 5-second-old manifests fights every in-flight
-            // write. The HTTP endpoint can override via its own param.
-            if n == 0 {
-                return Err(ConfigError::InvalidVacuumOlderThanDays(raw));
-            }
+            // `0` is the new default — every manifest LanceDB's
+            // pruner can remove gets removed. Negative values would
+            // be nonsensical (`u64` rules those out already).
             s.older_than_days = n;
+        }
+
+        // Opt-OUT of aggressive prune by setting
+        // MEM_VACUUM_PRESERVE_UNVERIFIED=1 (or true/yes). Default
+        // aggressive=true assumes single-writer local-first; shared
+        // / multi-writer deployments should opt out to keep the
+        // 7-day in-flight safety floor.
+        if let Some(raw) = get("MEM_VACUUM_PRESERVE_UNVERIFIED") {
+            if matches!(raw.to_ascii_lowercase().as_str(), "1" | "true" | "yes") {
+                s.aggressive = false;
+            }
         }
 
         Ok(s)
@@ -610,8 +631,11 @@ mod tests {
     fn vacuum_defaults_on() {
         let s = VacuumSettings::from_env_vars(|_| None).unwrap();
         assert!(!s.disabled);
-        assert_eq!(s.interval_secs, 86_400);
-        assert_eq!(s.older_than_days, 7);
+        // Hourly cadence + aggressive 0-day cutoff + bypass-the-7-day-
+        // floor — the single-writer local-first defaults.
+        assert_eq!(s.interval_secs, 3_600);
+        assert_eq!(s.older_than_days, 0);
+        assert!(s.aggressive);
     }
 
     #[test]
@@ -634,10 +658,33 @@ mod tests {
     }
 
     #[test]
-    fn vacuum_older_than_zero_rejected() {
-        let err =
-            VacuumSettings::from_env_vars(env(&[("MEM_VACUUM_OLDER_THAN_DAYS", "0")])).unwrap_err();
-        assert!(matches!(err, ConfigError::InvalidVacuumOlderThanDays(ref s) if s == "0"));
+    fn vacuum_older_than_zero_accepted() {
+        // `0` is the new default per development_defaults — every
+        // manifest LanceDB's pruner can remove gets removed. The
+        // previous "reject 0" guard predated the aggressive-default
+        // flip and would have made the default invalid.
+        let s =
+            VacuumSettings::from_env_vars(env(&[("MEM_VACUUM_OLDER_THAN_DAYS", "0")])).unwrap();
+        assert_eq!(s.older_than_days, 0);
+    }
+
+    #[test]
+    fn vacuum_preserve_unverified_opts_out_of_aggressive() {
+        // Default is aggressive=true; the env flag flips it to false
+        // to restore Lance's hard 7-day in-flight safety floor for
+        // multi-writer / shared-dataset deployments.
+        for raw in ["1", "true", "yes", "TRUE"] {
+            let s =
+                VacuumSettings::from_env_vars(env(&[("MEM_VACUUM_PRESERVE_UNVERIFIED", raw)]))
+                    .unwrap();
+            assert!(!s.aggressive, "{raw:?} should opt out of aggressive");
+        }
+        for raw in ["0", "false", "no", ""] {
+            let s =
+                VacuumSettings::from_env_vars(env(&[("MEM_VACUUM_PRESERVE_UNVERIFIED", raw)]))
+                    .unwrap();
+            assert!(s.aggressive, "{raw:?} should leave aggressive on");
+        }
     }
 
     #[test]

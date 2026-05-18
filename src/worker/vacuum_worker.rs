@@ -32,11 +32,18 @@ pub async fn run(store: Arc<dyn Backend>, settings: VacuumSettings) {
     info!(
         interval_secs = settings.interval_secs,
         older_than_days = settings.older_than_days,
+        aggressive = settings.aggressive,
         "vacuum_worker started",
     );
     loop {
         sleep(interval).await;
-        match sweep_once(&*store, settings.older_than_days as i64).await {
+        match sweep_once(
+            &*store,
+            settings.older_than_days as i64,
+            settings.aggressive,
+        )
+        .await
+        {
             Ok(stats) if stats.bytes_removed > 0 => {
                 info!(
                     bytes_removed = stats.bytes_removed,
@@ -56,12 +63,16 @@ pub async fn run(store: Arc<dyn Backend>, settings: VacuumSettings) {
 
 /// One sweep pass. Extracted so `POST /admin/vacuum` and the
 /// integration tests can drive the same logic without spinning up
-/// the loop.
+/// the loop. `aggressive=true` bypasses the 7-day in-flight safety
+/// floor (default for the single-writer local-first deploy).
 pub async fn sweep_once(
     store: &dyn Backend,
     older_than_days: i64,
+    aggressive: bool,
 ) -> Result<VacuumStats, crate::storage::StorageError> {
-    store.vacuum_old_versions(older_than_days).await
+    store
+        .vacuum_old_versions_with(older_than_days, aggressive)
+        .await
 }
 
 #[cfg(test)]
@@ -95,7 +106,7 @@ mod tests {
         // recent. With `older_than_days=0` the call still succeeds
         // and just reports zero-ish numbers, but the eagerly created
         // tables all exist so `tables_pruned` > 0.
-        let stats = sweep_once(&store, 0).await.unwrap();
+        let stats = sweep_once(&store, 0, true).await.unwrap();
         assert!(
             stats.tables_pruned > 0,
             "expected to visit at least one eagerly-created table, got {stats:?}",
@@ -118,10 +129,10 @@ mod tests {
             // production workload from the embedding worker.)
             let _ = store.accept_pending("t", "a").await;
         }
-        let before = sweep_once(&store, 999_999).await.unwrap();
+        let before = sweep_once(&store, 999_999, true).await.unwrap();
         assert_eq!(before.bytes_removed, 0, "high cutoff must remove nothing");
 
-        let after = sweep_once(&store, 0).await.unwrap();
+        let after = sweep_once(&store, 0, true).await.unwrap();
         assert!(
             after.bytes_removed > 0 || after.old_versions_removed > 0,
             "older_than=0 should reclaim something; got {after:?}",

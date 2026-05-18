@@ -53,27 +53,28 @@ const ALL_TABLES: &[&str] = &[
 impl LanceStore {
     /// Prune Lance version manifests older than `older_than_days`
     /// across every managed table. Idempotent and read-safe with
-    /// concurrent queries (Lance datasets are MVCC under the hood).
+    /// concurrent queries on the same `LanceStore` instance
+    /// (Lance datasets are MVCC under the hood).
     ///
-    /// `older_than_days = 0` is a valid operator override that
-    /// reclaims everything except the current version — the config
-    /// layer rejects it for the periodic worker, but the
-    /// `POST /admin/vacuum` HTTP path can pass it through for
-    /// immediate-relief sweeps on a developer machine. Always uses
-    /// `delete_unverified=false` (the Lance default), so the 7-day
-    /// safety margin against in-flight transactions still applies —
-    /// only versions strictly older than the `older_than_days`
-    /// cutoff AND committed at least 7 days ago will be removed
-    /// when the override goes below 7.
-    pub async fn vacuum_old_versions(
+    /// `aggressive=true` bypasses Lance's hard 7-day in-flight
+    /// safety floor (single-writer local-first default — see
+    /// [`crate::config::VacuumSettings::aggressive`]).
+    /// `aggressive=false` keeps the floor for multi-writer /
+    /// shared-dataset deployments.
+    pub async fn vacuum_old_versions_with(
         &self,
         older_than_days: i64,
+        aggressive: bool,
     ) -> Result<VacuumStats, StorageError> {
         let older_than = Duration::try_days(older_than_days).ok_or_else(|| {
             StorageError::InvalidInput(format!(
                 "older_than_days {older_than_days} cannot be converted to Duration",
             ))
         })?;
+        // `Some(true)` ↔ bypass the 7-day floor (single-writer
+        // local-first deploy); `None` ↔ Lance default (`false` =
+        // keep the floor, safe for shared/multi-writer setups).
+        let delete_unverified = if aggressive { Some(true) } else { None };
         let mut agg = VacuumStats::default();
         for name in ALL_TABLES {
             let table = match self.conn.open_table(*name).execute().await {
@@ -89,7 +90,7 @@ impl LanceStore {
             let stats: OptimizeStats = table
                 .optimize(OptimizeAction::Prune {
                     older_than: Some(older_than),
-                    delete_unverified: None,
+                    delete_unverified,
                     error_if_tagged_old_versions: None,
                 })
                 .await

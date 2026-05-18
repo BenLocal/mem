@@ -817,19 +817,6 @@ impl Store {
     /// `crate::worker::vacuum_worker` on a daily cadence and
     /// exposed on-demand via `POST /admin/vacuum`.
     ///
-    /// **LANCE-SPECIFIC**: Lance is copy-on-write, every UPDATE
-    /// writes a new manifest, old ones accumulate. Postgres has
-    /// autovacuum; SQLite has no equivalent concept. `MaintenanceStore`
-    /// trait (if it survives) should be capability-style — "if backend
-    /// supports prune, it has this method" — not a uniform interface.
-    pub async fn vacuum_old_versions(
-        &self,
-        older_than_days: i64,
-    ) -> Result<crate::storage::lance_store::VacuumStats, StorageError> {
-        self.commit_lance_write(self.lance.vacuum_old_versions(older_than_days).await)
-            .await
-    }
-
     /// Bulk decay sweep over `memories.decay_score`. Routes to
     /// DuckDbQuery — issued as a single SQL UPDATE via the lance
     /// extension (per-row Rust iteration is not viable for this

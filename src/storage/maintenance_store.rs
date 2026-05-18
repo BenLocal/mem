@@ -39,7 +39,22 @@ pub trait MaintenanceStore: Send + Sync {
     /// Prune Lance version manifests older than `older_than_days`
     /// across every managed table. Lance-specific by construction;
     /// non-Lance backends should return a zero-stats `VacuumStats`.
-    async fn vacuum_old_versions(&self, older_than_days: i64) -> Result<VacuumStats, StorageError>;
+    /// Trait default goes through the aggressive path
+    /// ([`Self::vacuum_old_versions_with`] with `aggressive=true`).
+    async fn vacuum_old_versions(&self, older_than_days: i64) -> Result<VacuumStats, StorageError> {
+        self.vacuum_old_versions_with(older_than_days, true).await
+    }
+
+    /// Explicit-flag variant. `aggressive=true` bypasses Lance's
+    /// hard 7-day in-flight safety floor (single-writer
+    /// local-first default); `aggressive=false` keeps the floor
+    /// (multi-writer / shared-dataset deployments). Non-Lance
+    /// backends ignore the flag and return zero-stats.
+    async fn vacuum_old_versions_with(
+        &self,
+        older_than_days: i64,
+        aggressive: bool,
+    ) -> Result<VacuumStats, StorageError>;
 
     /// Capsules eligible for auto-promote: `status=pending`,
     /// `updated_at < cutoff_updated_at`, `decay_score <
@@ -66,8 +81,19 @@ impl MaintenanceStore for Store {
         Store::apply_time_decay(self, decay_rate_per_day, now_ms, ms_per_day, now_ms_str).await
     }
 
-    async fn vacuum_old_versions(&self, older_than_days: i64) -> Result<VacuumStats, StorageError> {
-        Store::vacuum_old_versions(self, older_than_days).await
+    async fn vacuum_old_versions_with(
+        &self,
+        older_than_days: i64,
+        aggressive: bool,
+    ) -> Result<VacuumStats, StorageError> {
+        // commit_lance_write refreshes the DuckDB snapshot so the
+        // post-vacuum manifest set is visible immediately to readers.
+        self.commit_lance_write(
+            self.lance
+                .vacuum_old_versions_with(older_than_days, aggressive)
+                .await,
+        )
+        .await
     }
 
     async fn auto_promote_candidates(

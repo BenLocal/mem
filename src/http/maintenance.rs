@@ -20,15 +20,17 @@ pub fn router() -> Router<AppState> {
 ///
 /// `older_than_days` overrides the configured cutoff for this one
 /// call only — useful when an operator wants to reclaim everything
-/// right now and is OK with a more aggressive prune than the daily
-/// worker uses. The Lance default 7-day in-flight-transaction safety
-/// margin still applies (the storage layer never passes
-/// `delete_unverified=true`).
+/// right now. `preserve_unverified` (default `false` to match the
+/// `aggressive=true` worker default) opts back into Lance's 7-day
+/// in-flight safety floor for this one call — set when running
+/// alongside another writer on the same lance dir.
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "snake_case")]
 struct VacuumRequest {
     #[serde(default)]
     older_than_days: Option<i64>,
+    #[serde(default)]
+    preserve_unverified: bool,
 }
 
 async fn vacuum(
@@ -37,13 +39,19 @@ async fn vacuum(
 ) -> Result<Json<VacuumStats>, AppError> {
     let body = request.map(|Json(r)| r).unwrap_or(VacuumRequest {
         older_than_days: None,
+        preserve_unverified: false,
     });
     let cutoff = body
         .older_than_days
         .unwrap_or(app.config.vacuum.older_than_days as i64);
+    // Body flag wins over config: explicit `preserve_unverified=true`
+    // on a single call always restores the 7-day floor for that
+    // call, regardless of whether the daemon's worker runs in
+    // aggressive mode.
+    let aggressive = !body.preserve_unverified && app.config.vacuum.aggressive;
     let stats = app
         .capability_capsule_service
-        .vacuum(cutoff)
+        .vacuum(cutoff, aggressive)
         .await
         .map_err(AppError::from)?;
     Ok(Json(stats))

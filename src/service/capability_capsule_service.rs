@@ -774,15 +774,18 @@ impl CapabilityCapsuleService {
     }
 
     /// Service entry point for the Lance vacuum sweep — delegates to
-    /// `Store::vacuum_old_versions` via the worker helper. Used by
-    /// `POST /admin/vacuum` for on-demand operator runs; the
-    /// background worker (when enabled) bypasses this and calls the
-    /// worker function directly.
+    /// `MaintenanceStore::vacuum_old_versions_with` via the worker
+    /// helper. Used by `POST /admin/vacuum` for on-demand operator
+    /// runs; the background worker (when enabled) bypasses this and
+    /// calls the worker function directly. `aggressive=true`
+    /// bypasses Lance's 7-day in-flight safety floor (single-writer
+    /// local-first default per `VacuumSettings::development_defaults`).
     pub async fn vacuum(
         &self,
         older_than_days: i64,
+        aggressive: bool,
     ) -> Result<crate::storage::VacuumStats, ServiceError> {
-        crate::worker::vacuum_worker::sweep_once(&*self.store, older_than_days)
+        crate::worker::vacuum_worker::sweep_once(&*self.store, older_than_days, aggressive)
             .await
             .map_err(ServiceError::Storage)
     }
