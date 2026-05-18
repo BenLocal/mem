@@ -188,9 +188,25 @@ pub trait CapsuleStore: Send + Sync {
         feedback: FeedbackEvent,
     ) -> Result<CapabilityCapsuleRecord, StorageError>;
 
-    /// Hard delete (irreversible). Cascade-deletes from satellite
-    /// tables is a backend-implementation concern; see the
-    /// LANCE-SPECIFIC cascade note in `capability_capsule_service`.
+    /// Hard delete (irreversible). Trait contract: implementations
+    /// MUST cascade to remove dependent rows in `feedback_events`,
+    /// `embedding_jobs`, and `capability_capsule_embeddings` so the
+    /// caller does not have to choreograph satellite cleanup. Graph
+    /// edges where this capsule is the FROM node SHOULD be **closed**
+    /// (`valid_to = now`) rather than deleted, preserving the
+    /// time-travel `graph_edges.valid_from / valid_to` semantics.
+    ///
+    /// **Atomicity contract — NOT atomic across backends.** Same
+    /// shape as [`Self::replace_pending_with_successor`] and
+    /// [`Self::apply_feedback`]: backends that have transactions
+    /// (Postgres) MAY wrap the cascade in `BEGIN/COMMIT`; Lance
+    /// cannot. Callers MUST be prepared for partial-state failures
+    /// (capsule row gone, one or more satellite tables still
+    /// carrying orphans) and SHOULD retry on cascade errors — every
+    /// cascade helper is idempotent on empty-set inputs.
+    ///
+    /// Returns `Err(InvalidData("memory not found"))` when the
+    /// capsule row doesn't exist (no cascade attempted in that case).
     async fn delete_capability_capsule_hard(
         &self,
         tenant: &str,
@@ -702,6 +718,14 @@ impl CapsuleStore for InMemoryCapsuleStore {
                 return Err(StorageError::InvalidData("memory not found"));
             }
             s.capsules.remove(capability_capsule_id);
+            // Trait contract: cascade satellite tables. The InMemory
+            // backend only stores capsules + feedback events; drop
+            // matching feedback rows so `feedback_summary` for the
+            // deleted id returns the default after the cascade.
+            // (Other satellites — embedding_jobs / embeddings /
+            // graph_edges — aren't modeled in this dev/test backend.)
+            s.feedback
+                .retain(|ev| ev.capability_capsule_id != capability_capsule_id);
             Ok(())
         })
     }

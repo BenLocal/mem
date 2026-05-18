@@ -259,6 +259,49 @@ async fn delete_hard_removes_row(backend: Arc<dyn CapsuleStore>) {
     assert!(got.is_none(), "row should be gone after hard delete");
 }
 
+async fn delete_hard_cascades_feedback_events(backend: Arc<dyn CapsuleStore>) {
+    // Trait contract (audit D2): hard delete MUST cascade to
+    // satellite tables; specifically `feedback_events` rows
+    // referencing the deleted capsule_id are not allowed to linger
+    // as orphans. Other satellites (`embedding_jobs`,
+    // `capability_capsule_embeddings`, `graph_edges`) are tested at
+    // the Lance-backend level — `InMemoryCapsuleStore` doesn't model
+    // them.
+    let capsule = fixture("casc", CapabilityCapsuleStatus::Active);
+    backend
+        .insert_capability_capsule(capsule.clone())
+        .await
+        .unwrap();
+    backend
+        .apply_feedback(
+            &capsule,
+            FeedbackEvent {
+                feedback_id: "fb_cascade_1".into(),
+                capability_capsule_id: "casc".into(),
+                feedback_kind: FeedbackKind::Useful.as_str().to_string(),
+                created_at: current_timestamp(),
+                note: None,
+            },
+        )
+        .await
+        .unwrap();
+    // Confirm the feedback row landed (sanity check) before delete.
+    let before = backend.feedback_summary("casc").await.unwrap();
+    assert_eq!(before.total, 1, "precondition: feedback event seeded");
+    backend
+        .delete_capability_capsule_hard("t", "casc")
+        .await
+        .unwrap();
+    // After hard delete the feedback_events rows for this capsule
+    // MUST be gone — orphan rows would surface here as a non-zero
+    // total.
+    let after = backend.feedback_summary("casc").await.unwrap();
+    assert_eq!(
+        after.total, 0,
+        "cascade contract: feedback events for deleted capsule must be cleared",
+    );
+}
+
 async fn fetch_by_ids_returns_only_requested(backend: Arc<dyn CapsuleStore>) {
     backend
         .insert_capability_capsule(fixture("a", CapabilityCapsuleStatus::Active))
@@ -362,6 +405,7 @@ parity!(apply_feedback_useful_raises_confidence);
 parity!(apply_feedback_incorrect_archives);
 parity!(feedback_summary_counts_auto_promoted);
 parity!(delete_hard_removes_row);
+parity!(delete_hard_cascades_feedback_events);
 parity!(fetch_by_ids_returns_only_requested);
 parity!(fetch_by_ids_empty_short_circuits);
 parity!(replace_pending_with_successor_chains);

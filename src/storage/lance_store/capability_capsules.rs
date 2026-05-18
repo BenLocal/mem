@@ -523,6 +523,45 @@ impl LanceStore {
         Ok(())
     }
 
+    /// Delete every `feedback_events` row referencing this capsule.
+    /// Cascade helper called by [`Self::delete_capability_capsule_hard`].
+    /// Returns the number of rows removed (pre-count is canonical
+    /// because Lance servers older than this codebase may report 0
+    /// in `num_deleted_rows`).
+    pub async fn delete_feedback_events_by_capability_capsule_id(
+        &self,
+        capability_capsule_id: &str,
+    ) -> Result<usize, StorageError> {
+        let table = self
+            .conn
+            .open_table("feedback_events")
+            .execute()
+            .await
+            .map_err(lancedb_err)?;
+        let count = table
+            .count_rows(Some(format!(
+                "capability_capsule_id = {}",
+                sql_quote(capability_capsule_id)
+            )))
+            .await
+            .map_err(lancedb_err)?;
+        if count == 0 {
+            return Ok(0);
+        }
+        let result = table
+            .delete(&format!(
+                "capability_capsule_id = {}",
+                sql_quote(capability_capsule_id)
+            ))
+            .await
+            .map_err(lancedb_err)?;
+        if result.num_deleted_rows == 0 {
+            Ok(count)
+        } else {
+            Ok(usize::try_from(result.num_deleted_rows).unwrap_or(count))
+        }
+    }
+
     pub async fn delete_embedding_jobs_by_capability_capsule_id(
         &self,
         capability_capsule_id: &str,
@@ -775,6 +814,34 @@ impl LanceStore {
         Ok(summary)
     }
 
+    /// Hard-delete a capsule + its satellite rows in 4 dependent
+    /// tables. Order:
+    ///
+    /// 1. `capability_capsules` row (also serves as
+    ///    existence-check — `InvalidData("memory not found")` when
+    ///    the row isn't there, no satellite work attempted).
+    /// 2. `feedback_events` rows referencing this capsule_id.
+    /// 3. `embedding_jobs` rows referencing this capsule_id.
+    /// 4. `capability_capsule_embeddings` row (one per capsule).
+    /// 5. `graph_edges` rows where this capsule is the FROM node —
+    ///    these are *closed* (`valid_to = now`) rather than deleted,
+    ///    preserving the time-travel graph history per the
+    ///    `valid_from / valid_to` schema. Forward-facing edges
+    ///    pointing AT this capsule from elsewhere are NOT
+    ///    auto-handled (no `to_node_id`-rooted close helper today);
+    ///    they survive as dangling pointers — accepted as the
+    ///    cheaper trade-off vs. running a tenant-wide scan on every
+    ///    hard-delete.
+    ///
+    /// **Atomicity contract** (same as
+    /// `CapsuleStore::replace_pending_with_successor`,
+    /// `CapsuleStore::apply_feedback` — Phase 5 pain #4): LanceDB has
+    /// no cross-table transaction, so a crash between steps 1 and 5
+    /// leaves the capsule gone but one or more satellite tables
+    /// still holding orphans. Re-running the call is safe — every
+    /// cascade helper is idempotent (delete-from-empty-set is a
+    /// no-op + step 1 returns NotFound) so the caller can retry
+    /// until it returns NotFound to confirm clean state.
     pub async fn delete_capability_capsule_hard(
         &self,
         tenant: &str,
@@ -797,13 +864,19 @@ impl LanceStore {
         if result.num_deleted_rows == 0 {
             return Err(StorageError::InvalidData("memory not found"));
         }
-        // TODO: cascade-delete from `embedding_jobs` /
-        // `capability_capsule_embeddings` / `feedback_events` /
-        // `graph_edges` — these satellite tables all exist on the
-        // Lance side now but hard-delete doesn't reach into them, so
-        // the capsule row goes away and its embedding job / vector /
-        // feedback events / outgoing graph edges become orphans.
-        // Tracked in `docs/backend-coupling.md` followups.
+        // Cascade. Each helper is idempotent on empty-set inputs.
+        // Errors propagate so the caller observes partial-state
+        // failures; per the atomicity contract, retry of the same
+        // hard-delete call after a cascade failure is safe.
+        self.delete_feedback_events_by_capability_capsule_id(capability_capsule_id)
+            .await?;
+        self.delete_embedding_jobs_by_capability_capsule_id(capability_capsule_id)
+            .await?;
+        self.delete_capability_capsule_embedding(capability_capsule_id)
+            .await?;
+        self.close_edges_for_capability_capsule(capability_capsule_id)
+            .await
+            .map_err(|e| StorageError::InvalidInput(format!("close edges: {e}")))?;
         Ok(())
     }
 

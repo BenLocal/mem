@@ -605,19 +605,36 @@ impl CapsuleStore for PostgresCapsuleStore {
         tenant: &str,
         capability_capsule_id: &str,
     ) -> Result<(), StorageError> {
+        // ATOMIC via BEGIN/COMMIT — Postgres has real transactions
+        // so the trait's non-atomic-across-backends contract can be
+        // tightened on this backend without changing the caller
+        // observation surface. If the capsule row delete affects 0
+        // rows we roll back without touching `feedback_events`.
+        // Future migration adding `embedding_jobs` /
+        // `capability_capsule_embeddings` tables to the Postgres
+        // schema would add their DELETEs to this transaction too.
+        let mut tx = self.pool.begin().await.map_err(sqlx_err)?;
         let rows_affected = sqlx::query(
             "DELETE FROM capability_capsules \
              WHERE tenant = $1 AND capability_capsule_id = $2",
         )
         .bind(tenant)
         .bind(capability_capsule_id)
-        .execute(&self.pool)
+        .execute(&mut *tx)
         .await
         .map_err(sqlx_err)?
         .rows_affected();
         if rows_affected == 0 {
             return Err(StorageError::InvalidData("memory not found"));
         }
+        // Cascade — feedback_events is the only satellite the Phase 4
+        // Postgres schema currently models.
+        sqlx::query("DELETE FROM feedback_events WHERE capability_capsule_id = $1")
+            .bind(capability_capsule_id)
+            .execute(&mut *tx)
+            .await
+            .map_err(sqlx_err)?;
+        tx.commit().await.map_err(sqlx_err)?;
         Ok(())
     }
 
