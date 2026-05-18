@@ -11,57 +11,66 @@
 ## 0. 总体架构
 
 ```
-                ┌── Service / Pipeline ──┐
-                │  capability_capsule    │
-                │  transcript            │
-                │  entity                │
-                └────────────┬───────────┘
-                             │
-                  ┌──────────▼──────────┐
-                  │       Store         │   ← 唯一的存储句柄（Arc<LanceStore>+Arc<DuckDbQuery>）
-                  │ lance_write_then_   │
-                  │ refresh!() 宏统一   │
-                  │ 写后刷新 DuckDB     │
-                  └──────┬───────┬──────┘
-                         │       │
-                  写 ←───┘       └─→ 读
-                  ▼                  ▼
-          ┌──────────────┐    ┌──────────────┐
-          │  LanceStore  │    │  DuckDbQuery │
-          │ (lancedb-rs) │    │ (duckdb +    │
-          │              │    │  lance ext)  │
-          └──────┬───────┘    └──────┬───────┘
-                 │                   │
-                 └────── ATTACH ─────┘
-                          ▼
-                 同一个 lance 数据集目录
-                 （12 张表共存于 .lance/ 下）
+                ┌── Service / Worker / HTTP / Pipeline ──┐
+                │  capability_capsule                     │
+                │  transcript                             │
+                │  entity                                 │
+                └─────────────────┬───────────────────────┘
+                                  │ Arc<dyn Backend>      ← Phase 5 umbrella supertrait
+                                  │ （9 个 sub-trait 聚合：CapsuleStore / CapsuleSearchStore /
+                                  │  EmbeddingJobStore / EmbeddingVectorStore / GraphStore /
+                                  │  TranscriptStore / EntityRegistry / SessionStore /
+                                  │  MaintenanceStore）
+                       ┌──────────▼──────────┐
+                       │       Store         │   ← 当前唯一的 Backend 实现
+                       │ (blanket impl       │      （pub —— 是给 storage 外部用的句柄）
+                       │  Backend for Store) │
+                       │ commit_lance_write()│
+                       │ 写后刷新 DuckDB     │
+                       └──────┬───────┬──────┘
+                              │       │
+                       写 ←───┘       └─→ 读
+                       ▼                  ▼
+          ┌──────────────────┐    ┌──────────────────┐
+          │  LanceStore      │    │  DuckDbQuery     │
+          │ (pub(crate)，    │    │ (pub(crate)，    │
+          │  实现细节，外部  │    │  实现细节，外部  │
+          │  代码不可直接拿) │    │  代码不可直接拿) │
+          └────────┬─────────┘    └────────┬─────────┘
+                   │                       │
+                   └────── ATTACH ─────────┘
+                              ▼
+                     同一个 lance 数据集目录
+                     （12 张表共存于 .lance/ 下）
 ```
 
 **核心约束**：
 
 - LanceDB 是**单写者**。所有写入必须经过 `LanceStore`；同一进程多个 `Store` 句柄共享 `Arc<LanceStore>`，不共享 `Connection`（`open_in_memory` swap 解决 snapshot 缓存）。
-- DuckDB 端通过 `lance` 扩展 ATTACH 同一目录，承担**绝大多数读路径**。`lance_write_then_refresh!` 宏在每次写入后 swap 一个新的 in-memory DuckDB 连接，吃掉扩展的 snapshot 缓存。
-- 服务层永远握 `Store`，不直接握 `LanceStore` / `DuckDbQuery`。
+- DuckDB 端通过 `lance` 扩展 ATTACH 同一目录，承担**绝大多数读路径**。`Store::commit_lance_write` 在每次写入后 swap 一个新的 in-memory DuckDB 连接（Phase 1 QW-6 把 `lance_write_then_refresh!` 宏改成了显式 method）。
+- **Phase 5 之后**，service / worker / pipeline 持 `Arc<dyn Backend>`（umbrella trait），不再持 `Arc<Store>`。`LanceStore` / `DuckDbQuery` 都收窄成 `pub(crate)`——外部代码物理上无法直接拿到具体实现的句柄，必须经 `Backend` 或 9 个 sub-trait 的某一个。`Store` 自身仍是 `pub`，因为 `app.rs::from_config` 需要 `Store::open` + 一次 `set_transcript_job_provider`（Lance-only 配置），然后立刻 upcast 成 `Arc<dyn Backend>`。
+- **未来要换 backend**（如 Postgres）：再写一个 struct 把 9 个 sub-trait 实现一遍，blanket impl 自动让它满足 `Backend`，`app.rs` 改一个 binding 就完成切换——这是 Phase 5 抽 trait 的最终交付物。
 
 ---
 
 ## 1. 表清单（按业务域分组）
 
-| 业务域 | 表 | 主要写入入口 | 主要读取入口 |
+> 入口列出的是 trait 方法。Service / worker 持 `Arc<dyn Backend>`，自动派发到 `Store`（当前唯一的 backend impl）；表名后括号注的是承载这些方法的 sub-trait（Phase 3 抽出，Phase 5 凝成 `Backend` umbrella）。
+
+| 业务域 | 表 (sub-trait) | 主要写入入口 | 主要读取入口 |
 |---|---|---|---|
-| **能力胶囊** | `capability_capsules` | `Store::insert_capability_capsule[s]` | `Store::hybrid_candidates` / `search_candidates` |
-| | `capability_capsule_embeddings` | `Store::upsert_capability_capsule_embedding` | `Store::hybrid_candidates`（JOIN） |
-| | `embedding_jobs` | `Store::try_enqueue_embedding_job` / `enqueue_embedding_jobs` | `Store::claim_next_n_embedding_jobs`（worker） |
-| **会话 / 经验** | `sessions` | `Store::open_session` / `touch_session` / `close_session` | `Store::latest_active_session` |
-| | `episodes` | `Store::insert_episode` | `Store::list_successful_episodes_for_tenant` |
-| | `feedback_events` | `Store::apply_feedback` | `LanceStore::feedback_summary`（内部） |
-| **对话归档** | `conversation_messages` | `Store::create_conversation_message[s]` | `Store::bm25_transcript_candidates` / `semantic_search_transcripts` |
-| | `conversation_message_embeddings` | `Store::upsert_conversation_message_embedding` | `Store::semantic_search_transcripts`（JOIN） |
-| | `transcript_embedding_jobs` | LanceStore 内部（`create_conversation_message[s]_batch` 触发） | `Store::claim_next_n_transcript_embedding_jobs` |
-| **知识图谱** | `graph_edges` | `Store::sync_memory_edges` / `close_edges_for_capability_capsule` | `Store::neighbors` / `related_capability_capsule_ids` |
-| **实体注册表** | `entities` | `Store::resolve_or_create` | `Store::get_entity` / `list_entities` |
-| | `entity_aliases` | `Store::add_alias` / `resolve_or_create`（隐式） | `Store::lookup_alias`（含在 `get_entity`） |
+| **能力胶囊** | `capability_capsules` (`CapsuleStore` + `CapsuleSearchStore`) | `CapsuleStore::insert_capability_capsule[s]` | `CapsuleSearchStore::hybrid_candidates` / `search_candidates` |
+| | `capability_capsule_embeddings` (`EmbeddingVectorStore`) | `EmbeddingVectorStore::upsert_capability_capsule_embedding` | `CapsuleSearchStore::hybrid_candidates`（JOIN） |
+| | `embedding_jobs` (`EmbeddingJobStore`) | `EmbeddingJobStore::try_enqueue_embedding_job` / `enqueue_embedding_jobs` | `EmbeddingJobStore::claim_next_n_embedding_jobs`（worker） |
+| **会话 / 经验** | `sessions` (`SessionStore`) | `SessionStore::open_session` / `touch_session` / `close_session` | `SessionStore::latest_active_session` |
+| | `episodes` (`SessionStore`) | `SessionStore::insert_episode` | `SessionStore::list_successful_episodes_for_tenant` |
+| | `feedback_events` (`CapsuleStore`) | `CapsuleStore::apply_feedback` | `CapsuleStore::feedback_summary` |
+| **对话归档** | `conversation_messages` (`TranscriptStore`) | `TranscriptStore::create_conversation_message[s]` | `TranscriptStore::bm25_transcript_candidates` / `semantic_search_transcripts` |
+| | `conversation_message_embeddings` (`EmbeddingVectorStore`) | `EmbeddingVectorStore::upsert_conversation_message_embedding` | `TranscriptStore::semantic_search_transcripts`（JOIN） |
+| | `transcript_embedding_jobs` (`EmbeddingJobStore`) | LanceStore 内部（`create_conversation_messages_batch` 触发） | `EmbeddingJobStore::claim_next_n_transcript_embedding_jobs` |
+| **知识图谱** | `graph_edges` (`GraphStore`) | `GraphStore::sync_memory_edges` / `close_edges_for_capability_capsule` | `GraphStore::neighbors` / `related_capability_capsule_ids` |
+| **实体注册表** | `entities` (`EntityRegistry`) | `EntityRegistry::resolve_or_create` | `EntityRegistry::get_entity` / `list_entities` |
+| | `entity_aliases` (`EntityRegistry`) | `EntityRegistry::add_alias` / `resolve_or_create`（隐式） | `EntityRegistry::lookup_alias`（含在 `get_entity`） |
 
 ---
 
@@ -83,7 +92,7 @@
 | status | Utf8 | no | enum: provisional / pending_confirmation / active / archived / rejected |
 | scope | Utf8 | no | enum: global / project / repo / workspace |
 | visibility | Utf8 | no | enum: private / shared / system |
-| version | UInt64 | no | 版本链当前版本号 |
+| version | Int64 | no | 版本链当前版本号（Phase 5 pain #1 从 UInt64 改 Int64，Postgres BIGINT 直接 bind 不需要 try_from） |
 | summary | Utf8 | no | 索引/提示用，不作答案来源 |
 | content | Utf8 | no | **verbatim 事实源**，存档不改写 |
 | evidence | List\<Utf8\> | no | 证据链 / 引用 |
@@ -271,7 +280,7 @@
 |---|---|---|---|
 | feedback_id | Utf8 | no | PK，`fb_` UUIDv7 |
 | capability_capsule_id | Utf8 | no | FK |
-| feedback_kind | Utf8 | no | 5 种 `FeedbackKind` |
+| feedback_kind | Utf8 | no | 6 种 `FeedbackKind`（含 Phase 1 加入的 `auto_promoted`） |
 | created_at | Utf8 | no | |
 | note | Utf8 | yes | 调用方提供的自由文本注释；不参与排序，仅审计 |
 
@@ -529,7 +538,7 @@ verbatim 对话归档，零业务规则。
 
 `transcript_embedding_jobs` 状态机相同。
 
-### 4.4 反馈影响（5 种 `FeedbackKind`）
+### 4.4 反馈影响（6 种 `FeedbackKind`）
 
 | kind | confidence Δ | decay Δ | side effect |
 |---|---|---|---|
@@ -538,8 +547,9 @@ verbatim 对话归档，零业务规则。
 | outdated | 0 | +0.20 | — |
 | does_not_apply_here | 0 | +0.10 | — |
 | incorrect | 0 | 0 | status → archived |
+| auto_promoted | 0 | 0 | status → active（由 `worker/auto_promote_worker` 在长期 idle pending 上写入） |
 
-详细见 `domain/capability_capsule.rs::FeedbackKind`。
+详细见 `domain/capability_capsule.rs::FeedbackKind`。`FeedbackSummary` 6 个槽位（`total / useful / outdated / incorrect / applies_here / does_not_apply_here / auto_promoted`），每个 backend 的聚合器都要覆盖所有 kind——Phase 5 pain #5 修复过 `auto_promoted` 落入 catch-all 的静默 bug。
 
 ---
 
@@ -556,7 +566,9 @@ LanceDB 没有外置 migration 文件 —— schema 直接用 `Schema::new(vec![
 
 **删列**：先把代码里的所有引用全删 + 在新插入时 `append_null`；旧行的列空间是浪费但不会错。需要真彻底删除时只能整表重写一遍（目前没有内置 CLI，直接 Lance API `Dataset::add_columns` / `drop_columns` 走脚本）。
 
-**改类型**：不能原地改。需要：① 加新列 ② 双写一段时间 ③ 切读到新列 ④ 后续整表重建去掉旧列。
+**改类型**：不能原地改。需要：① 加新列 ② 双写一段时间 ③ 切读到新列 ④ 后续整表重建去掉旧列。**例外**：纯整数宽度切换（如 Phase 5 pain #1 `version: UInt64 → Int64`）实际上是 breaking schema change——本仓选择直接改 schema + 接受现有 dev DB 需要重建的代价（local-first 工具的合理取舍）。换 prod 部署得走双写迁移。
+
+**Postgres 端的 schema 演进**：Phase 4 的 Postgres spike 走传统 SQL migration（见 `migrations/postgres/0001_capsule_store.sql`，CREATE TABLE + indexes + CHECK 约束），sqlx 没有内置 migration runner——目前手动 `psql -f` 应用。如果 Phase 5+ 真的部署 Postgres，得引入 sqlx-migrate 或类似工具。
 
 参考已落地的 schema 演进案例：
 
@@ -564,9 +576,15 @@ LanceDB 没有外置 migration 文件 —— schema 直接用 `Schema::new(vec![
 - `capability_capsules.supersedes_capability_capsule_id` —— Task 11 加列
 - `conversation_messages.meta_json` —— Task 23 加列（envelope 元数据 + tool_result is_error）
 - `entities` / `entity_aliases` —— 整个表族新增
+- `capability_capsules.version` —— Phase 5 改类型 `UInt64 → Int64`（pain #1，对齐 Postgres BIGINT）
+- `FeedbackSummary.auto_promoted` —— Phase 5 加 domain struct 字段（pain #5，serde-default 反序列化为 0 保持向后兼容）
 
 ---
 
 ## 6. 维护命令
 
-当前没有内置的维护 CLI 子命令。HNSW sidecar 不一致时直接重启 `mem serve`——`LanceStore::open` 会在启动时比对 sidecar 与 Lance 表，自动重建。需要其他 schema 级运维操作（重建列、迁移历史 edge 等）走一次性脚本。
+- **`POST /admin/vacuum`** —— Phase 1 加的 Lance manifest prune endpoint，body 可选 `{older_than_days}`（默认走 `MEM_VACUUM_OLDER_THAN_DAYS` 配置）。返回 `VacuumStats { bytes_removed, old_versions_removed, tables_pruned, tables_skipped }`。背景里 `worker/vacuum_worker` 每天扫一次同样的 logic。
+- **`mem mine`** —— 一次性脚本，把 Claude Code transcript 喂给 `mem serve` 做双 sink（capsules + transcript archive）。
+- **`mem wake-up` / `mem feedback`** —— 同样是一次性 CLI。
+
+旧的 `mem repair` 子命令已经删掉——HNSW sidecar 已经被 LanceDB 0.27 native ANN 替换（Phase 1 QW-4 清理过）；其他 schema 级运维（重建列、迁移历史 edge 等）仍然走一次性脚本。

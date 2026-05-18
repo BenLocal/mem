@@ -310,7 +310,7 @@ score = round(1000 × (1/(60 + rank_lex) + 1/(60 + rank_sem)))   # 召回融合
 
 **几个值得记的观察**：
 
-- **Capsule 路径每行 ~1-2 ms 主要被 `lance_write_then_refresh!` 的 DuckDB 连接 swap 吞掉**——批量后 N 次 refresh → 1 次，所以 9-11× 提升基本是常数项摊销。Service 层的 graph edge 解析、entity registry 查询、embedding job enqueue 也合并成单次调用。
+- **Capsule 路径每行 ~1-2 ms 主要被 `Store::commit_lance_write`（原 `lance_write_then_refresh!` 宏，Phase 1 QW-6 改成 method）的 DuckDB 连接 swap 吞掉**——批量后 N 次 refresh → 1 次，所以 9-11× 提升基本是常数项摊销。Service 层的 graph edge 解析、entity registry 查询、embedding job enqueue 也合并成单次调用。
 - **Transcript 收益更夸张（最高 227×）是因为单条路径在 `create_conversation_message` 里每行都跑一次 `count_rows((path,line,block))` 做 dedup**——表越大扫描越慢，N=100 时已经是 218 μs/行的扫描放大。批量路径用一次 `transcript_path IN (...)` filter 拉所有现有 key，剩下全部内存里 dedup → 近 O(1)。
 - **典型 `mem mine` 场景**：一份会话 transcript 通常 100s–1000s blocks + 几十个 capsule。整体写入从分钟级降到秒级（100 capsule + 100 block 从 152 s → 14 s，约 10×）。
 

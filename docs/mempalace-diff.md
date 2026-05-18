@@ -665,11 +665,13 @@ M（1.5 天，前提是 #11 完成）：
 
 ## 14. Conversation Archive（verbatim transcript 全量归档，与 memories 管道完全隔离）
 
-> **2026-04-30 落地**：✅ 在 §13 的 `mem mine` 之上加一条**全量原始对话归档**管道。新表 `conversation_messages`（每个 transcript block 一行，verbatim）+ 独立队列 `transcript_embedding_jobs` + 独立 HNSW sidecar `<MEM_DB_PATH>.transcripts.usearch`；与 `memories` 表 / 嵌入队列 / sidecar **完全不共享**任何状态或向量空间。`mem mine` 改为 dual-sink，单次扫描既写既有 memories 路径也写新 archive。HTTP 路由 `POST /transcripts/messages` / `POST /transcripts/search` / `GET /transcripts?session_id=…&tenant=…`。**MCP 表面零变化**——transcript 搜索仅 HTTP，agent 走 `memory_search` → 命中后用 `session_id` 拉对应 transcript。
+> **2026-04-30 落地**：✅ 在 §13 的 `mem mine` 之上加一条**全量原始对话归档**管道。新表 `conversation_messages`（每个 transcript block 一行，verbatim）+ 独立队列 `transcript_embedding_jobs` + 独立 embedding 表 `conversation_message_embeddings`；与 `memories` 表 / 嵌入队列 **完全不共享**任何状态或向量空间。`mem mine` 改为 dual-sink，单次扫描既写既有 memories 路径也写新 archive。HTTP 路由 `POST /transcripts/messages` / `POST /transcripts/search` / `GET /transcripts?session_id=…&tenant=…`。**MCP 表面零变化**——transcript 搜索仅 HTTP，agent 走 `memory_search` → 命中后用 `session_id` 拉对应 transcript。
+>
+> **2026-05 后续**：原方案的 `<MEM_DB_PATH>.transcripts.usearch` HNSW sidecar 在 backend-coupling QW-4 里被 LanceDB 0.27 native ANN 全替换。向量索引现在内建在 `conversation_message_embeddings` 表里，无外部 sidecar 文件——架构上更干净，env `MEM_TRANSCRIPT_VECTOR_INDEX_FLUSH_EVERY` 已删。
 
 ### 与既有路线的关系
 
-§7 verbatim 纪律的自然延伸：`memories.content` 守护事实级原文，`conversation_messages.content` 守护对话级原文。两条管道共用一个 `session_id` 锚点（§11 Sessions），但 ranking / lifecycle / compress / verbatim guard 全部不动。新增 env：`MEM_TRANSCRIPT_EMBED_DISABLED=1`（停 transcript embedding worker，避免 OpenAI 用户成本翻倍）、`MEM_TRANSCRIPT_VECTOR_INDEX_FLUSH_EVERY`（默认 256，低于 memories sidecar 的 1024，因为单 session 写入 burst 更大）。
+§7 verbatim 纪律的自然延伸：`memories.content` 守护事实级原文，`conversation_messages.content` 守护对话级原文。两条管道共用一个 `session_id` 锚点（§11 Sessions），但 ranking / lifecycle / compress / verbatim guard 全部不动。env：`MEM_TRANSCRIPT_EMBED_DISABLED=1`（停 transcript embedding worker，避免 OpenAI 用户成本翻倍）、`MEM_TRANSCRIPT_OVERSAMPLE`（transcript search candidate fan-out factor）。
 
 > commit 时引用：`feat(transcripts): add conversation_messages archive pipeline alongside memories (closes mempalace-diff §14)`
 
@@ -686,7 +688,7 @@ M（1.5 天，前提是 #11 完成）：
 | 维度 | mem | MemPalace | 论证位置 |
 |---|---|---|---|
 | 服务模型 | 长驻 HTTP（axum :3000）+ 多 agent 共享 | MCP server（stdio）+ CLI，单用户单机 | §0 |
-| 存储引擎 | DuckDB 单文件 + usearch HNSW sidecar + 内置 `graph_edges` 表 | ChromaDB（SQLite + HNSW 段）+ 独立 SQLite KG | §0 / §2 |
+| 存储引擎 | LanceDB on disk（12 张表）+ DuckDB 通过 `lance` 扩展 ATTACH 做读层 + Lance native ANN/FTS（内置，无外部 sidecar） | ChromaDB（SQLite + HNSW 段）+ 独立 SQLite KG | §0 / §2 |
 | 语言/栈 | Rust + axum + tokio + DuckDB-rs | Python + ChromaDB + SQLite | §0 |
 | 核心哲学 | 结构化记忆**生命周期**（status / supersedes / feedback / decay） | **Verbatim** 不改写、只压缩索引层 | §0 / §6 / §7 |
 | 输出形态 | token-budgeted 四段式（directives / facts / patterns / workflow） | 返回 drawer 列表，让 caller LLM 自己整合 | §3 / §12 |
@@ -698,8 +700,8 @@ M（1.5 天，前提是 #11 完成）：
 | 来源（MemPalace 概念） | mem 落地 | ROADMAP # | 章节 |
 |---|---|---|---|
 | 时序图 `valid_from` / `valid_to` | `graph_edges` 表内置 | #4 | §5 |
-| HNSW ANN（消除全表扫 + `limit 2000` 隐式截断）| usearch sidecar | #2 | §3 / §4 |
-| HNSW 健康自检 + repair CLI | ~~`mem repair --check / --rebuild`~~（CLI 已删；sidecar 健康检查保留在 `LanceStore::open` 启动路径里） | #3 | §3 |
+| HNSW ANN（消除全表扫 + `limit 2000` 隐式截断）| 原 usearch sidecar，2026-05 重构里被 LanceDB 0.27 native ANN 替换（backend-coupling QW-4）。隐式截断问题永久消除 | #2 | §3 / §4 |
+| HNSW 健康自检 + repair CLI | ~~`mem repair --check / --rebuild`~~（连同 sidecar 一并删除——LanceDB native ANN 不需要外部 repair 路径） | #3 | §3 |
 | BM25 + 向量 RRF | `pipeline/retrieve.rs` 两路 RRF（k=60） | #5 | §3 |
 | Entity registry（人/项目消歧） | `entities` + `entity_aliases` 表 | #8 | §2 |
 | Verbatim 纪律（token 计数 + summary 守护）| tiktoken-rs / ingest 校验 `summary != content` | #6 / #9 | §7 |
@@ -729,3 +731,16 @@ M（1.5 天，前提是 #11 完成）：
 ### 15.5 一句话总结
 
 > mempalace-diff 路线图（#1–#15）已全部 ✅。剩下的差异是**有意保留的形态/哲学差异**——服务模型（HTTP vs MCP）、存储栈（Rust+DuckDB vs Python+Chroma）、哲学侧重（lifecycle 治理 vs verbatim 档案），不是落后或缺口。新对齐项请先回 §5 / §7 / §11 / §12 / §13 / §14 等加章节，再同步更新本节 15.2/15.3/15.4 表格 + ROADMAP.MD。
+
+### 15.6 平行工作线：Backend 存储抽象
+
+ROADMAP #1–#20 跟踪的是 **MemPalace 对齐** 这一条线。与之独立、不互相阻塞的是 **存储 backend 抽象**——把 storage 层从 "唯一一个 `Store` (Lance+DuckDB) 句柄" 演进成 "`Arc<dyn Backend>` umbrella 持 9 个 sub-trait"，让未来换 Postgres / 其他后端只需写 N 个 sub-trait 实现就能 drop-in。
+
+路线图见 [`backend-coupling.md`](./backend-coupling.md) §6 (Phase 0–5)，**全部 ✅ shipped (2026-05-18)**：
+- Phase 0–1：QW-1..6 quick wins（hybrid compose primitives、embedding wire format、宏 → method 等）
+- Phase 2：第一个真 trait `CapsuleStore` + `InMemoryCapsuleStore` parity backend (26/26 tests)
+- Phase 3：另外 8 个 sub-trait 抽出（71 个方法）
+- Phase 4：`PostgresCapsuleStore` scaffold（spike，含 5 个 pain points 总结）
+- Phase 5：Backend umbrella + service migration + 4 个 pain-point 修（version u64→i64 / FeedbackSummary.auto_promoted / postgres COALESCE / atomicity trait doc）+ `LanceStore`/`DuckDbQuery` → `pub(crate)`（删 ~22 个 dead read 方法）
+
+这条线的 commit message 用 `closes backend-coupling §6 Phase N`，不和 `closes ROADMAP #N` 混。
