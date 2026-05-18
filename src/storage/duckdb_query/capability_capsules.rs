@@ -1027,34 +1027,55 @@ impl DuckDbQuery {
         .await
     }
 
-    /// Version-chain metadata for `tenant` (every memory's version
-    /// link, ordered `version DESC, updated_at DESC`).
+    /// Version-chain metadata for a single capsule. Walks both
+    /// directions of the `supersedes_capability_capsule_id` link:
+    /// **backward** to every predecessor the requested capsule chains
+    /// down to, and **forward** to every successor that chains back
+    /// up through the requested capsule. Returns each link as a
+    /// `CapabilityCapsuleVersionLink` ordered `version DESC,
+    /// updated_at DESC` (newest first).
     ///
-    /// **TODO:** the legacy DuckDB-as-storage signature accepts a
-    /// `capability_capsule_id` parameter but ignores it — the SQL only filters by
-    /// tenant. Service-layer callers (`get_memory_detail`) expect the
-    /// returned chain to be tenant-scoped *and* memory-scoped, so
-    /// they're getting a too-broad answer today. Mirroring the broken
-    /// behavior here for cutover parity; will fix with a proper
-    /// version-chain walk (`WHERE capability_capsule_id = ?2 OR
-    /// supersedes_capability_capsule_id = ?2`, recursive) in a follow-up.
+    /// Walk is implemented as one recursive CTE in DuckDB SQL so the
+    /// chain (typically 1–3 links, occasionally more) round-trips in
+    /// one query. `tenant` filters every recursion step, so capsules
+    /// from other tenants never leak in even if their ids
+    /// accidentally collide.
     pub async fn list_capability_capsule_versions_for_tenant(
         &self,
         tenant: &str,
         capability_capsule_id: &str,
     ) -> Result<Vec<CapabilityCapsuleVersionLink>, StorageError> {
-        let _ = capability_capsule_id;
         let conn = self.conn.clone();
         let tenant = tenant.to_string();
+        let capability_capsule_id = capability_capsule_id.to_string();
         spawn_blocking_storage(move || {
             let conn = conn.lock().expect("duckdb_query mutex poisoned");
+            // Recursive CTE: anchor = the requested capsule; then
+            // UNION on (predecessors via supersedes_capability_capsule_id
+            // pointing INTO chain) and (successors via
+            // supersedes_capability_capsule_id pointing FROM chain).
+            // Tenant filter applied at every step.
             let mut stmt = conn.prepare(
-                "SELECT capability_capsule_id, version, status, updated_at, supersedes_capability_capsule_id \
-                 FROM ns.main.capability_capsules \
-                 WHERE tenant = ?1 \
-                 ORDER BY version DESC, updated_at DESC",
+                "WITH RECURSIVE chain AS ( \
+                    SELECT capability_capsule_id, version, status, updated_at, \
+                           supersedes_capability_capsule_id \
+                    FROM ns.main.capability_capsules \
+                    WHERE tenant = ?1 AND capability_capsule_id = ?2 \
+                  UNION \
+                    SELECT c.capability_capsule_id, c.version, c.status, c.updated_at, \
+                           c.supersedes_capability_capsule_id \
+                    FROM ns.main.capability_capsules c \
+                    JOIN chain ch \
+                      ON c.capability_capsule_id = ch.supersedes_capability_capsule_id \
+                      OR c.supersedes_capability_capsule_id = ch.capability_capsule_id \
+                    WHERE c.tenant = ?1 \
+                ) \
+                SELECT capability_capsule_id, version, status, updated_at, \
+                       supersedes_capability_capsule_id \
+                FROM chain \
+                ORDER BY version DESC, updated_at DESC",
             )?;
-            let rows = stmt.query_map(params![tenant], |row| {
+            let rows = stmt.query_map(params![tenant, capability_capsule_id], |row| {
                 Ok(CapabilityCapsuleVersionLink {
                     capability_capsule_id: row.get(0)?,
                     version: row.get::<_, i64>(1)?,
@@ -1406,32 +1427,86 @@ mod tests {
             .unwrap();
         assert!(ids_empty.is_empty());
 
-        // list_capability_capsule_versions_for_tenant: ordered (version DESC,
-        // updated_at DESC). NOTE: passes capability_capsule_id but the legacy
-        // implementation ignores it; we mirror that here so behavior
-        // stays parity until a follow-up fixes the version-chain
-        // walk.
+        // list_capability_capsule_versions_for_tenant: walks the
+        // `supersedes` chain rooted at the requested capsule, both
+        // backward (predecessors) and forward (successors). In this
+        // fixture m_b ←supersedes m_b_v2 is the only chain — m_a and
+        // m_arc are independent and must NOT leak into the result.
         let chain = q
             .list_capability_capsule_versions_for_tenant("tenant-a", "m_b")
             .await
             .unwrap();
-        // Returns ALL tenant-a rows' version links — m_b_v2 (v=2) +
-        // m_a (v=2) + m_b (v=1) + m_arc (v=1, fixture default).
-        assert_eq!(chain.len(), 4);
-        // The supersedes link is preserved.
-        let bv2_link = chain
+        let chain_ids: Vec<&str> = chain
             .iter()
-            .find(|l| l.capability_capsule_id == "m_b_v2")
-            .expect("m_b_v2 in chain");
+            .map(|l| l.capability_capsule_id.as_str())
+            .collect();
         assert_eq!(
-            bv2_link.supersedes_capability_capsule_id.as_deref(),
+            chain_ids,
+            vec!["m_b_v2", "m_b"],
+            "version-chain walk must isolate the rooted capsule's lineage from other tenant-a rows; got {chain_ids:?}",
+        );
+        // The supersedes link is preserved on both ends.
+        assert_eq!(
+            chain[0].capability_capsule_id, "m_b_v2",
+            "version DESC ordering: successor first"
+        );
+        assert_eq!(
+            chain[0].supersedes_capability_capsule_id.as_deref(),
             Some("m_b")
         );
-        let b_link = chain
+        assert!(chain[1].supersedes_capability_capsule_id.is_none());
+
+        // Walk also starts from any node in the chain — request mid-
+        // chain id m_b_v2 returns the same set.
+        let chain_from_successor = q
+            .list_capability_capsule_versions_for_tenant("tenant-a", "m_b_v2")
+            .await
+            .unwrap();
+        let from_successor_ids: Vec<&str> = chain_from_successor
             .iter()
-            .find(|l| l.capability_capsule_id == "m_b")
-            .expect("m_b in chain");
-        assert!(b_link.supersedes_capability_capsule_id.is_none());
+            .map(|l| l.capability_capsule_id.as_str())
+            .collect();
+        assert_eq!(
+            from_successor_ids,
+            vec!["m_b_v2", "m_b"],
+            "walk rooted at successor must surface the predecessor too",
+        );
+
+        // Empty result when the requested id doesn't exist (no anchor
+        // row to start from).
+        let unknown = q
+            .list_capability_capsule_versions_for_tenant("tenant-a", "does-not-exist")
+            .await
+            .unwrap();
+        assert!(unknown.is_empty());
+
+        // Cross-tenant: tenant-b has m_other (no supersedes), no
+        // chain. Result is just m_other — none of tenant-a's chain
+        // leaks across tenant boundaries.
+        let cross = q
+            .list_capability_capsule_versions_for_tenant("tenant-b", "m_other")
+            .await
+            .unwrap();
+        let cross_ids: Vec<&str> = cross
+            .iter()
+            .map(|l| l.capability_capsule_id.as_str())
+            .collect();
+        assert_eq!(
+            cross_ids,
+            vec!["m_other"],
+            "tenant filter must apply at every recursion step",
+        );
+
+        // Cross-tenant id miss: requesting tenant-a's m_b under
+        // tenant-b returns empty (no anchor row matches the tenant).
+        let miss = q
+            .list_capability_capsule_versions_for_tenant("tenant-b", "m_b")
+            .await
+            .unwrap();
+        assert!(
+            miss.is_empty(),
+            "tenant-a's id must not surface under tenant-b"
+        );
     }
 
     /// Cross-table SQL hybrid: lance_fts + lance_vector_search joined
