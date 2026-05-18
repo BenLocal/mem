@@ -15,9 +15,7 @@ use super::{
     lancedb_err, record_batch_to_capability_capsules, record_batch_to_embedding_job_rows,
     record_batch_to_feedback_events, sql_quote, EmbeddingJobRow, LanceStore,
 };
-use crate::domain::capability_capsule::{
-    CapabilityCapsuleRecord, CapabilityCapsuleVersionLink, FeedbackSummary,
-};
+use crate::domain::capability_capsule::{CapabilityCapsuleRecord, FeedbackSummary};
 use crate::domain::embeddings::EmbeddingJobInfo;
 use crate::embedding::wire::decode_f32_blob;
 use crate::storage::types::{ClaimedEmbeddingJob, EmbeddingJobInsert, FeedbackEvent, StorageError};
@@ -417,14 +415,6 @@ impl LanceStore {
         Ok(())
     }
 
-    pub async fn list_capability_capsules_for_tenant(
-        &self,
-        tenant: &str,
-    ) -> Result<Vec<CapabilityCapsuleRecord>, StorageError> {
-        self.query_capability_capsules(format!("tenant = {}", sql_quote(tenant)), None)
-            .await
-    }
-
     pub async fn complete_embedding_job(
         &self,
         job_id: &str,
@@ -610,109 +600,6 @@ impl LanceStore {
         Ok(None)
     }
 
-    pub async fn get_pending(
-        &self,
-        tenant: &str,
-        capability_capsule_id: &str,
-    ) -> Result<Option<CapabilityCapsuleRecord>, StorageError> {
-        let filter = format!(
-            "tenant = {} AND capability_capsule_id = {} AND status = 'pending_confirmation'",
-            sql_quote(tenant),
-            sql_quote(capability_capsule_id),
-        );
-        Ok(self
-            .query_capability_capsules(filter, Some(1))
-            .await?
-            .into_iter()
-            .next())
-    }
-
-    pub async fn find_by_idempotency_or_hash(
-        &self,
-        tenant: &str,
-        idempotency_key: &Option<String>,
-        content_hash: &str,
-    ) -> Result<Option<CapabilityCapsuleRecord>, StorageError> {
-        // Match either `idempotency_key` (when caller provided one) OR
-        // `content_hash` — same precedence as DuckDB's variant.
-        let filter = match idempotency_key.as_deref() {
-            Some(k) => format!(
-                "tenant = {} AND (idempotency_key = {} OR content_hash = {})",
-                sql_quote(tenant),
-                sql_quote(k),
-                sql_quote(content_hash),
-            ),
-            None => format!(
-                "tenant = {} AND content_hash = {}",
-                sql_quote(tenant),
-                sql_quote(content_hash),
-            ),
-        };
-        Ok(self
-            .query_capability_capsules(filter, Some(1))
-            .await?
-            .into_iter()
-            .next())
-    }
-
-    pub async fn list_pending_review(
-        &self,
-        tenant: &str,
-    ) -> Result<Vec<CapabilityCapsuleRecord>, StorageError> {
-        let filter = format!(
-            "tenant = {} AND status = 'pending_confirmation'",
-            sql_quote(tenant),
-        );
-        self.query_capability_capsules(filter, None).await
-    }
-
-    pub async fn search_candidates(
-        &self,
-        tenant: &str,
-    ) -> Result<Vec<CapabilityCapsuleRecord>, StorageError> {
-        // Same live-status filter the DuckDB backend uses
-        // (`pipeline::retrieve` post-filters this set anyway).
-        let filter = format!(
-            "tenant = {} AND status NOT IN ('rejected', 'archived')",
-            sql_quote(tenant),
-        );
-        self.query_capability_capsules(filter, None).await
-    }
-
-    pub async fn recent_active_capability_capsules(
-        &self,
-        tenant: &str,
-        limit: usize,
-    ) -> Result<Vec<CapabilityCapsuleRecord>, StorageError> {
-        // NOTE: LanceDB's `Query::limit` doesn't guarantee any ordering
-        // without a `Table::create_index` on `updated_at`. For now this
-        // returns _some_ N rows; switching to ordered results requires
-        // an index + `Query::nearest_to` or a sort step. The DuckDB
-        // backend uses `ORDER BY updated_at DESC`.
-        let filter = format!(
-            "tenant = {} AND status NOT IN ('rejected', 'archived')",
-            sql_quote(tenant),
-        );
-        self.query_capability_capsules(filter, Some(limit)).await
-    }
-
-    pub async fn fetch_capability_capsules_by_ids(
-        &self,
-        tenant: &str,
-        ids: &[&str],
-    ) -> Result<Vec<CapabilityCapsuleRecord>, StorageError> {
-        if ids.is_empty() {
-            return Ok(vec![]);
-        }
-        let id_list: Vec<String> = ids.iter().map(|i| sql_quote(i)).collect();
-        let filter = format!(
-            "tenant = {} AND status NOT IN ('rejected', 'archived') AND capability_capsule_id IN ({})",
-            sql_quote(tenant),
-            id_list.join(", "),
-        );
-        self.query_capability_capsules(filter, None).await
-    }
-
     pub async fn accept_pending(
         &self,
         tenant: &str,
@@ -861,49 +748,6 @@ impl LanceStore {
         Ok(out)
     }
 
-    pub async fn list_capability_capsule_versions_for_tenant(
-        &self,
-        tenant: &str,
-        capability_capsule_id: &str,
-    ) -> Result<Vec<CapabilityCapsuleVersionLink>, StorageError> {
-        // Walk the supersedes chain backwards: start from `capability_capsule_id`,
-        // follow `supersedes_capability_capsule_id` to predecessors, and append each
-        // record. Output ordered newest → oldest by version DESC.
-        let mut chain: Vec<CapabilityCapsuleRecord> = Vec::new();
-        let mut cursor = Some(capability_capsule_id.to_string());
-        // Cap depth — the chain should be short (typically 1–3) and a
-        // cycle would loop forever otherwise.
-        for _ in 0..32 {
-            let Some(id) = cursor.take() else { break };
-            let rec = self
-                .query_capability_capsules(
-                    format!(
-                        "tenant = {} AND capability_capsule_id = {}",
-                        sql_quote(tenant),
-                        sql_quote(&id)
-                    ),
-                    Some(1),
-                )
-                .await?
-                .into_iter()
-                .next();
-            let Some(r) = rec else { break };
-            cursor = r.supersedes_capability_capsule_id.clone();
-            chain.push(r);
-        }
-        chain.sort_by_key(|r| std::cmp::Reverse(r.version));
-        Ok(chain
-            .into_iter()
-            .map(|r| CapabilityCapsuleVersionLink {
-                capability_capsule_id: r.capability_capsule_id,
-                version: r.version,
-                status: r.status,
-                updated_at: r.updated_at,
-                supersedes_capability_capsule_id: r.supersedes_capability_capsule_id,
-            })
-            .collect())
-    }
-
     pub async fn feedback_summary(
         &self,
         capability_capsule_id: &str,
@@ -973,18 +817,6 @@ impl LanceStore {
             .await?
             .into_iter()
             .next())
-    }
-
-    pub async fn list_capability_capsule_ids_for_tenant(
-        &self,
-        tenant: &str,
-    ) -> Result<Vec<String>, StorageError> {
-        Ok(self
-            .query_capability_capsules(format!("tenant = {}", sql_quote(tenant)), None)
-            .await?
-            .into_iter()
-            .map(|m| m.capability_capsule_id)
-            .collect())
     }
 
     pub async fn list_embedding_jobs(
@@ -1244,112 +1076,18 @@ mod tests {
         assert!(wrong_tenant.is_none());
     }
 
-    /// Exercises the batch-impl filter methods (`list_capability_capsules_for_tenant`,
-    /// `list_capability_capsule_ids_for_tenant`, `find_by_idempotency_or_hash`,
-    /// `search_candidates`, `recent_active_capability_capsules`,
-    /// `fetch_capability_capsules_by_ids`, `list_pending_review`, `get_pending`,
-    /// `get_capability_capsule`).
-    #[tokio::test]
-    pub async fn lancedb_filter_methods_round_trip() {
-        let dir = tempdir().unwrap();
-        let path = dir.path().join("lance.store");
-        let repo = LanceStore::open(&path).await.unwrap();
-
-        let mut a1 = fixture("mem_a_001", "tenant-a");
-        a1.idempotency_key = Some("idem-a-1".into());
-        let mut a2 = fixture("mem_a_002", "tenant-a");
-        a2.status = CapabilityCapsuleStatus::PendingConfirmation;
-        a2.content_hash = "h2".repeat(32);
-        let mut a3 = fixture("mem_a_003", "tenant-a");
-        a3.status = CapabilityCapsuleStatus::Archived;
-        let b1 = fixture("mem_b_001", "tenant-b");
-
-        for m in [&a1, &a2, &a3, &b1] {
-            repo.insert_capability_capsule(m.clone()).await.unwrap();
-        }
-
-        // list_capability_capsules_for_tenant
-        let a_all = repo
-            .list_capability_capsules_for_tenant("tenant-a")
-            .await
-            .unwrap();
-        assert_eq!(a_all.len(), 3);
-        let b_all = repo
-            .list_capability_capsules_for_tenant("tenant-b")
-            .await
-            .unwrap();
-        assert_eq!(b_all.len(), 1);
-
-        // list_capability_capsule_ids_for_tenant
-        let mut ids_a = repo
-            .list_capability_capsule_ids_for_tenant("tenant-a")
-            .await
-            .unwrap();
-        ids_a.sort();
-        assert_eq!(ids_a, vec!["mem_a_001", "mem_a_002", "mem_a_003"]);
-
-        // find_by_idempotency_or_hash — match via idempotency_key
-        let by_idem = repo
-            .find_by_idempotency_or_hash("tenant-a", &Some("idem-a-1".into()), "no-such-hash")
-            .await
-            .unwrap();
-        assert_eq!(by_idem.unwrap().capability_capsule_id, "mem_a_001");
-
-        // ... match via content_hash when no idempotency_key supplied
-        let by_hash = repo
-            .find_by_idempotency_or_hash("tenant-a", &None, &a2.content_hash)
-            .await
-            .unwrap();
-        assert_eq!(by_hash.unwrap().capability_capsule_id, "mem_a_002");
-
-        // search_candidates — drops `archived`
-        let cands = repo.search_candidates("tenant-a").await.unwrap();
-        let mut cand_ids: Vec<_> = cands
-            .iter()
-            .map(|m| m.capability_capsule_id.clone())
-            .collect();
-        cand_ids.sort();
-        assert_eq!(cand_ids, vec!["mem_a_001", "mem_a_002"]);
-
-        // recent_active_capability_capsules — same filter, with limit
-        let recent = repo
-            .recent_active_capability_capsules("tenant-a", 1)
-            .await
-            .unwrap();
-        assert_eq!(recent.len(), 1);
-
-        // fetch_capability_capsules_by_ids — IN clause
-        let by_ids = repo
-            .fetch_capability_capsules_by_ids("tenant-a", &["mem_a_001", "mem_a_002"])
-            .await
-            .unwrap();
-        assert_eq!(by_ids.len(), 2);
-        // Empty input — short-circuit, no query.
-        assert!(repo
-            .fetch_capability_capsules_by_ids("tenant-a", &[])
-            .await
-            .unwrap()
-            .is_empty());
-
-        // list_pending_review
-        let pending = repo.list_pending_review("tenant-a").await.unwrap();
-        assert_eq!(pending.len(), 1);
-        assert_eq!(pending[0].capability_capsule_id, "mem_a_002");
-
-        // get_pending — exact one
-        let p = repo.get_pending("tenant-a", "mem_a_002").await.unwrap();
-        assert_eq!(p.unwrap().capability_capsule_id, "mem_a_002");
-        // get_pending — wrong status returns None
-        let np = repo.get_pending("tenant-a", "mem_a_001").await.unwrap();
-        assert!(np.is_none());
-
-        // get_capability_capsule — cross-tenant (no tenant filter)
-        let cross = repo
-            .get_capability_capsule("mem_b_001".into())
-            .await
-            .unwrap();
-        assert_eq!(cross.unwrap().tenant, "tenant-b");
-    }
+    // The previous `lancedb_filter_methods_round_trip` test that
+    // lived here was deleted along with the lance-side filter
+    // readers (`list_capability_capsules_for_tenant`, `get_pending`,
+    // `find_by_idempotency_or_hash`, `list_pending_review`,
+    // `search_candidates`, `recent_active_capability_capsules`,
+    // `fetch_capability_capsules_by_ids`,
+    // `list_capability_capsule_versions_for_tenant`,
+    // `list_capability_capsule_ids_for_tenant`). The canonical reads
+    // are on `DuckDbQuery` and validated by
+    // `src/storage/duckdb_query/capability_capsules.rs::tests`, which
+    // exercises every filter + the version-chain walk against
+    // LanceStore-written data through the DuckDB-extension path.
 
     /// Mutating-method round-trip: accept_pending, reject_pending,
     /// replace_pending_with_successor, delete_capability_capsule_hard.
@@ -1378,9 +1116,11 @@ mod tests {
         let rejected = repo.reject_pending("tenant", "mem_q").await.unwrap();
         assert_eq!(rejected.status, CapabilityCapsuleStatus::Rejected);
 
-        // After accept/reject, list_pending_review is empty
-        let pending = repo.list_pending_review("tenant").await.unwrap();
-        assert!(pending.is_empty());
+        // (The previous `list_pending_review` follow-up assertion was
+        // dropped along with the lance-side reader — the
+        // accept/reject status assertions above are the canonical
+        // check; the queue-emptiness invariant is covered in
+        // `src/storage/duckdb_query/capability_capsules.rs::tests`.)
 
         // replace_pending_with_successor: archive r, insert successor
         let mut succ = fixture("mem_r_v2", "tenant");

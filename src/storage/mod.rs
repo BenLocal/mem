@@ -21,18 +21,16 @@
 pub mod backend;
 pub mod capsule_search_store;
 pub mod capsule_store;
-// `lance_store` and `duckdb_query` remain `pub` for now: hiding
-// them under `pub(crate)` is sound at the call-site level (all
-// external callers go through `Backend` or a sub-trait) but
-// surfaces ~20 LanceStore READ methods that became dead when
-// DuckDbQuery took over reads. That cleanup is its own commit
-// — see doc §6.6 "pub(crate) hiding" tail item.
-pub mod duckdb_query;
+// The two storage halves are implementation detail. External
+// callers go through `Backend` (umbrella) or one of the 9
+// sub-traits — never the concrete halves. `pub(crate)` blocks
+// cross-crate access; intra-storage modules still see them.
+pub(crate) mod duckdb_query;
 pub mod embedding_job_store;
 pub mod embedding_vector_store;
 pub mod entity_registry;
 pub mod graph_store;
-pub mod lance_store;
+pub(crate) mod lance_store;
 pub mod maintenance_store;
 #[cfg(feature = "postgres")]
 pub mod postgres_capsule_store;

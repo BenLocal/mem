@@ -1,16 +1,16 @@
-//! Entity registry: `entities` + `entity_aliases` tables. Methods
-//! previously bound by the `EntityRegistry` trait, now inherent on
-//! `LanceStore`.
+//! Entity registry: `entities` + `entity_aliases` tables. Only the
+//! WRITE half lives here — `resolve_or_create`, `add_alias`, and
+//! the in-write `lookup_alias` precondition. The full read surface
+//! (`get_entity`, `list_entities`) is canonical on `DuckDbQuery`.
 
 use arrow_array::{RecordBatch, StringArray};
 use futures::TryStreamExt;
 use lancedb::query::{ExecutableQuery, QueryBase};
 
 use super::{
-    entity_alias_to_record_batch, entity_to_record_batch, lancedb_err, record_batch_to_entities,
-    sql_quote, LanceStore,
+    entity_alias_to_record_batch, entity_to_record_batch, lancedb_err, sql_quote, LanceStore,
 };
-use crate::domain::{AddAliasOutcome, Entity, EntityKind, EntityWithAliases};
+use crate::domain::{AddAliasOutcome, Entity, EntityKind};
 use crate::storage::types::StorageError;
 
 impl LanceStore {
@@ -68,88 +68,6 @@ impl LanceStore {
             .await
             .map_err(lancedb_err)?;
         Ok(entity_id)
-    }
-
-    pub async fn get_entity(
-        &self,
-        tenant: &str,
-        entity_id: &str,
-    ) -> Result<Option<EntityWithAliases>, StorageError> {
-        let entities = self
-            .conn
-            .open_table("entities")
-            .execute()
-            .await
-            .map_err(lancedb_err)?;
-        let stream = entities
-            .query()
-            .only_if(format!(
-                "tenant = {} AND entity_id = {}",
-                sql_quote(tenant),
-                sql_quote(entity_id),
-            ))
-            .limit(1)
-            .execute()
-            .await
-            .map_err(lancedb_err)?;
-        let batches: Vec<RecordBatch> = stream
-            .try_collect()
-            .await
-            .map_err(|e| StorageError::InvalidInput(format!("lancedb stream: {e}")))?;
-        let mut entity_iter = batches
-            .iter()
-            .flat_map(|b| record_batch_to_entities(b).unwrap_or_default().into_iter());
-        let Some(entity) = entity_iter.next() else {
-            return Ok(None);
-        };
-
-        // Pull aliases for this entity, sorted by created_at ASC then
-        // alias_text ASC (mirror DuckDB SQL).
-        let aliases_table = self
-            .conn
-            .open_table("entity_aliases")
-            .execute()
-            .await
-            .map_err(lancedb_err)?;
-        let stream2 = aliases_table
-            .query()
-            .only_if(format!(
-                "tenant = {} AND entity_id = {}",
-                sql_quote(tenant),
-                sql_quote(entity_id),
-            ))
-            .execute()
-            .await
-            .map_err(lancedb_err)?;
-        let batches2: Vec<RecordBatch> = stream2
-            .try_collect()
-            .await
-            .map_err(|e| StorageError::InvalidInput(format!("lancedb stream: {e}")))?;
-        let mut alias_rows: Vec<(String, String)> = Vec::new(); // (created_at, alias_text)
-        for b in &batches2 {
-            fn col<'a, T: 'static>(
-                batch: &'a RecordBatch,
-                name: &'static str,
-            ) -> Result<&'a T, StorageError> {
-                batch
-                    .column_by_name(name)
-                    .ok_or(StorageError::InvalidData("missing column"))?
-                    .as_any()
-                    .downcast_ref::<T>()
-                    .ok_or(StorageError::InvalidData("column type mismatch"))
-            }
-            let alias_text = col::<StringArray>(b, "alias_text")?;
-            let created_at = col::<StringArray>(b, "created_at")?;
-            for i in 0..b.num_rows() {
-                alias_rows.push((
-                    created_at.value(i).to_string(),
-                    alias_text.value(i).to_string(),
-                ));
-            }
-        }
-        alias_rows.sort();
-        let aliases: Vec<String> = alias_rows.into_iter().map(|(_, a)| a).collect();
-        Ok(Some(EntityWithAliases { entity, aliases }))
     }
 
     pub async fn add_alias(
@@ -231,51 +149,6 @@ impl LanceStore {
         }
         Ok(None)
     }
-
-    pub async fn list_entities(
-        &self,
-        tenant: &str,
-        kind_filter: Option<EntityKind>,
-        query: Option<&str>,
-        limit: usize,
-    ) -> Result<Vec<Entity>, StorageError> {
-        let mut filter = format!("tenant = {}", sql_quote(tenant));
-        if let Some(k) = kind_filter {
-            filter.push_str(&format!(" AND kind = {}", sql_quote(k.as_db_str())));
-        }
-        // canonical_name LIKE '%query%' — LanceDB's filter parser accepts
-        // SQL LIKE patterns with `%` wildcards.
-        if let Some(q) = query {
-            filter.push_str(&format!(
-                " AND canonical_name LIKE {}",
-                sql_quote(&format!("%{q}%")),
-            ));
-        }
-        let table = self
-            .conn
-            .open_table("entities")
-            .execute()
-            .await
-            .map_err(lancedb_err)?;
-        let stream = table
-            .query()
-            .only_if(filter)
-            .execute()
-            .await
-            .map_err(lancedb_err)?;
-        let batches: Vec<RecordBatch> = stream
-            .try_collect()
-            .await
-            .map_err(|e| StorageError::InvalidInput(format!("lancedb stream: {e}")))?;
-        let mut entities = Vec::new();
-        for b in &batches {
-            entities.extend(record_batch_to_entities(b)?);
-        }
-        // ORDER BY created_at DESC — sort in-memory.
-        entities.sort_by(|a, b| b.created_at.cmp(&a.created_at));
-        entities.truncate(limit);
-        Ok(entities)
-    }
 }
 
 #[cfg(test)]
@@ -284,9 +157,14 @@ mod tests {
     use crate::domain::AddAliasOutcome;
     use tempfile::tempdir;
 
-    /// lookup_alias, list_entities (kind + LIKE filters).
+    /// Writes-only round trip: `resolve_or_create` + `add_alias` +
+    /// `lookup_alias`. The read-shape assertions (`get_entity`,
+    /// `list_entities` with kind / LIKE filters) live in
+    /// `src/storage/duckdb_query/entities.rs::tests` — that file
+    /// seeds via `resolve_or_create` / `add_alias` on `LanceStore`
+    /// then reads back through the canonical DuckDB query path.
     #[tokio::test]
-    pub async fn lancedb_entity_registry_round_trip() {
+    pub async fn lancedb_entity_registry_writes_round_trip() {
         let dir = tempdir().unwrap();
         let path = dir.path().join("lance.store");
         let repo = LanceStore::open(&path).await.unwrap();
@@ -335,18 +213,6 @@ mod tests {
             .unwrap();
         assert_ne!(id1, id3);
 
-        let with_aliases = repo
-            .get_entity("tenant-a", &id1)
-            .await
-            .unwrap()
-            .expect("entity should exist");
-        assert_eq!(with_aliases.entity.canonical_name, "Rust Async");
-        assert_eq!(with_aliases.entity.kind, EntityKind::Topic);
-        assert_eq!(with_aliases.aliases, vec!["rust async".to_string()]);
-
-        let none = repo.get_entity("tenant-a", "does-not-exist").await.unwrap();
-        assert!(none.is_none());
-
         // add_alias: new alias on same entity → Inserted.
         let r1 = repo
             .add_alias("tenant-a", &id1, "Tokio", "00000001778000000010")
@@ -371,43 +237,12 @@ mod tests {
             AddAliasOutcome::ConflictWithDifferentEntity(id1.clone())
         );
 
-        // lookup_alias short-circuit.
+        // lookup_alias short-circuit — this read stays inherent on
+        // LanceStore because `resolve_or_create` and `add_alias` use
+        // it as a precondition.
         let look = repo.lookup_alias("tenant-a", "Rust Async").await.unwrap();
         assert_eq!(look.as_deref(), Some(id1.as_str()));
         let look_none = repo.lookup_alias("tenant-a", "unknown").await.unwrap();
         assert!(look_none.is_none());
-
-        // list_entities: tenant-a has 2 entities, ORDER BY created_at DESC.
-        let all_a = repo
-            .list_entities("tenant-a", None, None, 10)
-            .await
-            .unwrap();
-        assert_eq!(all_a.len(), 2);
-        assert_eq!(all_a[0].entity_id, id2);
-        assert_eq!(all_a[1].entity_id, id1);
-
-        // kind filter.
-        let topics = repo
-            .list_entities("tenant-a", Some(EntityKind::Topic), None, 10)
-            .await
-            .unwrap();
-        assert_eq!(topics.len(), 1);
-        assert_eq!(topics[0].entity_id, id1);
-
-        // LIKE filter on canonical_name.
-        let like = repo
-            .list_entities("tenant-a", None, Some("Rust"), 10)
-            .await
-            .unwrap();
-        assert_eq!(like.len(), 1);
-        assert_eq!(like[0].canonical_name, "Rust Async");
-
-        // tenant-b has just the cross-tenant duplicate.
-        let all_b = repo
-            .list_entities("tenant-b", None, None, 10)
-            .await
-            .unwrap();
-        assert_eq!(all_b.len(), 1);
-        assert_eq!(all_b[0].entity_id, id3);
     }
 }

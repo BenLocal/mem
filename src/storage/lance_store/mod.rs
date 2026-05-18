@@ -77,8 +77,8 @@ mod transcripts;
 pub use maintenance::VacuumStats;
 
 use crate::domain::capability_capsule::{CapabilityCapsuleRecord, GraphEdge};
+use crate::domain::Entity;
 use crate::domain::{BlockType, ConversationMessage, MessageRole};
-use crate::domain::{Entity, EntityKind};
 use crate::storage::{FeedbackEvent, StorageError};
 
 /// LanceDB-backed implementation of the storage trait surface.
@@ -1000,42 +1000,6 @@ pub(super) fn graph_edge_to_record_batch(edge: &GraphEdge) -> Result<RecordBatch
         .map_err(|e| StorageError::InvalidInput(format!("graph_edge record batch: {e}")))
 }
 
-pub(super) fn record_batch_to_graph_edges(
-    batch: &RecordBatch,
-) -> Result<Vec<GraphEdge>, StorageError> {
-    fn col<'a, T: 'static>(
-        batch: &'a RecordBatch,
-        name: &'static str,
-    ) -> Result<&'a T, StorageError> {
-        batch
-            .column_by_name(name)
-            .ok_or(StorageError::InvalidData("missing column"))?
-            .as_any()
-            .downcast_ref::<T>()
-            .ok_or(StorageError::InvalidData("column type mismatch"))
-    }
-    let from = col::<StringArray>(batch, "from_node_id")?;
-    let to = col::<StringArray>(batch, "to_node_id")?;
-    let relation = col::<StringArray>(batch, "relation")?;
-    let valid_from = col::<StringArray>(batch, "valid_from")?;
-    let valid_to = col::<StringArray>(batch, "valid_to")?;
-    let mut out = Vec::with_capacity(batch.num_rows());
-    for i in 0..batch.num_rows() {
-        out.push(GraphEdge {
-            from_node_id: from.value(i).to_string(),
-            to_node_id: to.value(i).to_string(),
-            relation: relation.value(i).to_string(),
-            valid_from: valid_from.value(i).to_string(),
-            valid_to: if valid_to.is_null(i) {
-                None
-            } else {
-                Some(valid_to.value(i).to_string())
-            },
-        });
-    }
-    Ok(out)
-}
-
 /// Arrow schema for `entities`. Mirrors DuckDB 1:1 (5 cols, scalar).
 fn entities_schema() -> Schema {
     Schema::new(vec![
@@ -1067,39 +1031,6 @@ pub(super) fn entity_to_record_batch(entity: &Entity) -> Result<RecordBatch, Sto
     ];
     RecordBatch::try_new(Arc::new(entities_schema()), columns)
         .map_err(|e| StorageError::InvalidInput(format!("entity record batch: {e}")))
-}
-
-pub(super) fn record_batch_to_entities(batch: &RecordBatch) -> Result<Vec<Entity>, StorageError> {
-    fn col<'a, T: 'static>(
-        batch: &'a RecordBatch,
-        name: &'static str,
-    ) -> Result<&'a T, StorageError> {
-        batch
-            .column_by_name(name)
-            .ok_or(StorageError::InvalidData("missing column"))?
-            .as_any()
-            .downcast_ref::<T>()
-            .ok_or(StorageError::InvalidData("column type mismatch"))
-    }
-    let entity_id = col::<StringArray>(batch, "entity_id")?;
-    let tenant = col::<StringArray>(batch, "tenant")?;
-    let canonical_name = col::<StringArray>(batch, "canonical_name")?;
-    let kind = col::<StringArray>(batch, "kind")?;
-    let created_at = col::<StringArray>(batch, "created_at")?;
-    let mut out = Vec::with_capacity(batch.num_rows());
-    for i in 0..batch.num_rows() {
-        let kind_s = kind.value(i);
-        let kind = EntityKind::from_db_str(kind_s)
-            .ok_or(StorageError::InvalidData("invalid entity kind"))?;
-        out.push(Entity {
-            entity_id: entity_id.value(i).to_string(),
-            tenant: tenant.value(i).to_string(),
-            canonical_name: canonical_name.value(i).to_string(),
-            kind,
-            created_at: created_at.value(i).to_string(),
-        });
-    }
-    Ok(out)
 }
 
 /// Arrow schema for `entity_aliases`. Composite "PK" = (tenant,
@@ -1580,15 +1511,4 @@ pub(super) fn record_batch_to_capability_capsules(
 /// to escape an embedded quote.
 pub(super) fn sql_quote(s: &str) -> String {
     format!("'{}'", s.replace('\'', "''"))
-}
-
-/// In-memory chronological ASC sort matching DuckDB's
-/// `(created_at, line_number, block_index)` SQL ORDER BY.
-pub(super) fn sort_messages_chronological_asc(msgs: &mut [ConversationMessage]) {
-    msgs.sort_by(|a, b| {
-        a.created_at
-            .cmp(&b.created_at)
-            .then_with(|| a.line_number.cmp(&b.line_number))
-            .then_with(|| a.block_index.cmp(&b.block_index))
-    });
 }
