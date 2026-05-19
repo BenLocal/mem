@@ -44,12 +44,21 @@ pub struct EmbeddingSettings {
 
 /// Settings for the auto-promote sweep — promotes `PendingConfirmation`
 /// capsules to `Active` after they sit idle past `age_days`, audited
-/// via a `feedback_events` row with `kind=auto_promoted`. Default OFF;
-/// opt in with `MEM_AUTO_PROMOTE_ENABLED=1`.
+/// via a `feedback_events` row with `kind=auto_promoted`. Default ON
+/// (worker spawns + auto-prunes long-idle pending rows). Opt OUT with
+/// `MEM_AUTO_PROMOTE_DISABLED=1`.
+///
+/// Why default ON: the MCP `capability_capsule_ingest` hook always
+/// writes `write_mode=propose`, so every agent-proposed capsule lands
+/// in PendingConfirmation. Without an auto-promote sweep, the queue
+/// grows unbounded unless a human runs `review_accept` per row. The
+/// guardrails (`age_days`, `decay_threshold`, type allowlist) make
+/// the automatic path safe — only long-untouched, low-decay,
+/// non-Preference/Workflow capsules get promoted.
 #[derive(Debug, Clone)]
 pub struct AutoPromoteSettings {
     /// Master switch. Worker is not spawned and HTTP endpoint refuses
-    /// `dry_run=false` when this is false. Default `false`.
+    /// `dry_run=false` when this is false. Default `true`.
     pub enabled: bool,
     /// Minimum age (since `updated_at`) before a pending row qualifies.
     /// Using `updated_at` rather than `created_at` keeps in-flight
@@ -251,12 +260,15 @@ impl EmbeddingSettings {
 }
 
 impl AutoPromoteSettings {
-    /// Development / test defaults: feature OFF. Production opts in
-    /// via `MEM_AUTO_PROMOTE_ENABLED=1` after observing the feature in
-    /// dry-run.
+    /// Development / test defaults: feature ON, 7-day idle threshold,
+    /// hourly cadence, default type allowlist (Experience /
+    /// Implementation / Episode / Diary — Preference + Workflow
+    /// excluded because they're durable commitments that warrant a
+    /// human read), decay threshold 0.5. Opt OUT via
+    /// `MEM_AUTO_PROMOTE_DISABLED=1`.
     pub fn development_defaults() -> Self {
         Self {
-            enabled: false,
+            enabled: true,
             age_days: 7,
             interval_secs: 3600,
             types: vec![
@@ -272,6 +284,20 @@ impl AutoPromoteSettings {
     pub fn from_env_vars(get: impl Fn(&str) -> Option<String>) -> Result<Self, ConfigError> {
         let mut s = Self::development_defaults();
 
+        // Canonical opt-out (mirrors `MEM_VACUUM_DISABLED`).
+        if let Some(raw) = get("MEM_AUTO_PROMOTE_DISABLED") {
+            if matches!(raw.to_ascii_lowercase().as_str(), "1" | "true" | "yes") {
+                s.enabled = false;
+            }
+        }
+
+        // Back-compat: the legacy `MEM_AUTO_PROMOTE_ENABLED` env var
+        // (which was the opt-IN switch when this feature was default
+        // OFF) still works. Truthy values are now redundant against
+        // the default-on; falsy values (`0` / `false` / `no` / empty)
+        // act as an opt-out alongside the canonical `_DISABLED` var.
+        // This way users who had it set to either value before the
+        // flip don't get surprised by the new default.
         if let Some(raw) = get("MEM_AUTO_PROMOTE_ENABLED") {
             s.enabled = matches!(raw.to_ascii_lowercase().as_str(), "1" | "true" | "yes");
         }
@@ -533,9 +559,11 @@ mod tests {
     }
 
     #[test]
-    fn auto_promote_defaults_off() {
+    fn auto_promote_defaults_on() {
         let s = AutoPromoteSettings::from_env_vars(|_| None).unwrap();
-        assert!(!s.enabled);
+        // Worker ON by default — the MCP propose path floods
+        // PendingConfirmation, so the sweep needs to keep up.
+        assert!(s.enabled);
         assert_eq!(s.age_days, 7);
         assert_eq!(s.interval_secs, 3600);
         assert_eq!(s.decay_threshold, 0.5);
@@ -551,16 +579,34 @@ mod tests {
     }
 
     #[test]
-    fn auto_promote_enable_via_env() {
+    fn auto_promote_disabled_via_env() {
+        // Canonical opt-out (mirrors `MEM_VACUUM_DISABLED`).
+        for raw in ["1", "true", "yes", "TRUE"] {
+            let s = AutoPromoteSettings::from_env_vars(env(&[("MEM_AUTO_PROMOTE_DISABLED", raw)]))
+                .unwrap();
+            assert!(!s.enabled, "{raw:?} should disable");
+        }
+        for raw in ["0", "false", "no", ""] {
+            let s = AutoPromoteSettings::from_env_vars(env(&[("MEM_AUTO_PROMOTE_DISABLED", raw)]))
+                .unwrap();
+            assert!(s.enabled, "{raw:?} should leave enabled");
+        }
+    }
+
+    #[test]
+    fn auto_promote_enabled_back_compat() {
+        // Legacy env var still parsed. Truthy is redundant against
+        // the default-on; falsy opts out, matching pre-flip users
+        // who had `MEM_AUTO_PROMOTE_ENABLED=0` explicitly set.
         for raw in ["1", "true", "yes", "TRUE"] {
             let s = AutoPromoteSettings::from_env_vars(env(&[("MEM_AUTO_PROMOTE_ENABLED", raw)]))
                 .unwrap();
-            assert!(s.enabled, "expected {raw:?} to enable");
+            assert!(s.enabled, "{raw:?} should leave enabled");
         }
         for raw in ["0", "false", "no", ""] {
             let s = AutoPromoteSettings::from_env_vars(env(&[("MEM_AUTO_PROMOTE_ENABLED", raw)]))
                 .unwrap();
-            assert!(!s.enabled, "expected {raw:?} to leave disabled");
+            assert!(!s.enabled, "{raw:?} should disable");
         }
     }
 
@@ -663,8 +709,7 @@ mod tests {
         // manifest LanceDB's pruner can remove gets removed. The
         // previous "reject 0" guard predated the aggressive-default
         // flip and would have made the default invalid.
-        let s =
-            VacuumSettings::from_env_vars(env(&[("MEM_VACUUM_OLDER_THAN_DAYS", "0")])).unwrap();
+        let s = VacuumSettings::from_env_vars(env(&[("MEM_VACUUM_OLDER_THAN_DAYS", "0")])).unwrap();
         assert_eq!(s.older_than_days, 0);
     }
 
@@ -674,15 +719,13 @@ mod tests {
         // to restore Lance's hard 7-day in-flight safety floor for
         // multi-writer / shared-dataset deployments.
         for raw in ["1", "true", "yes", "TRUE"] {
-            let s =
-                VacuumSettings::from_env_vars(env(&[("MEM_VACUUM_PRESERVE_UNVERIFIED", raw)]))
-                    .unwrap();
+            let s = VacuumSettings::from_env_vars(env(&[("MEM_VACUUM_PRESERVE_UNVERIFIED", raw)]))
+                .unwrap();
             assert!(!s.aggressive, "{raw:?} should opt out of aggressive");
         }
         for raw in ["0", "false", "no", ""] {
-            let s =
-                VacuumSettings::from_env_vars(env(&[("MEM_VACUUM_PRESERVE_UNVERIFIED", raw)]))
-                    .unwrap();
+            let s = VacuumSettings::from_env_vars(env(&[("MEM_VACUUM_PRESERVE_UNVERIFIED", raw)]))
+                .unwrap();
             assert!(s.aggressive, "{raw:?} should leave aggressive on");
         }
     }

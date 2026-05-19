@@ -3,8 +3,9 @@
 //! eligible types to `Active`, writing an audit row to
 //! `feedback_events` with `feedback_kind=auto_promoted`.
 //!
-//! Spawned by `app::AppState::from_config` only when
-//! `config.auto_promote.enabled` is true; default is OFF.
+//! Spawned by `app::AppState::from_config` when
+//! `config.auto_promote.enabled` is true; **default ON**, opt out
+//! via `MEM_AUTO_PROMOTE_DISABLED=1`.
 //!
 //! **Tenant model.** The MVP sweeps a single tenant
 //! (`MEM_TENANT` or `"local"`). A future iteration that needs

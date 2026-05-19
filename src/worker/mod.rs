@@ -7,8 +7,8 @@
 //!
 //! - `auto_promote_worker` — periodic sweep of long-idle
 //!   `PendingConfirmation` rows → `Active`, audited via a
-//!   `feedback_events` row with `kind=auto_promoted`. Opt-in via
-//!   `MEM_AUTO_PROMOTE_ENABLED=1`.
+//!   `feedback_events` row with `kind=auto_promoted`. Default ON;
+//!   opt out via `MEM_AUTO_PROMOTE_DISABLED=1`.
 //! - `vacuum_worker` — daily Lance manifest pruning across every
 //!   managed table. Always-on maintenance (reclaims accumulated
 //!   copy-on-write history); opt out with `MEM_VACUUM_DISABLED=1`.

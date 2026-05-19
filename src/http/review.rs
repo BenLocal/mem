@@ -111,9 +111,10 @@ impl From<HttpEditPendingRequest> for EditPendingRequest {
 ///
 /// `dry_run=true` (the default) only previews candidate ids; nothing
 /// is written. `dry_run=false` actually promotes — even when the
-/// background worker is disabled via `MEM_AUTO_PROMOTE_ENABLED=0`, so
-/// this endpoint doubles as a one-shot CLI hook for operators who
-/// want to run the sweep on demand without flipping the master switch.
+/// background worker is disabled via `MEM_AUTO_PROMOTE_DISABLED=1`,
+/// so this endpoint doubles as a one-shot CLI hook for operators
+/// who want to run the sweep on demand without flipping the master
+/// switch.
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "snake_case")]
 struct AutoPromoteRequest {
