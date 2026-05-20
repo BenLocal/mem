@@ -432,6 +432,35 @@ pub struct KgInvalidateEdgeArgs {
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct FactCheckArgs {
+    /// Verbatim content the caller is *about to* ingest. Used for
+    /// fuzzy typo scanning (tokens ≥ 4 chars are compared against
+    /// existing entity canonical names + aliases).
+    #[serde(default)]
+    pub content: Option<String>,
+    /// Explicit caller-supplied entity hints (same shape as the
+    /// `topics` field on `capability_capsule_ingest`). Scanned for
+    /// typos in addition to `content`.
+    #[serde(default)]
+    pub topics: Option<Vec<String>>,
+    /// Structured relationship triples the caller wants cross-checked
+    /// against KG state. Each is `{subject, predicate, object}` —
+    /// subject / object resolve via the entity registry; predicate is
+    /// matched verbatim. Empty / missing skips KG checks.
+    #[serde(default)]
+    pub relationships: Option<Vec<FactCheckTripleArg>>,
+    #[serde(default)]
+    pub tenant: Option<String>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema, Serialize)]
+pub struct FactCheckTripleArg {
+    pub subject: String,
+    pub predicate: String,
+    pub object: String,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct ListInScopeArgs {
     #[serde(default)]
     pub tenant: Option<String>,
@@ -1422,6 +1451,31 @@ impl MemMcpServer {
         }
         self.post_json("graph/edges/invalidate", &Value::Object(body))
             .await
+    }
+
+    // ------------------- capability_capsule_fact_check -------------------
+    #[tool(
+        description = "Pre-ingest sanity check against the entity registry + KG — surfaces (a) probable-typo entity names (Levenshtein ≤ 2, token length ≥ 4), (b) direction-reversed active edges that contradict a caller-supplied (subject, predicate, object) triple, and (c) value-changed or restated-closed contradictions in the KG. Pure read; never writes. Mempalace's `fact_checker.py` analogue minus the LLM — caller decides whether to act on the report. Pass `relationships=[]` (or omit) to skip the KG checks and only run typo scanning."
+    )]
+    async fn capability_capsule_fact_check(
+        &self,
+        Parameters(args): Parameters<FactCheckArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        let mut body = Map::new();
+        body.insert(
+            "tenant".into(),
+            json!(self.resolve_tenant(args.tenant.as_ref())),
+        );
+        if let Some(v) = args.content {
+            body.insert("content".into(), json!(v));
+        }
+        if let Some(v) = args.topics {
+            body.insert("topics".into(), json!(v));
+        }
+        if let Some(v) = args.relationships {
+            body.insert("relationships".into(), json!(v));
+        }
+        self.post_json("fact_check", &Value::Object(body)).await
     }
 
     // ------------------- capability_capsule_list_wings -------------------

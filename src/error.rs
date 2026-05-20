@@ -5,7 +5,10 @@ use axum::{
 };
 use serde_json::json;
 
-use crate::{service::capability_capsule_service::ServiceError, storage::StorageError};
+use crate::{
+    service::capability_capsule_service::ServiceError,
+    storage::{GraphError, StorageError},
+};
 
 pub type Result<T> = std::result::Result<T, anyhow::Error>;
 
@@ -20,6 +23,12 @@ impl From<StorageError> for AppError {
 
 impl From<ServiceError> for AppError {
     fn from(error: ServiceError) -> Self {
+        Self(error.into())
+    }
+}
+
+impl From<GraphError> for AppError {
+    fn from(error: GraphError) -> Self {
         Self(error.into())
     }
 }

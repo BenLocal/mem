@@ -8,7 +8,7 @@ use tracing::info;
 
 use crate::{
     http,
-    service::{CapabilityCapsuleService, EntityService, TranscriptService},
+    service::{CapabilityCapsuleService, EntityService, FactCheckService, TranscriptService},
     storage::{Backend, Store},
 };
 
@@ -20,6 +20,10 @@ pub struct AppState {
     pub transcript_service: Arc<TranscriptService>,
     /// Service façade backing the `/entities/*` HTTP routes.
     pub entity_service: EntityService,
+    /// Service façade backing `POST /fact_check` — pre-ingest
+    /// entity-registry + KG sanity check (mempalace `fact_checker.py`
+    /// analogue, minus the LLM). See `docs/mempalace-diff-v3.md` §5.
+    pub fact_check_service: FactCheckService,
 }
 
 impl AppState {
@@ -116,6 +120,7 @@ impl AppState {
             Some(provider.clone()),
         ));
         let entity_service = EntityService::new(store.clone());
+        let fact_check_service = FactCheckService::new(store.clone());
         let capability_capsule_service =
             CapabilityCapsuleService::with_providers(store, embedding_provider_id, Some(provider))
                 .with_transcript_service(transcript_service.clone());
@@ -125,6 +130,7 @@ impl AppState {
             config,
             transcript_service,
             entity_service,
+            fact_check_service,
         })
     }
 

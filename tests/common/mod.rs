@@ -22,7 +22,7 @@ use std::sync::Arc;
 
 use mem::{
     app::AppState,
-    service::{CapabilityCapsuleService, EntityService, TranscriptService},
+    service::{CapabilityCapsuleService, EntityService, FactCheckService, TranscriptService},
     storage::Store,
 };
 use tempfile::TempDir;
@@ -52,11 +52,13 @@ pub fn test_app_state(
     capability_capsule_service: CapabilityCapsuleService,
 ) -> AppState {
     let transcript_service = Arc::new(TranscriptService::new(store.clone(), None));
-    let entity_service = EntityService::new(store);
+    let entity_service = EntityService::new(store.clone());
+    let fact_check_service = FactCheckService::new(store);
     AppState {
         capability_capsule_service,
         config: mem::config::Config::local(),
         transcript_service,
         entity_service,
+        fact_check_service,
     }
 }
