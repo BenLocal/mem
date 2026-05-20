@@ -4,7 +4,7 @@
 //! across these methods live with their domain rather than in
 //! `mod.rs`.
 
-use arrow_array::{RecordBatch, StringArray};
+use arrow_array::{Float32Array, RecordBatch, StringArray};
 use futures::TryStreamExt;
 use lancedb::query::{ExecutableQuery, QueryBase};
 
@@ -1039,6 +1039,70 @@ impl LanceStore {
                 hash.value(0).to_string(),
                 updated.value(0).to_string(),
             )));
+        }
+        Ok(None)
+    }
+
+    /// Read the raw embedding vector for `capability_capsule_id`.
+    /// Returns `None` when (a) the embeddings table hasn't been
+    /// created yet (semantic search never used), or (b) no row exists
+    /// for this id. Added for the dedup worker, which needs vectors to
+    /// compute pairwise cosine — `get_capability_capsule_embedding_row`
+    /// only exposes the metadata triple `(model, hash, updated_at)`.
+    pub async fn get_capability_capsule_embedding_vector(
+        &self,
+        capability_capsule_id: &str,
+    ) -> Result<Option<Vec<f32>>, StorageError> {
+        let names = self
+            .conn
+            .table_names()
+            .execute()
+            .await
+            .map_err(lancedb_err)?;
+        if !names.iter().any(|n| n == "capability_capsule_embeddings") {
+            return Ok(None);
+        }
+        let table = self
+            .conn
+            .open_table("capability_capsule_embeddings")
+            .execute()
+            .await
+            .map_err(lancedb_err)?;
+        let stream = table
+            .query()
+            .only_if(format!(
+                "capability_capsule_id = {}",
+                sql_quote(capability_capsule_id)
+            ))
+            .limit(1)
+            .execute()
+            .await
+            .map_err(lancedb_err)?;
+        let batches: Vec<RecordBatch> = stream
+            .try_collect()
+            .await
+            .map_err(|e| StorageError::InvalidInput(format!("lancedb stream: {e}")))?;
+        for b in &batches {
+            if b.num_rows() == 0 {
+                continue;
+            }
+            // `embedding` is a FixedSizeList<Float32, dim>; extract the
+            // single row's underlying Float32Array values.
+            let col = b
+                .column_by_name("embedding")
+                .ok_or(StorageError::InvalidData("missing embedding column"))?;
+            let fsl = col
+                .as_any()
+                .downcast_ref::<arrow_array::FixedSizeListArray>()
+                .ok_or(StorageError::InvalidData(
+                    "embedding column not FixedSizeListArray",
+                ))?;
+            let values = fsl.value(0);
+            let floats = values
+                .as_any()
+                .downcast_ref::<Float32Array>()
+                .ok_or(StorageError::InvalidData("embedding inner not Float32"))?;
+            return Ok(Some(floats.values().to_vec()));
         }
         Ok(None)
     }

@@ -122,6 +122,41 @@ pub struct VacuumSettings {
     pub aggressive: bool,
 }
 
+/// Near-duplicate sweep settings — closes mempalace-diff-v3 #30.
+///
+/// The dedup worker periodically scans active capsules grouped by
+/// `(source_agent, project, repo)`, computes pairwise cosine on their
+/// embeddings, and soft-deletes any pair-cluster member that's shorter
+/// than the longest one in the cluster (via `feedback_kind=incorrect`,
+/// which moves status to `Archived`). Mempalace's `dedup.py` analogue.
+///
+/// **Default OFF for v1** (mirrors the original `auto_promote` shape
+/// before its default-flip). Dedup is destructive — it archives rows —
+/// so the conservative default is opt-in. Once we have telemetry on
+/// false-positive rates we can revisit.
+#[derive(Debug, Clone)]
+pub struct DedupSettings {
+    /// Worker is not spawned when false. Default false (opt-in).
+    pub enabled: bool,
+    /// Sweep cadence in seconds. Default 6 hours — dedup sweeps the
+    /// full active capsule set, which is more expensive than vacuum,
+    /// and the duplicates it catches accumulate slowly (one extra
+    /// row per redundant mining pass).
+    pub interval_secs: u64,
+    /// Cosine similarity threshold. Default 0.92 — pairs with cosine
+    /// at or above this are treated as near-duplicates. The 0.92
+    /// floor catches transcript-miner re-runs without flagging
+    /// genuinely related but distinct capsules (`mempalace/dedup.py`
+    /// uses 0.85 as its lowest setting, but mem capsules are
+    /// typically shorter / more focused so the threshold is higher).
+    pub threshold: f32,
+    /// Per-sweep cap on candidate capsules pulled. Default 2_000.
+    /// Bigger tenants need a higher cap (or per-scope iteration in a
+    /// future revision); the cap exists to keep one sweep's worst
+    /// case bounded in memory.
+    pub scan_limit: usize,
+}
+
 #[derive(Debug, Clone)]
 pub struct Config {
     pub bind_addr: String,
@@ -129,6 +164,7 @@ pub struct Config {
     pub embedding: EmbeddingSettings,
     pub auto_promote: AutoPromoteSettings,
     pub vacuum: VacuumSettings,
+    pub dedup: DedupSettings,
 }
 
 #[derive(Debug, Error)]
@@ -157,6 +193,12 @@ pub enum ConfigError {
     InvalidVacuumIntervalSecs(String),
     #[error("invalid MEM_VACUUM_OLDER_THAN_DAYS: {0}")]
     InvalidVacuumOlderThanDays(String),
+    #[error("invalid MEM_DEDUP_INTERVAL_SECS: {0}")]
+    InvalidDedupIntervalSecs(String),
+    #[error("invalid MEM_DEDUP_THRESHOLD: {0} (expected float in (0, 1])")]
+    InvalidDedupThreshold(String),
+    #[error("invalid MEM_DEDUP_SCAN_LIMIT: {0}")]
+    InvalidDedupScanLimit(String),
 }
 
 impl EmbeddingSettings {
@@ -417,6 +459,54 @@ impl VacuumSettings {
     }
 }
 
+impl DedupSettings {
+    /// Default: worker OFF, 6-hour cadence, threshold 0.92, 2_000 cap.
+    /// Opt in via `MEM_DEDUP_ENABLED=1`.
+    pub fn development_defaults() -> Self {
+        Self {
+            enabled: false,
+            interval_secs: 6 * 3_600,
+            threshold: 0.92,
+            scan_limit: 2_000,
+        }
+    }
+
+    pub fn from_env_vars(get: impl Fn(&str) -> Option<String>) -> Result<Self, ConfigError> {
+        let mut s = Self::development_defaults();
+        if let Some(raw) = get("MEM_DEDUP_ENABLED") {
+            s.enabled = matches!(raw.to_ascii_lowercase().as_str(), "1" | "true" | "yes");
+        }
+        if let Some(raw) = get("MEM_DEDUP_INTERVAL_SECS") {
+            let n: u64 = raw
+                .parse()
+                .map_err(|_| ConfigError::InvalidDedupIntervalSecs(raw.clone()))?;
+            if n == 0 {
+                return Err(ConfigError::InvalidDedupIntervalSecs(raw));
+            }
+            s.interval_secs = n;
+        }
+        if let Some(raw) = get("MEM_DEDUP_THRESHOLD") {
+            let n: f32 = raw
+                .parse()
+                .map_err(|_| ConfigError::InvalidDedupThreshold(raw.clone()))?;
+            if !(0.0 < n && n <= 1.0) {
+                return Err(ConfigError::InvalidDedupThreshold(raw));
+            }
+            s.threshold = n;
+        }
+        if let Some(raw) = get("MEM_DEDUP_SCAN_LIMIT") {
+            let n: usize = raw
+                .parse()
+                .map_err(|_| ConfigError::InvalidDedupScanLimit(raw.clone()))?;
+            if n == 0 {
+                return Err(ConfigError::InvalidDedupScanLimit(raw));
+            }
+            s.scan_limit = n;
+        }
+        Ok(s)
+    }
+}
+
 impl Config {
     pub fn local() -> Self {
         Self {
@@ -425,6 +515,7 @@ impl Config {
             embedding: EmbeddingSettings::development_defaults(),
             auto_promote: AutoPromoteSettings::development_defaults(),
             vacuum: VacuumSettings::development_defaults(),
+            dedup: DedupSettings::development_defaults(),
         }
     }
 
@@ -436,6 +527,7 @@ impl Config {
             embedding: EmbeddingSettings::from_env_vars(|k| std::env::var(k).ok())?,
             auto_promote: AutoPromoteSettings::from_env_vars(|k| std::env::var(k).ok())?,
             vacuum: VacuumSettings::from_env_vars(|k| std::env::var(k).ok())?,
+            dedup: DedupSettings::from_env_vars(|k| std::env::var(k).ok())?,
         })
     }
 }

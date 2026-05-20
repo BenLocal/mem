@@ -52,6 +52,14 @@ pub trait EmbeddingVectorStore: Send + Sync {
         capability_capsule_id: &str,
     ) -> Result<Option<(String, String, String)>, StorageError>;
 
+    /// Read the raw embedding vector for `capability_capsule_id`. Used
+    /// by the dedup worker for pairwise cosine. Returns `None` when
+    /// the embeddings table doesn't exist yet or no row matches.
+    async fn get_capability_capsule_embedding_vector(
+        &self,
+        capability_capsule_id: &str,
+    ) -> Result<Option<Vec<f32>>, StorageError>;
+
     /// Upsert a transcript-block embedding. Same wire format as
     /// the capsule side; targets the separate
     /// `conversation_message_embeddings` table.
@@ -115,6 +123,15 @@ impl EmbeddingVectorStore for Store {
     ) -> Result<Option<(String, String, String)>, StorageError> {
         self.lance
             .get_capability_capsule_embedding_row(capability_capsule_id)
+            .await
+    }
+
+    async fn get_capability_capsule_embedding_vector(
+        &self,
+        capability_capsule_id: &str,
+    ) -> Result<Option<Vec<f32>>, StorageError> {
+        self.lance
+            .get_capability_capsule_embedding_vector(capability_capsule_id)
             .await
     }
 

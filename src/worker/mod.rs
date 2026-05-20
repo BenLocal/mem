@@ -9,6 +9,11 @@
 //!   `PendingConfirmation` rows → `Active`, audited via a
 //!   `feedback_events` row with `kind=auto_promoted`. Default ON;
 //!   opt out via `MEM_AUTO_PROMOTE_DISABLED=1`.
+//! - `dedup_worker` — periodic near-duplicate sweep. Groups active
+//!   capsules by `(source_agent, project, repo)`, computes pairwise
+//!   cosine on embeddings, archives shorter members of near-dup
+//!   clusters via `feedback_kind=incorrect`. Default OFF (destructive);
+//!   opt in via `MEM_DEDUP_ENABLED=1`. Mempalace `dedup.py` analogue.
 //! - `vacuum_worker` — daily Lance manifest pruning across every
 //!   managed table. Always-on maintenance (reclaims accumulated
 //!   copy-on-write history); opt out with `MEM_VACUUM_DISABLED=1`.
@@ -29,6 +34,7 @@
 
 pub mod auto_promote_worker;
 pub mod decay_worker;
+pub mod dedup_worker;
 pub mod embedding_worker;
 pub mod transcript_embedding_worker;
 pub mod vacuum_worker;

@@ -99,6 +99,16 @@ impl AppState {
             });
         }
 
+        if config.dedup.enabled {
+            let store_dedup = store.clone();
+            let dedup_settings = config.dedup.clone();
+            // Same single-tenant MVP scope as auto_promote.
+            let tenant = std::env::var("MEM_TENANT").unwrap_or_else(|_| "local".to_string());
+            tokio::spawn(async move {
+                crate::worker::dedup_worker::run(store_dedup, dedup_settings, tenant).await;
+            });
+        }
+
         if !config.embedding.transcript_disabled {
             let provider_transcript = provider.clone();
             let store_transcript = store.clone();

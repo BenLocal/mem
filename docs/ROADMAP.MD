@@ -1,11 +1,18 @@
 # mem 改造路线图
 
-> 本文件是 [`mempalace-diff.md`](./mempalace-diff.md) 抽取出来的执行面板，便于单独维护与外发。
-> **新增 / 调整路线图项请先回 `mempalace-diff.md` 改对应章节，再同步更新本文件。** 设计原则、每项的论证、不做的事见原文档对应章节号（§5、§7、§8、§11、§12、§13、§14 等）。"现在差异快照"看 [§15](./mempalace-diff.md#15-当前差异快照2026-05-06)。
+> 本文件是三篇 mempalace 对照文档抽取出来的执行面板，便于单独维护与外发：
+> - [`mempalace-diff.md`](./mempalace-diff.md)（v1，~2026-05-06）—— 架构 / 数据模型 / 检索流水线层；产出 #1–#20
+> - [`mempalace-diff-v2.md`](./mempalace-diff-v2.md)（2026-05-12）—— MCP 工具表面层补审；产出 #16–#28（部分编号与 v1 §8 重叠，新条目 #21–#28）
+> - [`mempalace-diff-v3.md`](./mempalace-diff-v3.md)（2026-05-20）—— module / CLI 表面层补审；产出 **#29–#33**
 >
-> **状态（2026-05-18）**：#1–#19 全部 ✅；#20 仍待办（内容自动抽取实体，opt-in regex 路径，需要单独决策）。批 H 全 4 条（#16 tags / #17 supersedes / #18 session / #19 file）已落地，KG 入图入口扩展完工。
+> **新增 / 调整路线图项请先回对应 diff 文档改章节，再同步更新本文件。** 设计原则、每项的论证、不做的事见原文档对应章节号：
+> - v1：§5 / §7 / §8 / §11 / §12 / §13 / §14；"现在差异快照"看 v1 [§15](./mempalace-diff.md#15-当前差异快照2026-05-06)
+> - v2：§2（MCP 表面对照）/ §3（推荐路线）/ §4（#16 详化）
+> - v3：§2（CLI 对照）/ §3（module 对照）/ §4（推荐路线）/ §5（#29 详化）
 >
-> **平行工作线**：MemPalace 对齐之外，**Backend 存储抽象**走独立 workstream，路线图见 [`backend-coupling.md`](./backend-coupling.md) §6（Phase 0–5 已 shipped；DuckDbQuery / LanceStore 已收窄 `pub(crate)`）。两条线 commit message 用各自的 close 引用（`closes ROADMAP #N` vs `closes backend-coupling §6 Phase N`），不互相阻塞。
+> **状态（2026-05-20）**：v1 #1–#19 + v2 #16–#28 全部 ✅；v3 **#29 (fact_check API+MCP) + #30 (dedup worker)** 已 ✅（14/14 新 integration tests 通过，fmt + clippy 干净）；剩 #20（内容自动抽取实体，opt-in regex）+ v3 #31–#33（init CLI / sweep cursor / 隐私警告）待办。
+>
+> **平行工作线**：MemPalace 对齐之外，**Backend 存储抽象**走独立 workstream，路线图见 [`backend-coupling.md`](./backend-coupling.md) §6（Phase 0–5 已 shipped；DuckDbQuery / LanceStore 已收窄 `pub(crate)`）。两条线 commit message 用各自的 close 引用（`closes ROADMAP #N` / `closes mempalace-diff-v2 #N` / `closes mempalace-diff-v3 #N` vs `closes backend-coupling §6 Phase N`），不互相阻塞。
 
 ## 路线图
 
@@ -49,10 +56,15 @@
 
 ## 下一阶段
 
-#1–#19 已完成；#20 待办，触发条件按性质分两条：
+v1 #1–#19 + v2 #16–#28 已完成；剩余待办：
+
+- **v1 #20** — 内容自动抽取实体（opt-in regex），风险高，需要先定 Verbatim 边界，暂缓。
+- **v3 #29–#33** — module / CLI 表面层补审产出，未开工。v3 §4 建议先做 **#29（fact_check API）+ #31（`mem init` CLI）**；#30（近似去重）次之；#32 / #33 延后。
+
+新对齐项触发条件按性质分两条：
 
 - **本质形态差异** — `mempalace-diff §15.1` 列举（HTTP vs MCP / DuckDB vs Chroma / lifecycle vs verbatim）。这些**不会主动消除**；改变只能在哲学路线整体重定义时讨论。
-- **新对齐项 / 实测 gap** — 当 mempalace 主仓有新设计或 mem 实测出新 gap 时：先回 `mempalace-diff.md` 加 / 改章节做论证，再回本文件追加新行号（#21+），同时更新 `mempalace-diff §15.2/15.3/15.4` 三张映射表保持一致。#16–#20 的论证沉在 [§5.1](./mempalace-diff.md#51-实测-kg-不够稠密2026-05-07-抽样)。
+- **新对齐项 / 实测 gap** — 当 mempalace 主仓有新设计或 mem 实测出新 gap 时：先回对应 diff 文档加 / 改章节做论证（v1 架构层 / v2 MCP 表面 / v3 module-CLI 表面），再回本文件追加新行号或在 header 更新状态，同时更新 `mempalace-diff §15.2/15.3/15.4` 三张映射表保持一致。#16–#20 的论证沉在 v1 [§5.1](./mempalace-diff.md#51-实测-kg-不够稠密2026-05-07-抽样)；#21–#28 沉在 v2 §2；#29–#33 沉在 v3 §2–§3。
 
 已知 incident TODO（不计入 ROADMAP，但留档）：
 1. 找出 `embedding_jobs` orphan 行的产生路径（疑在某条 supersede / delete pipeline）
@@ -64,6 +76,9 @@
 ---
 
 > **维护规则**：
-> 1. 每完成一项，更新对应行的状态（✅ done / 🚧 in progress）。
-> 2. git commit message 引用编号：`feat(retrieve): introduce usearch sidecar ANN (closes ROADMAP #2)`。
-> 3. 新增 ROADMAP 行后，**同步更新 `mempalace-diff §15.2`（已吸收）/ `§15.3`（mem 独有）/ `§15.4`（不引入）三张映射表**——否则"现在差异快照"会与 ROADMAP 漂移。
+> 1. 每完成一项，更新对应行的状态（✅ done / 🚧 in progress）；v2/v3 的项在各自 diff 文档的表格里更新。
+> 2. git commit message 引用编号，区分来源：
+>    - v1 ROADMAP 项：`feat(retrieve): introduce usearch sidecar ANN (closes ROADMAP #2)`
+>    - v2 项：`feat(graph): add kg_timeline MCP (closes mempalace-diff-v2 #16)`
+>    - v3 项：`feat(service): add fact_check API (closes mempalace-diff-v3 #29)`
+> 3. 新增 v1 ROADMAP 行后，**同步更新 `mempalace-diff §15.2`（已吸收）/ `§15.3`（mem 独有）/ `§15.4`（不引入）三张映射表**——否则"现在差异快照"会与 ROADMAP 漂移。v2/v3 行不动 §15 表。

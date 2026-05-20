@@ -1,0 +1,160 @@
+## MemPalace × mem 对照（v3 — 2026-05-20 module / CLI 表面层补审）
+
+> 本篇承接 [`mempalace-diff-v2.md`](./mempalace-diff-v2.md)。v2 的结论是 MCP 工具表面层 #16–#28 已全部 ✅，剩下都是"有意保留的形态/哲学差异"。**本篇不否认那个结论**——重新核过 mempalace HEAD（commit `de7801e`，2026-04-27），`mempalace/mcp_server.py` 仍是 29 个 MCP 工具，一条没多。
+>
+> 但 v2 的比较粒度止步于 **MCP 表面**；它没有逐个对照两边的 **module / CLI 表面**。本篇做了那个事：把 mempalace 当前 14 个 CLI 子命令 + 一批非 MCP-暴露的 module（`fact_checker.py` / `dedup.py` / `corpus_origin.py` / `onboarding.py` 等）逐一映射到 mem 的对应物，结果发现 5 处**值得做的缺口**——既不属于 §15.4（已论证拒绝）也不在 v1 §8 / v2 §3 路线图里。
+>
+> 维护原则同 v1/v2：本篇与代码不一致时**以代码为权威**；落地一项后回到对应表格更新状态（✅ done / 🚧 in progress）。
+
+---
+
+## 0. 方法论
+
+| 步骤 | 来源 |
+|---|---|
+| 列 mempalace 当前 CLI 子命令 | `grep '^def cmd_' /root/workspace/master/mempalace/mempalace/cli.py` |
+| 列 mempalace 非 MCP module | `ls /root/workspace/master/mempalace/mempalace/*.py` + 各 module docstring |
+| 列 mem 当前 CLI 子命令 | `ls src/cli/*.rs` + `src/main.rs` 的 clap 子命令 |
+| 列 mem MCP 工具 | v2 §2 已对齐，不重复 |
+| 分类 | (A) 已等价吸收 (B) 部分覆盖 (C) 真正缺口 (D) §15.4 / v2 §2.8 已拒绝 |
+
+MCP 表面层的对照见 v2，本篇不重复。
+
+---
+
+## 1. 一句话结论
+
+> **MCP 表面层无新缺口；module / CLI 层有 5 处值得补**——集中在 **数据卫生**（fact_check / 近似去重）和 **首跑体验**（`mem init` / per-session cursor / 外发 provider 警告）两块。所有数据 schema 都已就位，缺的是把现有 entity registry / KG / embedding 能力封装成对外 API 或独立 CLI。
+>
+> 不补：spellcheck（违反 Verbatim §7）、`llm_refine`（§15.4 已论证）、`mem repair`（随 usearch sidecar 一起删，Lance native ANN 没这个 failure mode）。
+
+---
+
+## 2. CLI 表面对照
+
+mempalace HEAD 14 个 CLI 子命令；mem HEAD 5 个（`serve` / `mcp` / `mine` / `wake-up` / `feedback`）。
+
+| mempalace | mem 对应 | 映射强度 | 备注 |
+|---|---|---|---|
+| `mempalace init` | — | ❌ | **缺**：mode-based 默认 wing taxonomy（`code` / `personal` / `research`）+ 零配置首跑骨架 |
+| `mempalace mine` | `mem mine` | ✅ | mem 是 dual-sink（写 capsule + transcript 归档），mempalace 只写 drawer |
+| `mempalace sweep` | (`mem mine` 已 per-block) | ⚠️ | 部分覆盖：mem mine 已是 block 粒度，缺**per-session cursor resume**（mempalace `sweeper.py` 按 session_id 跳过 already-mined messages，规模上去后性能差异显著） |
+| `mempalace search` | (无独立 CLI) | ⚠️ | mem 通过 MCP `capability_capsule_search` 提供；缺独立 CLI 供脚本/debug 用 |
+| `mempalace wakeup` | `mem wake-up` | ✅ | |
+| `mempalace split` | — | ❌ | 缺：split mega transcript files（niche——只在 import 外部 mega-dump 时有用）|
+| `mempalace migrate` | — | ❌ | 缺：schema migration runner（暂不需要——schema 在源码里 inline 跟 record_batch builder 同步更新；只有跨次 break 时才用得到） |
+| `mempalace status` | `mem_health` MCP | ⚠️ | mem 通过 MCP 提供（v2 #28），缺独立 CLI |
+| `mempalace repair_status` / `repair` | — | 🚫 | **不做**：mem 把 usearch sidecar 替换成 Lance native ANN，HNSW capacity divergence / blob-seq marker 这些 failure mode 不复存在 |
+| `mempalace hook` | (hooks 是 bash shell 脚本) | ✅ | 两边都走 hook，实现形态不同 |
+| `mempalace instructions` | (SKILL.md / wake-up payload) | ✅ | mem 通过 `mem wake-up` 注入 SessionStart |
+| `mempalace mcp` | (README 写明) | ⚠️ | mem 缺一个"打印怎么接 MCP" 的辅助 CLI——README 章节代偿，但 onboarding 不如一行 CLI 直观 |
+| `mempalace compress <id>` | — | ❌ | 缺：调试用 standalone compress（compress.rs 现在只在 retrieve pipeline 里跑）|
+
+---
+
+## 3. Module 级能力对照（mempalace 有 / mem 没有）
+
+> 排除 mempalace 内部的 `palace.py` / `palace_graph.py` / `searcher.py` 等"换皮等价物"——mem 都有对应实现（`storage/lance_store/` + `storage/duckdb_query/` + `pipeline/retrieve.rs`）。下面只列**功能性差异**。
+
+| mempalace module | 做什么 | mem 状态 | 值得做？ |
+|---|---|---|---|
+| **`fact_checker.py`** | ingest 前过一遍 entity registry + KG，检查 (a) `similar_name` typo（"Alic" vs 已注册的 "Alice"）(b) `relationship_mismatch`（声明 "X manages Y" 但 KG 里是 Y manages X）(c) 与已知 fact 冲突；返回 warning 不阻塞 | ❌ | **建议做**（→ #29）——entity registry 和 KG 都已就位，是薄薄一层，给 review-flow 当 PR-bot 用 |
+| **`dedup.py`**（近似去重） | cosine similarity 找同 `source_file` 的近似 capsule，保留 最长最富信息的一行，其他归档 | partial | mem 有 `content_hash` exact-dedup + `idempotency_key`，**没有近似扫**。**建议做**（→ #30）——cron 或 `POST /admin/dedup_sweep` |
+| **`corpus_origin.py`** | 探测 corpus 是不是 AI 对话 + 哪个平台 + agent persona names（解 "my three sons in Claude = three AI instances vs three biological children" 这种歧义） | ❌ | **暂不做**——niche，mem mine 默认假定 Claude Code transcript；等接非 Claude 源再说 |
+| **`general_extractor.py`** | regex 5 类自动分类（decision / preference / milestone / problem / emotional），在 mine 路径里跑 | ❌ | **谨慎**——和 §15.4 "caller 决定 type" 原则有张力；若做应限于 mine 路径不污染 ingest API。低优先 |
+| **`onboarding.py`** | mode-based 默认 wing taxonomies（`code` / `personal` / `research`），`mempalace.yaml` 初始化 | ❌ | **建议做**（→ #31）——和 #31 `mem init` 一起 |
+| **`spellcheck.py`** | 写入前拼写纠正，保留技术词 / CamelCase / 实体名 / URL | ❌ | 🚫 **不做**——违反 Verbatim §7 |
+| **`llm_refine.py`** | opt-in LLM 二次精排 entity 候选（PERSON/PROJECT/TOPIC/COMMON_WORD/AMBIGUOUS）| ❌ | 🚫 **不做**——§15.4 已论证（服务端不烧 LLM） |
+| **`dialect.py`**（AAAK 输出格式）| 把抽取结果序列化成 AAAK 紧凑结构 | ❌ | 🚫 **不做**——AAAK 整体在 §15.4 已拒绝 |
+| **隐私守护**（commits `a0b7ba0` Tailscale CGNAT / `4400734` external-LLM warn）| 启动 / 配置时警告 embedding provider 外发，识别 Tailscale CGNAT (`100.64.0.0/10`) 为本地 | ❌ | **建议做**（→ #33）——mem 现在 `EmbeddingProvider::OpenAI` 静默上线，应该给一次启动警告 |
+| `sweeper.py` | message-granular fallback miner + per-session cursor resume | partial | mem mine 已经 block 粒度，但缺 cursor 持久化。**建议做**（→ #32） |
+| `split_mega_files.py` | 切分超大单文件 session | ❌ | 暂不做——niche |
+| `repair.py` | rebuild vector index from metadata，HNSW capacity divergence detection | ❌ | 🚫 **不做**——随 usearch sidecar 一起删，Lance native ANN 没这个 failure mode |
+| `migrate.py` | ChromaDB 跨版本 schema 迁移 | ❌ | 暂不做——mem 在 source 里 inline schema，没有跨版本兼容需求 |
+
+---
+
+## 4. 推荐路线（#29–#33，沿用 v2 §3 编号风格）
+
+> 编号继续 v2 §3（最后是 #28），新条目从 #29 起。commit 引用格式：`(closes mempalace-diff-v3 #N)`。
+
+| # | 题目 | 改动面 | 工作量估 | 优先级 |
+|---|---|---|---|---|
+| **#29** ✅ | **`fact_check` API + MCP**：`POST /fact_check` body `{tenant, content, topics, relationships}` → `{similar_names, relationship_conflicts, kg_contradictions}`；read-only 不写库；MCP wrapper `capability_capsule_fact_check`。复用 `EntityRegistry::resolve_or_create` 的 normalize 路径 + Levenshtein ≤ 2 找 typo（token len ≥ 4 floor 防 trivial 撞）；扫 `graph_edges` 找 (a) 方向反转 same-predicate (b) 同 (S,P,*) 不同 object (c) 重述已 closed 的 (S,P,O)。**`relationships` 由 caller 传**——mem 无 LLM 抽取，与 §15.4 一致 | 新 `service/fact_check_service.rs`（FactCheckService + FactCheckError）+ `http/fact_check.rs` + `error.rs` 加 `From<GraphError>` + `mcp::server` 加 `FactCheckArgs` + `capability_capsule_fact_check` tool；9 个 integration tests | M（实际 ~3h） | **P1** — 9/9 tests green, fmt + clippy clean |
+| **#30** ✅ | **近似去重 worker**：`src/worker/dedup_worker.rs::sweep_once` —— 按 `(source_agent, project, repo)` 分组活跃 capsule，组内拉 embedding 向量做 pairwise cosine + union-find 聚类，cosine ≥ `threshold` 的聚成一簇，保留 `len(content)` 最大（tie-break 最早 `created_at`）的一条，其余通过 `apply_feedback(FeedbackKind::Incorrect)` 走软删；`dry_run=true` 只报告候选 id 不写。`DedupSettings` **默认 OFF**（destructive），`MEM_DEDUP_ENABLED=1` 开；`MEM_DEDUP_INTERVAL_SECS` / `MEM_DEDUP_THRESHOLD` / `MEM_DEDUP_SCAN_LIMIT` 调参 | 新 `EmbeddingVectorStore::get_capability_capsule_embedding_vector` trait 方法 + Lance impl（读 `FixedSizeListArray`）+ `config::DedupSettings` + `worker/dedup_worker.rs` + `app.rs` 条件 spawn + 5 个 integration tests | M（实际 ~2h） | P1 — 5/5 tests green, fmt + clippy clean |
+| **#31** | **`mem init` CLI**：`mem init [--mode code|personal|research] [--path .mem/]` 写 `.mem/config.toml`（默认 `MEM_DB_PATH` / mode 对应 wing/repo defaults / `EMBEDDING_PROVIDER=fake` 起步）；交互式问几个关键开关；输出"下一步：`mem serve`"的引导 | 新 `src/cli/init.rs` + clap 子命令 + 内置模板 | S | P1 — 零成本撑起 onboarding |
+| **#32** | **`mem mine` per-session cursor**：新 lance 表 `mine_cursors(session_id, last_mined_ts, updated_at)`；`mine` 每次开扫前查 cursor，跳过 `timestamp < cursor` 的 block；写完更新 cursor。**幂等性已由 server-side dedup 兜底**，cursor 是性能优化不是正确性 | 1 个新 lance 表 + lance_store/duckdb_query CRUD + `cli/mine.rs` 串通 | S | P2 — 规模上去再做（当前 mine 5 万 block 也只需几秒） |
+| **#33** | **外发 embedding provider 启动警告**：`AppState::from_config` 时如果 `EmbeddingProvider` 非 `Fake` / 非 `EmbedAnything`（local）就 `tracing::warn!("Embedding will leave this machine via provider X")`；首次 enqueue 也再打一次；新增 `MEM_PRIVACY_WARN_SUPPRESS=1` 关掉 | 1 处 startup + 1 处 worker enqueue 加 warn；env var 开关 | S | P2 — 隐私守护 |
+
+### 决策点
+
+- **已完成**：#29（fact_check API + MCP）+ #30（dedup worker）—— 9+5 integration tests green
+- **下一波**：#31（`mem init` CLI）—— 零成本撑起 onboarding
+- **延后**：#32（性能优化，规模未到痛点）/ #33（影响范围小）
+- **不做**：spellcheck / llm_refine / dialect / repair / corpus_origin / general_extractor / split_mega_files / migrate（理由见 §3 表的 🚫 标）
+
+---
+
+## 5. 实施清单（#29 详化，给执行者参考）
+
+> #29 是本批最有体量的一项；展开如下。其余 #30–#33 按照"先 service 后 http 后 mcp"标准三层套用即可。
+
+### 5.1 接口形状
+
+```jsonc
+// Request
+{
+  "tenant": "local",
+  "content": "Alic Smith manages Project Phoenix as of Q1 2026",
+  "topics": ["project-phoenix", "alic"],
+  "code_refs": []
+}
+
+// Response — read-only, no side effects
+{
+  "similar_names": [
+    { "in_input": "Alic", "matches": [{ "entity_id": "ent_01...", "canonical_name": "Alice", "edit_distance": 1 }] }
+  ],
+  "relationship_conflicts": [
+    { "subject": "alice", "predicate": "manages", "object": "project-phoenix",
+      "existing_edge": { "subject": "project-phoenix", "predicate": "managed_by", "object": "alice", "valid_from": "..." },
+      "note": "direction mismatch: existing edge has reversed subject/object" }
+  ],
+  "kg_contradictions": [
+    { "claim": "alice manages project-phoenix",
+      "existing": { "from": "project-phoenix", "to": "bob", "relation": "managed_by", "valid_to": null },
+      "note": "active fact in KG: project-phoenix is currently managed by bob" }
+  ]
+}
+```
+
+### 5.2 落地步骤
+
+1. **`src/service/fact_check_service.rs`** 新模块：
+   - `check_similar_names(tenant, content, topics)`：拆词 + `EntityRegistry::resolve_alias` 命中失败的进 Levenshtein ≤ 2 候选；
+   - `check_relationship_conflicts(tenant, subject, predicate, object)`：查 `graph_edges` 反向边、已 closed 的同断言；
+   - 返回 `FactCheckReport` 结构体（read-only）
+2. **`src/http/fact_check.rs`** 新 router：`POST /fact_check`
+3. **`src/mcp/server.rs`** 加一个 `capability_capsule_fact_check` tool
+4. **测试**：
+   - 单元：`tests/fact_check.rs`，至少覆盖 typo 命中、方向反转、冲突 active fact 三类
+   - 集成：起 `mem serve`、posts 一组 fixture、断言返回 shape
+
+### 5.3 边界说明
+
+- **不做 LLM**——一切判断走 entity registry + graph_edges 的结构化数据。与 §15.4 一致
+- **不阻塞 ingest**——纯 read-only API，caller 自己决定是否要根据 report 改 input 再 ingest
+- **Levenshtein 上限 ≤ 2 + len(token) ≥ 4**——避免 "a" ↔ "b" 这种 trivial 匹配淹没结果
+- **direction-mismatch 只覆盖 KG 已建过的 predicate 对**——首次出现的 predicate 没法判方向，跳过
+
+---
+
+## 6. 时间戳与维护
+
+- 本篇生成时间：**2026-05-20**
+- 上一次比较：v2，2026-05-12
+- 检查的 mempalace HEAD：commit `de7801e`，2026-04-27（v2 之后 mempalace 未新增 MCP 工具，仍是 29 个）
+- 维护建议：
+  1. 完成 #29–#33 任一项后，回 §4 表格标 ✅ 并写 commit hash
+  2. 新增 mempalace 上游 module / CLI 时回 §2 / §3 对应表加一行
+  3. 当 v1 §15.2/15.3/15.4 三张映射表需要变动时，同时回 ROADMAP.MD 追加新行号
