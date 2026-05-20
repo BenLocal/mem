@@ -82,15 +82,14 @@ mempalace HEAD 14 个 CLI 子命令；mem HEAD 5 个（`serve` / `mcp` / `mine` 
 |---|---|---|---|---|
 | **#29** ✅ | **`fact_check` API + MCP**：`POST /fact_check` body `{tenant, content, topics, relationships}` → `{similar_names, relationship_conflicts, kg_contradictions}`；read-only 不写库；MCP wrapper `capability_capsule_fact_check`。复用 `EntityRegistry::resolve_or_create` 的 normalize 路径 + Levenshtein ≤ 2 找 typo（token len ≥ 4 floor 防 trivial 撞）；扫 `graph_edges` 找 (a) 方向反转 same-predicate (b) 同 (S,P,*) 不同 object (c) 重述已 closed 的 (S,P,O)。**`relationships` 由 caller 传**——mem 无 LLM 抽取，与 §15.4 一致 | 新 `service/fact_check_service.rs`（FactCheckService + FactCheckError）+ `http/fact_check.rs` + `error.rs` 加 `From<GraphError>` + `mcp::server` 加 `FactCheckArgs` + `capability_capsule_fact_check` tool；9 个 integration tests | M（实际 ~3h） | **P1** — 9/9 tests green, fmt + clippy clean |
 | **#30** ✅ | **近似去重 worker**：`src/worker/dedup_worker.rs::sweep_once` —— 按 `(source_agent, project, repo)` 分组活跃 capsule，组内拉 embedding 向量做 pairwise cosine + union-find 聚类，cosine ≥ `threshold` 的聚成一簇，保留 `len(content)` 最大（tie-break 最早 `created_at`）的一条，其余通过 `apply_feedback(FeedbackKind::Incorrect)` 走软删；`dry_run=true` 只报告候选 id 不写。`DedupSettings` **默认 OFF**（destructive），`MEM_DEDUP_ENABLED=1` 开；`MEM_DEDUP_INTERVAL_SECS` / `MEM_DEDUP_THRESHOLD` / `MEM_DEDUP_SCAN_LIMIT` 调参 | 新 `EmbeddingVectorStore::get_capability_capsule_embedding_vector` trait 方法 + Lance impl（读 `FixedSizeListArray`）+ `config::DedupSettings` + `worker/dedup_worker.rs` + `app.rs` 条件 spawn + 5 个 integration tests | M（实际 ~2h） | P1 — 5/5 tests green, fmt + clippy clean |
-| **#31** | **`mem init` CLI**：`mem init [--mode code|personal|research] [--path .mem/]` 写 `.mem/config.toml`（默认 `MEM_DB_PATH` / mode 对应 wing/repo defaults / `EMBEDDING_PROVIDER=fake` 起步）；交互式问几个关键开关；输出"下一步：`mem serve`"的引导 | 新 `src/cli/init.rs` + clap 子命令 + 内置模板 | S | P1 — 零成本撑起 onboarding |
+| **#31** ✅ | **`mem init` CLI**：`mem init [--mode code\|personal\|research] [--path PATH] [--force]` 在 `<path>/.mem/` 下写三个文件：`config.env`（`MEM_DB_PATH` / `BIND_ADDR` / `EMBEDDING_PROVIDER=fake` 等保守 env defaults，含被注释的 `MEM_DEDUP_ENABLED` 提示）、`taxonomy.toml`（mode 对应的 starter `projects` / `repos` 列表——code/personal/research 三套，纯文档不参与运行时）、`README.md`（下一步引导）。Refuse-overwrite-without-force（exit code 2）。**走 `.env` 路线不引入 TOML 配置加载**——mem 现在全部走 env vars，新增 TOML 解析层会是另一个 surface，文件只是声明而非运行时输入 | 新 `src/cli/init.rs` + `cli/mod.rs` 注册 + `main.rs` 子命令；6 个单元测试 | S（实际 ~1h） | P1 — 6/6 tests green, fmt + clippy clean |
 | **#32** | **`mem mine` per-session cursor**：新 lance 表 `mine_cursors(session_id, last_mined_ts, updated_at)`；`mine` 每次开扫前查 cursor，跳过 `timestamp < cursor` 的 block；写完更新 cursor。**幂等性已由 server-side dedup 兜底**，cursor 是性能优化不是正确性 | 1 个新 lance 表 + lance_store/duckdb_query CRUD + `cli/mine.rs` 串通 | S | P2 — 规模上去再做（当前 mine 5 万 block 也只需几秒） |
 | **#33** | **外发 embedding provider 启动警告**：`AppState::from_config` 时如果 `EmbeddingProvider` 非 `Fake` / 非 `EmbedAnything`（local）就 `tracing::warn!("Embedding will leave this machine via provider X")`；首次 enqueue 也再打一次；新增 `MEM_PRIVACY_WARN_SUPPRESS=1` 关掉 | 1 处 startup + 1 处 worker enqueue 加 warn；env var 开关 | S | P2 — 隐私守护 |
 
 ### 决策点
 
-- **已完成**：#29（fact_check API + MCP）+ #30（dedup worker）—— 9+5 integration tests green
-- **下一波**：#31（`mem init` CLI）—— 零成本撑起 onboarding
-- **延后**：#32（性能优化，规模未到痛点）/ #33（影响范围小）
+- **已完成**：#29（fact_check API + MCP）+ #30（dedup worker）+ #31（`mem init` CLI）—— 9+5+6 = 20 个新测试 green
+- **下一波**（如果继续）：#32（per-session mining cursor）—— 规模性能优化 / #33（外发 embedding provider 启动警告）
 - **不做**：spellcheck / llm_refine / dialect / repair / corpus_origin / general_extractor / split_mega_files / migrate（理由见 §3 表的 🚫 标）
 
 ---

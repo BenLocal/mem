@@ -10,7 +10,7 @@
 > - v2：§2（MCP 表面对照）/ §3（推荐路线）/ §4（#16 详化）
 > - v3：§2（CLI 对照）/ §3（module 对照）/ §4（推荐路线）/ §5（#29 详化）
 >
-> **状态（2026-05-20）**：v1 #1–#19 + v2 #16–#28 全部 ✅；v3 **#29 (fact_check API+MCP) + #30 (dedup worker)** 已 ✅（14/14 新 integration tests 通过，fmt + clippy 干净）；剩 #20（内容自动抽取实体，opt-in regex）+ v3 #31–#33（init CLI / sweep cursor / 隐私警告）待办。
+> **状态（2026-05-20）**：v1 #1–#19 + v2 #16–#28 全部 ✅；v3 **#29 (fact_check API+MCP) + #30 (dedup worker) + #31 (`mem init` CLI)** 已 ✅（20 个新测试通过，fmt + clippy 干净）；剩 v1 #20（内容自动抽取实体，opt-in regex）+ v3 #32（per-session mining cursor，性能）+ v3 #33（外发 embedding provider 启动警告，隐私）待办。
 >
 > **平行工作线**：MemPalace 对齐之外，**Backend 存储抽象**走独立 workstream，路线图见 [`backend-coupling.md`](./backend-coupling.md) §6（Phase 0–5 已 shipped；DuckDbQuery / LanceStore 已收窄 `pub(crate)`）。两条线 commit message 用各自的 close 引用（`closes ROADMAP #N` / `closes mempalace-diff-v2 #N` / `closes mempalace-diff-v3 #N` vs `closes backend-coupling §6 Phase N`），不互相阻塞。
 

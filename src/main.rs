@@ -19,6 +19,10 @@ enum Command {
     Serve,
     /// Run the MCP (Model Context Protocol) stdio server.
     Mcp,
+    /// Scaffold a new `.mem/` directory with mode-based env defaults +
+    /// a taxonomy starter file. First-run UX — analogous to mempalace's
+    /// `onboarding.py`.
+    Init(mem::cli::init::InitArgs),
     /// Mine memories from Claude Code transcript.
     Mine(mem::cli::mine::MineArgs),
     /// Query and format memories for session start injection.
@@ -40,6 +44,10 @@ async fn main() -> error::Result<()> {
     match command {
         Command::Serve => mem::cli::serve::run().await,
         Command::Mcp => mem::cli::mcp::run().await,
+        Command::Init(args) => {
+            let code = mem::cli::init::run(args);
+            std::process::exit(code);
+        }
         Command::Mine(args) => {
             let code = mem::cli::mine::run(args).await;
             std::process::exit(code);
