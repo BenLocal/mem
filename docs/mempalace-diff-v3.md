@@ -153,7 +153,61 @@ mempalace HEAD 14 个 CLI 子命令；mem HEAD 5 个（`serve` / `mcp` / `mine` 
 - 本篇生成时间：**2026-05-20**
 - 上一次比较：v2，2026-05-12
 - 检查的 mempalace HEAD：commit `de7801e`，2026-04-27（v2 之后 mempalace 未新增 MCP 工具，仍是 29 个）
+- §7 KG 层补审：2026-05-21
 - 维护建议：
   1. 完成 #29–#33 任一项后，回 §4 表格标 ✅ 并写 commit hash
   2. 新增 mempalace 上游 module / CLI 时回 §2 / §3 对应表加一行
   3. 当 v1 §15.2/15.3/15.4 三张映射表需要变动时，同时回 ROADMAP.MD 追加新行号
+  4. KG 侧（K1–K5）回 §7 表格更新
+
+---
+
+## 7. KG 侧补审（2026-05-21）
+
+> §2-§3 覆盖了 mempalace 的 MCP / CLI / module 表面，但**单独把 KG 层拎出来比**还没做过。本节对照 mempalace 的 `knowledge_graph.py` + `palace_graph.py` + `entity_registry.py` + `entity_detector.py` 四个 KG 模块和 mem 的图层（`storage/graph_store`、`storage/entity_registry`、`pipeline/ingest::extract_graph_edge_drafts`、MCP `capability_capsule_kg_*`），产出 K1-K5 五项优化方向。
+>
+> 维护原则同 §4：完成一项回到对应行标 ✅ + commit hash。
+
+### 7.1 表面对照（mempalace vs mem）
+
+| mempalace | mem | 状态 |
+|---|---|---|
+| `triples(subject, predicate, object, valid_from, valid_to, confidence, source_*, adapter_name, extracted_at)` | `graph_edges(from_node_id, to_node_id, relation, valid_from, valid_to)` | mem 缺 **confidence** + **source/adapter provenance** |
+| `entities(id, name, type, properties JSON, created_at)` | `entities(id, tenant, canonical_name, kind, created_at)` | mem 缺 **properties JSON** 字段 |
+| `add_triple` 自动 dedup on active triple | `sync_memory_edges` / `add_edge_direct` 同形态 | ✅ |
+| `invalidate(subj, pred, obj, ended)` | `invalidate_edge` (v2 #16) | ✅ |
+| `query_entity(name, as_of, direction)` | `neighbors_within(node, max_hops, as_of)` (v2 #16) | ✅ |
+| `query_relationship(predicate, as_of)` | — | ❌ → **K4** |
+| `timeline(entity_name)` | `kg_timeline(node_id)` (v2 #16) | ✅ |
+| `stats` | `graph_stats` (v2 #17) | ✅ 不同视角（mempalace `rooms_per_wing` vs mem `top_relations`）|
+| `build_graph` 从 drawer metadata 推 topology | mem 直接存边为 first-class | 🔄 redesigned — mem 哲学不同 |
+| `compute_topic_tunnels(topics_by_wing, min_count)` | `topic_tunnel_worker` (2026-05-21) | ✅ **K2** — `2a964ee` |
+| `topic_tunnels_for_wing(wing)` 增量 | 包含在 K2 sweep 中（每次扫全量，简单实现）| ✅ K2 收口 |
+| explicit tunnels (caller-curated) | `user_tunnel:*` relation prefix (v2 #20 phase A) | ✅ |
+| `traverse(start_room, max_hops)` BFS | `neighbors_within` BFS | ✅ |
+| `find_tunnels(wing_a, wing_b)` | `find_tunnels(prefix_a, prefix_b)` (v2 #23) | ✅ |
+| `_fuzzy_match` on missing room | — | ❌ → **K5** |
+| 图缓存 + TTL + invalidate | — | ⚠️ DuckDB 实时查已经快，边际价值小 |
+| `entity_detector.detect_entities` 从 prose 抽取 | — | ⏸️ ROADMAP v1 #20 LATER |
+| `learn_from_text` + `wikipedia_lookup` | — | 🚫 不做（offline-first + Verbatim） |
+| 模式化 entity seed（`seed(mode, people, projects)`） | `mem init --mode` 只写 taxonomy 不 seed entity | 🚧 partial（K8）|
+
+### 7.2 优化方向（K1–K8）
+
+| K# | 题目 | 工作量 | 状态 |
+|---|---|---|---|
+| **K1** | edge `confidence` 列 —— caller 可声明 "这条边 0.6 可信"，retrieve `graph_boost` 用它加权 | L（实测 ~1 天：schema 加列 + Lance `add_columns(AllNulls)` 迁移 + GraphEdge 22 处构造位 + 7 处 record_batch helper + DuckDB SELECT 投影 + 测试矩阵）| ❌ 未做。**K2 已用 relation prefix `user_tunnel:topic:%` 替代部分价值**；真正想做 K1 时需要单独排期一次 spec-then-implement session |
+| **K2** ✅ | `compute_topic_tunnels` 等价 worker —— 按 project 分组扫 active capsule，topic overlap >= `min_count` 时自动建 `user_tunnel:topic:<X>` 边；幂等via `add_edge_direct` | M（实际 ~3h）| ✅ `2a964ee` —— 6/6 unit tests green；默认 OFF + `MEM_TOPIC_TUNNEL_ENABLED=1` |
+| **K3** | edge `extractor` / `source_adapter` 字段 —— 标记每条边由哪条代码路径产生（`tagged_extractor` / `file_ref_extractor` / `caller_supplied` / `topic_tunnel_worker`）| S（~2h）| ❌ 未做。**当前用 relation 前缀间接区分**（K2 capsule `mem_019e497e` 详）；正式 column 等 K1 一起做 |
+| **K4** | `kg_query_predicate(predicate, as_of)` MCP —— 列所有 `predicate=X` 的活跃/历史边 | S（~1h）| ❌ 未做 |
+| **K5** | fuzzy match on `graph_neighbors` —— node_id 不存在时返回 `{neighbors: [], suggestions: [...]}`（复用 v3 #29 fact_check 的 Levenshtein）| S（~1h）| ❌ 未做 |
+| **K6** | `entities.properties` JSON 字段（caller 自由 metadata）| M | ⏸️ YAGNI，无具体场景 |
+| **K7** | 图缓存（TTL + invalidation）| S | ⏸️ DuckDB 实时查已经快 |
+| **K8** | `mem init --mode` 写 starter entities（不止 taxonomy）| S | ⏸️ 轻量 UX 改善 |
+
+### 7.3 决策点
+
+- **已完成**：K2（topic-tunnel worker auto-derived cross-project edges）
+- **下一波可选**：K4 + K5 一组（~2h，纯 MCP 补齐，不动 schema）
+- **正式 K1+K3 排期**：单独一次 session，先写 spec（schema migration 策略 + caller 更新清单 + 测试矩阵），再实现
+- **不做**：K6/K7/K8 暂搁；prose extraction + Wikipedia 已在 §15.4 / v1 #20 论证过
