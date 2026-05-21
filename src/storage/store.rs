@@ -79,26 +79,38 @@ use crate::domain::session::Session;
 use crate::domain::{AddAliasOutcome, ConversationMessage, Entity, EntityKind, EntityWithAliases};
 
 /// Handle carried by every service / worker / HTTP component. Cheap
-/// to clone (just two `Arc`s).
+/// to clone (just three `Arc`s).
 #[derive(Clone)]
 pub struct Store {
     /// Writes (and a handful of yet-to-be-migrated reads) flow here.
     pub(crate) lance: Arc<LanceStore>,
     /// Reads flow here.
     pub(crate) query: Arc<DuckDbQuery>,
+    /// Open-time advisory lock — held for the full lifetime of every
+    /// `Store` clone (`Arc` keeps it alive until the last clone drops).
+    /// `None` when `MEM_OPEN_LOCK_DISABLED=1` skipped acquisition. See
+    /// `storage::open_lock` for the design rationale (incident TODO #3
+    /// — multi-process write detection).
+    _open_lock: Arc<Option<crate::storage::open_lock::OpenLock>>,
 }
 
 impl Store {
     /// Open both halves at `path` (a directory holding lance datasets).
     /// Creates the directory + lance datasets via `LanceStore::open`,
     /// then opens an in-process DuckDB and ATTACHes the lance dir.
+    ///
+    /// **Advisory lock**: refuses to open if another `mem` process
+    /// already holds a lock on `<path>.lock`. Opt out with
+    /// `MEM_OPEN_LOCK_DISABLED=1` (see `storage::open_lock`).
     pub async fn open(path: impl AsRef<Path>) -> Result<Self, StorageError> {
         let path = path.as_ref();
+        let lock = crate::storage::open_lock::acquire(path)?;
         let lance = LanceStore::open(path).await?;
         let query = DuckDbQuery::open(path).await?;
         Ok(Self {
             lance: Arc::new(lance),
             query: Arc::new(query),
+            _open_lock: Arc::new(lock),
         })
     }
 
@@ -108,17 +120,21 @@ impl Store {
     /// DuckDB query side is unaffected — it reads whatever vectors
     /// are on disk regardless of who computed them.
     ///
+    /// Acquires the same multi-process write guard as [`Self::open`].
+    ///
     /// [`EmbeddingProvider`]: crate::embedding::EmbeddingProvider
     pub async fn open_with_provider(
         path: impl AsRef<Path>,
         provider: Arc<dyn crate::embedding::EmbeddingProvider>,
     ) -> Result<Self, StorageError> {
         let path = path.as_ref();
+        let lock = crate::storage::open_lock::acquire(path)?;
         let lance = LanceStore::open_with_provider(path, provider).await?;
         let query = DuckDbQuery::open(path).await?;
         Ok(Self {
             lance: Arc::new(lance),
             query: Arc::new(query),
+            _open_lock: Arc::new(lock),
         })
     }
 }

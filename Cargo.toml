@@ -64,6 +64,13 @@ uuid = { version = "1", features = ["v5", "v7"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 rust-embed = { version = "8", features = ["debug-embed"] }
+# Cross-platform advisory file lock used by `Store::open` to refuse a
+# second `mem` process opening the same DB dir concurrently. mem is
+# single-writer by design (CLAUDE.md "Architecture" §1); the lock turns
+# that documented contract into a runtime guard. fs4 was already in the
+# tree transitively (via lancedb's storage layer); promoting it to a
+# direct dep so we can import it.
+fs4 = "0.8"
 
 [dev-dependencies]
 rand = "0.8"

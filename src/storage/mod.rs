@@ -32,6 +32,7 @@ pub mod entity_registry;
 pub mod graph_store;
 pub(crate) mod lance_store;
 pub mod maintenance_store;
+pub mod open_lock;
 #[cfg(feature = "postgres")]
 pub mod postgres_capsule_store;
 pub mod session_store;

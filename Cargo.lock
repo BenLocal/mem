@@ -5041,6 +5041,7 @@ dependencies = [
  "clap",
  "duckdb",
  "embed_anything",
+ "fs4",
  "futures",
  "http-body-util",
  "lancedb",
