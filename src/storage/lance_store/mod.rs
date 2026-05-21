@@ -241,6 +241,39 @@ pub(super) fn lancedb_err(e: lancedb::Error) -> StorageError {
     StorageError::InvalidInput(format!("lancedb: {e}"))
 }
 
+/// Typed column accessor shared by every `record_batch_to_*` parser.
+/// Returns the same stable `&'static str` `StorageError` as the
+/// pre-2026-05-21 inline helpers (so the HTTP layer's error mapping is
+/// unchanged), but emits a structured `tracing::error!` line naming
+/// the failing table + column + expected vs actual arrow type on
+/// every failure.
+///
+/// This is the canonical version of the `col` helper that used to be
+/// duplicated inline inside each parser (a26cdd2 enhanced one of
+/// them; this lifts the pattern out so every parser benefits without
+/// 5+ near-identical edits). Call from inside each `record_batch_to_*`
+/// passing a stable `table` name string for the log context.
+pub(super) fn parse_col<'a, T: 'static>(
+    batch: &'a RecordBatch,
+    table: &'static str,
+    name: &'static str,
+) -> Result<&'a T, StorageError> {
+    let column = batch.column_by_name(name).ok_or_else(|| {
+        tracing::error!(table = table, column = name, "missing column in batch");
+        StorageError::InvalidData("missing column")
+    })?;
+    column.as_any().downcast_ref::<T>().ok_or_else(|| {
+        tracing::error!(
+            table = table,
+            column = name,
+            expected = std::any::type_name::<T>(),
+            actual = %column.data_type(),
+            "column type mismatch in batch",
+        );
+        StorageError::InvalidData("column type mismatch")
+    })
+}
+
 /// Arrow schema for the `memories` LanceDB table. One column per
 /// [`CapabilityCapsuleRecord`] field; enums (`capability_capsule_type`, `status`, `scope`,
 /// `visibility`) are stored as their `serde` snake_case representation
@@ -478,21 +511,11 @@ pub(super) fn feedback_events_to_record_batch(
 pub(super) fn record_batch_to_feedback_events(
     batch: &RecordBatch,
 ) -> Result<Vec<FeedbackEvent>, StorageError> {
-    fn col<'a, T: 'static>(
-        batch: &'a RecordBatch,
-        name: &'static str,
-    ) -> Result<&'a T, StorageError> {
-        batch
-            .column_by_name(name)
-            .ok_or(StorageError::InvalidData("missing column"))?
-            .as_any()
-            .downcast_ref::<T>()
-            .ok_or(StorageError::InvalidData("column type mismatch"))
-    }
-    let feedback_id = col::<StringArray>(batch, "feedback_id")?;
-    let capability_capsule_id = col::<StringArray>(batch, "capability_capsule_id")?;
-    let feedback_kind = col::<StringArray>(batch, "feedback_kind")?;
-    let created_at = col::<StringArray>(batch, "created_at")?;
+    let feedback_id = parse_col::<StringArray>(batch, "feedback_events", "feedback_id")?;
+    let capability_capsule_id =
+        parse_col::<StringArray>(batch, "feedback_events", "capability_capsule_id")?;
+    let feedback_kind = parse_col::<StringArray>(batch, "feedback_events", "feedback_kind")?;
+    let created_at = parse_col::<StringArray>(batch, "feedback_events", "created_at")?;
     // `note` is optional in the batch — older datasets that pre-date
     // the column won't have it. Read defensively.
     let note = batch
@@ -771,29 +794,19 @@ pub(super) fn embedding_job_rows_to_record_batch(
 pub(super) fn record_batch_to_embedding_job_rows(
     batch: &RecordBatch,
 ) -> Result<Vec<EmbeddingJobRow>, StorageError> {
-    fn col<'a, T: 'static>(
-        batch: &'a RecordBatch,
-        name: &'static str,
-    ) -> Result<&'a T, StorageError> {
-        batch
-            .column_by_name(name)
-            .ok_or(StorageError::InvalidData("missing column"))?
-            .as_any()
-            .downcast_ref::<T>()
-            .ok_or(StorageError::InvalidData("column type mismatch"))
-    }
     use arrow_array::Int64Array;
-    let job_id = col::<StringArray>(batch, "job_id")?;
-    let tenant = col::<StringArray>(batch, "tenant")?;
-    let capability_capsule_id = col::<StringArray>(batch, "capability_capsule_id")?;
-    let target_content_hash = col::<StringArray>(batch, "target_content_hash")?;
-    let provider = col::<StringArray>(batch, "provider")?;
-    let status = col::<StringArray>(batch, "status")?;
-    let attempt_count = col::<Int64Array>(batch, "attempt_count")?;
-    let last_error = col::<StringArray>(batch, "last_error")?;
-    let available_at = col::<StringArray>(batch, "available_at")?;
-    let created_at = col::<StringArray>(batch, "created_at")?;
-    let updated_at = col::<StringArray>(batch, "updated_at")?;
+    const TABLE: &str = "embedding_jobs";
+    let job_id = parse_col::<StringArray>(batch, TABLE, "job_id")?;
+    let tenant = parse_col::<StringArray>(batch, TABLE, "tenant")?;
+    let capability_capsule_id = parse_col::<StringArray>(batch, TABLE, "capability_capsule_id")?;
+    let target_content_hash = parse_col::<StringArray>(batch, TABLE, "target_content_hash")?;
+    let provider = parse_col::<StringArray>(batch, TABLE, "provider")?;
+    let status = parse_col::<StringArray>(batch, TABLE, "status")?;
+    let attempt_count = parse_col::<Int64Array>(batch, TABLE, "attempt_count")?;
+    let last_error = parse_col::<StringArray>(batch, TABLE, "last_error")?;
+    let available_at = parse_col::<StringArray>(batch, TABLE, "available_at")?;
+    let created_at = parse_col::<StringArray>(batch, TABLE, "created_at")?;
+    let updated_at = parse_col::<StringArray>(batch, TABLE, "updated_at")?;
     let mut out = Vec::with_capacity(batch.num_rows());
     for i in 0..batch.num_rows() {
         out.push(EmbeddingJobRow {
@@ -907,28 +920,18 @@ pub(super) fn transcript_embedding_job_rows_to_record_batch(
 pub(super) fn record_batch_to_transcript_embedding_job_rows(
     batch: &RecordBatch,
 ) -> Result<Vec<TranscriptEmbeddingJobRow>, StorageError> {
-    fn col<'a, T: 'static>(
-        batch: &'a RecordBatch,
-        name: &'static str,
-    ) -> Result<&'a T, StorageError> {
-        batch
-            .column_by_name(name)
-            .ok_or(StorageError::InvalidData("missing column"))?
-            .as_any()
-            .downcast_ref::<T>()
-            .ok_or(StorageError::InvalidData("column type mismatch"))
-    }
     use arrow_array::Int64Array;
-    let job_id = col::<StringArray>(batch, "job_id")?;
-    let tenant = col::<StringArray>(batch, "tenant")?;
-    let message_block_id = col::<StringArray>(batch, "message_block_id")?;
-    let provider = col::<StringArray>(batch, "provider")?;
-    let status = col::<StringArray>(batch, "status")?;
-    let attempt_count = col::<Int64Array>(batch, "attempt_count")?;
-    let last_error = col::<StringArray>(batch, "last_error")?;
-    let available_at = col::<StringArray>(batch, "available_at")?;
-    let created_at = col::<StringArray>(batch, "created_at")?;
-    let updated_at = col::<StringArray>(batch, "updated_at")?;
+    const TABLE: &str = "transcript_embedding_jobs";
+    let job_id = parse_col::<StringArray>(batch, TABLE, "job_id")?;
+    let tenant = parse_col::<StringArray>(batch, TABLE, "tenant")?;
+    let message_block_id = parse_col::<StringArray>(batch, TABLE, "message_block_id")?;
+    let provider = parse_col::<StringArray>(batch, TABLE, "provider")?;
+    let status = parse_col::<StringArray>(batch, TABLE, "status")?;
+    let attempt_count = parse_col::<Int64Array>(batch, TABLE, "attempt_count")?;
+    let last_error = parse_col::<StringArray>(batch, TABLE, "last_error")?;
+    let available_at = parse_col::<StringArray>(batch, TABLE, "available_at")?;
+    let created_at = parse_col::<StringArray>(batch, TABLE, "created_at")?;
+    let updated_at = parse_col::<StringArray>(batch, TABLE, "updated_at")?;
     let mut out = Vec::with_capacity(batch.num_rows());
     for i in 0..batch.num_rows() {
         out.push(TranscriptEmbeddingJobRow {
@@ -1168,33 +1171,22 @@ pub(super) fn record_batch_to_conversation_messages(
     batch: &RecordBatch,
 ) -> Result<Vec<ConversationMessage>, StorageError> {
     use arrow_array::{BooleanArray, UInt32Array};
-
-    fn col<'a, T: 'static>(
-        batch: &'a RecordBatch,
-        name: &'static str,
-    ) -> Result<&'a T, StorageError> {
-        batch
-            .column_by_name(name)
-            .ok_or(StorageError::InvalidData("missing column"))?
-            .as_any()
-            .downcast_ref::<T>()
-            .ok_or(StorageError::InvalidData("column type mismatch"))
-    }
-    let message_block_id = col::<StringArray>(batch, "message_block_id")?;
-    let session_id = col::<StringArray>(batch, "session_id")?;
-    let tenant = col::<StringArray>(batch, "tenant")?;
-    let caller_agent = col::<StringArray>(batch, "caller_agent")?;
-    let transcript_path = col::<StringArray>(batch, "transcript_path")?;
-    let line_number = col::<UInt64Array>(batch, "line_number")?;
-    let block_index = col::<UInt32Array>(batch, "block_index")?;
-    let message_uuid = col::<StringArray>(batch, "message_uuid")?;
-    let role = col::<StringArray>(batch, "role")?;
-    let block_type = col::<StringArray>(batch, "block_type")?;
-    let content = col::<StringArray>(batch, "content")?;
-    let tool_name = col::<StringArray>(batch, "tool_name")?;
-    let tool_use_id = col::<StringArray>(batch, "tool_use_id")?;
-    let embed_eligible = col::<BooleanArray>(batch, "embed_eligible")?;
-    let created_at = col::<StringArray>(batch, "created_at")?;
+    const TABLE: &str = "conversation_messages";
+    let message_block_id = parse_col::<StringArray>(batch, TABLE, "message_block_id")?;
+    let session_id = parse_col::<StringArray>(batch, TABLE, "session_id")?;
+    let tenant = parse_col::<StringArray>(batch, TABLE, "tenant")?;
+    let caller_agent = parse_col::<StringArray>(batch, TABLE, "caller_agent")?;
+    let transcript_path = parse_col::<StringArray>(batch, TABLE, "transcript_path")?;
+    let line_number = parse_col::<UInt64Array>(batch, TABLE, "line_number")?;
+    let block_index = parse_col::<UInt32Array>(batch, TABLE, "block_index")?;
+    let message_uuid = parse_col::<StringArray>(batch, TABLE, "message_uuid")?;
+    let role = parse_col::<StringArray>(batch, TABLE, "role")?;
+    let block_type = parse_col::<StringArray>(batch, TABLE, "block_type")?;
+    let content = parse_col::<StringArray>(batch, TABLE, "content")?;
+    let tool_name = parse_col::<StringArray>(batch, TABLE, "tool_name")?;
+    let tool_use_id = parse_col::<StringArray>(batch, TABLE, "tool_use_id")?;
+    let embed_eligible = parse_col::<BooleanArray>(batch, TABLE, "embed_eligible")?;
+    let created_at = parse_col::<StringArray>(batch, TABLE, "created_at")?;
     // meta_json is optional in the batch — older datasets that
     // pre-date the column won't have it. Read defensively.
     let meta_json = batch
@@ -1399,69 +1391,47 @@ pub(super) fn capability_capsules_to_record_batch(
 
 /// Inverse of `capability_capsules_to_record_batch`: parse a Lance query result into
 /// `CapabilityCapsuleRecord`s.
+///
+/// Uses the shared [`parse_col`] helper for column-name-tagged decode
+/// errors (a26cdd2 + follow-up). On any column failure the server log
+/// gets a structured `tracing::error!` line naming the table, the column,
+/// and expected-vs-actual arrow type; the HTTP-layer error stays the
+/// same `&'static str` flavored `StorageError` so client error bodies
+/// are unchanged.
 pub(super) fn record_batch_to_capability_capsules(
     batch: &RecordBatch,
 ) -> Result<Vec<CapabilityCapsuleRecord>, StorageError> {
     use arrow_array::Int64Array;
-    // `col` returns the same `&'static str` flavored StorageError as
-    // before (so the HTTP layer still maps it to 500 with a stable
-    // body), but emits a structured `tracing::error!` line naming the
-    // failing column + expected vs actual arrow type on failure. This
-    // is the difference between "column type mismatch" being a dead-
-    // end log line and being a one-grep debug — the symptom that
-    // fired the diagnostic (2026-05-21 phantom 500 on `accept_pending`)
-    // was unfindable with the old generic error.
-    //
-    // Sibling parsers (`record_batch_to_feedback_events`,
-    // `record_batch_to_*` in entities/sessions/episodes) still carry
-    // the old generic `ok_or` — they don't have a known field-decode
-    // incident yet. Apply this pattern when one fires.
-    fn col<'a, T: 'static>(
-        batch: &'a RecordBatch,
-        name: &'static str,
-    ) -> Result<&'a T, StorageError> {
-        let column = batch.column_by_name(name).ok_or_else(|| {
-            tracing::error!(column = name, "missing column in capability_capsules batch");
-            StorageError::InvalidData("missing column")
-        })?;
-        column.as_any().downcast_ref::<T>().ok_or_else(|| {
-            tracing::error!(
-                column = name,
-                expected = std::any::type_name::<T>(),
-                actual = %column.data_type(),
-                "column type mismatch in capability_capsules batch",
-            );
-            StorageError::InvalidData("column type mismatch")
-        })
-    }
-    let capability_capsule_id = col::<StringArray>(batch, "capability_capsule_id")?;
-    let tenant = col::<StringArray>(batch, "tenant")?;
-    let capability_capsule_type = col::<StringArray>(batch, "capability_capsule_type")?;
-    let status = col::<StringArray>(batch, "status")?;
-    let scope = col::<StringArray>(batch, "scope")?;
-    let visibility = col::<StringArray>(batch, "visibility")?;
-    let version = col::<Int64Array>(batch, "version")?;
-    let summary = col::<StringArray>(batch, "summary")?;
-    let content = col::<StringArray>(batch, "content")?;
-    let evidence = col::<ListArray>(batch, "evidence")?;
-    let code_refs = col::<ListArray>(batch, "code_refs")?;
-    let project = col::<StringArray>(batch, "project")?;
-    let repo = col::<StringArray>(batch, "repo")?;
-    let module = col::<StringArray>(batch, "module")?;
-    let task_type = col::<StringArray>(batch, "task_type")?;
-    let tags = col::<ListArray>(batch, "tags")?;
-    let topics = col::<ListArray>(batch, "topics")?;
-    let confidence = col::<Float32Array>(batch, "confidence")?;
-    let decay_score = col::<Float32Array>(batch, "decay_score")?;
-    let content_hash = col::<StringArray>(batch, "content_hash")?;
-    let idempotency_key = col::<StringArray>(batch, "idempotency_key")?;
-    let session_id = col::<StringArray>(batch, "session_id")?;
+    const TABLE: &str = "capability_capsules";
+    let capability_capsule_id = parse_col::<StringArray>(batch, TABLE, "capability_capsule_id")?;
+    let tenant = parse_col::<StringArray>(batch, TABLE, "tenant")?;
+    let capability_capsule_type =
+        parse_col::<StringArray>(batch, TABLE, "capability_capsule_type")?;
+    let status = parse_col::<StringArray>(batch, TABLE, "status")?;
+    let scope = parse_col::<StringArray>(batch, TABLE, "scope")?;
+    let visibility = parse_col::<StringArray>(batch, TABLE, "visibility")?;
+    let version = parse_col::<Int64Array>(batch, TABLE, "version")?;
+    let summary = parse_col::<StringArray>(batch, TABLE, "summary")?;
+    let content = parse_col::<StringArray>(batch, TABLE, "content")?;
+    let evidence = parse_col::<ListArray>(batch, TABLE, "evidence")?;
+    let code_refs = parse_col::<ListArray>(batch, TABLE, "code_refs")?;
+    let project = parse_col::<StringArray>(batch, TABLE, "project")?;
+    let repo = parse_col::<StringArray>(batch, TABLE, "repo")?;
+    let module = parse_col::<StringArray>(batch, TABLE, "module")?;
+    let task_type = parse_col::<StringArray>(batch, TABLE, "task_type")?;
+    let tags = parse_col::<ListArray>(batch, TABLE, "tags")?;
+    let topics = parse_col::<ListArray>(batch, TABLE, "topics")?;
+    let confidence = parse_col::<Float32Array>(batch, TABLE, "confidence")?;
+    let decay_score = parse_col::<Float32Array>(batch, TABLE, "decay_score")?;
+    let content_hash = parse_col::<StringArray>(batch, TABLE, "content_hash")?;
+    let idempotency_key = parse_col::<StringArray>(batch, TABLE, "idempotency_key")?;
+    let session_id = parse_col::<StringArray>(batch, TABLE, "session_id")?;
     let supersedes_capability_capsule_id =
-        col::<StringArray>(batch, "supersedes_capability_capsule_id")?;
-    let source_agent = col::<StringArray>(batch, "source_agent")?;
-    let created_at = col::<StringArray>(batch, "created_at")?;
-    let updated_at = col::<StringArray>(batch, "updated_at")?;
-    let last_validated_at = col::<StringArray>(batch, "last_validated_at")?;
+        parse_col::<StringArray>(batch, TABLE, "supersedes_capability_capsule_id")?;
+    let source_agent = parse_col::<StringArray>(batch, TABLE, "source_agent")?;
+    let created_at = parse_col::<StringArray>(batch, TABLE, "created_at")?;
+    let updated_at = parse_col::<StringArray>(batch, TABLE, "updated_at")?;
+    let last_validated_at = parse_col::<StringArray>(batch, TABLE, "last_validated_at")?;
 
     fn list_at(arr: &ListArray, i: usize) -> Result<Vec<String>, StorageError> {
         let inner = arr.value(i);

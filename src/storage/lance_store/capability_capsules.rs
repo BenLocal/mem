@@ -12,8 +12,9 @@ use super::{
     capability_capsule_embedding_to_record_batch, capability_capsules_to_record_batch,
     embedding_job_row_to_record_batch, embedding_job_rows_to_record_batch,
     ensure_capability_capsule_embeddings_table, enum_to_str, feedback_events_to_record_batch,
-    lancedb_err, record_batch_to_capability_capsules, record_batch_to_embedding_job_rows,
-    record_batch_to_feedback_events, sql_quote, EmbeddingJobRow, LanceStore,
+    lancedb_err, parse_col, record_batch_to_capability_capsules,
+    record_batch_to_embedding_job_rows, record_batch_to_feedback_events, sql_quote,
+    EmbeddingJobRow, LanceStore,
 };
 use crate::domain::capability_capsule::{CapabilityCapsuleRecord, FeedbackSummary};
 use crate::domain::embeddings::EmbeddingJobInfo;
@@ -1020,20 +1021,10 @@ impl LanceStore {
             if b.num_rows() == 0 {
                 continue;
             }
-            fn col<'a, T: 'static>(
-                batch: &'a RecordBatch,
-                name: &'static str,
-            ) -> Result<&'a T, StorageError> {
-                batch
-                    .column_by_name(name)
-                    .ok_or(StorageError::InvalidData("missing column"))?
-                    .as_any()
-                    .downcast_ref::<T>()
-                    .ok_or(StorageError::InvalidData("column type mismatch"))
-            }
-            let model = col::<StringArray>(b, "embedding_model")?;
-            let hash = col::<StringArray>(b, "content_hash")?;
-            let updated = col::<StringArray>(b, "updated_at")?;
+            const TABLE: &str = "capability_capsule_embeddings";
+            let model = parse_col::<StringArray>(b, TABLE, "embedding_model")?;
+            let hash = parse_col::<StringArray>(b, TABLE, "content_hash")?;
+            let updated = parse_col::<StringArray>(b, TABLE, "updated_at")?;
             return Ok(Some((
                 model.value(0).to_string(),
                 hash.value(0).to_string(),
@@ -1088,20 +1079,23 @@ impl LanceStore {
             }
             // `embedding` is a FixedSizeList<Float32, dim>; extract the
             // single row's underlying Float32Array values.
-            let col = b
-                .column_by_name("embedding")
-                .ok_or(StorageError::InvalidData("missing embedding column"))?;
-            let fsl = col
-                .as_any()
-                .downcast_ref::<arrow_array::FixedSizeListArray>()
-                .ok_or(StorageError::InvalidData(
-                    "embedding column not FixedSizeListArray",
-                ))?;
+            let fsl = parse_col::<arrow_array::FixedSizeListArray>(
+                b,
+                "capability_capsule_embeddings",
+                "embedding",
+            )?;
             let values = fsl.value(0);
             let floats = values
                 .as_any()
                 .downcast_ref::<Float32Array>()
-                .ok_or(StorageError::InvalidData("embedding inner not Float32"))?;
+                .ok_or_else(|| {
+                    tracing::error!(
+                        table = "capability_capsule_embeddings",
+                        column = "embedding",
+                        "FixedSizeList inner is not Float32Array",
+                    );
+                    StorageError::InvalidData("embedding inner not Float32")
+                })?;
             return Ok(Some(floats.values().to_vec()));
         }
         Ok(None)

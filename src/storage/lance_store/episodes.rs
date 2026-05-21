@@ -11,7 +11,9 @@ use arrow_array::{
 use futures::TryStreamExt;
 use lancedb::query::{ExecutableQuery, QueryBase};
 
-use super::{enum_from_str, enum_to_str, episodes_schema, lancedb_err, sql_quote, LanceStore};
+use super::{
+    enum_from_str, enum_to_str, episodes_schema, lancedb_err, parse_col, sql_quote, LanceStore,
+};
 use crate::domain::capability_capsule::{Scope, Visibility};
 use crate::domain::episode::EpisodeRecord;
 use crate::domain::workflow::WorkflowCandidate;
@@ -106,30 +108,24 @@ fn episode_to_record_batch(e: &EpisodeRecord) -> Result<RecordBatch, StorageErro
 }
 
 fn record_batch_to_episodes(batch: &RecordBatch) -> Result<Vec<EpisodeRecord>, StorageError> {
-    fn col<'a, T: 'static>(b: &'a RecordBatch, name: &'static str) -> Result<&'a T, StorageError> {
-        b.column_by_name(name)
-            .ok_or(StorageError::InvalidData("missing column"))?
-            .as_any()
-            .downcast_ref::<T>()
-            .ok_or(StorageError::InvalidData("column type mismatch"))
-    }
-    let episode_id = col::<StringArray>(batch, "episode_id")?;
-    let tenant = col::<StringArray>(batch, "tenant")?;
-    let goal = col::<StringArray>(batch, "goal")?;
-    let steps = col::<ListArray>(batch, "steps")?;
-    let outcome = col::<StringArray>(batch, "outcome")?;
-    let evidence = col::<ListArray>(batch, "evidence")?;
-    let scope = col::<StringArray>(batch, "scope")?;
-    let visibility = col::<StringArray>(batch, "visibility")?;
-    let project = col::<StringArray>(batch, "project")?;
-    let repo = col::<StringArray>(batch, "repo")?;
-    let module = col::<StringArray>(batch, "module")?;
-    let tags = col::<ListArray>(batch, "tags")?;
-    let source_agent = col::<StringArray>(batch, "source_agent")?;
-    let idempotency_key = col::<StringArray>(batch, "idempotency_key")?;
-    let created_at = col::<StringArray>(batch, "created_at")?;
-    let updated_at = col::<StringArray>(batch, "updated_at")?;
-    let workflow_candidate = col::<StringArray>(batch, "workflow_candidate")?;
+    const TABLE: &str = "episodes";
+    let episode_id = parse_col::<StringArray>(batch, TABLE, "episode_id")?;
+    let tenant = parse_col::<StringArray>(batch, TABLE, "tenant")?;
+    let goal = parse_col::<StringArray>(batch, TABLE, "goal")?;
+    let steps = parse_col::<ListArray>(batch, TABLE, "steps")?;
+    let outcome = parse_col::<StringArray>(batch, TABLE, "outcome")?;
+    let evidence = parse_col::<ListArray>(batch, TABLE, "evidence")?;
+    let scope = parse_col::<StringArray>(batch, TABLE, "scope")?;
+    let visibility = parse_col::<StringArray>(batch, TABLE, "visibility")?;
+    let project = parse_col::<StringArray>(batch, TABLE, "project")?;
+    let repo = parse_col::<StringArray>(batch, TABLE, "repo")?;
+    let module = parse_col::<StringArray>(batch, TABLE, "module")?;
+    let tags = parse_col::<ListArray>(batch, TABLE, "tags")?;
+    let source_agent = parse_col::<StringArray>(batch, TABLE, "source_agent")?;
+    let idempotency_key = parse_col::<StringArray>(batch, TABLE, "idempotency_key")?;
+    let created_at = parse_col::<StringArray>(batch, TABLE, "created_at")?;
+    let updated_at = parse_col::<StringArray>(batch, TABLE, "updated_at")?;
+    let workflow_candidate = parse_col::<StringArray>(batch, TABLE, "workflow_candidate")?;
 
     let opt_str = |arr: &StringArray, i: usize| -> Option<String> {
         if arr.is_null(i) {

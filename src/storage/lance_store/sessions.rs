@@ -12,7 +12,7 @@ use arrow_array::{
 use futures::TryStreamExt;
 use lancedb::query::{ExecutableQuery, QueryBase};
 
-use super::{lancedb_err, sessions_schema, sql_quote, LanceStore};
+use super::{lancedb_err, parse_col, sessions_schema, sql_quote, LanceStore};
 use crate::domain::session::Session;
 use crate::storage::types::StorageError;
 
@@ -59,21 +59,15 @@ fn session_to_record_batch(s: &Session) -> Result<RecordBatch, StorageError> {
 }
 
 fn record_batch_to_sessions(batch: &RecordBatch) -> Result<Vec<Session>, StorageError> {
-    fn col<'a, T: 'static>(b: &'a RecordBatch, name: &'static str) -> Result<&'a T, StorageError> {
-        b.column_by_name(name)
-            .ok_or(StorageError::InvalidData("missing column"))?
-            .as_any()
-            .downcast_ref::<T>()
-            .ok_or(StorageError::InvalidData("column type mismatch"))
-    }
-    let session_id = col::<StringArray>(batch, "session_id")?;
-    let tenant = col::<StringArray>(batch, "tenant")?;
-    let caller_agent = col::<StringArray>(batch, "caller_agent")?;
-    let started_at = col::<StringArray>(batch, "started_at")?;
-    let last_seen_at = col::<StringArray>(batch, "last_seen_at")?;
-    let ended_at = col::<StringArray>(batch, "ended_at")?;
-    let goal = col::<StringArray>(batch, "goal")?;
-    let memory_count = col::<UInt32Array>(batch, "memory_count")?;
+    const TABLE: &str = "sessions";
+    let session_id = parse_col::<StringArray>(batch, TABLE, "session_id")?;
+    let tenant = parse_col::<StringArray>(batch, TABLE, "tenant")?;
+    let caller_agent = parse_col::<StringArray>(batch, TABLE, "caller_agent")?;
+    let started_at = parse_col::<StringArray>(batch, TABLE, "started_at")?;
+    let last_seen_at = parse_col::<StringArray>(batch, TABLE, "last_seen_at")?;
+    let ended_at = parse_col::<StringArray>(batch, TABLE, "ended_at")?;
+    let goal = parse_col::<StringArray>(batch, TABLE, "goal")?;
+    let memory_count = parse_col::<UInt32Array>(batch, TABLE, "memory_count")?;
 
     let opt_str = |arr: &StringArray, i: usize| -> Option<String> {
         if arr.is_null(i) {
