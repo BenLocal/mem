@@ -73,7 +73,7 @@ rust-embed = { version = "8", features = ["debug-embed"] }
 fs4 = "0.8"
 
 [dev-dependencies]
-rand = "0.8"
+rand = "0.10"
 
 # PoC: probe the Lance DuckDB extension's row-level DML capabilities
 # and Rust-write→DuckDB-read visibility model. Run with:
