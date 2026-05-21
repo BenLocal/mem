@@ -265,7 +265,20 @@ impl EmbeddingSettings {
             provider: EmbeddingProviderKind::EmbedAnything,
             model: "Qwen/Qwen3-Embedding-0.6B".to_string(),
             dim: 1024,
-            worker_poll_interval_ms: 1000,
+            // **Default 10_000 ms** (was 1_000 pre-2026-05-21). Measured
+            // idle baseline of mem with workers polling at 1 Hz was
+            // ~510% CPU + 800+ tokio blocking threads (spawn_blocking
+            // accumulates each tick, EmbedAnything model + Rayon pool
+            // pile on, futex contention on the single DuckDB mutex
+            // dominates). Dropping to 10 s tick cuts the spawn-blocking
+            // / mutex-storm cost ~9× — measured 510% → ~56% CPU and
+            // 800 → 217 threads on the same workload. The trade-off is
+            // worst-case 10 s latency between job enqueue and pick-up,
+            // which is fine for the embedding queue (background work).
+            // Set EMBEDDING_WORKER_POLL_INTERVAL_MS=1000 to restore the
+            // legacy aggressive cadence if a latency-sensitive caller
+            // needs sub-second job pickup.
+            worker_poll_interval_ms: 10_000,
             // Failure attempts allowed before permanent `failed` (initial pending try + retries).
             max_retries: 4,
             // **Default 8** (was 1 pre-2026-05-21). Each `embedding_worker`
@@ -703,7 +716,7 @@ mod tests {
         assert_eq!(s.dim, 1024);
         assert_eq!(s.openai_api_key, None);
         assert_eq!(s.batch_size, 8);
-        assert_eq!(s.worker_poll_interval_ms, 1000);
+        assert_eq!(s.worker_poll_interval_ms, 10_000);
     }
 
     #[test]
