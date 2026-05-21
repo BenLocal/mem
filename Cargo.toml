@@ -22,7 +22,7 @@ sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio",
 # LanceDB is the storage backend (on-disk Lance datasets) and DuckDB
 # is the SQL query engine on top via the `lance` core extension. Both
 # are unconditional dependencies — there's only one storage path now.
-lancedb = "0.27"
+lancedb = "0.29"
 # arrow-array must be pinned to lancedb 0.27's transitive 57.x —
 # otherwise cargo can resolve to 58.x for our direct dep, leaving two
 # distinct `RecordBatch` types in the dep graph that fail to typecheck
