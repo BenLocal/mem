@@ -1403,16 +1403,36 @@ pub(super) fn record_batch_to_capability_capsules(
     batch: &RecordBatch,
 ) -> Result<Vec<CapabilityCapsuleRecord>, StorageError> {
     use arrow_array::Int64Array;
+    // `col` returns the same `&'static str` flavored StorageError as
+    // before (so the HTTP layer still maps it to 500 with a stable
+    // body), but emits a structured `tracing::error!` line naming the
+    // failing column + expected vs actual arrow type on failure. This
+    // is the difference between "column type mismatch" being a dead-
+    // end log line and being a one-grep debug — the symptom that
+    // fired the diagnostic (2026-05-21 phantom 500 on `accept_pending`)
+    // was unfindable with the old generic error.
+    //
+    // Sibling parsers (`record_batch_to_feedback_events`,
+    // `record_batch_to_*` in entities/sessions/episodes) still carry
+    // the old generic `ok_or` — they don't have a known field-decode
+    // incident yet. Apply this pattern when one fires.
     fn col<'a, T: 'static>(
         batch: &'a RecordBatch,
         name: &'static str,
     ) -> Result<&'a T, StorageError> {
-        batch
-            .column_by_name(name)
-            .ok_or(StorageError::InvalidData("missing column"))?
-            .as_any()
-            .downcast_ref::<T>()
-            .ok_or(StorageError::InvalidData("column type mismatch"))
+        let column = batch.column_by_name(name).ok_or_else(|| {
+            tracing::error!(column = name, "missing column in capability_capsules batch");
+            StorageError::InvalidData("missing column")
+        })?;
+        column.as_any().downcast_ref::<T>().ok_or_else(|| {
+            tracing::error!(
+                column = name,
+                expected = std::any::type_name::<T>(),
+                actual = %column.data_type(),
+                "column type mismatch in capability_capsules batch",
+            );
+            StorageError::InvalidData("column type mismatch")
+        })
     }
     let capability_capsule_id = col::<StringArray>(batch, "capability_capsule_id")?;
     let tenant = col::<StringArray>(batch, "tenant")?;

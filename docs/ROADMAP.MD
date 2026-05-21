@@ -70,6 +70,7 @@ v1 #1–#19 + v2 #16–#28 已完成；剩余待办：
 1. 找出 `embedding_jobs` orphan 行的产生路径（疑在某条 supersede / delete pipeline）
 2. ~~修复 `migrate_content_hash_to_sha256` 在带子表行时的 FK 失败~~ ✅ `6af5a3e`（load/delete/restore dance）
 3. ~~检测同一 `.duckdb` 文件多进程写入（advisory lock / pid file）~~ ✅ `1756033`（`storage::open_lock` — fs4 advisory lock at `Store::open`；sentinel `<path>.lock`；`MEM_OPEN_LOCK_DISABLED=1` 逃生口）
+4. **`accept_pending` 返回 HTTP 500 "column type mismatch"** —— 2026-05-21 review session 发现：6 个 capsule 全部 accept 时报 500，但实际写入成功（status flip 到 active，confidence bump 到 0.6）。500 是 phantom——response-decode 阶段 `record_batch_to_capability_capsules` 的某个 column downcast 失败。具体哪个 column 之前不可知（错误信息无 column 名）。**部分修复**：`8c39c3a`(待提交) 给 `record_batch_to_capability_capsules` 的 `col` helper 加结构化 `tracing::error!`，下次 fire 时日志里能看到 column 名 + expected / actual arrow 类型。**完整 fix 仍待**：(a) 需要 mem serve 重启加载新二进制 才能下次发生时看到日志细节；(b) sibling parsers 还没加同样的诊断；(c) 真根因（schema 漂移？stale binary？）仍未定位
 
 详见 mem incident memory `mem_019dfba4-9e08-71b2-a676-f0218c01f9b6`。
 
