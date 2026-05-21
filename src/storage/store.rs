@@ -1211,6 +1211,14 @@ impl Store {
         self.query.kg_timeline(node_id).await
     }
 
+    pub async fn query_predicate(
+        &self,
+        predicate: &str,
+        as_of: Option<&str>,
+    ) -> Result<Vec<GraphEdge>, GraphError> {
+        self.query.query_predicate(predicate, as_of).await
+    }
+
     pub async fn list_user_tunnels(&self, limit: usize) -> Result<Vec<GraphEdge>, GraphError> {
         self.query.list_user_tunnels(limit).await
     }

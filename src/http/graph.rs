@@ -9,12 +9,18 @@ use crate::{
     app::AppState,
     domain::capability_capsule::{GraphEdge, GraphStats},
     error::AppError,
+    service::NeighborSuggestion,
 };
 
 pub fn router() -> Router<AppState> {
     Router::new()
         .route("/graph/neighbors/{node_id}", get(graph_neighbors))
+        .route(
+            "/graph/neighbors/{node_id}/suggestions",
+            get(graph_neighbor_suggestions),
+        )
         .route("/graph/timeline/{node_id}", get(graph_timeline))
+        .route("/graph/predicate/{predicate}", get(graph_query_predicate))
         .route("/graph/stats", get(graph_stats))
         .route("/graph/tunnels", get(graph_list_user_tunnels))
         .route("/graph/tunnels/find", get(graph_find_tunnels))
@@ -55,6 +61,34 @@ async fn graph_neighbors(
     Ok(Json(edges))
 }
 
+#[derive(Debug, Deserialize, Default)]
+pub struct SuggestionsQuery {
+    #[serde(default = "default_tenant")]
+    pub tenant: String,
+    #[serde(default = "default_suggestion_limit")]
+    pub limit: usize,
+}
+
+fn default_tenant() -> String {
+    "local".to_string()
+}
+
+fn default_suggestion_limit() -> usize {
+    5
+}
+
+async fn graph_neighbor_suggestions(
+    State(app): State<AppState>,
+    Path(node_id): Path<String>,
+    Query(q): Query<SuggestionsQuery>,
+) -> Result<Json<Vec<NeighborSuggestion>>, AppError> {
+    Ok(Json(
+        app.capability_capsule_service
+            .graph_neighbor_suggestions(&q.tenant, &node_id, q.limit)
+            .await?,
+    ))
+}
+
 async fn graph_timeline(
     State(app): State<AppState>,
     Path(node_id): Path<String>,
@@ -62,6 +96,28 @@ async fn graph_timeline(
     Ok(Json(
         app.capability_capsule_service
             .graph_timeline(&node_id)
+            .await?,
+    ))
+}
+
+#[derive(Debug, Deserialize, Default)]
+pub struct QueryPredicateQuery {
+    /// Lexicographic timestamp (20-digit ms string) — when set, only
+    /// edges active at `as_of` (`valid_from <= as_of AND (valid_to IS
+    /// NULL OR valid_to > as_of)`) are returned. Omit for "every
+    /// edge with this predicate, active + closed".
+    #[serde(default)]
+    pub as_of: Option<String>,
+}
+
+async fn graph_query_predicate(
+    State(app): State<AppState>,
+    Path(predicate): Path<String>,
+    Query(q): Query<QueryPredicateQuery>,
+) -> Result<Json<Vec<GraphEdge>>, AppError> {
+    Ok(Json(
+        app.capability_capsule_service
+            .graph_query_predicate(&predicate, q.as_of.as_deref())
             .await?,
     ))
 }

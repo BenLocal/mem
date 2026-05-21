@@ -351,7 +351,11 @@ fn collect_typo_candidates(content: &str, topics: &[String]) -> Vec<String> {
 
 /// Classic iterative two-row Levenshtein. Operates on chars (not
 /// bytes) so multi-byte UTF-8 counts as one edit, not several.
-fn levenshtein(a: &str, b: &str) -> usize {
+///
+/// `pub(crate)` so the K5 graph-neighbors fuzzy-suggestion path
+/// (`CapabilityCapsuleService::graph_neighbor_suggestions`) can reuse
+/// it without duplicating the algorithm.
+pub(crate) fn levenshtein(a: &str, b: &str) -> usize {
     if a == b {
         return 0;
     }

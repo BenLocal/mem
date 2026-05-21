@@ -330,6 +330,64 @@ impl DuckDbQuery {
         .await
     }
 
+    /// All edges with `relation = predicate`, optionally restricted
+    /// to those active at `as_of` (20-digit ms string). When `as_of`
+    /// is `None` the result includes both active and closed edges —
+    /// the canonical "show me every assertion of this relation"
+    /// inspection. mempalace's `query_relationship` analogue (KG K4).
+    ///
+    /// Ordered `valid_from ASC, from_node_id ASC, to_node_id ASC` for
+    /// deterministic output. No pagination — predicate-scoped reads
+    /// are expected to return tens to low hundreds of rows in
+    /// practice; if a predicate explodes past that, caller should
+    /// switch to `neighbors_within` from a specific node.
+    pub async fn query_predicate(
+        &self,
+        predicate: &str,
+        as_of: Option<&str>,
+    ) -> Result<Vec<GraphEdge>, GraphError> {
+        let conn = self.conn.clone();
+        let predicate = predicate.to_string();
+        let as_of = as_of.map(str::to_string);
+        spawn_blocking_graph(move || {
+            let conn = conn.lock().expect("duckdb_query mutex poisoned");
+            let rows = match as_of {
+                Some(ts) => {
+                    let mut stmt = conn.prepare(
+                        "SELECT from_node_id, to_node_id, relation, valid_from, valid_to \
+                         FROM ns.main.graph_edges \
+                         WHERE relation = ?1 \
+                           AND valid_from <= ?2 \
+                           AND (valid_to IS NULL OR valid_to > ?2) \
+                         ORDER BY valid_from ASC, from_node_id ASC, to_node_id ASC",
+                    )?;
+                    let mapped = stmt.query_map(params![predicate, ts], row_to_graph_edge)?;
+                    let mut out = Vec::new();
+                    for r in mapped {
+                        out.push(r?);
+                    }
+                    out
+                }
+                None => {
+                    let mut stmt = conn.prepare(
+                        "SELECT from_node_id, to_node_id, relation, valid_from, valid_to \
+                         FROM ns.main.graph_edges \
+                         WHERE relation = ?1 \
+                         ORDER BY valid_from ASC, from_node_id ASC, to_node_id ASC",
+                    )?;
+                    let mapped = stmt.query_map(params![predicate], row_to_graph_edge)?;
+                    let mut out = Vec::new();
+                    for r in mapped {
+                        out.push(r?);
+                    }
+                    out
+                }
+            };
+            Ok(rows)
+        })
+        .await
+    }
+
     /// Whole-graph aggregate: node and edge counts, active vs closed
     /// split, top-N relation kinds. Tenant-less because the
     /// `graph_edges` schema has no tenant column (all tenants share

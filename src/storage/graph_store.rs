@@ -34,6 +34,16 @@ pub trait GraphStore: Send + Sync {
     /// ordered chronologically by `valid_from`.
     async fn kg_timeline(&self, node_id: &str) -> Result<Vec<GraphEdge>, GraphError>;
 
+    /// All edges with `relation = predicate`, optionally restricted
+    /// to those active at `as_of` (20-digit ms string). When `as_of`
+    /// is `None` the result includes both active and closed edges.
+    /// mempalace's `query_relationship` analogue (KG K4).
+    async fn query_predicate(
+        &self,
+        predicate: &str,
+        as_of: Option<&str>,
+    ) -> Result<Vec<GraphEdge>, GraphError>;
+
     /// Active user-tunnel edges (relation `user:tunnel:*`), bounded
     /// by `limit`.
     async fn list_user_tunnels(&self, limit: usize) -> Result<Vec<GraphEdge>, GraphError>;
@@ -114,6 +124,14 @@ impl GraphStore for Store {
 
     async fn kg_timeline(&self, node_id: &str) -> Result<Vec<GraphEdge>, GraphError> {
         Store::kg_timeline(self, node_id).await
+    }
+
+    async fn query_predicate(
+        &self,
+        predicate: &str,
+        as_of: Option<&str>,
+    ) -> Result<Vec<GraphEdge>, GraphError> {
+        Store::query_predicate(self, predicate, as_of).await
     }
 
     async fn list_user_tunnels(&self, limit: usize) -> Result<Vec<GraphEdge>, GraphError> {

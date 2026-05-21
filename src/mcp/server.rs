@@ -396,6 +396,12 @@ pub struct GraphNeighborsArgs {
     /// valid_to > as_of)` are returned. Omit for "active now".
     #[serde(default)]
     pub as_of: Option<String>,
+    /// Tenant context for the K5 fuzzy-suggestion fallback. When the
+    /// neighbor walk returns an empty result, the wrapper consults
+    /// the entity registry for similar canonical names. Defaults to
+    /// the MCP server's `MEM_TENANT`.
+    #[serde(default)]
+    pub tenant: Option<String>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -403,6 +409,19 @@ pub struct KgTimelineArgs {
     /// Node id whose full edge history to surface (active + closed,
     /// ordered chronologically by `valid_from`).
     pub node_id: String,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct KgQueryPredicateArgs {
+    /// Predicate / relation string to look up — every edge with
+    /// `relation = this` is returned.
+    pub predicate: String,
+    /// Optional point-in-time filter (20-digit ms string). When set,
+    /// only edges active at that moment (`valid_from <= as_of AND
+    /// (valid_to IS NULL OR valid_to > as_of)`) are returned. Omit
+    /// for "every edge with this predicate, active + closed".
+    #[serde(default)]
+    pub as_of: Option<String>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -1373,7 +1392,7 @@ impl MemMcpServer {
 
     // ------------------- capability_capsule_graph_neighbors -------------------
     #[tool(
-        description = "List graph edges adjacent to a node id (e.g. module:mem:billing, project:acme). Optional `max_hops` (default 1, cap 3) performs a BFS walk; `as_of` filters to edges active at a point in time (20-digit ms string). Complements capability_capsule_search when expand_graph is not enough."
+        description = "List graph edges adjacent to a node id (e.g. module:mem:billing, project:acme). Optional `max_hops` (default 1, cap 3) performs a BFS walk; `as_of` filters to edges active at a point in time (20-digit ms string). Complements capability_capsule_search when expand_graph is not enough. **K5 enhancement**: when the result is empty, the wrapper also calls `/graph/neighbors/{node_id}/suggestions` to fetch fuzzy-matched entity canonical names (Levenshtein ≤ 3) and returns `{neighbors: [], suggestions: [...]}` instead of bare `[]`, so callers who typo'd a node_id get back actionable alternatives."
     )]
     async fn capability_capsule_graph_neighbors(
         &self,
@@ -1387,7 +1406,52 @@ impl MemMcpServer {
         if let Some(t) = args.as_of {
             query.push(("as_of", t));
         }
-        self.get_with_query(&path, &query).await
+        // First call: the canonical neighbors lookup. If it errors,
+        // bubble through unchanged — fuzzy suggestions only matter
+        // on the empty-but-otherwise-fine case.
+        let neighbors_val = match self
+            .client
+            .request_json::<Value>(Method::GET, &path, None)
+            .await
+        {
+            Ok(v) => v,
+            Err(e) => return Ok(err_text(e.to_string())),
+        };
+
+        // Bypass the suggestion fetch unless the response is
+        // unambiguously an empty array — anything else (non-empty
+        // edges, unexpected shape) goes back to the caller as-is.
+        let is_empty = matches!(neighbors_val.as_array(), Some(a) if a.is_empty());
+        if !is_empty {
+            return Ok(ok_json(&neighbors_val));
+        }
+
+        let tenant = self.resolve_tenant(args.tenant.as_ref());
+        let suggestions_path = format!(
+            "graph/neighbors/{}/suggestions",
+            encode_segment(&args.node_id),
+        );
+        let suggestions_val = match self
+            .client
+            .request_json_with_query::<Value>(
+                Method::GET,
+                &suggestions_path,
+                None,
+                &[("tenant", tenant)],
+            )
+            .await
+        {
+            Ok(v) => v,
+            // Suggestions failure is non-fatal — degrade to the
+            // original empty-array response. The caller still gets a
+            // valid (if minimal) answer.
+            Err(_) => return Ok(ok_json(&neighbors_val)),
+        };
+
+        let mut envelope = Map::new();
+        envelope.insert("neighbors".into(), neighbors_val);
+        envelope.insert("suggestions".into(), suggestions_val);
+        Ok(ok_json(&Value::Object(envelope)))
     }
 
     // ------------------- capability_capsule_kg_timeline -------------------
@@ -1400,6 +1464,22 @@ impl MemMcpServer {
     ) -> Result<CallToolResult, McpError> {
         let path = format!("graph/timeline/{}", encode_segment(&args.node_id));
         self.get_with_query(&path, &[]).await
+    }
+
+    // ------------------- capability_capsule_kg_query_predicate -------------------
+    #[tool(
+        description = "All edges with `relation = predicate`. Tenant-less because graph_edges is — every tenant shares one graph. Optional `as_of` (20-digit ms timestamp string) restricts to edges active at that moment; omit for the full history (active + closed). Ordered `valid_from ASC`. Use for `show me every assertion of P` audits — e.g. \"what does the KG currently believe about `managed_by`?\" Pairs with `capability_capsule_kg_timeline` (which is node-scoped) for the orthogonal predicate-scoped read. mempalace `query_relationship` analogue (KG K4)."
+    )]
+    async fn capability_capsule_kg_query_predicate(
+        &self,
+        Parameters(args): Parameters<KgQueryPredicateArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        let path = format!("graph/predicate/{}", encode_segment(&args.predicate));
+        let query: Vec<(&str, String)> = match args.as_of {
+            Some(ts) => vec![("as_of", ts)],
+            None => Vec::new(),
+        };
+        self.get_with_query(&path, &query).await
     }
 
     // ------------------- capability_capsule_graph_stats -------------------

@@ -54,6 +54,24 @@ pub enum BatchIngestItem {
     },
 }
 
+/// One fuzzy-match suggestion returned by
+/// [`CapabilityCapsuleService::graph_neighbor_suggestions`] when a
+/// `graph_neighbors` call produced no results — mempalace's
+/// `_fuzzy_match` analogue at the KG level. Each entry is a known
+/// entity whose canonical name is Levenshtein-≤3 from the input
+/// node_id's parsed alias / suffix.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct NeighborSuggestion {
+    /// Suggested replacement node_id (typically `entity:<uuid>`),
+    /// ready to pass back into `graph_neighbors`.
+    pub suggested_node_id: String,
+    /// Human-readable canonical name as stored in the entity registry.
+    pub canonical_name: String,
+    /// Levenshtein distance between the input alias / suffix and the
+    /// suggested canonical name. Lower is closer.
+    pub edit_distance: usize,
+}
+
 #[derive(Debug, Error)]
 pub enum ServiceError {
     #[error("memory not found")]
@@ -937,6 +955,69 @@ impl CapabilityCapsuleService {
     /// the `kg_timeline` MCP tool.
     pub async fn graph_timeline(&self, node_id: &str) -> Result<Vec<GraphEdge>, ServiceError> {
         Ok(self.store.kg_timeline(node_id).await?)
+    }
+
+    /// All edges with `relation = predicate`. Optionally restricted to
+    /// edges active at `as_of` (20-digit ms string). mempalace's
+    /// `query_relationship` analogue — KG K4.
+    pub async fn graph_query_predicate(
+        &self,
+        predicate: &str,
+        as_of: Option<&str>,
+    ) -> Result<Vec<GraphEdge>, ServiceError> {
+        Ok(self.store.query_predicate(predicate, as_of).await?)
+    }
+
+    /// Suggest entity canonical_names close to `node_id` for callers
+    /// who hit an empty-result `graph_neighbors`. mempalace's
+    /// `_fuzzy_match` analogue — KG K5.
+    ///
+    /// Parses `entity:<id>` / `entity:<alias>` prefixes; for everything
+    /// else (`capability_capsule:` / `session:` / bare strings) the
+    /// suggestion source is still entity canonical names since those
+    /// are the only human-readable corpus mem indexes. Returns up to
+    /// `limit` matches with Levenshtein ≤ 3 on the normalized form;
+    /// empty when nothing close.
+    pub async fn graph_neighbor_suggestions(
+        &self,
+        tenant: &str,
+        node_id: &str,
+        limit: usize,
+    ) -> Result<Vec<NeighborSuggestion>, ServiceError> {
+        let token = node_id.strip_prefix("entity:").unwrap_or(node_id);
+        let normalized = crate::pipeline::entity_normalize::normalize_alias(token);
+        if normalized.is_empty() {
+            return Ok(Vec::new());
+        }
+        // Scan the registry — capped at 1000 to bound worst case;
+        // larger tenants need an index but that's a future concern.
+        let entities = self.store.list_entities(tenant, None, None, 1000).await?;
+        let mut scored: Vec<NeighborSuggestion> = entities
+            .into_iter()
+            .filter_map(|e| {
+                let candidate =
+                    crate::pipeline::entity_normalize::normalize_alias(&e.canonical_name);
+                if candidate.is_empty() || candidate == normalized {
+                    return None;
+                }
+                let dist = crate::service::fact_check_service::levenshtein(&normalized, &candidate);
+                if dist > 3 || dist == 0 {
+                    return None;
+                }
+                Some(NeighborSuggestion {
+                    suggested_node_id: format!("entity:{}", e.entity_id),
+                    canonical_name: e.canonical_name,
+                    edit_distance: dist,
+                })
+            })
+            .collect();
+        scored.sort_by(|a, b| {
+            a.edit_distance
+                .cmp(&b.edit_distance)
+                .then_with(|| a.canonical_name.cmp(&b.canonical_name))
+        });
+        scored.truncate(limit.max(1));
+        Ok(scored)
     }
 
     /// Caller-curated tunnel listing (relation prefix `user_tunnel:`).
