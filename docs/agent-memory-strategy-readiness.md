@@ -341,11 +341,11 @@
 |---|---|---|---|
 | 1 | supersede 最小规则 | 🚧 partial | `supersedes_capability_capsule_id` 字段 + `capability_capsule_supersede` MCP（v2 #26）+ ingest 路径自动写 `supersedes` graph edge（ROADMAP #17）已落地；但"什么时候应该 supersede"没有形成文字化规则——caller 自由判断 |
 | 2 | `contradicts` / `supersedes` 关系的写入与维护 | ✅ done | `supersedes` edge（ROADMAP #17）+ `kg_invalidate_edge` MCP（v2 #16，显式关边） + `extracted_from` edge（ROADMAP #18） + `mentions_file` edge（ROADMAP #19）。`contradicts:` tag 前缀在 ingest 过滤（CLAUDE.md ROADMAP #16） |
-| 3 | retrieval 优先展示当前有效版本 | ❌ open | `retrieve.rs` 没有 version-chain dedup。supersede 创建新 Active 行，原行**也保持 Active**（`capability_capsule_service.rs:870-916` 复制 status），所以 search 可能同时返回旧 + 新两个版本。是真 gap——加一层 "if supersedes != None, drop the superseded id from result" 或在 SQL WHERE 加 `NOT EXISTS (SELECT 1 ... WHERE supersedes_capability_capsule_id = id)` |
+| 3 | retrieval 优先展示当前有效版本 | ✅ done (`95ac414`) | SQL `NOT EXISTS` correlated subquery 加在 `search_candidates` 的 outer WHERE 和 `hybrid_candidates` 的 hydration JOIN 上，suppress 任何被其他 active 行 supersede 的 capsule。三处 invariant：(a) 仅在 search 路径生效，browsing/audit 路径（`list_*` / `fetch_by_ids`）保留全量；(b) superseder 必须 `status=active`（archived 不算，否则 rollback proposed update 会丢数据）；(c) `s.tenant = m.tenant` 防 cross-tenant 污染。5 个新 integration tests 覆盖 single/chained/archived/cross-tenant/browsing-still-works |
 | 4 | preference 冲突人工 review | ✅ done | Preference 强制 PendingConfirmation（§9.2 #4）。冲突 preference 双双进 review，最终生效版本通过 `review_accept` / `review_edit_accept` / `review_reject` 收敛 |
 | 5 | 冲突可观测指标 | ❌ open | `mem_health` MCP（v2 #28）有 capsule by-status 计数 + graph stats，但没有"active conflict pairs"指标。可以通过 graph stats 间接看 active edges with relation=contradicts，但不是 first-class 视图 |
 
-**§4.4 小结**：5 条中 2 done / 1 partial / 2 open。**最值得做的是 #3**——version-chain 旧版本仍 Active 会污染召回，是结构性 bug 不是设计选择。
+**§4.4 小结**：5 条中 3 done / 1 partial / 1 open。**#3 已 ✅** (`95ac414`)——SQL `NOT EXISTS` 在 search 路径 dedup。仅剩 #5 冲突可观测指标。
 
 ### 9.5 §4.5 P1 复用质量闭环
 
@@ -377,20 +377,22 @@
 
 | 状态 | 数 | 占比 |
 |---|---|---|
-| ✅ done | 18 | 58% |
+| ✅ done | 19 | 61% |
 | 🚧 partial | 7 | 23% |
 | 🔄 redesigned | 2 | 6% |
-| ❌ open | 4 | 13% |
+| ❌ open | 3 | 10% |
 
-**真 open 的 4 条**（按工作量 × 价值排序）：
+**真 open 的 3 条**（按工作量 × 价值排序）：
 
-1. **§4.4 #3 — version-chain 优先有效版本**（结构性 bug，~半天）：supersede 创建新行后旧行 Active 不变；搜索可能同时返回新旧两版。加 retrieve 层 dedup。
-2. **§4.3 #3 — 自动写入阈值**（mining 路径节流，~3h）：transcript miner 一次能写几十条；加 `MEM_MAX_INGEST_PER_SESSION` + service-layer 计数。
-3. **§4.1 #4 — 边界缺失请求清晰错误**（~2h）：`scope ∈ {Project, Repo}` 时 `project` 必填，否则 400。
-4. **§4.3 #5 — 高噪声 agent 降权钩子**（设计 + 实现，~M）：per-agent noise score 累积，按阈值降权 / 审计。
+1. **§4.3 #3 — 自动写入阈值**（mining 路径节流，~3h）：transcript miner 一次能写几十条；加 `MEM_MAX_INGEST_PER_SESSION` + service-layer 计数。
+2. **§4.1 #4 — 边界缺失请求清晰错误**（~2h）：`scope ∈ {Project, Repo}` 时 `project` 必填，否则 400。
+3. **§4.3 #5 — 高噪声 agent 降权钩子**（设计 + 实现，~M）：per-agent noise score 累积，按阈值降权 / 审计。
+
+**已完成自 2026-05-21 audit 起**：
+- §4.4 #3 version-chain dedup —— `95ac414`（详见 §9.4 表行）。**Beta gating 五条门槛全部 ✅。**
 
 **真 partial 但已够好的**：§4.1 #1 / #3、§4.2 #5、§4.4 #1、§4.5 #1、§4.6 #7——文档/规范缺位，代码到位；改 README/SKILL.md 即可补。
 
 **redesigned 的 2 条**（§4.2 #1 + §4.2 #3）：实际走了 intent-aware × type-matrix 路线，比原稿的 type-static 降权更细。文档以 readiness doc 为准的话需要更新原稿描述。
 
-**Beta gating 视角**：§6.2 列的五条 Beta 门槛——project-first ✅、fact/experience/preference 分流 ✅、基础去噪 + 反馈回流 ✅、真实任务样本 ✅、冲突治理进入流程 🚧（缺 version-chain dedup 这一关）。**做完 §9.7 #1 那条就基本到 Beta 门槛**。
+**Beta gating 视角**：§6.2 列的五条 Beta 门槛全部 ✅ —— project-first ✅、fact/experience/preference 分流 ✅、基础去噪 + 反馈回流 ✅、真实任务样本 ✅、**冲突治理 ✅** (`95ac414` 收尾)。mem 当前已经满足 §6.2 Beta criteria；进一步要看 §6.3 Production-ready for coding agents（不同维度，需要长期多 agent 共享实战验证）。
