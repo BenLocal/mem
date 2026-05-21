@@ -10,7 +10,7 @@
 > - v2：§2（MCP 表面对照）/ §3（推荐路线）/ §4（#16 详化）
 > - v3：§2（CLI 对照）/ §3（module 对照）/ §4（推荐路线）/ §5（#29 详化）
 >
-> **状态（2026-05-20）**：v1 #1–#19 + v2 #16–#28 全部 ✅；v3 **#29 (fact_check API+MCP) + #30 (dedup worker) + #31 (`mem init` CLI)** 已 ✅（20 个新测试通过，fmt + clippy 干净）；剩 v1 #20（内容自动抽取实体，opt-in regex）+ v3 #32（per-session mining cursor，性能）+ v3 #33（外发 embedding provider 启动警告，隐私）待办。
+> **状态（2026-05-21）**：v1 #1–#19 + v2 #16–#28 全部 ✅；v3 **#29 (fact_check API+MCP) + #30 (dedup worker) + #31 (`mem init` CLI) + #33 (privacy startup warn)** 已 ✅；**Incident TODO #3 (multi-process write guard) 已 ✅**（`storage::open_lock` 通过 fs4 advisory lock 兜底单写者契约）。剩 v1 #20（内容自动抽取实体，opt-in regex）+ v3 #32（per-session mining cursor，性能）待办。
 >
 > **平行工作线**：MemPalace 对齐之外，**Backend 存储抽象**走独立 workstream，路线图见 [`backend-coupling.md`](./backend-coupling.md) §6（Phase 0–5 已 shipped；DuckDbQuery / LanceStore 已收窄 `pub(crate)`）。两条线 commit message 用各自的 close 引用（`closes ROADMAP #N` / `closes mempalace-diff-v2 #N` / `closes mempalace-diff-v3 #N` vs `closes backend-coupling §6 Phase N`），不互相阻塞。
 
@@ -69,7 +69,7 @@ v1 #1–#19 + v2 #16–#28 已完成；剩余待办：
 已知 incident TODO（不计入 ROADMAP，但留档）：
 1. 找出 `embedding_jobs` orphan 行的产生路径（疑在某条 supersede / delete pipeline）
 2. ~~修复 `migrate_content_hash_to_sha256` 在带子表行时的 FK 失败~~ ✅ `6af5a3e`（load/delete/restore dance）
-3. 检测同一 `.duckdb` 文件多进程写入（advisory lock / pid file）
+3. ~~检测同一 `.duckdb` 文件多进程写入（advisory lock / pid file）~~ ✅ `1756033`（`storage::open_lock` — fs4 advisory lock at `Store::open`；sentinel `<path>.lock`；`MEM_OPEN_LOCK_DISABLED=1` 逃生口）
 
 详见 mem incident memory `mem_019dfba4-9e08-71b2-a676-f0218c01f9b6`。
 
