@@ -268,7 +268,17 @@ impl EmbeddingSettings {
             worker_poll_interval_ms: 1000,
             // Failure attempts allowed before permanent `failed` (initial pending try + retries).
             max_retries: 4,
-            batch_size: 1,
+            // **Default 8** (was 1 pre-2026-05-21). Each `embedding_worker`
+            // tick triggers one `DuckDbQuery::refresh()` regardless of how
+            // many jobs were processed — that's ~100ms of `INSTALL lance;
+            // LOAD lance; ATTACH` per tick (see `duckdb_query::refresh` doc).
+            // Going from 1 → 8 cuts refresh frequency 8x for backlog drain,
+            // amortizes EmbedAnything's CPU inference cost (the local Qwen3
+            // model dominates per-batch latency once the batch is non-trivial),
+            // and turns one HTTP call into N for OpenAI. Set
+            // `EMBEDDING_BATCH_SIZE=1` to restore the per-job behavior if
+            // a downstream cares about per-job ordering / failure isolation.
+            batch_size: 8,
             openai_api_key: None,
             transcript_disabled: false,
         }
@@ -684,12 +694,16 @@ mod tests {
         // Mirrors `EmbeddingSettings::development_defaults` exactly: when the
         // closure returns no env vars the parser must hand back the in-code
         // defaults verbatim. Update both sides together when those defaults
-        // change (last touched by `47aff1e`, which switched to EmbedAnything).
+        // change (last touched: `47aff1e` flipped to EmbedAnything;
+        // 2026-05-21 flipped `batch_size` 1 → 8 to amortize the per-tick
+        // `DuckDbQuery::refresh()` cost — see config doc-comment).
         let s = EmbeddingSettings::from_env_vars(|_| None).unwrap();
         assert_eq!(s.provider, EmbeddingProviderKind::EmbedAnything);
         assert_eq!(s.model, "Qwen/Qwen3-Embedding-0.6B");
         assert_eq!(s.dim, 1024);
         assert_eq!(s.openai_api_key, None);
+        assert_eq!(s.batch_size, 8);
+        assert_eq!(s.worker_poll_interval_ms, 1000);
     }
 
     #[test]
