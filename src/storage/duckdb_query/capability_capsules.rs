@@ -589,17 +589,37 @@ impl DuckDbQuery {
         let tenant = tenant.to_string();
         let rejected = enum_to_text(&CapabilityCapsuleStatus::Rejected)?;
         let archived = enum_to_text(&CapabilityCapsuleStatus::Archived)?;
+        let active = enum_to_text(&CapabilityCapsuleStatus::Active)?;
         spawn_blocking_storage(move || {
             let conn = conn.lock().expect("duckdb_query mutex poisoned");
+            // Outer alias `c` so the NOT EXISTS subquery can correlate
+            // on `c.capability_capsule_id` + `c.tenant`. The subquery
+            // (`s`) suppresses any row that has been superseded by
+            // another *active* row in the same tenant — version-chain
+            // dedup at retrieve time (strategy-readiness §4.4 #3).
+            // Browsing paths (`list_capability_capsule_ids_for_tenant`,
+            // `list_in_scope`, `fetch_capability_capsules_by_ids`) are
+            // deliberately NOT filtered — admin reads want every row.
             let sql = format!(
-                "SELECT {CAPABILITY_CAPSULE_COLS} FROM ns.main.capability_capsules \
-                 WHERE tenant = ?1 AND status NOT IN (?2, ?3) AND capability_capsule_type != 'diary' \
-                 ORDER BY updated_at DESC, version DESC, capability_capsule_id ASC",
-                CAPABILITY_CAPSULE_COLS = CAPABILITY_CAPSULE_COLS,
+                "SELECT {cols_c} FROM ns.main.capability_capsules c \
+                 WHERE c.tenant = ?1 AND c.status NOT IN (?2, ?3) \
+                   AND c.capability_capsule_type != 'diary' \
+                   AND NOT EXISTS ( \
+                       SELECT 1 FROM ns.main.capability_capsules s \
+                       WHERE s.supersedes_capability_capsule_id = c.capability_capsule_id \
+                         AND s.tenant = c.tenant \
+                         AND s.status = ?4 \
+                   ) \
+                 ORDER BY c.updated_at DESC, c.version DESC, c.capability_capsule_id ASC",
+                cols_c = CAPABILITY_CAPSULE_COLS
+                    .split(',')
+                    .map(|col| format!("c.{}", col.trim()))
+                    .collect::<Vec<_>>()
+                    .join(", "),
             );
             let mut stmt = conn.prepare(&sql)?;
             let rows = stmt.query_map(
-                params![tenant, rejected, archived],
+                params![tenant, rejected, archived, active],
                 row_to_capability_capsule_record,
             )?;
             collect_capability_capsules(rows)
@@ -868,6 +888,7 @@ impl DuckDbQuery {
         let oversample = k_i.saturating_mul(2);
         let rejected = enum_to_text(&CapabilityCapsuleStatus::Rejected)?;
         let archived = enum_to_text(&CapabilityCapsuleStatus::Archived)?;
+        let active = enum_to_text(&CapabilityCapsuleStatus::Active)?;
 
         let vector_lit = if has_vec {
             format!(
@@ -963,8 +984,16 @@ impl DuckDbQuery {
                 let p_outer_tenant = bind(Box::new(tenant.clone()));
                 let p_outer_arch = bind(Box::new(archived.clone()));
                 let p_outer_rej = bind(Box::new(rejected.clone()));
+                let p_outer_active = bind(Box::new(active.clone()));
                 let p_outer_lim = bind(Box::new(k_i));
 
+                // The NOT EXISTS clause is the version-chain dedup
+                // (strategy-readiness §4.4 #3): drop any row that's
+                // been superseded by another active row in the same
+                // tenant. Without it, supersede creates a new active
+                // row but leaves the old one Active too, so search
+                // returns both. `s` is the superseder; `m` is the
+                // (potentially) old version we suppress.
                 let sql = format!(
                     "WITH \
                      {fts_cte}, \
@@ -982,6 +1011,12 @@ impl DuckDbQuery {
                      WHERE m.tenant = ?{p_outer_tenant} \
                        AND m.status NOT IN (?{p_outer_arch}, ?{p_outer_rej}) \
                        AND m.capability_capsule_type != 'diary' \
+                       AND NOT EXISTS ( \
+                           SELECT 1 FROM ns.main.capability_capsules s \
+                           WHERE s.supersedes_capability_capsule_id = m.capability_capsule_id \
+                             AND s.tenant = m.tenant \
+                             AND s.status = ?{p_outer_active} \
+                       ) \
                      ORDER BY f.rrf_score DESC, m.updated_at DESC, m.capability_capsule_id ASC \
                      LIMIT ?{p_outer_lim}"
                 );
@@ -1368,6 +1403,12 @@ mod tests {
 
         // search_candidates: archived/rejected excluded; tenant-scoped;
         // ordered (updated_at DESC, version DESC, capability_capsule_id ASC).
+        // **Version-chain dedup** (strategy-readiness §4.4 #3): m_b is
+        // suppressed because m_b_v2 supersedes it and is active.
+        // Browsing paths (`list_capability_capsule_ids_for_tenant`,
+        // `fetch_capability_capsules_by_ids`) still surface m_b — see
+        // the `tests/version_chain_dedup.rs` integration suite for the
+        // browsing-vs-search split.
         let cands = q.search_candidates("tenant-a").await.unwrap();
         let cand_ids: Vec<&str> = cands
             .iter()
@@ -1375,8 +1416,8 @@ mod tests {
             .collect();
         assert_eq!(
             cand_ids,
-            vec!["m_b_v2", "m_a", "m_b"],
-            "tenant-a candidates: archived excluded, ordered by updated_at DESC"
+            vec!["m_b_v2", "m_a"],
+            "tenant-a search candidates: archived excluded + superseded m_b suppressed by active m_b_v2"
         );
         let cands_b = q.search_candidates("tenant-b").await.unwrap();
         assert_eq!(cands_b.len(), 1);
