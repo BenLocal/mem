@@ -177,6 +177,37 @@ pub struct DedupSettings {
     pub scan_limit: usize,
 }
 
+/// Topic-tunnel auto-derivation settings — mempalace `compute_topic_tunnels`
+/// analogue. The worker scans active capsules in one tenant, groups them
+/// by `project`, computes shared-topic overlap between project pairs, and
+/// creates `user_tunnel:topic:<topic-name>` graph edges between project
+/// entities when the overlap meets `min_count`.
+///
+/// **Default OFF.** Topic tunnels are non-destructive (only add edges,
+/// never close) but they bulk-write to the graph and a wrong min_count
+/// can flood the user_tunnel namespace. Opt in via
+/// `MEM_TOPIC_TUNNEL_ENABLED=1` once you've decided on the threshold.
+///
+/// Edges use the `user_tunnel:topic:<name>` relation prefix so they
+/// surface via `kg_list_user_tunnels` (v2 #20 phase A) alongside
+/// caller-curated tunnels. Operators can filter `relation LIKE
+/// 'user_tunnel:topic:%'` to see auto-derived ones specifically.
+#[derive(Debug, Clone)]
+pub struct TopicTunnelSettings {
+    /// Worker is not spawned when false. Default false.
+    pub enabled: bool,
+    /// Sweep cadence in seconds. Default 6h — topic overlap evolves
+    /// slowly (new capsules with new topics land hourly at most), so
+    /// hourly would be wasteful.
+    pub interval_secs: u64,
+    /// Minimum shared-topic count between two projects required to
+    /// drop a tunnel. Default 2 to suppress coincidental single-topic
+    /// overlaps. mempalace `compute_topic_tunnels` uses the same idea.
+    pub min_count: usize,
+    /// Per-sweep cap on candidate capsules pulled. Default 2_000.
+    pub scan_limit: usize,
+}
+
 #[derive(Debug, Clone)]
 pub struct Config {
     pub bind_addr: String,
@@ -185,6 +216,7 @@ pub struct Config {
     pub auto_promote: AutoPromoteSettings,
     pub vacuum: VacuumSettings,
     pub dedup: DedupSettings,
+    pub topic_tunnel: TopicTunnelSettings,
 }
 
 #[derive(Debug, Error)]
@@ -219,6 +251,12 @@ pub enum ConfigError {
     InvalidDedupThreshold(String),
     #[error("invalid MEM_DEDUP_SCAN_LIMIT: {0}")]
     InvalidDedupScanLimit(String),
+    #[error("invalid MEM_TOPIC_TUNNEL_INTERVAL_SECS: {0}")]
+    InvalidTopicTunnelIntervalSecs(String),
+    #[error("invalid MEM_TOPIC_TUNNEL_MIN_COUNT: {0}")]
+    InvalidTopicTunnelMinCount(String),
+    #[error("invalid MEM_TOPIC_TUNNEL_SCAN_LIMIT: {0}")]
+    InvalidTopicTunnelScanLimit(String),
 }
 
 impl EmbeddingSettings {
@@ -527,6 +565,52 @@ impl DedupSettings {
     }
 }
 
+impl TopicTunnelSettings {
+    pub fn development_defaults() -> Self {
+        Self {
+            enabled: false,
+            interval_secs: 6 * 3_600,
+            min_count: 2,
+            scan_limit: 2_000,
+        }
+    }
+
+    pub fn from_env_vars(get: impl Fn(&str) -> Option<String>) -> Result<Self, ConfigError> {
+        let mut s = Self::development_defaults();
+        if let Some(raw) = get("MEM_TOPIC_TUNNEL_ENABLED") {
+            s.enabled = matches!(raw.to_ascii_lowercase().as_str(), "1" | "true" | "yes");
+        }
+        if let Some(raw) = get("MEM_TOPIC_TUNNEL_INTERVAL_SECS") {
+            let n: u64 = raw
+                .parse()
+                .map_err(|_| ConfigError::InvalidTopicTunnelIntervalSecs(raw.clone()))?;
+            if n == 0 {
+                return Err(ConfigError::InvalidTopicTunnelIntervalSecs(raw));
+            }
+            s.interval_secs = n;
+        }
+        if let Some(raw) = get("MEM_TOPIC_TUNNEL_MIN_COUNT") {
+            let n: usize = raw
+                .parse()
+                .map_err(|_| ConfigError::InvalidTopicTunnelMinCount(raw.clone()))?;
+            if n == 0 {
+                return Err(ConfigError::InvalidTopicTunnelMinCount(raw));
+            }
+            s.min_count = n;
+        }
+        if let Some(raw) = get("MEM_TOPIC_TUNNEL_SCAN_LIMIT") {
+            let n: usize = raw
+                .parse()
+                .map_err(|_| ConfigError::InvalidTopicTunnelScanLimit(raw.clone()))?;
+            if n == 0 {
+                return Err(ConfigError::InvalidTopicTunnelScanLimit(raw));
+            }
+            s.scan_limit = n;
+        }
+        Ok(s)
+    }
+}
+
 impl Config {
     pub fn local() -> Self {
         Self {
@@ -536,6 +620,7 @@ impl Config {
             auto_promote: AutoPromoteSettings::development_defaults(),
             vacuum: VacuumSettings::development_defaults(),
             dedup: DedupSettings::development_defaults(),
+            topic_tunnel: TopicTunnelSettings::development_defaults(),
         }
     }
 
@@ -548,6 +633,7 @@ impl Config {
             auto_promote: AutoPromoteSettings::from_env_vars(|k| std::env::var(k).ok())?,
             vacuum: VacuumSettings::from_env_vars(|k| std::env::var(k).ok())?,
             dedup: DedupSettings::from_env_vars(|k| std::env::var(k).ok())?,
+            topic_tunnel: TopicTunnelSettings::from_env_vars(|k| std::env::var(k).ok())?,
         })
     }
 }

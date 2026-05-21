@@ -120,6 +120,15 @@ impl AppState {
             });
         }
 
+        if config.topic_tunnel.enabled {
+            let store_tt = store.clone();
+            let tt_settings = config.topic_tunnel.clone();
+            let tenant = std::env::var("MEM_TENANT").unwrap_or_else(|_| "local".to_string());
+            tokio::spawn(async move {
+                crate::worker::topic_tunnel_worker::run(store_tt, tt_settings, tenant).await;
+            });
+        }
+
         if !config.embedding.transcript_disabled {
             let provider_transcript = provider.clone();
             let store_transcript = store.clone();

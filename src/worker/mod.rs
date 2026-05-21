@@ -14,6 +14,12 @@
 //!   cosine on embeddings, archives shorter members of near-dup
 //!   clusters via `feedback_kind=incorrect`. Default OFF (destructive);
 //!   opt in via `MEM_DEDUP_ENABLED=1`. Mempalace `dedup.py` analogue.
+//! - `topic_tunnel_worker` — periodic auto-derivation of cross-project
+//!   `user_tunnel:topic:<X>` edges. Groups active capsules by project,
+//!   finds projects that share ≥ `min_count` topics, creates one
+//!   tunnel edge per shared topic between the two project entities.
+//!   Default OFF; opt in via `MEM_TOPIC_TUNNEL_ENABLED=1`. Mempalace
+//!   `compute_topic_tunnels` analogue, adapted to mem's edge-first KG.
 //! - `vacuum_worker` — daily Lance manifest pruning across every
 //!   managed table. Always-on maintenance (reclaims accumulated
 //!   copy-on-write history); opt out with `MEM_VACUUM_DISABLED=1`.
@@ -36,5 +42,6 @@ pub mod auto_promote_worker;
 pub mod decay_worker;
 pub mod dedup_worker;
 pub mod embedding_worker;
+pub mod topic_tunnel_worker;
 pub mod transcript_embedding_worker;
 pub mod vacuum_worker;
