@@ -4,7 +4,7 @@
 use std::sync::Arc;
 
 use axum::Router;
-use tracing::info;
+use tracing::{info, warn};
 
 use crate::{
     http,
@@ -39,6 +39,17 @@ impl AppState {
             dim = provider.dim(),
             "embedding provider initialized"
         );
+        // Privacy guard (v3 #33): warn loudly when the configured
+        // provider sends content off the local machine. Opt out with
+        // MEM_PRIVACY_WARN_SUPPRESS=1 once the operator has
+        // acknowledged the data flow and doesn't want startup noise.
+        if config.embedding.provider.sends_off_machine() && !privacy_warn_suppressed() {
+            warn!(
+                provider = provider.name(),
+                model = provider.model(),
+                "embedding provider sends content OFF this machine — set MEM_PRIVACY_WARN_SUPPRESS=1 to silence",
+            );
+        }
 
         // Open the unified storage handle. LanceStore creates the
         // schema + FTS indexes; DuckDbQuery ATTACHes the lance dir.
@@ -147,6 +158,21 @@ impl AppState {
     pub async fn local() -> anyhow::Result<Self> {
         Self::from_config(crate::config::Config::local()).await
     }
+}
+
+/// Read the privacy-warning suppression env var. Truthy
+/// (`1`/`true`/`yes`, case-insensitive) silences the off-machine
+/// embedding warning emitted by `from_config`. Default: unset →
+/// warning fires whenever a hosted provider is configured.
+fn privacy_warn_suppressed() -> bool {
+    matches!(
+        std::env::var("MEM_PRIVACY_WARN_SUPPRESS")
+            .ok()
+            .as_deref()
+            .map(str::to_ascii_lowercase)
+            .as_deref(),
+        Some("1") | Some("true") | Some("yes")
+    )
 }
 
 pub async fn router() -> anyhow::Result<Router> {

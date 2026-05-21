@@ -16,6 +16,26 @@ pub enum EmbeddingProviderKind {
     EmbedAnything,
 }
 
+impl EmbeddingProviderKind {
+    /// Does this provider send capsule / transcript content off the
+    /// local machine? Used by the startup privacy warning (v3 #33) —
+    /// any "yes" provider gets a one-shot `tracing::warn!` at boot
+    /// unless `MEM_PRIVACY_WARN_SUPPRESS=1` is set.
+    ///
+    /// Today only OpenAI qualifies; `Fake` is pure-Rust deterministic
+    /// hashing and `EmbedAnything` runs local model inference (no
+    /// network calls). New providers default to "yes" via the
+    /// catch-all arm so adding a hosted provider can't silently slip
+    /// past this warning — the compiler forces the author of a new
+    /// variant to pick a side here.
+    pub fn sends_off_machine(self) -> bool {
+        match self {
+            EmbeddingProviderKind::Fake | EmbeddingProviderKind::EmbedAnything => false,
+            EmbeddingProviderKind::OpenAi => true,
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct EmbeddingSettings {
     pub provider: EmbeddingProviderKind,
@@ -558,6 +578,19 @@ mod tests {
                 .find(|(key, _)| *key == k)
                 .map(|(_, v)| (*v).to_string())
         }
+    }
+
+    #[test]
+    fn provider_kind_sends_off_machine_classification() {
+        // Closes mempalace-diff-v3 #33 — the startup privacy warn keys
+        // off this method. If a new variant is added to
+        // `EmbeddingProviderKind`, the match arm in `sends_off_machine`
+        // must classify it explicitly; this test acts as the trip-wire
+        // by hardcoding the expected classification for every known
+        // variant.
+        assert!(!EmbeddingProviderKind::Fake.sends_off_machine());
+        assert!(!EmbeddingProviderKind::EmbedAnything.sends_off_machine());
+        assert!(EmbeddingProviderKind::OpenAi.sends_off_machine());
     }
 
     #[test]

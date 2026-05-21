@@ -161,6 +161,8 @@ BIND_ADDR="127.0.0.1:3000"
 # Embedding provider — `fake` works offline (deterministic hash-based
 # vectors). Swap to `embedanything` for local CPU inference once you
 # have model weights cached, or `openai` after setting OPENAI_API_KEY.
+# Note: `openai` sends content off this machine — mem will warn at
+# startup; set MEM_PRIVACY_WARN_SUPPRESS=1 to silence once acknowledged.
 EMBEDDING_PROVIDER="fake"
 
 # Background workers — defaults match the in-process worker shapes
