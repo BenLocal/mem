@@ -276,6 +276,63 @@ pub(super) fn parse_col<'a, T: 'static>(
     })
 }
 
+/// Schema-drift-tolerant reader for the `version` column.
+///
+/// Commit `45c65f4` (2026-05-17) flipped the declared schema from
+/// `UInt64` to `Int64` to drop four `i64::try_from(u64)` shims at the
+/// Postgres boundary. New tables created after that commit are `Int64`;
+/// long-lived prod dbs created before it keep `UInt64` because
+/// `ensure_table` skips when the table already exists (no migration).
+///
+/// `DuckDbQuery` read paths coerce UInt64→i64 silently via
+/// `row.get::<_, i64>`, so single-row gets / lists / searches work on
+/// drifted dbs. The Lance read paths (`update_status` → strict
+/// `Int64Array` downcast) do not, so `accept_pending` / `reject_pending`
+/// / `apply_feedback` on a drifted db blow up with `column type
+/// mismatch` immediately after a successful write.
+///
+/// This reader accepts either Arrow type and returns `i64`. The UInt64
+/// branch is unreachable on fresh dbs; deleting it is safe once every
+/// long-lived db has either been migrated or recreated.
+pub(super) fn parse_version_column(
+    batch: &RecordBatch,
+    table: &'static str,
+) -> Result<arrow_array::Int64Array, StorageError> {
+    use arrow_array::{Int64Array, UInt64Array};
+    let column = batch.column_by_name("version").ok_or_else(|| {
+        tracing::error!(table, column = "version", "missing column in batch");
+        StorageError::InvalidData("missing column")
+    })?;
+    if let Some(arr) = column.as_any().downcast_ref::<Int64Array>() {
+        return Ok(arr.clone());
+    }
+    if let Some(arr) = column.as_any().downcast_ref::<UInt64Array>() {
+        let mut out = arrow_array::builder::Int64Builder::with_capacity(arr.len());
+        for i in 0..arr.len() {
+            let v = arr.value(i);
+            let signed = i64::try_from(v).map_err(|_| {
+                tracing::error!(
+                    table,
+                    column = "version",
+                    value = v,
+                    "legacy UInt64 version > i64::MAX",
+                );
+                StorageError::InvalidData("version value overflows i64")
+            })?;
+            out.append_value(signed);
+        }
+        return Ok(out.finish());
+    }
+    tracing::error!(
+        table,
+        column = "version",
+        expected = "Int64Array (current) or UInt64Array (pre-45c65f4 legacy)",
+        actual = %column.data_type(),
+        "version column type mismatch",
+    );
+    Err(StorageError::InvalidData("column type mismatch"))
+}
+
 /// Arrow schema for the `memories` LanceDB table. One column per
 /// [`CapabilityCapsuleRecord`] field; enums (`capability_capsule_type`, `status`, `scope`,
 /// `visibility`) are stored as their `serde` snake_case representation
@@ -1429,7 +1486,6 @@ pub(super) fn capability_capsules_to_record_batch(
 pub(super) fn record_batch_to_capability_capsules(
     batch: &RecordBatch,
 ) -> Result<Vec<CapabilityCapsuleRecord>, StorageError> {
-    use arrow_array::Int64Array;
     const TABLE: &str = "capability_capsules";
     let capability_capsule_id = parse_col::<StringArray>(batch, TABLE, "capability_capsule_id")?;
     let tenant = parse_col::<StringArray>(batch, TABLE, "tenant")?;
@@ -1438,7 +1494,7 @@ pub(super) fn record_batch_to_capability_capsules(
     let status = parse_col::<StringArray>(batch, TABLE, "status")?;
     let scope = parse_col::<StringArray>(batch, TABLE, "scope")?;
     let visibility = parse_col::<StringArray>(batch, TABLE, "visibility")?;
-    let version = parse_col::<Int64Array>(batch, TABLE, "version")?;
+    let version = parse_version_column(batch, TABLE)?;
     let summary = parse_col::<StringArray>(batch, TABLE, "summary")?;
     let content = parse_col::<StringArray>(batch, TABLE, "content")?;
     let evidence = parse_col::<ListArray>(batch, TABLE, "evidence")?;
