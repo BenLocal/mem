@@ -96,7 +96,7 @@ impl DuckDbQuery {
         &self,
         tenant: &str,
     ) -> Result<Vec<CapabilityCapsuleRecord>, StorageError> {
-        let conn = self.conn.clone();
+        let conn = self.fresh_conn().await?;
         let tenant = tenant.to_string();
         spawn_blocking_storage(move || {
             let conn = conn.lock().expect("duckdb_query mutex poisoned");
@@ -117,7 +117,7 @@ impl DuckDbQuery {
     /// (future enum additions reading old data) are silently dropped —
     /// caller can detect via `sum(by_status) != total`.
     pub async fn capsule_stats(&self, tenant: &str) -> Result<CapsuleStats, StorageError> {
-        let conn = self.conn.clone();
+        let conn = self.fresh_conn().await?;
         let tenant = tenant.to_string();
         spawn_blocking_storage(move || {
             let conn = conn.lock().expect("duckdb_query mutex poisoned");
@@ -154,7 +154,7 @@ impl DuckDbQuery {
     /// repo space too (a "diary about project X" is still a thing
     /// for that project).
     pub async fn list_wings(&self, tenant: &str) -> Result<Vec<String>, StorageError> {
-        let conn = self.conn.clone();
+        let conn = self.fresh_conn().await?;
         let tenant = tenant.to_string();
         spawn_blocking_storage(move || {
             let conn = conn.lock().expect("duckdb_query mutex poisoned");
@@ -189,7 +189,7 @@ impl DuckDbQuery {
         &self,
         tenant: &str,
     ) -> Result<Vec<(String, Vec<String>)>, StorageError> {
-        let conn = self.conn.clone();
+        let conn = self.fresh_conn().await?;
         let tenant = tenant.to_string();
         spawn_blocking_storage(move || {
             let conn = conn.lock().expect("duckdb_query mutex poisoned");
@@ -255,7 +255,7 @@ impl DuckDbQuery {
         cursor: Option<(&str, &str)>,
         limit: usize,
     ) -> Result<(Vec<CapabilityCapsuleRecord>, bool), StorageError> {
-        let conn = self.conn.clone();
+        let conn = self.fresh_conn().await?;
         let tenant = tenant.to_string();
         let project = project.map(str::to_owned);
         let repo = repo.map(str::to_owned);
@@ -343,7 +343,7 @@ impl DuckDbQuery {
         tenant: &str,
         capability_capsule_id: &str,
     ) -> Result<Option<CapabilityCapsuleRecord>, StorageError> {
-        let conn = self.conn.clone();
+        let conn = self.fresh_conn().await?;
         let tenant = tenant.to_string();
         let capability_capsule_id = capability_capsule_id.to_string();
         spawn_blocking_storage(move || {
@@ -373,7 +373,7 @@ impl DuckDbQuery {
         tenant: &str,
         capability_capsule_id: &str,
     ) -> Result<Option<CapabilityCapsuleRecord>, StorageError> {
-        let conn = self.conn.clone();
+        let conn = self.fresh_conn().await?;
         let tenant = tenant.to_string();
         let capability_capsule_id = capability_capsule_id.to_string();
         let status = enum_to_text(&CapabilityCapsuleStatus::PendingConfirmation)?;
@@ -407,7 +407,7 @@ impl DuckDbQuery {
         idempotency_key: &Option<String>,
         content_hash: &str,
     ) -> Result<Option<CapabilityCapsuleRecord>, StorageError> {
-        let conn = self.conn.clone();
+        let conn = self.fresh_conn().await?;
         let tenant = tenant.to_string();
         let idempotency_key = idempotency_key.clone();
         let content_hash = content_hash.to_string();
@@ -461,7 +461,7 @@ impl DuckDbQuery {
         if types.is_empty() {
             return Ok(Vec::new());
         }
-        let conn = self.conn.clone();
+        let conn = self.fresh_conn().await?;
         let tenant = tenant.to_string();
         let cutoff = cutoff_updated_at.to_string();
         let status = enum_to_text(&CapabilityCapsuleStatus::PendingConfirmation)?;
@@ -513,7 +513,7 @@ impl DuckDbQuery {
         &self,
         tenant: &str,
     ) -> Result<Vec<CapabilityCapsuleRecord>, StorageError> {
-        let conn = self.conn.clone();
+        let conn = self.fresh_conn().await?;
         let tenant = tenant.to_string();
         let status = enum_to_text(&CapabilityCapsuleStatus::PendingConfirmation)?;
         spawn_blocking_storage(move || {
@@ -543,7 +543,7 @@ impl DuckDbQuery {
         tenant: &str,
         limit: usize,
     ) -> Result<Vec<CapabilityCapsuleRecord>, StorageError> {
-        let conn = self.conn.clone();
+        let conn = self.fresh_conn().await?;
         let tenant = tenant.to_string();
         let lim = i64::try_from(limit).unwrap_or(64).clamp(1, 1024);
         let rejected = enum_to_text(&CapabilityCapsuleStatus::Rejected)?;
@@ -585,7 +585,7 @@ impl DuckDbQuery {
         &self,
         tenant: &str,
     ) -> Result<Vec<CapabilityCapsuleRecord>, StorageError> {
-        let conn = self.conn.clone();
+        let conn = self.fresh_conn().await?;
         let tenant = tenant.to_string();
         let rejected = enum_to_text(&CapabilityCapsuleStatus::Rejected)?;
         let archived = enum_to_text(&CapabilityCapsuleStatus::Archived)?;
@@ -646,7 +646,7 @@ impl DuckDbQuery {
         if ids.is_empty() {
             return Ok(Vec::new());
         }
-        let conn = self.conn.clone();
+        let conn = self.fresh_conn().await?;
         let tenant = tenant.to_string();
         let ids: Vec<String> = ids.iter().map(|s| s.to_string()).collect();
         spawn_blocking_storage(move || {
@@ -682,7 +682,7 @@ impl DuckDbQuery {
         &self,
         tenant: &str,
     ) -> Result<Vec<String>, StorageError> {
-        let conn = self.conn.clone();
+        let conn = self.fresh_conn().await?;
         let tenant = tenant.to_string();
         spawn_blocking_storage(move || {
             let conn = conn.lock().expect("duckdb_query mutex poisoned");
@@ -726,7 +726,7 @@ impl DuckDbQuery {
         if query_text.trim().is_empty() || k == 0 {
             return Ok(Vec::new());
         }
-        let conn = self.conn.clone();
+        let conn = self.fresh_conn().await?;
         let tenant = tenant.to_string();
         let query_text = query_text.to_string();
         let k_i = i64::try_from(k).unwrap_or(64).clamp(1, 1024);
@@ -784,7 +784,7 @@ impl DuckDbQuery {
         if query_embedding.is_empty() || k == 0 {
             return Ok(Vec::new());
         }
-        let conn = self.conn.clone();
+        let conn = self.fresh_conn().await?;
         let tenant = tenant.to_string();
         let k_i = i64::try_from(k).unwrap_or(64).clamp(1, 1024);
         // Vector literal interpolated into SQL — duckdb-rs has no
@@ -881,7 +881,7 @@ impl DuckDbQuery {
             .collect::<Vec<_>>()
             .join(", ");
 
-        let conn = self.conn.clone();
+        let conn = self.fresh_conn().await?;
         let tenant = tenant.to_string();
         let query_text = query_text.to_string();
         let k_i = i64::try_from(k).unwrap_or(64).clamp(1, 1024);
@@ -1080,7 +1080,7 @@ impl DuckDbQuery {
         tenant: &str,
         capability_capsule_id: &str,
     ) -> Result<Vec<CapabilityCapsuleVersionLink>, StorageError> {
-        let conn = self.conn.clone();
+        let conn = self.fresh_conn().await?;
         let tenant = tenant.to_string();
         let capability_capsule_id = capability_capsule_id.to_string();
         spawn_blocking_storage(move || {

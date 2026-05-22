@@ -323,7 +323,7 @@ async fn implementation_memory_auto_activates() {
             json!({
                 "capability_capsule_type": "implementation",
                 "content": "invalidate cache when schema changes",
-                "scope": "repo",
+                "scope": "repo", "project": "test-project", "project": "test-project", "project": "test-project",
                 "write_mode": "auto"
             }),
         )
@@ -339,7 +339,7 @@ async fn repeated_ingest_with_same_idempotency_key_returns_existing_memory() {
     let request = json!({
         "capability_capsule_type": "implementation",
         "content": "invalidate cache when schema changes",
-        "scope": "repo",
+        "scope": "repo", "project": "test-project",
         "write_mode": "auto",
         "idempotency_key": "idem-123"
     });
@@ -367,7 +367,7 @@ async fn same_idempotency_key_in_different_tenants_creates_distinct_memories() {
                 "tenant": "tenant-a",
                 "capability_capsule_type": "implementation",
                 "content": "invalidate cache when schema changes",
-                "scope": "repo",
+                "scope": "repo", "project": "test-project", "project": "test-project", "project": "test-project",
                 "write_mode": "auto",
                 "idempotency_key": "idem-shared"
             }),
@@ -381,7 +381,7 @@ async fn same_idempotency_key_in_different_tenants_creates_distinct_memories() {
                 "tenant": "tenant-b",
                 "capability_capsule_type": "implementation",
                 "content": "invalidate cache when schema changes",
-                "scope": "repo",
+                "scope": "repo", "project": "test-project", "project": "test-project", "project": "test-project",
                 "write_mode": "auto",
                 "idempotency_key": "idem-shared"
             }),
@@ -405,7 +405,7 @@ async fn get_memory_returns_full_record() {
             json!({
                 "capability_capsule_type": "implementation",
                 "content": "invalidate cache when schema changes",
-                "scope": "repo",
+                "scope": "repo", "project": "test-project", "project": "test-project", "project": "test-project",
                 "write_mode": "auto",
                 "idempotency_key": "detail-lookup"
             }),
@@ -551,7 +551,7 @@ async fn ingest_rejects_summary_equals_content() {
                 "capability_capsule_type": "implementation",
                 "content": verbatim_text,
                 "summary": verbatim_text,
-                "scope": "repo",
+                "scope": "repo", "project": "test-project", "project": "test-project", "project": "test-project",
                 "write_mode": "auto"
             }),
         )
@@ -581,7 +581,7 @@ async fn ingest_accepts_caller_summary_and_stores_it() {
                 "capability_capsule_type": "implementation",
                 "content": content,
                 "summary": caller_summary,
-                "scope": "repo",
+                "scope": "repo", "project": "test-project", "project": "test-project", "project": "test-project",
                 "write_mode": "auto"
             }),
         )
@@ -611,14 +611,14 @@ async fn batch_ingest_returns_per_item_results() {
         {
             "capability_capsule_type": "implementation",
             "content": "alpha — first capsule of the batch",
-            "scope": "repo",
+            "scope": "repo", "project": "test-project", "project": "test-project",
             "write_mode": "auto",
             "idempotency_key": "batch-alpha"
         },
         {
             "capability_capsule_type": "implementation",
             "content": "beta — second capsule of the batch",
-            "scope": "repo",
+            "scope": "repo", "project": "test-project", "project": "test-project",
             "write_mode": "auto",
             "idempotency_key": "batch-beta"
         }
@@ -641,7 +641,7 @@ async fn batch_ingest_dedupes_against_existing_idempotency_key() {
     let single = json!({
         "capability_capsule_type": "implementation",
         "content": "shared — pre-seeded via single endpoint",
-        "scope": "repo",
+        "scope": "repo", "project": "test-project",
         "write_mode": "auto",
         "idempotency_key": "shared-key"
     });
@@ -657,7 +657,7 @@ async fn batch_ingest_dedupes_against_existing_idempotency_key() {
     let body = json!([{
         "capability_capsule_type": "implementation",
         "content": "shared — pre-seeded via single endpoint",
-        "scope": "repo",
+        "scope": "repo", "project": "test-project",
         "write_mode": "auto",
         "idempotency_key": "shared-key"
     }]);

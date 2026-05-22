@@ -20,7 +20,7 @@ impl DuckDbQuery {
         tenant: &str,
         entity_id: &str,
     ) -> Result<Option<EntityWithAliases>, StorageError> {
-        let conn = self.conn.clone();
+        let conn = self.fresh_conn().await?;
         let tenant = tenant.to_string();
         let entity_id = entity_id.to_string();
         spawn_blocking_storage(move || {
@@ -65,7 +65,7 @@ impl DuckDbQuery {
         alias: &str,
     ) -> Result<Option<String>, StorageError> {
         let normalized = normalize_alias(alias);
-        let conn = self.conn.clone();
+        let conn = self.fresh_conn().await?;
         let tenant = tenant.to_string();
         spawn_blocking_storage(move || {
             let conn = conn.lock().expect("duckdb_query mutex poisoned");
@@ -97,7 +97,7 @@ impl DuckDbQuery {
         query: Option<&str>,
         limit: usize,
     ) -> Result<Vec<Entity>, StorageError> {
-        let conn = self.conn.clone();
+        let conn = self.fresh_conn().await?;
         let tenant = tenant.to_string();
         let kind_filter = kind_filter.map(|k| k.as_db_str().to_string());
         let query = query.map(|q| format!("%{q}%"));

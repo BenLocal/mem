@@ -76,7 +76,7 @@ impl DuckDbQuery {
         tenant: &str,
         session_id: &str,
     ) -> Result<Vec<ConversationMessage>, StorageError> {
-        let conn = self.conn.clone();
+        let conn = self.fresh_conn().await?;
         let tenant = tenant.to_string();
         let session_id = session_id.to_string();
         spawn_blocking_storage(move || {
@@ -118,7 +118,7 @@ impl DuckDbQuery {
         cursor: Option<(&str, i64, i64)>,
         limit: usize,
     ) -> Result<(Vec<ConversationMessage>, bool), StorageError> {
-        let conn = self.conn.clone();
+        let conn = self.fresh_conn().await?;
         let tenant = tenant.to_string();
         let session_id = session_id.to_string();
         let since = since.map(str::to_owned);
@@ -214,7 +214,7 @@ impl DuckDbQuery {
         cursor: Option<(&str, i64, i64)>,
         limit: usize,
     ) -> Result<(Vec<ConversationMessage>, bool), StorageError> {
-        let conn = self.conn.clone();
+        let conn = self.fresh_conn().await?;
         let tenant = tenant.to_string();
         let time_from = time_from.map(str::to_owned);
         let time_to = time_to.map(str::to_owned);
@@ -292,7 +292,7 @@ impl DuckDbQuery {
         &self,
         tenant: &str,
     ) -> Result<Vec<TranscriptSessionSummary>, StorageError> {
-        let conn = self.conn.clone();
+        let conn = self.fresh_conn().await?;
         let tenant = tenant.to_string();
         spawn_blocking_storage(move || {
             let conn = conn.lock().expect("duckdb_query mutex poisoned");
@@ -338,7 +338,7 @@ impl DuckDbQuery {
         if ids.is_empty() {
             return Ok(Vec::new());
         }
-        let conn = self.conn.clone();
+        let conn = self.fresh_conn().await?;
         let tenant = tenant.to_string();
         let ids: Vec<String> = ids.to_vec();
         spawn_blocking_storage(move || {
@@ -395,7 +395,7 @@ impl DuckDbQuery {
         k_after: usize,
         include_tool_blocks: bool,
     ) -> Result<ContextWindow, StorageError> {
-        let conn = self.conn.clone();
+        let conn = self.fresh_conn().await?;
         let tenant = tenant.to_string();
         let primary_id = primary_id.to_string();
         let k_before = i64::try_from(k_before).unwrap_or(0);
@@ -543,7 +543,7 @@ impl DuckDbQuery {
         if k == 0 {
             return Ok(Vec::new());
         }
-        let conn = self.conn.clone();
+        let conn = self.fresh_conn().await?;
         let tenant = tenant.to_string();
         let session_id = session_id.to_string();
         let k_i = i64::try_from(k).unwrap_or(64);
@@ -576,7 +576,7 @@ impl DuckDbQuery {
         tenant: &str,
         limit: usize,
     ) -> Result<Vec<ConversationMessage>, StorageError> {
-        let conn = self.conn.clone();
+        let conn = self.fresh_conn().await?;
         let tenant = tenant.to_string();
         let lim = i64::try_from(limit).unwrap_or(64).clamp(1, 1024);
         spawn_blocking_storage(move || {
@@ -610,7 +610,7 @@ impl DuckDbQuery {
         if query.trim().is_empty() || k == 0 {
             return Ok(Vec::new());
         }
-        let conn = self.conn.clone();
+        let conn = self.fresh_conn().await?;
         let tenant = tenant.to_string();
         let query = query.to_string();
         let k_i = i64::try_from(k).unwrap_or(64).clamp(1, 1024);
@@ -672,7 +672,7 @@ impl DuckDbQuery {
                 .collect::<Vec<_>>()
                 .join(", "),
         );
-        let conn = self.conn.clone();
+        let conn = self.fresh_conn().await?;
         let tenant = tenant.to_string();
         let lim = i64::try_from(limit).unwrap_or(64).clamp(1, 1024);
         let oversample = lim.saturating_mul(2);

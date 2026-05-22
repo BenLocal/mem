@@ -61,6 +61,19 @@ pub struct DuckDbQuery {
     /// connection (which the extension's snapshot caching otherwise
     /// hides).
     pub(super) lance_path: PathBuf,
+    /// Dirty flag — `true` when a Lance write has happened since the
+    /// last `refresh()` and a subsequent read needs to re-attach to
+    /// see the latest version (v3 D2 — defer refresh until a reader
+    /// actually needs it).
+    ///
+    /// Set by [`Store::commit_lance_write`] after every mutating
+    /// call; cleared by [`Self::ensure_fresh`] right before refresh.
+    /// Multiple writes between reads coalesce into a single refresh.
+    /// This dropped idle baseline CPU from ~510% to ~56% in measured
+    /// workloads pre-D1; D2 closes the per-tick refresh churn so we
+    /// can return poll cadence to 1 Hz without re-incurring the
+    /// 100ms-per-write hit.
+    pub(super) dirty: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl DuckDbQuery {
@@ -103,7 +116,55 @@ impl DuckDbQuery {
         Ok(Self {
             conn: Arc::new(Mutex::new(conn)),
             lance_path: path,
+            dirty: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         })
+    }
+
+    /// Mark the connection dirty — call from the write path after a
+    /// lance mutation. Cheap (one atomic store); the actual refresh
+    /// is deferred until a reader calls [`Self::ensure_fresh`].
+    pub fn mark_dirty(&self) {
+        self.dirty.store(true, std::sync::atomic::Ordering::Release);
+    }
+
+    /// Refresh the connection iff the dirty flag is set; clear it
+    /// either way. Called by every read entry point in
+    /// `duckdb_query/*` so reads always see the latest version after
+    /// any pending writes.
+    ///
+    /// Concurrency: the swap-then-refresh ordering means a write that
+    /// arrives between the swap and the refresh sets dirty=true
+    /// again, which the NEXT reader will see and act on. No write is
+    /// ever lost; in the worst case, two consecutive reads both pay
+    /// the refresh cost (one from the original swap, one from the
+    /// racing write that arrived during the first refresh).
+    pub async fn ensure_fresh(&self) -> Result<(), StorageError> {
+        // swap clears + tells us the prior value atomically.
+        if self.dirty.swap(false, std::sync::atomic::Ordering::AcqRel) {
+            self.refresh().await?;
+        }
+        Ok(())
+    }
+
+    /// Convenience: `ensure_fresh().await?` + `conn.clone()` in one
+    /// step. Read methods should replace `let conn = self.conn.clone();`
+    /// with `let conn = self.fresh_conn().await?;` so the returned
+    /// connection has already picked up any pending lance writes.
+    pub(super) async fn fresh_conn(&self) -> Result<Arc<Mutex<Connection>>, StorageError> {
+        self.ensure_fresh().await?;
+        Ok(self.conn.clone())
+    }
+
+    /// Same as `fresh_conn` but for graph read methods that surface
+    /// `GraphError`. The refresh error is wrapped in
+    /// `GraphError::Backend`.
+    pub(super) async fn fresh_conn_for_graph(
+        &self,
+    ) -> Result<Arc<Mutex<Connection>>, crate::storage::types::GraphError> {
+        self.ensure_fresh()
+            .await
+            .map_err(|e| crate::storage::types::GraphError::Backend(e.to_string()))?;
+        Ok(self.conn.clone())
     }
 
     /// Replace the in-process DuckDB connection with a fresh one

@@ -686,6 +686,7 @@ async fn fts_rebuild_survives_repeat_dirty_cycles() {
                 "content": "second round payload for the FTS rebuild probe",
                 "scope": "repo",
                 "visibility": "shared",
+                "project": "mem",
                 "repo": "mem",
                 "module": "storage",
                 "source_agent": "test",

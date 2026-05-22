@@ -168,20 +168,27 @@ impl Store {
         &self,
         result: Result<T, StorageError>,
     ) -> Result<T, StorageError> {
-        // Refresh whether or not the write succeeded — partial
-        // commits in lance still bump the manifest version, so we
-        // want a clean view either way.
-        if let Err(refresh_err) = self.query.refresh().await {
-            // If we *did* have a successful write but the refresh
-            // failed, prefer to surface the refresh error (the
-            // caller should know the read view is stale). If the
-            // write itself failed, that's the more interesting
-            // error.
-            return match result {
-                Ok(_) => Err(refresh_err),
-                Err(orig) => Err(orig),
-            };
-        }
+        // **D2 (2026-05-22)**: deferred refresh — flip the dirty flag
+        // here (cheap atomic store) instead of eagerly calling
+        // `refresh()` (which is ~100ms each: `Connection::open_in_memory`
+        // + `INSTALL lance; LOAD lance;` + `ATTACH 12 tables`). The
+        // next read on this `DuckDbQuery` instance calls
+        // `ensure_fresh()` which sees the dirty flag and pays the
+        // refresh cost once for N intervening writes.
+        //
+        // Trade-off: a caller that issues 10 writes back-to-back used
+        // to pay 10×100ms; now pays 0×100ms + one refresh on whatever
+        // read comes next. For worker tick loops (which write often
+        // but read rarely on the same connection), this is the dominant
+        // CPU win. For interactive flows (write → immediately read on
+        // a different connection), the refresh shifts from write-time
+        // to read-time but the user-visible latency stays the same.
+        //
+        // Mark-dirty + ensure_fresh ordering is documented on
+        // `DuckDbQuery::ensure_fresh` — concurrent writers can't lose
+        // updates because dirty=true is monotonic until the next
+        // reader's atomic swap.
+        self.query.mark_dirty();
         result
     }
 }
@@ -1259,12 +1266,8 @@ impl Store {
         now: &str,
     ) -> Result<(), GraphError> {
         let result = self.lance.sync_memory_edges(edges, now).await;
-        if let Err(e) = self.query.refresh().await {
-            return match result {
-                Ok(_) => Err(GraphError::Backend(e.to_string())),
-                Err(orig) => Err(orig),
-            };
-        }
+        // D2: defer refresh — flip dirty flag, let next read pay it.
+        self.query.mark_dirty();
         result
     }
 
@@ -1274,12 +1277,7 @@ impl Store {
     /// override). Idempotent on active `(from, to, relation)`.
     pub async fn add_edge_direct(&self, edge: &GraphEdge) -> Result<bool, GraphError> {
         let result = self.lance.add_edge_direct(edge).await;
-        if let Err(e) = self.query.refresh().await {
-            return match result {
-                Ok(_) => Err(GraphError::Backend(e.to_string())),
-                Err(orig) => Err(orig),
-            };
-        }
+        self.query.mark_dirty();
         result
     }
 
@@ -1297,12 +1295,7 @@ impl Store {
             .lance
             .invalidate_edge(from_node_id, predicate, to_node_id, ended_at)
             .await;
-        if let Err(e) = self.query.refresh().await {
-            return match result {
-                Ok(_) => Err(GraphError::Backend(e.to_string())),
-                Err(orig) => Err(orig),
-            };
-        }
+        self.query.mark_dirty();
         result
     }
 
@@ -1314,12 +1307,7 @@ impl Store {
             .lance
             .close_edges_for_capability_capsule(capability_capsule_id)
             .await;
-        if let Err(e) = self.query.refresh().await {
-            return match result {
-                Ok(_) => Err(GraphError::Backend(e.to_string())),
-                Err(orig) => Err(orig),
-            };
-        }
+        self.query.mark_dirty();
         result
     }
 }

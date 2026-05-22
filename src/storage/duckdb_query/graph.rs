@@ -25,7 +25,7 @@ impl DuckDbQuery {
     /// callers (and tests) that don't need the multi-hop / time-point
     /// machinery.
     pub async fn neighbors(&self, node_id: &str) -> Result<Vec<GraphEdge>, GraphError> {
-        let conn = self.conn.clone();
+        let conn = self.fresh_conn_for_graph().await?;
         let node_id = node_id.to_string();
         spawn_blocking_graph(move || {
             let conn = conn.lock().expect("duckdb_query mutex poisoned");
@@ -67,7 +67,7 @@ impl DuckDbQuery {
         as_of: Option<&str>,
     ) -> Result<Vec<GraphEdge>, GraphError> {
         let hops = max_hops.clamp(1, MAX_HOPS_CAP);
-        let conn = self.conn.clone();
+        let conn = self.fresh_conn_for_graph().await?;
         let start = node_id.to_string();
         let as_of = as_of.map(str::to_owned);
         spawn_blocking_graph(move || {
@@ -157,7 +157,7 @@ impl DuckDbQuery {
         prefix_b: &str,
         limit: usize,
     ) -> Result<Vec<GraphEdge>, GraphError> {
-        let conn = self.conn.clone();
+        let conn = self.fresh_conn_for_graph().await?;
         let prefix_a = format!("{prefix_a}%");
         let prefix_b = format!("{prefix_b}%");
         let lim = i64::try_from(limit.clamp(1, 200)).unwrap_or(50);
@@ -212,7 +212,7 @@ impl DuckDbQuery {
         max_hops: u32,
     ) -> Result<Vec<GraphEdge>, GraphError> {
         let hops = max_hops.clamp(1, MAX_HOPS_CAP);
-        let conn = self.conn.clone();
+        let conn = self.fresh_conn_for_graph().await?;
         let start = node_id.to_string();
         spawn_blocking_graph(move || {
             let conn = conn.lock().expect("duckdb_query mutex poisoned");
@@ -282,7 +282,7 @@ impl DuckDbQuery {
     /// #20 phase-A discussion). When/if a real `origin` column lands,
     /// this method should switch to a strict equality filter.
     pub async fn list_user_tunnels(&self, limit: usize) -> Result<Vec<GraphEdge>, GraphError> {
-        let conn = self.conn.clone();
+        let conn = self.fresh_conn_for_graph().await?;
         let lim = i64::try_from(limit.clamp(1, 200)).unwrap_or(50);
         spawn_blocking_graph(move || {
             let conn = conn.lock().expect("duckdb_query mutex poisoned");
@@ -310,7 +310,7 @@ impl DuckDbQuery {
     /// [`Self::neighbors`], closed edges (`valid_to IS NOT NULL`) are
     /// surfaced here because that's the whole point of a timeline.
     pub async fn kg_timeline(&self, node_id: &str) -> Result<Vec<GraphEdge>, GraphError> {
-        let conn = self.conn.clone();
+        let conn = self.fresh_conn_for_graph().await?;
         let node_id = node_id.to_string();
         spawn_blocking_graph(move || {
             let conn = conn.lock().expect("duckdb_query mutex poisoned");
@@ -346,7 +346,7 @@ impl DuckDbQuery {
         predicate: &str,
         as_of: Option<&str>,
     ) -> Result<Vec<GraphEdge>, GraphError> {
-        let conn = self.conn.clone();
+        let conn = self.fresh_conn_for_graph().await?;
         let predicate = predicate.to_string();
         let as_of = as_of.map(str::to_string);
         spawn_blocking_graph(move || {
@@ -396,7 +396,7 @@ impl DuckDbQuery {
     /// distribution; full per-kind breakdown can be derived with a
     /// dedicated SQL query.
     pub async fn graph_stats(&self) -> Result<GraphStats, GraphError> {
-        let conn = self.conn.clone();
+        let conn = self.fresh_conn_for_graph().await?;
         spawn_blocking_graph(move || {
             let conn = conn.lock().expect("duckdb_query mutex poisoned");
             let total_edges: i64 =
@@ -458,7 +458,7 @@ impl DuckDbQuery {
         if node_ids.is_empty() {
             return Ok(Vec::new());
         }
-        let conn = self.conn.clone();
+        let conn = self.fresh_conn_for_graph().await?;
         let node_ids: Vec<String> = node_ids.to_vec();
         spawn_blocking_graph(move || {
             let conn = conn.lock().expect("duckdb_query mutex poisoned");

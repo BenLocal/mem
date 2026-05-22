@@ -17,7 +17,7 @@ impl DuckDbQuery {
         &self,
         job_id: &str,
     ) -> Result<Option<String>, StorageError> {
-        let conn = self.conn.clone();
+        let conn = self.fresh_conn().await?;
         let job_id = job_id.to_string();
         spawn_blocking_storage(move || {
             let conn = conn.lock().expect("duckdb_query mutex poisoned");
@@ -40,7 +40,7 @@ impl DuckDbQuery {
         &self,
         job_id: &str,
     ) -> Result<Option<String>, StorageError> {
-        let conn = self.conn.clone();
+        let conn = self.fresh_conn().await?;
         let job_id = job_id.to_string();
         spawn_blocking_storage(move || {
             let conn = conn.lock().expect("duckdb_query mutex poisoned");
