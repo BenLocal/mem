@@ -60,6 +60,7 @@ mod entities;
 mod episodes;
 mod graph;
 mod maintenance;
+pub(crate) mod mine_cursors;
 mod sessions;
 mod transcripts;
 
@@ -154,6 +155,7 @@ impl LanceStore {
         ensure_transcript_embedding_jobs_table(&conn).await?;
         ensure_sessions_table(&conn).await?;
         ensure_episodes_table(&conn).await?;
+        ensure_mine_cursors_table(&conn).await?;
         // capability_capsule_embeddings is lazy-created on first upsert (dim is
         // provider-dependent and unknown here without provider).
 
@@ -395,6 +397,32 @@ pub(super) async fn ensure_sessions_table(conn: &Connection) -> Result<(), Stora
 
 pub(super) async fn ensure_episodes_table(conn: &Connection) -> Result<(), StorageError> {
     ensure_table(conn, "episodes", episodes_schema()).await
+}
+
+pub(super) async fn ensure_mine_cursors_table(conn: &Connection) -> Result<(), StorageError> {
+    ensure_table(conn, "mine_cursors", mine_cursors_schema()).await
+}
+
+/// Arrow schema for `mine_cursors`. Per-transcript cursor recording
+/// the highest `line_number` that the `mem mine` client has shipped
+/// to the server. Used as a client-side optimization (v3 #32):
+/// a re-run of `mine` against the same file can fast-skip parsed
+/// lines whose number is ≤ the cursor, avoiding the parse + HTTP
+/// round-trip cost for already-mined content. Server-side dedup
+/// (idempotency_key + content_hash) still catches anything that
+/// slips past the cursor — so the cursor is purely a perf hint,
+/// never a correctness boundary.
+///
+/// Schema:
+///   - `transcript_path` (PK) — absolute path; one cursor per file
+///   - `last_line_number` — highest 1-based line number mined
+///   - `updated_at` — 20-digit ms timestamp of last cursor write
+fn mine_cursors_schema() -> Schema {
+    Schema::new(vec![
+        Field::new("transcript_path", DataType::Utf8, false),
+        Field::new("last_line_number", DataType::Int64, false),
+        Field::new("updated_at", DataType::Utf8, false),
+    ])
 }
 
 /// Arrow schema for the `sessions` table. Layout: session_id PK,

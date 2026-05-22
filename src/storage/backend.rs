@@ -24,10 +24,10 @@
 
 use super::{
     CapsuleSearchStore, CapsuleStore, EmbeddingJobStore, EmbeddingVectorStore, EntityRegistry,
-    GraphStore, MaintenanceStore, SessionStore, TranscriptStore,
+    GraphStore, MaintenanceStore, MineCursorStore, SessionStore, TranscriptStore,
 };
 
-/// Backend supertrait — anything that implements all nine storage
+/// Backend supertrait — anything that implements all 10 storage
 /// sub-traits. See module docs for the rationale.
 pub trait Backend:
     CapsuleStore
@@ -39,6 +39,7 @@ pub trait Backend:
     + EntityRegistry
     + SessionStore
     + MaintenanceStore
+    + MineCursorStore
     + Send
     + Sync
     + 'static
@@ -55,6 +56,7 @@ impl<T> Backend for T where
         + EntityRegistry
         + SessionStore
         + MaintenanceStore
+        + MineCursorStore
         + Send
         + Sync
         + 'static

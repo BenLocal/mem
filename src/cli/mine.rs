@@ -572,6 +572,55 @@ pub async fn run_with_counts(args: MineArgs) -> anyhow::Result<MineCounts> {
     let mut block_ok: u32 = 0;
     let mut block_fail: u32 = 0;
 
+    // v3 #32 fast-skip: query the server's per-transcript cursor; if
+    // present, drop memories/blocks whose line_number ≤ cursor. Pure
+    // perf — server-side dedup (idempotency_key on capsules; (path,
+    // line, block_index) on transcript blocks) still catches anything
+    // we choose to ship anyway, so a 404 / network failure on cursor
+    // read just degrades to the legacy "re-mine + re-dedup" path.
+    let transcript_path_str = args.transcript_path.display().to_string();
+    let cursor_line: Option<i64> = match client
+        .get(format!("{}/mine/cursors", args.remote.base_url))
+        .query(&[("transcript_path", transcript_path_str.as_str())])
+        .send()
+        .await
+    {
+        Ok(resp) if resp.status().is_success() => resp
+            .json::<serde_json::Value>()
+            .await
+            .ok()
+            .and_then(|v| v.get("last_line_number").and_then(|n| n.as_i64())),
+        _ => None,
+    };
+    let (memories, blocks) = if let Some(c) = cursor_line {
+        let before_mem = memories.len();
+        let before_blk = blocks.len();
+        let memories: Vec<_> = memories
+            .into_iter()
+            .filter(|m| (m.line_number as i64) > c)
+            .collect();
+        let blocks: Vec<_> = blocks
+            .into_iter()
+            .filter(|b| (b.line_number as i64) > c)
+            .collect();
+        eprintln!(
+            "mine: cursor at line {c}; skipped {} capsules + {} blocks already mined",
+            before_mem - memories.len(),
+            before_blk - blocks.len(),
+        );
+        (memories, blocks)
+    } else {
+        (memories, blocks)
+    };
+
+    // Capture max line_number BEFORE the moves below so we can update
+    // the cursor after both batches succeed.
+    let max_line: Option<i64> = memories
+        .iter()
+        .map(|m| m.line_number as i64)
+        .chain(blocks.iter().map(|b| b.line_number as i64))
+        .max();
+
     // ── Capsules: chunked POST to /capability_capsules/batch.
     //
     // Each request body is the same shape as the single endpoint plus
@@ -712,6 +761,27 @@ pub async fn run_with_counts(args: MineArgs) -> anyhow::Result<MineCounts> {
     // idempotency_key for memories, so re-running mine on the same file
     // returns 2xx without double-inserting. Use `mem-cli` / DuckDB queries
     // to count rows on disk if you need exact insert deltas.
+
+    // v3 #32 cursor write — advance the high-water mark only when
+    // every batch this run shipped landed cleanly (no per-item failures
+    // anywhere). Partial-failure runs leave the cursor untouched so the
+    // next mine re-processes the failed lines. Best-effort — a cursor
+    // write failure doesn't fail the mine (server-side dedup still
+    // protects future runs from double-write).
+    let all_clean = mem_fail == 0 && block_fail == 0;
+    if all_clean {
+        if let Some(line) = max_line {
+            let _ = client
+                .post(format!("{}/mine/cursors", args.remote.base_url))
+                .json(&serde_json::json!({
+                    "transcript_path": transcript_path_str,
+                    "last_line_number": line,
+                }))
+                .send()
+                .await;
+        }
+    }
+
     Ok(MineCounts {
         mem_ok,
         mem_fail,

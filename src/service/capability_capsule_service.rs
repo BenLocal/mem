@@ -183,6 +183,31 @@ impl CapabilityCapsuleService {
         self
     }
 
+    /// Read the mine cursor for `transcript_path`. v3 #32 — pure
+    /// perf hint, never a correctness boundary; missing cursor just
+    /// means "re-mine the whole file."
+    pub async fn mine_cursor_get(
+        &self,
+        transcript_path: &str,
+    ) -> Result<Option<crate::storage::MineCursor>, ServiceError> {
+        Ok(self.store.get_mine_cursor(transcript_path).await?)
+    }
+
+    /// Upsert the mine cursor for `transcript_path`. `mem mine`
+    /// writes this after each successful batch round-trip so the next
+    /// re-run can skip already-processed lines.
+    pub async fn mine_cursor_upsert(
+        &self,
+        transcript_path: &str,
+        last_line_number: i64,
+        now: &str,
+    ) -> Result<(), ServiceError> {
+        Ok(self
+            .store
+            .upsert_mine_cursor(transcript_path, last_line_number, now)
+            .await?)
+    }
+
     /// Atomic check-and-increment of the per-session ingest counter.
     /// Returns `Ok(())` when slot reserved (caller is clear to write),
     /// or `Err(ServiceError::Storage(InvalidInput))` when the session's

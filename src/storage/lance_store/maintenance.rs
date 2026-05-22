@@ -54,6 +54,7 @@ const ALL_TABLES: &[&str] = &[
     "transcript_embedding_jobs",
     "sessions",
     "episodes",
+    "mine_cursors",
     // Lazy-created on first upsert; open_table fails if absent and
     // we skip without erroring.
     "capability_capsule_embeddings",

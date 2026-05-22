@@ -7,6 +7,7 @@ pub mod graph;
 pub mod health;
 pub mod logging;
 pub mod maintenance;
+pub mod mine_cursors;
 pub mod review;
 pub mod transcripts;
 
@@ -25,6 +26,7 @@ pub fn router() -> Router<AppState> {
         .merge(entities::router())
         .merge(fact_check::router())
         .merge(maintenance::router())
+        .merge(mine_cursors::router())
         .merge(admin::router())
         .layer(middleware::from_fn(logging::log_request_response))
 }
