@@ -189,6 +189,11 @@ impl CapabilityCapsuleService {
 
         crate::pipeline::ingest::validate_verbatim(&request.content, request.summary.as_deref())
             .map_err(|e| ServiceError::Storage(StorageError::InvalidInput(e)))?;
+        crate::pipeline::ingest::validate_scope_boundary(
+            &request.scope,
+            request.project.as_deref(),
+        )
+        .map_err(|e| ServiceError::Storage(StorageError::InvalidInput(e)))?;
 
         let summary = request
             .summary
@@ -379,6 +384,11 @@ impl CapabilityCapsuleService {
         let status = initial_status(&request.capability_capsule_type, &request.write_mode);
         crate::pipeline::ingest::validate_verbatim(&request.content, request.summary.as_deref())
             .map_err(|e| ServiceError::Storage(StorageError::InvalidInput(e)))?;
+        crate::pipeline::ingest::validate_scope_boundary(
+            &request.scope,
+            request.project.as_deref(),
+        )
+        .map_err(|e| ServiceError::Storage(StorageError::InvalidInput(e)))?;
         let summary = request
             .summary
             .as_deref()

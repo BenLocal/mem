@@ -24,6 +24,32 @@ pub fn validate_verbatim(content: &str, caller_summary: Option<&str>) -> Result<
     Ok(())
 }
 
+/// Validate that the scope / project boundary fields are coherent.
+/// Closes `agent-memory-strategy-readiness §4.1 #4`: a capsule with
+/// `scope=Project` or `scope=Repo` requires `project` to be set,
+/// otherwise the row is filed into the project-scoped pool with no
+/// way to filter back out. Rejects ingest at boundary time rather
+/// than silently writing a mis-scoped capsule.
+///
+/// `Global` and `Workspace` scopes are unaffected (Global has no
+/// project anchor by design; Workspace is workspace-wide so project
+/// is optional metadata, not a filter key).
+pub fn validate_scope_boundary(
+    scope: &crate::domain::capability_capsule::Scope,
+    project: Option<&str>,
+) -> Result<(), String> {
+    use crate::domain::capability_capsule::Scope;
+    let needs_project = matches!(scope, Scope::Project | Scope::Repo);
+    let has_project = project.is_some_and(|p| !p.trim().is_empty());
+    if needs_project && !has_project {
+        return Err(format!(
+            "scope={scope:?} requires non-empty `project` field; \
+             omit project only when scope is `global` or `workspace`",
+        ));
+    }
+    Ok(())
+}
+
 /// Compute the initial `status` for a freshly-ingested capsule.
 ///
 /// Status routing table:
@@ -808,5 +834,47 @@ mod tests {
             "error must mention verbatim: {}",
             err
         );
+    }
+
+    #[test]
+    fn validate_scope_project_requires_project_field() {
+        use crate::domain::capability_capsule::Scope;
+        let err = validate_scope_boundary(&Scope::Project, None)
+            .expect_err("scope=Project + project=None should reject");
+        assert!(err.contains("project"), "error must mention project: {err}");
+    }
+
+    #[test]
+    fn validate_scope_repo_requires_project_field() {
+        use crate::domain::capability_capsule::Scope;
+        let err = validate_scope_boundary(&Scope::Repo, None)
+            .expect_err("scope=Repo + project=None should reject");
+        assert!(err.contains("project"), "error must mention project: {err}");
+    }
+
+    #[test]
+    fn validate_scope_project_empty_string_also_rejected() {
+        use crate::domain::capability_capsule::Scope;
+        for blank in ["", "   ", "\t\n"] {
+            validate_scope_boundary(&Scope::Project, Some(blank))
+                .expect_err("blank-string project under scope=Project should reject");
+        }
+    }
+
+    #[test]
+    fn validate_scope_project_with_project_ok() {
+        use crate::domain::capability_capsule::Scope;
+        assert!(validate_scope_boundary(&Scope::Project, Some("phoenix")).is_ok());
+        assert!(validate_scope_boundary(&Scope::Repo, Some("mem")).is_ok());
+    }
+
+    #[test]
+    fn validate_scope_global_and_workspace_allow_no_project() {
+        use crate::domain::capability_capsule::Scope;
+        // Global / Workspace scopes don't anchor to a project — None is fine.
+        assert!(validate_scope_boundary(&Scope::Global, None).is_ok());
+        assert!(validate_scope_boundary(&Scope::Workspace, None).is_ok());
+        // And of course a project is still allowed (treated as metadata).
+        assert!(validate_scope_boundary(&Scope::Global, Some("any")).is_ok());
     }
 }
