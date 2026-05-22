@@ -153,7 +153,8 @@ impl AppState {
         let fact_check_service = FactCheckService::new(store.clone());
         let capability_capsule_service =
             CapabilityCapsuleService::with_providers(store, embedding_provider_id, Some(provider))
-                .with_transcript_service(transcript_service.clone());
+                .with_transcript_service(transcript_service.clone())
+                .with_ingest_settings(config.ingest.clone());
 
         Ok(Self {
             capability_capsule_service,

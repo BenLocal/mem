@@ -1,5 +1,6 @@
 use serde::Serialize;
-use std::sync::Arc;
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
 use thiserror::Error;
 
 use crate::domain::{
@@ -112,6 +113,15 @@ pub struct CapabilityCapsuleService {
     /// Tests / unit fixtures that don't need transcript enrichment
     /// pass `None` via [`Self::new`] / [`Self::with_providers`].
     transcript_service: Option<Arc<crate::service::TranscriptService>>,
+    /// Per-session ingest throttle settings (cap). `None` ⇒ no cap.
+    /// Closes `agent-memory-strategy-readiness §4.3 #3`.
+    ingest_settings: crate::config::IngestSettings,
+    /// Process-local per-session ingest counter. Keyed on
+    /// `request.session_id`; entries are never evicted (counts grow
+    /// until process restart). When `ingest_settings.max_per_session`
+    /// is `None` the counter is still maintained (cheap) but never
+    /// consulted — the gate short-circuits.
+    ingest_counters: Arc<Mutex<HashMap<String, usize>>>,
 }
 
 impl CapabilityCapsuleService {
@@ -124,6 +134,8 @@ impl CapabilityCapsuleService {
             embedding_job_provider: "fake".to_string(),
             embedding_search_provider: None,
             transcript_service: None,
+            ingest_settings: crate::config::IngestSettings::development_defaults(),
+            ingest_counters: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -140,6 +152,8 @@ impl CapabilityCapsuleService {
             embedding_job_provider: settings.job_provider_id().to_string(),
             embedding_search_provider: None,
             transcript_service: None,
+            ingest_settings: crate::config::IngestSettings::development_defaults(),
+            ingest_counters: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -156,7 +170,41 @@ impl CapabilityCapsuleService {
             embedding_job_provider,
             embedding_search_provider,
             transcript_service: None,
+            ingest_settings: crate::config::IngestSettings::development_defaults(),
+            ingest_counters: Arc::new(Mutex::new(HashMap::new())),
         }
+    }
+
+    /// Builder-style: attach an `IngestSettings` (typically from
+    /// `Config::ingest`). The cap defaults to `None` (no throttle) when
+    /// this isn't called.
+    pub fn with_ingest_settings(mut self, settings: crate::config::IngestSettings) -> Self {
+        self.ingest_settings = settings;
+        self
+    }
+
+    /// Atomic check-and-increment of the per-session ingest counter.
+    /// Returns `Ok(())` when slot reserved (caller is clear to write),
+    /// or `Err(ServiceError::Storage(InvalidInput))` when the session's
+    /// count already meets / exceeds the configured cap. Short-circuits
+    /// when `ingest_settings.max_per_session` is `None`.
+    fn check_and_reserve_ingest_slot(&self, session_id: &str) -> Result<(), ServiceError> {
+        let Some(cap) = self.ingest_settings.max_per_session else {
+            return Ok(());
+        };
+        let mut counters = self
+            .ingest_counters
+            .lock()
+            .expect("ingest_counters mutex poisoned");
+        let count = counters.entry(session_id.to_string()).or_insert(0);
+        if *count >= cap {
+            return Err(ServiceError::Storage(StorageError::InvalidInput(format!(
+                "per-session ingest cap reached: session {session_id} has {count} accepted writes \
+                 (MEM_MAX_INGEST_PER_SESSION={cap}); restart mem or unset the env var to clear",
+            ))));
+        }
+        *count += 1;
+        Ok(())
     }
 
     /// Attach a transcript service so the wake-up fast path can
@@ -211,6 +259,13 @@ impl CapabilityCapsuleService {
         )
         .await
         .map_err(ServiceError::Storage)?;
+
+        // Per-session ingest cap (§4.3 #3). Reserves a slot BEFORE
+        // the write — caller sees rejection deterministically rather
+        // than racing with successful but undercounted writes. The
+        // counter is incremented atomically; rejection returns
+        // without bumping.
+        self.check_and_reserve_ingest_slot(&session_id)?;
 
         let memory = CapabilityCapsuleRecord {
             capability_capsule_id: next_memory_id(),

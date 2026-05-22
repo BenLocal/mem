@@ -208,6 +208,32 @@ pub struct TopicTunnelSettings {
     pub scan_limit: usize,
 }
 
+/// Per-session ingest throttling — closes
+/// `agent-memory-strategy-readiness §4.3 #3`.
+///
+/// Background: transcript mining (`mem mine`) can land hundreds of
+/// blocks per session in a single sweep, each enqueuing an ingest +
+/// an embedding job. Without a cap, a bursty miner can flood the
+/// capsule pool with single-session content, drowning out cross-
+/// session signals during retrieve scoring.
+///
+/// The cap is **process-local** (in-memory HashMap of session_id →
+/// count, reset on restart). DB-backed quotas were considered but
+/// rejected for v1: the counter is purely advisory ("back off this
+/// session"); fresh accounting on restart is the right semantics for
+/// "current burst." Persistent quotas would need separate design.
+///
+/// Default: **None** (no cap). Set `MEM_MAX_INGEST_PER_SESSION=200`
+/// or similar to enforce. When unset, ingest is unthrottled
+/// (backwards compatible). Sessions with no `session_id` provided
+/// in the ingest request are not subject to the cap — counts are
+/// keyed on session_id, so missing-id ingests pass through.
+#[derive(Debug, Clone, Default)]
+pub struct IngestSettings {
+    /// Max accepted ingests per session_id. `None` = unlimited.
+    pub max_per_session: Option<usize>,
+}
+
 #[derive(Debug, Clone)]
 pub struct Config {
     pub bind_addr: String,
@@ -217,6 +243,7 @@ pub struct Config {
     pub vacuum: VacuumSettings,
     pub dedup: DedupSettings,
     pub topic_tunnel: TopicTunnelSettings,
+    pub ingest: IngestSettings,
 }
 
 #[derive(Debug, Error)]
@@ -257,6 +284,8 @@ pub enum ConfigError {
     InvalidTopicTunnelMinCount(String),
     #[error("invalid MEM_TOPIC_TUNNEL_SCAN_LIMIT: {0}")]
     InvalidTopicTunnelScanLimit(String),
+    #[error("invalid MEM_MAX_INGEST_PER_SESSION: {0}")]
+    InvalidMaxIngestPerSession(String),
 }
 
 impl EmbeddingSettings {
@@ -634,6 +663,29 @@ impl TopicTunnelSettings {
     }
 }
 
+impl IngestSettings {
+    pub fn development_defaults() -> Self {
+        Self {
+            max_per_session: None,
+        }
+    }
+
+    pub fn from_env_vars(get: impl Fn(&str) -> Option<String>) -> Result<Self, ConfigError> {
+        let mut s = Self::development_defaults();
+        if let Some(raw) = get("MEM_MAX_INGEST_PER_SESSION") {
+            let n: usize = raw
+                .parse()
+                .map_err(|_| ConfigError::InvalidMaxIngestPerSession(raw.clone()))?;
+            // `0` is treated as "no cap" (same as unset) — saves
+            // callers from a footgun where a typo'd / empty templated
+            // value reads as `0` and blocks all ingest. If you really
+            // want zero ingests, kill the service.
+            s.max_per_session = if n == 0 { None } else { Some(n) };
+        }
+        Ok(s)
+    }
+}
+
 impl Config {
     pub fn local() -> Self {
         Self {
@@ -644,6 +696,7 @@ impl Config {
             vacuum: VacuumSettings::development_defaults(),
             dedup: DedupSettings::development_defaults(),
             topic_tunnel: TopicTunnelSettings::development_defaults(),
+            ingest: IngestSettings::development_defaults(),
         }
     }
 
@@ -657,6 +710,7 @@ impl Config {
             vacuum: VacuumSettings::from_env_vars(|k| std::env::var(k).ok())?,
             dedup: DedupSettings::from_env_vars(|k| std::env::var(k).ok())?,
             topic_tunnel: TopicTunnelSettings::from_env_vars(|k| std::env::var(k).ok())?,
+            ingest: IngestSettings::from_env_vars(|k| std::env::var(k).ok())?,
         })
     }
 }
