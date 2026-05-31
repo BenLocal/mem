@@ -20,6 +20,12 @@
 //!   tunnel edge per shared topic between the two project entities.
 //!   Default OFF; opt in via `MEM_TOPIC_TUNNEL_ENABLED=1`. Mempalace
 //!   `compute_topic_tunnels` analogue, adapted to mem's edge-first KG.
+//! - `potentiation_worker` — K9 edge dynamics (strategy B). Drains an
+//!   in-memory channel of graph-edge co-access events that retrieve
+//!   enqueues, dedups bursts, and applies one Hebbian potentiation per
+//!   unique edge via `Store::potentiate_edge` — off the read path.
+//!   Default OFF; opt in via `MEM_EDGE_DYNAMICS_ENABLED=1`. Mempalace
+//!   `dynamics.py` analogue.
 //! - `vacuum_worker` — daily Lance manifest pruning across every
 //!   managed table. Always-on maintenance (reclaims accumulated
 //!   copy-on-write history); opt out with `MEM_VACUUM_DISABLED=1`.
@@ -42,6 +48,7 @@ pub mod auto_promote_worker;
 pub mod decay_worker;
 pub mod dedup_worker;
 pub mod embedding_worker;
+pub mod potentiation_worker;
 pub mod topic_tunnel_worker;
 pub mod transcript_embedding_worker;
 pub mod vacuum_worker;

@@ -234,6 +234,24 @@ pub struct IngestSettings {
     pub max_per_session: Option<usize>,
 }
 
+/// K9 edge-dynamics potentiation (closes mempalace-diff-v4 K9).
+/// **Default OFF.** When enabled, retrieve enqueues graph-edge co-access
+/// events to an in-memory channel and a worker batch-potentiates them
+/// (Hebbian strength growth); retrieve weights the graph boost by each
+/// edge's time-decayed strength. Disabled = behaviour unchanged (flat
+/// graph boost, no potentiation). Opt in via `MEM_EDGE_DYNAMICS_ENABLED=1`.
+#[derive(Debug, Clone)]
+pub struct EdgeDynamicsSettings {
+    /// Worker not spawned, and retrieve neither enqueues nor weights,
+    /// when false. Default false (opt-in).
+    pub enabled: bool,
+    /// Cadence (seconds) at which the potentiation worker drains the
+    /// access-event channel and writes batched potentiations. Default
+    /// 60s. Repeated accesses to the same edge within one drain window
+    /// collapse to a single potentiation (realising Cepeda anti-massing).
+    pub batch_interval_secs: u64,
+}
+
 #[derive(Debug, Clone)]
 pub struct Config {
     pub bind_addr: String,
@@ -244,6 +262,7 @@ pub struct Config {
     pub dedup: DedupSettings,
     pub topic_tunnel: TopicTunnelSettings,
     pub ingest: IngestSettings,
+    pub edge_dynamics: EdgeDynamicsSettings,
 }
 
 #[derive(Debug, Error)]
@@ -280,6 +299,8 @@ pub enum ConfigError {
     InvalidDedupScanLimit(String),
     #[error("invalid MEM_TOPIC_TUNNEL_INTERVAL_SECS: {0}")]
     InvalidTopicTunnelIntervalSecs(String),
+    #[error("invalid MEM_EDGE_DYNAMICS_BATCH_SECS: {0} (expected positive integer)")]
+    InvalidEdgeDynamicsBatchSecs(String),
     #[error("invalid MEM_TOPIC_TUNNEL_MIN_COUNT: {0}")]
     InvalidTopicTunnelMinCount(String),
     #[error("invalid MEM_TOPIC_TUNNEL_SCAN_LIMIT: {0}")]
@@ -663,6 +684,32 @@ impl TopicTunnelSettings {
     }
 }
 
+impl EdgeDynamicsSettings {
+    pub fn development_defaults() -> Self {
+        Self {
+            enabled: false,
+            batch_interval_secs: 60,
+        }
+    }
+
+    pub fn from_env_vars(get: impl Fn(&str) -> Option<String>) -> Result<Self, ConfigError> {
+        let mut s = Self::development_defaults();
+        if let Some(raw) = get("MEM_EDGE_DYNAMICS_ENABLED") {
+            s.enabled = matches!(raw.to_ascii_lowercase().as_str(), "1" | "true" | "yes");
+        }
+        if let Some(raw) = get("MEM_EDGE_DYNAMICS_BATCH_SECS") {
+            let n: u64 = raw
+                .parse()
+                .map_err(|_| ConfigError::InvalidEdgeDynamicsBatchSecs(raw.clone()))?;
+            if n == 0 {
+                return Err(ConfigError::InvalidEdgeDynamicsBatchSecs(raw));
+            }
+            s.batch_interval_secs = n;
+        }
+        Ok(s)
+    }
+}
+
 impl IngestSettings {
     pub fn development_defaults() -> Self {
         Self {
@@ -697,6 +744,7 @@ impl Config {
             dedup: DedupSettings::development_defaults(),
             topic_tunnel: TopicTunnelSettings::development_defaults(),
             ingest: IngestSettings::development_defaults(),
+            edge_dynamics: EdgeDynamicsSettings::development_defaults(),
         }
     }
 
@@ -711,6 +759,7 @@ impl Config {
             dedup: DedupSettings::from_env_vars(|k| std::env::var(k).ok())?,
             topic_tunnel: TopicTunnelSettings::from_env_vars(|k| std::env::var(k).ok())?,
             ingest: IngestSettings::from_env_vars(|k| std::env::var(k).ok())?,
+            edge_dynamics: EdgeDynamicsSettings::from_env_vars(|k| std::env::var(k).ok())?,
         })
     }
 }
