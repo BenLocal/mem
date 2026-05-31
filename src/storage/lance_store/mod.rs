@@ -51,6 +51,7 @@ use arrow_array::{
 };
 use lancedb::arrow::arrow_schema::{DataType, Field, Schema};
 use lancedb::embeddings::{EmbeddingFunction, EmbeddingRegistry, MemoryRegistry};
+use lancedb::table::NewColumnTransform;
 use lancedb::Connection;
 use serde::{de::DeserializeOwned, Serialize};
 
@@ -419,7 +420,44 @@ async fn ensure_embedding_jobs_table(conn: &Connection) -> Result<(), StorageErr
 }
 
 async fn ensure_graph_edges_table(conn: &Connection) -> Result<(), StorageError> {
-    ensure_table(conn, "graph_edges", graph_edges_schema()).await
+    ensure_table(conn, "graph_edges", graph_edges_schema()).await?;
+    migrate_graph_edges_add_columns(conn).await
+}
+
+/// Migration (closes mempalace-diff-v3 K1, K3): pre-K1 `graph_edges`
+/// tables on disk have a 5-column schema. Add the nullable `confidence`
+/// (K1) and `extractor` (K3) columns — backfilled NULL via Lance's
+/// `add_columns(AllNulls)` — so 7-column writes succeed and legacy rows
+/// read back as `None`. Idempotent: a freshly-created 7-column table
+/// already carries both columns, so this no-ops there. This is mem's
+/// first on-disk schema migration; the generic `ensure_table` stays
+/// create-only by design, so column-add migrations live in dedicated
+/// per-table `ensure_*` wrappers like this one.
+async fn migrate_graph_edges_add_columns(conn: &Connection) -> Result<(), StorageError> {
+    let table = conn
+        .open_table("graph_edges")
+        .execute()
+        .await
+        .map_err(lancedb_err)?;
+    let schema = table.schema().await.map_err(lancedb_err)?;
+    let mut missing: Vec<Field> = Vec::new();
+    if schema.field_with_name("confidence").is_err() {
+        missing.push(Field::new("confidence", DataType::Float32, true));
+    }
+    if schema.field_with_name("extractor").is_err() {
+        missing.push(Field::new("extractor", DataType::Utf8, true));
+    }
+    if missing.is_empty() {
+        return Ok(());
+    }
+    table
+        .add_columns(
+            NewColumnTransform::AllNulls(Arc::new(Schema::new(missing))),
+            None,
+        )
+        .await
+        .map_err(lancedb_err)?;
+    Ok(())
 }
 
 async fn ensure_entities_table(conn: &Connection) -> Result<(), StorageError> {
@@ -1048,6 +1086,11 @@ fn graph_edges_schema() -> Schema {
         Field::new("relation", DataType::Utf8, false),
         Field::new("valid_from", DataType::Utf8, false),
         Field::new("valid_to", DataType::Utf8, true),
+        // K1 / K3 (closes mempalace-diff-v3 K1, K3): caller-declared
+        // confidence + provenance tag. Both nullable so the
+        // `add_columns(AllNulls)` migration can backfill legacy rows.
+        Field::new("confidence", DataType::Float32, true),
+        Field::new("extractor", DataType::Utf8, true),
     ])
 }
 
@@ -1057,6 +1100,8 @@ pub(super) fn graph_edge_to_record_batch(edge: &GraphEdge) -> Result<RecordBatch
     let mut relation = StringBuilder::new();
     let mut valid_from = StringBuilder::new();
     let mut valid_to = StringBuilder::new();
+    let mut confidence = Float32Builder::new();
+    let mut extractor = StringBuilder::new();
     from.append_value(&edge.from_node_id);
     to.append_value(&edge.to_node_id);
     relation.append_value(&edge.relation);
@@ -1065,12 +1110,22 @@ pub(super) fn graph_edge_to_record_batch(edge: &GraphEdge) -> Result<RecordBatch
         Some(s) => valid_to.append_value(s),
         None => valid_to.append_null(),
     }
+    match edge.confidence {
+        Some(c) => confidence.append_value(c),
+        None => confidence.append_null(),
+    }
+    match &edge.extractor {
+        Some(s) => extractor.append_value(s),
+        None => extractor.append_null(),
+    }
     let columns: Vec<Arc<dyn Array>> = vec![
         Arc::new(from.finish()),
         Arc::new(to.finish()),
         Arc::new(relation.finish()),
         Arc::new(valid_from.finish()),
         Arc::new(valid_to.finish()),
+        Arc::new(confidence.finish()),
+        Arc::new(extractor.finish()),
     ];
     RecordBatch::try_new(Arc::new(graph_edges_schema()), columns)
         .map_err(|e| StorageError::InvalidInput(format!("graph_edge record batch: {e}")))

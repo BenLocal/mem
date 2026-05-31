@@ -290,7 +290,7 @@ pub struct CapabilityCapsuleVersionLink {
     pub supersedes_capability_capsule_id: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "snake_case")]
 pub struct GraphEdge {
     pub from_node_id: String,
@@ -298,6 +298,18 @@ pub struct GraphEdge {
     pub relation: String,
     pub valid_from: String,
     pub valid_to: Option<String>,
+    /// K1 — caller-declared edge confidence in `[0, 1]`. `None` (the
+    /// pre-K1 default and the value backfilled for legacy rows by the
+    /// `add_columns` migration) reads back as "unspecified"; consumers
+    /// treat unspecified as full confidence. Static for now — K9 will
+    /// layer Hebbian/Ebbinghaus dynamics on the same column set.
+    #[serde(default, skip_serializing_if = "skip_none")]
+    pub confidence: Option<f32>,
+    /// K3 — provenance tag for the code path that produced this edge
+    /// (`"ingest"`, `"topic_tunnel"`, `"caller"`, …). `None` for legacy
+    /// rows and unattributed writes.
+    #[serde(default, skip_serializing_if = "skip_none")]
+    pub extractor: Option<String>,
 }
 
 /// Aggregate counts over the whole `graph_edges` table. Tenant-less

@@ -87,7 +87,7 @@ pub struct RelationshipTriple {
     pub object: String,
 }
 
-#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, PartialEq)]
 pub struct FactCheckReport {
     pub similar_names: Vec<SimilarNameMatch>,
     pub relationship_conflicts: Vec<RelationshipConflict>,
@@ -109,7 +109,7 @@ pub struct EntitySuggestion {
     pub edit_distance: usize,
 }
 
-#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, PartialEq)]
 pub struct RelationshipConflict {
     pub subject: String,
     pub predicate: String,
@@ -118,7 +118,7 @@ pub struct RelationshipConflict {
     pub note: String,
 }
 
-#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, PartialEq)]
 pub struct KgContradiction {
     pub claim: String,
     pub existing: GraphEdge,

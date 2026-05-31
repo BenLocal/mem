@@ -164,6 +164,8 @@ mod tests {
                 relation: "mentions".into(),
                 valid_from: "00000001778000000000".into(),
                 valid_to: None,
+                confidence: None,
+                extractor: None,
             },
             GraphEdge {
                 from_node_id: "capability_capsule:m2".into(),
@@ -171,6 +173,8 @@ mod tests {
                 relation: "mentions".into(),
                 valid_from: "00000001778000000000".into(),
                 valid_to: None,
+                confidence: None,
+                extractor: None,
             },
             GraphEdge {
                 from_node_id: "capability_capsule:m1".into(),
@@ -178,6 +182,8 @@ mod tests {
                 relation: "discusses".into(),
                 valid_from: "00000001778000000000".into(),
                 valid_to: None,
+                confidence: None,
+                extractor: None,
             },
         ];
         lance
@@ -194,6 +200,8 @@ mod tests {
                     relation: "mentions".into(),
                     valid_from: "00000001778000000000".into(),
                     valid_to: None,
+                    confidence: None,
+                    extractor: None,
                 }],
                 "00000001778000010000",
             )

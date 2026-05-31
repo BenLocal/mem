@@ -476,6 +476,8 @@ pub fn extract_graph_edges(memory: &CapabilityCapsuleRecord) -> Vec<GraphEdge> {
             relation: draft.relation,
             valid_from: String::new(),
             valid_to: None,
+            confidence: None,
+            extractor: None,
         })
         .collect();
 
@@ -493,6 +495,8 @@ pub fn extract_graph_edges(memory: &CapabilityCapsuleRecord) -> Vec<GraphEdge> {
             relation: "contradicts".into(),
             valid_from: String::new(),
             valid_to: None,
+            confidence: None,
+            extractor: None,
         });
     }
 

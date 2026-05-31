@@ -199,6 +199,16 @@ pub struct AddEdgeRequest {
     /// wants to insert an already-closed historical edge in one shot.
     #[serde(default)]
     pub valid_to: Option<String>,
+    /// K1 — optional caller-declared confidence in `[0, 1]`. Omitted →
+    /// `None` (stored as SQL NULL, read back as "unspecified").
+    #[serde(default)]
+    pub confidence: Option<f32>,
+    /// K3 — optional provenance tag. Omitted → the edge is recorded with
+    /// no extractor attribution. A caller-supplied API edge that sets
+    /// nothing is, by convention, `"caller"`-originated; callers may
+    /// override with a more specific tag.
+    #[serde(default)]
+    pub extractor: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -216,6 +226,8 @@ async fn graph_add_edge(
         relation: req.relation,
         valid_from: req.valid_from.unwrap_or_default(),
         valid_to: req.valid_to,
+        confidence: req.confidence,
+        extractor: req.extractor.clone(),
     };
     let written = app.capability_capsule_service.graph_add_edge(edge).await?;
     Ok(Json(AddEdgeResponse { written }))

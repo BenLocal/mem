@@ -1351,6 +1351,8 @@ pub(crate) async fn resolve_drafts_to_edges(
             relation: draft.relation,
             valid_from: now.to_string(),
             valid_to: None,
+            confidence: None,
+            extractor: None,
         });
     }
     Ok(out)

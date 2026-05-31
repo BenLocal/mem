@@ -27,6 +27,8 @@ async fn add_edge(store: &Store, from: &str, to: &str, relation: &str, valid_fro
         relation: relation.into(),
         valid_from: valid_from.into(),
         valid_to: None,
+        confidence: None,
+        extractor: None,
     };
     store.add_edge_direct(&edge).await.unwrap();
 }

@@ -183,6 +183,8 @@ async fn direction_reversed_edge_flags_relationship_conflict() {
         relation: "managed_by".into(),
         valid_from: now.clone(),
         valid_to: None,
+        confidence: None,
+        extractor: None,
     };
     app.store
         .add_edge_direct(&edge)
@@ -239,6 +241,8 @@ async fn value_change_on_same_predicate_flags_kg_contradiction() {
         relation: "owned_by".into(),
         valid_from: now.clone(),
         valid_to: None,
+        confidence: None,
+        extractor: None,
     };
     app.store.add_edge_direct(&edge).await.unwrap();
 
@@ -286,6 +290,8 @@ async fn restating_closed_edge_flags_kg_contradiction() {
         relation: "depended_on".into(),
         valid_from: now.clone(),
         valid_to: None,
+        confidence: None,
+        extractor: None,
     };
     app.store.add_edge_direct(&edge).await.unwrap();
     let closed = app

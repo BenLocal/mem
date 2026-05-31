@@ -198,6 +198,8 @@ pub async fn sweep_once(
                     relation: relation.clone(),
                     valid_from: now.clone(),
                     valid_to: None,
+                    confidence: None,
+                    extractor: Some("topic_tunnel".into()),
                 };
                 match store.add_edge_direct(&edge).await {
                     Ok(true) => created.push(relation),
@@ -296,6 +298,18 @@ mod tests {
         );
         assert!(created.iter().any(|r| r == "user_tunnel:topic:rust"));
         assert!(created.iter().any(|r| r == "user_tunnel:topic:lance"));
+
+        // K3 (closes mempalace-diff-v3 K3): worker-produced tunnel edges
+        // carry the `topic_tunnel` provenance tag so operators can tell
+        // auto-derived edges from caller-curated ones.
+        let tunnels = store.list_user_tunnels(100).await.unwrap();
+        assert!(
+            !tunnels.is_empty()
+                && tunnels
+                    .iter()
+                    .all(|e| e.extractor.as_deref() == Some("topic_tunnel")),
+            "topic-tunnel worker edges must be tagged extractor=topic_tunnel: {tunnels:?}"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread")]

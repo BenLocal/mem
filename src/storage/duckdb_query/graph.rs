@@ -30,7 +30,7 @@ impl DuckDbQuery {
         spawn_blocking_graph(move || {
             let conn = conn.lock().expect("duckdb_query mutex poisoned");
             let mut stmt = conn.prepare(
-                "SELECT from_node_id, to_node_id, relation, valid_from, valid_to \
+                "SELECT from_node_id, to_node_id, relation, valid_from, valid_to, confidence, extractor \
                  FROM ns.main.graph_edges \
                  WHERE (from_node_id = ?1 OR to_node_id = ?1) AND valid_to IS NULL \
                  ORDER BY relation, from_node_id, to_node_id",
@@ -94,7 +94,7 @@ impl DuckDbQuery {
                 let mut next_frontier: Vec<String> = Vec::new();
                 for node in frontier.drain(..) {
                     let mut sql = String::from(
-                        "SELECT from_node_id, to_node_id, relation, valid_from, valid_to \
+                        "SELECT from_node_id, to_node_id, relation, valid_from, valid_to, confidence, extractor \
                          FROM ns.main.graph_edges \
                          WHERE (from_node_id = ?1 OR to_node_id = ?1) AND ",
                     );
@@ -167,7 +167,7 @@ impl DuckDbQuery {
             // covers both directions; we de-dupe via the SET shape
             // below (HashSet on the tuple) in case prefix_a == prefix_b.
             let mut stmt = conn.prepare(
-                "SELECT from_node_id, to_node_id, relation, valid_from, valid_to \
+                "SELECT from_node_id, to_node_id, relation, valid_from, valid_to, confidence, extractor \
                  FROM ns.main.graph_edges \
                  WHERE relation LIKE 'user_tunnel:%' AND valid_to IS NULL \
                    AND ((from_node_id LIKE ?1 AND to_node_id LIKE ?2) \
@@ -229,7 +229,7 @@ impl DuckDbQuery {
                 let mut next_frontier: Vec<String> = Vec::new();
                 for node in frontier.drain(..) {
                     let mut stmt = conn.prepare(
-                        "SELECT from_node_id, to_node_id, relation, valid_from, valid_to \
+                        "SELECT from_node_id, to_node_id, relation, valid_from, valid_to, confidence, extractor \
                          FROM ns.main.graph_edges \
                          WHERE (from_node_id = ?1 OR to_node_id = ?1) \
                            AND relation LIKE 'user_tunnel:%' \
@@ -287,7 +287,7 @@ impl DuckDbQuery {
         spawn_blocking_graph(move || {
             let conn = conn.lock().expect("duckdb_query mutex poisoned");
             let mut stmt = conn.prepare(
-                "SELECT from_node_id, to_node_id, relation, valid_from, valid_to \
+                "SELECT from_node_id, to_node_id, relation, valid_from, valid_to, confidence, extractor \
                  FROM ns.main.graph_edges \
                  WHERE relation LIKE 'user_tunnel:%' AND valid_to IS NULL \
                  ORDER BY relation, from_node_id, to_node_id \
@@ -315,7 +315,7 @@ impl DuckDbQuery {
         spawn_blocking_graph(move || {
             let conn = conn.lock().expect("duckdb_query mutex poisoned");
             let mut stmt = conn.prepare(
-                "SELECT from_node_id, to_node_id, relation, valid_from, valid_to \
+                "SELECT from_node_id, to_node_id, relation, valid_from, valid_to, confidence, extractor \
                  FROM ns.main.graph_edges \
                  WHERE from_node_id = ?1 OR to_node_id = ?1 \
                  ORDER BY valid_from ASC, relation ASC, from_node_id ASC, to_node_id ASC",
@@ -354,7 +354,7 @@ impl DuckDbQuery {
             let rows = match as_of {
                 Some(ts) => {
                     let mut stmt = conn.prepare(
-                        "SELECT from_node_id, to_node_id, relation, valid_from, valid_to \
+                        "SELECT from_node_id, to_node_id, relation, valid_from, valid_to, confidence, extractor \
                          FROM ns.main.graph_edges \
                          WHERE relation = ?1 \
                            AND valid_from <= ?2 \
@@ -370,7 +370,7 @@ impl DuckDbQuery {
                 }
                 None => {
                     let mut stmt = conn.prepare(
-                        "SELECT from_node_id, to_node_id, relation, valid_from, valid_to \
+                        "SELECT from_node_id, to_node_id, relation, valid_from, valid_to, confidence, extractor \
                          FROM ns.main.graph_edges \
                          WHERE relation = ?1 \
                          ORDER BY valid_from ASC, from_node_id ASC, to_node_id ASC",
@@ -528,6 +528,8 @@ mod tests {
                 relation: "mentions".into(),
                 valid_from: "00000001778000010000".into(),
                 valid_to: None,
+                confidence: None,
+                extractor: None,
             },
             GraphEdge {
                 from_node_id: "capability_capsule:c2".into(),
@@ -535,6 +537,8 @@ mod tests {
                 relation: "mentions".into(),
                 valid_from: "00000001778000010001".into(),
                 valid_to: None,
+                confidence: None,
+                extractor: None,
             },
             GraphEdge {
                 from_node_id: "entity:e_alpha".into(),
@@ -542,6 +546,8 @@ mod tests {
                 relation: "tagged".into(),
                 valid_from: "00000001778000010002".into(),
                 valid_to: None,
+                confidence: None,
+                extractor: None,
             },
             // Pre-closed historical edge — relevant for timeline ordering
             // and graph_stats `closed_edges` count.
@@ -551,12 +557,181 @@ mod tests {
                 relation: "supersedes".into(),
                 valid_from: "00000001778000010003".into(),
                 valid_to: Some("00000001778000020000".into()),
+                confidence: None,
+                extractor: None,
             },
         ];
         for e in &edges {
             store.add_edge_direct(e).await.unwrap();
         }
         store
+    }
+
+    /// K1 + K3: an edge written with a caller-supplied `confidence`
+    /// (K1) and `extractor` provenance tag (K3) round-trips through the
+    /// Lance write path and the DuckDB read path unchanged.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn graph_edge_round_trips_confidence_and_extractor() {
+        let dir = tempdir().unwrap();
+        let store = LanceStore::open(dir.path()).await.unwrap();
+        store
+            .add_edge_direct(&GraphEdge {
+                from_node_id: "capability_capsule:c1".into(),
+                to_node_id: "entity:e_alpha".into(),
+                relation: "mentions".into(),
+                valid_from: "00000001778000010000".into(),
+                valid_to: None,
+                confidence: Some(0.6),
+                extractor: Some("caller".into()),
+            })
+            .await
+            .unwrap();
+
+        let q = DuckDbQuery::open(dir.path()).await.unwrap();
+        let edges = q.neighbors_within("entity:e_alpha", 1, None).await.unwrap();
+        let edge = edges
+            .iter()
+            .find(|e| e.from_node_id == "capability_capsule:c1")
+            .expect("seeded edge must be present");
+        assert_eq!(
+            edge.confidence,
+            Some(0.6),
+            "confidence (K1) must round-trip"
+        );
+        assert_eq!(
+            edge.extractor.as_deref(),
+            Some("caller"),
+            "extractor provenance (K3) must round-trip"
+        );
+    }
+
+    /// K1 + K3 migration (closes mempalace-diff-v3 K1, K3): a
+    /// `graph_edges` table created with the pre-K1 5-column schema is
+    /// transparently upgraded with the `confidence` / `extractor`
+    /// columns (backfilled NULL) when `LanceStore::open` runs its
+    /// ensure/migrate path. Legacy rows read back `None`; new 7-column
+    /// writes succeed against the migrated table.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn graph_edges_5col_table_migrates_to_add_confidence_extractor() {
+        use arrow_array::{RecordBatch, StringArray};
+        use lancedb::arrow::arrow_schema::{DataType, Field, Schema};
+
+        let dir = tempdir().unwrap();
+        let uri = dir.path().to_str().unwrap();
+
+        // 1. Hand-create graph_edges with the OLD 5-column schema + one
+        //    legacy row, simulating a pre-K1 on-disk database.
+        {
+            let conn = lancedb::connect(uri).execute().await.unwrap();
+            let old_schema = std::sync::Arc::new(Schema::new(vec![
+                Field::new("from_node_id", DataType::Utf8, false),
+                Field::new("to_node_id", DataType::Utf8, false),
+                Field::new("relation", DataType::Utf8, false),
+                Field::new("valid_from", DataType::Utf8, false),
+                Field::new("valid_to", DataType::Utf8, true),
+            ]));
+            let batch = RecordBatch::try_new(
+                old_schema.clone(),
+                vec![
+                    std::sync::Arc::new(StringArray::from(vec!["capability_capsule:legacy"])),
+                    std::sync::Arc::new(StringArray::from(vec!["entity:old"])),
+                    std::sync::Arc::new(StringArray::from(vec!["mentions"])),
+                    std::sync::Arc::new(StringArray::from(vec!["00000001778000000001"])),
+                    std::sync::Arc::new(StringArray::from(vec![None as Option<&str>])),
+                ],
+            )
+            .unwrap();
+            let tbl = conn
+                .create_empty_table("graph_edges", old_schema)
+                .execute()
+                .await
+                .unwrap();
+            tbl.add(batch).execute().await.unwrap();
+        }
+
+        // 2. Open through LanceStore — triggers the ensure/migrate path
+        //    that must detect the missing columns and add them.
+        let store = LanceStore::open(dir.path()).await.unwrap();
+
+        // 3. A NEW edge carrying confidence + extractor must write
+        //    cleanly against the migrated (7-col) table.
+        store
+            .add_edge_direct(&GraphEdge {
+                from_node_id: "capability_capsule:new".into(),
+                to_node_id: "entity:old".into(),
+                relation: "mentions".into(),
+                valid_from: "00000001778000000002".into(),
+                valid_to: None,
+                confidence: Some(0.9),
+                extractor: Some("caller".into()),
+            })
+            .await
+            .unwrap();
+
+        // 4. Read back via DuckDB: the legacy row reads None/None; the
+        //    fresh row carries its declared values.
+        let q = DuckDbQuery::open(dir.path()).await.unwrap();
+        let edges = q.neighbors_within("entity:old", 1, None).await.unwrap();
+        let legacy = edges
+            .iter()
+            .find(|e| e.from_node_id == "capability_capsule:legacy")
+            .expect("legacy row must survive migration");
+        assert_eq!(
+            legacy.confidence, None,
+            "legacy confidence backfills NULL→None"
+        );
+        assert_eq!(
+            legacy.extractor, None,
+            "legacy extractor backfills NULL→None"
+        );
+        let fresh = edges
+            .iter()
+            .find(|e| e.from_node_id == "capability_capsule:new")
+            .expect("post-migration write must be present");
+        assert_eq!(fresh.confidence, Some(0.9));
+        assert_eq!(fresh.extractor.as_deref(), Some("caller"));
+    }
+
+    /// K1 + K3: the `sync_memory_edges` write path (used by the ingest
+    /// graph-edge sync) must carry `confidence` / `extractor` through to
+    /// storage. It overrides `valid_from` with the server `now` but must
+    /// NOT drop the provenance/confidence the caller supplied.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn sync_memory_edges_preserves_confidence_and_extractor() {
+        let dir = tempdir().unwrap();
+        let store = LanceStore::open(dir.path()).await.unwrap();
+        store
+            .sync_memory_edges(
+                &[GraphEdge {
+                    from_node_id: "capability_capsule:s1".into(),
+                    to_node_id: "entity:e_sync".into(),
+                    relation: "mentions".into(),
+                    valid_from: "ignored-overridden-by-now".into(),
+                    valid_to: None,
+                    confidence: Some(0.42),
+                    extractor: Some("ingest".into()),
+                }],
+                "00000001778000099999",
+            )
+            .await
+            .unwrap();
+
+        let q = DuckDbQuery::open(dir.path()).await.unwrap();
+        let edges = q.neighbors_within("entity:e_sync", 1, None).await.unwrap();
+        let e = edges
+            .iter()
+            .find(|e| e.from_node_id == "capability_capsule:s1")
+            .expect("synced edge must be present");
+        assert_eq!(
+            e.confidence,
+            Some(0.42),
+            "sync_memory_edges must preserve caller confidence"
+        );
+        assert_eq!(e.extractor.as_deref(), Some("ingest"));
+        assert_eq!(
+            e.valid_from, "00000001778000099999",
+            "sync_memory_edges still overrides valid_from with server now"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -620,6 +795,8 @@ mod tests {
                 relation: "co_occurs_with".into(),
                 valid_from: "00000001778000030000".into(),
                 valid_to: None,
+                confidence: None,
+                extractor: None,
             })
             .await
             .unwrap();
@@ -684,6 +861,8 @@ mod tests {
                 relation: "user_tunnel:cross_project_link".into(),
                 valid_from: "00000001778000050000".into(),
                 valid_to: None,
+                confidence: None,
+                extractor: None,
             })
             .await
             .unwrap();
@@ -694,6 +873,8 @@ mod tests {
                 relation: "user_tunnel:related_topics".into(),
                 valid_from: "00000001778000050001".into(),
                 valid_to: None,
+                confidence: None,
+                extractor: None,
             })
             .await
             .unwrap();
@@ -705,6 +886,8 @@ mod tests {
                 relation: "user_tunnel:archived".into(),
                 valid_from: "00000001778000050002".into(),
                 valid_to: Some("00000001778000060000".into()),
+                confidence: None,
+                extractor: None,
             })
             .await
             .unwrap();

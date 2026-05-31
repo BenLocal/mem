@@ -248,6 +248,8 @@ pub(super) fn row_to_graph_edge(row: &duckdb::Row<'_>) -> duckdb::Result<GraphEd
         relation: row.get(2)?,
         valid_from: row.get(3)?,
         valid_to: row.get(4)?,
+        confidence: row.get(5)?,
+        extractor: row.get(6)?,
     })
 }
 
