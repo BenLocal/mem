@@ -23,7 +23,7 @@ async fn fetch_by_ids_filters_tenant_and_status() {
         code_refs: vec![],
         scope: Scope::Repo,
         visibility: Visibility::Shared,
-        project: None,
+        project: Some("mem".into()),
         repo: Some("mem".into()),
         module: None,
         task_type: None,
