@@ -1,5 +1,6 @@
 pub mod capability_capsule;
 pub mod conversation_message;
+pub mod edge_dynamics;
 pub mod embeddings;
 pub mod entity;
 pub mod episode;
