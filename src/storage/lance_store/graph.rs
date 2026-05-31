@@ -52,6 +52,10 @@ impl LanceStore {
                 valid_to: None,
                 confidence: edge.confidence,
                 extractor: edge.extractor.clone(),
+                strength: edge.strength,
+                stability: edge.stability,
+                last_activated: edge.last_activated.clone(),
+                access_count: edge.access_count,
             };
             let batch = graph_edge_to_record_batch(&to_write)
                 .map_err(|e| GraphError::Backend(e.to_string()))?;

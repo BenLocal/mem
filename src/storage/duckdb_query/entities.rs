@@ -166,6 +166,10 @@ mod tests {
                 valid_to: None,
                 confidence: None,
                 extractor: None,
+                strength: None,
+                stability: None,
+                last_activated: None,
+                access_count: None,
             },
             GraphEdge {
                 from_node_id: "capability_capsule:m2".into(),
@@ -175,6 +179,10 @@ mod tests {
                 valid_to: None,
                 confidence: None,
                 extractor: None,
+                strength: None,
+                stability: None,
+                last_activated: None,
+                access_count: None,
             },
             GraphEdge {
                 from_node_id: "capability_capsule:m1".into(),
@@ -184,6 +192,10 @@ mod tests {
                 valid_to: None,
                 confidence: None,
                 extractor: None,
+                strength: None,
+                stability: None,
+                last_activated: None,
+                access_count: None,
             },
         ];
         lance
@@ -202,6 +214,10 @@ mod tests {
                     valid_to: None,
                     confidence: None,
                     extractor: None,
+                    strength: None,
+                    stability: None,
+                    last_activated: None,
+                    access_count: None,
                 }],
                 "00000001778000010000",
             )

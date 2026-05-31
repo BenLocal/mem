@@ -310,6 +310,23 @@ pub struct GraphEdge {
     /// rows and unattributed writes.
     #[serde(default, skip_serializing_if = "skip_none")]
     pub extractor: Option<String>,
+    /// K9 — Hebbian connection weight. Grows on (batched) co-access via
+    /// the potentiation worker, decays with time since `last_activated`
+    /// (Ebbinghaus). `None` (legacy / unattributed) reads as the default
+    /// `1.0`; floored at `0.05`, capped at `5.0`. See [`crate::domain::edge_dynamics`].
+    #[serde(default, skip_serializing_if = "skip_none")]
+    pub strength: Option<f32>,
+    /// K9 — decay resistance. Grows only on *spaced* reinforcement
+    /// (Cepeda spacing effect); `None` reads as `1.0`.
+    #[serde(default, skip_serializing_if = "skip_none")]
+    pub stability: Option<f32>,
+    /// K9 — `current_timestamp()` of the last potentiation; drives the
+    /// Ebbinghaus decay clock. `None` until first potentiated.
+    #[serde(default, skip_serializing_if = "skip_none")]
+    pub last_activated: Option<String>,
+    /// K9 — cumulative co-access count. `None` reads as `0`.
+    #[serde(default, skip_serializing_if = "skip_none")]
+    pub access_count: Option<i64>,
 }
 
 /// Aggregate counts over the whole `graph_edges` table. Tenant-less

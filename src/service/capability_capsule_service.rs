@@ -1353,6 +1353,10 @@ pub(crate) async fn resolve_drafts_to_edges(
             valid_to: None,
             confidence: None,
             extractor: None,
+            strength: None,
+            stability: None,
+            last_activated: None,
+            access_count: None,
         });
     }
     Ok(out)

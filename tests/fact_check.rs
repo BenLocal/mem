@@ -185,6 +185,10 @@ async fn direction_reversed_edge_flags_relationship_conflict() {
         valid_to: None,
         confidence: None,
         extractor: None,
+        strength: None,
+        stability: None,
+        last_activated: None,
+        access_count: None,
     };
     app.store
         .add_edge_direct(&edge)
@@ -243,6 +247,10 @@ async fn value_change_on_same_predicate_flags_kg_contradiction() {
         valid_to: None,
         confidence: None,
         extractor: None,
+        strength: None,
+        stability: None,
+        last_activated: None,
+        access_count: None,
     };
     app.store.add_edge_direct(&edge).await.unwrap();
 
@@ -292,6 +300,10 @@ async fn restating_closed_edge_flags_kg_contradiction() {
         valid_to: None,
         confidence: None,
         extractor: None,
+        strength: None,
+        stability: None,
+        last_activated: None,
+        access_count: None,
     };
     app.store.add_edge_direct(&edge).await.unwrap();
     let closed = app

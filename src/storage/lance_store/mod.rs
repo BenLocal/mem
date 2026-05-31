@@ -447,6 +447,19 @@ async fn migrate_graph_edges_add_columns(conn: &Connection) -> Result<(), Storag
     if schema.field_with_name("extractor").is_err() {
         missing.push(Field::new("extractor", DataType::Utf8, true));
     }
+    // K9 dynamics columns (same backfill-NULL migration).
+    if schema.field_with_name("strength").is_err() {
+        missing.push(Field::new("strength", DataType::Float32, true));
+    }
+    if schema.field_with_name("stability").is_err() {
+        missing.push(Field::new("stability", DataType::Float32, true));
+    }
+    if schema.field_with_name("last_activated").is_err() {
+        missing.push(Field::new("last_activated", DataType::Utf8, true));
+    }
+    if schema.field_with_name("access_count").is_err() {
+        missing.push(Field::new("access_count", DataType::Int64, true));
+    }
     if missing.is_empty() {
         return Ok(());
     }
@@ -1091,6 +1104,13 @@ fn graph_edges_schema() -> Schema {
         // `add_columns(AllNulls)` migration can backfill legacy rows.
         Field::new("confidence", DataType::Float32, true),
         Field::new("extractor", DataType::Utf8, true),
+        // K9 (closes mempalace-diff-v4 K9): edge "living weight"
+        // dynamics. All nullable, backfilled NULL by the same
+        // `add_columns(AllNulls)` migration as K1/K3.
+        Field::new("strength", DataType::Float32, true),
+        Field::new("stability", DataType::Float32, true),
+        Field::new("last_activated", DataType::Utf8, true),
+        Field::new("access_count", DataType::Int64, true),
     ])
 }
 
@@ -1102,6 +1122,10 @@ pub(super) fn graph_edge_to_record_batch(edge: &GraphEdge) -> Result<RecordBatch
     let mut valid_to = StringBuilder::new();
     let mut confidence = Float32Builder::new();
     let mut extractor = StringBuilder::new();
+    let mut strength = Float32Builder::new();
+    let mut stability = Float32Builder::new();
+    let mut last_activated = StringBuilder::new();
+    let mut access_count = Int64Builder::new();
     from.append_value(&edge.from_node_id);
     to.append_value(&edge.to_node_id);
     relation.append_value(&edge.relation);
@@ -1118,6 +1142,22 @@ pub(super) fn graph_edge_to_record_batch(edge: &GraphEdge) -> Result<RecordBatch
         Some(s) => extractor.append_value(s),
         None => extractor.append_null(),
     }
+    match edge.strength {
+        Some(v) => strength.append_value(v),
+        None => strength.append_null(),
+    }
+    match edge.stability {
+        Some(v) => stability.append_value(v),
+        None => stability.append_null(),
+    }
+    match &edge.last_activated {
+        Some(s) => last_activated.append_value(s),
+        None => last_activated.append_null(),
+    }
+    match edge.access_count {
+        Some(n) => access_count.append_value(n),
+        None => access_count.append_null(),
+    }
     let columns: Vec<Arc<dyn Array>> = vec![
         Arc::new(from.finish()),
         Arc::new(to.finish()),
@@ -1126,6 +1166,10 @@ pub(super) fn graph_edge_to_record_batch(edge: &GraphEdge) -> Result<RecordBatch
         Arc::new(valid_to.finish()),
         Arc::new(confidence.finish()),
         Arc::new(extractor.finish()),
+        Arc::new(strength.finish()),
+        Arc::new(stability.finish()),
+        Arc::new(last_activated.finish()),
+        Arc::new(access_count.finish()),
     ];
     RecordBatch::try_new(Arc::new(graph_edges_schema()), columns)
         .map_err(|e| StorageError::InvalidInput(format!("graph_edge record batch: {e}")))

@@ -228,6 +228,10 @@ async fn graph_add_edge(
         valid_to: req.valid_to,
         confidence: req.confidence,
         extractor: req.extractor.clone(),
+        strength: None,
+        stability: None,
+        last_activated: None,
+        access_count: None,
     };
     let written = app.capability_capsule_service.graph_add_edge(edge).await?;
     Ok(Json(AddEdgeResponse { written }))

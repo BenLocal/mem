@@ -200,6 +200,10 @@ pub async fn sweep_once(
                     valid_to: None,
                     confidence: None,
                     extractor: Some("topic_tunnel".into()),
+                    strength: None,
+                    stability: None,
+                    last_activated: None,
+                    access_count: None,
                 };
                 match store.add_edge_direct(&edge).await {
                     Ok(true) => created.push(relation),

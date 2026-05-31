@@ -478,6 +478,10 @@ pub fn extract_graph_edges(memory: &CapabilityCapsuleRecord) -> Vec<GraphEdge> {
             valid_to: None,
             confidence: None,
             extractor: None,
+            strength: None,
+            stability: None,
+            last_activated: None,
+            access_count: None,
         })
         .collect();
 
@@ -497,6 +501,10 @@ pub fn extract_graph_edges(memory: &CapabilityCapsuleRecord) -> Vec<GraphEdge> {
             valid_to: None,
             confidence: None,
             extractor: None,
+            strength: None,
+            stability: None,
+            last_activated: None,
+            access_count: None,
         });
     }
 

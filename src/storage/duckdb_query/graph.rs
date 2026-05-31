@@ -30,7 +30,7 @@ impl DuckDbQuery {
         spawn_blocking_graph(move || {
             let conn = conn.lock().expect("duckdb_query mutex poisoned");
             let mut stmt = conn.prepare(
-                "SELECT from_node_id, to_node_id, relation, valid_from, valid_to, confidence, extractor \
+                "SELECT from_node_id, to_node_id, relation, valid_from, valid_to, confidence, extractor, strength, stability, last_activated, access_count \
                  FROM ns.main.graph_edges \
                  WHERE (from_node_id = ?1 OR to_node_id = ?1) AND valid_to IS NULL \
                  ORDER BY relation, from_node_id, to_node_id",
@@ -94,7 +94,7 @@ impl DuckDbQuery {
                 let mut next_frontier: Vec<String> = Vec::new();
                 for node in frontier.drain(..) {
                     let mut sql = String::from(
-                        "SELECT from_node_id, to_node_id, relation, valid_from, valid_to, confidence, extractor \
+                        "SELECT from_node_id, to_node_id, relation, valid_from, valid_to, confidence, extractor, strength, stability, last_activated, access_count \
                          FROM ns.main.graph_edges \
                          WHERE (from_node_id = ?1 OR to_node_id = ?1) AND ",
                     );
@@ -167,7 +167,7 @@ impl DuckDbQuery {
             // covers both directions; we de-dupe via the SET shape
             // below (HashSet on the tuple) in case prefix_a == prefix_b.
             let mut stmt = conn.prepare(
-                "SELECT from_node_id, to_node_id, relation, valid_from, valid_to, confidence, extractor \
+                "SELECT from_node_id, to_node_id, relation, valid_from, valid_to, confidence, extractor, strength, stability, last_activated, access_count \
                  FROM ns.main.graph_edges \
                  WHERE relation LIKE 'user_tunnel:%' AND valid_to IS NULL \
                    AND ((from_node_id LIKE ?1 AND to_node_id LIKE ?2) \
@@ -229,7 +229,7 @@ impl DuckDbQuery {
                 let mut next_frontier: Vec<String> = Vec::new();
                 for node in frontier.drain(..) {
                     let mut stmt = conn.prepare(
-                        "SELECT from_node_id, to_node_id, relation, valid_from, valid_to, confidence, extractor \
+                        "SELECT from_node_id, to_node_id, relation, valid_from, valid_to, confidence, extractor, strength, stability, last_activated, access_count \
                          FROM ns.main.graph_edges \
                          WHERE (from_node_id = ?1 OR to_node_id = ?1) \
                            AND relation LIKE 'user_tunnel:%' \
@@ -287,7 +287,7 @@ impl DuckDbQuery {
         spawn_blocking_graph(move || {
             let conn = conn.lock().expect("duckdb_query mutex poisoned");
             let mut stmt = conn.prepare(
-                "SELECT from_node_id, to_node_id, relation, valid_from, valid_to, confidence, extractor \
+                "SELECT from_node_id, to_node_id, relation, valid_from, valid_to, confidence, extractor, strength, stability, last_activated, access_count \
                  FROM ns.main.graph_edges \
                  WHERE relation LIKE 'user_tunnel:%' AND valid_to IS NULL \
                  ORDER BY relation, from_node_id, to_node_id \
@@ -315,7 +315,7 @@ impl DuckDbQuery {
         spawn_blocking_graph(move || {
             let conn = conn.lock().expect("duckdb_query mutex poisoned");
             let mut stmt = conn.prepare(
-                "SELECT from_node_id, to_node_id, relation, valid_from, valid_to, confidence, extractor \
+                "SELECT from_node_id, to_node_id, relation, valid_from, valid_to, confidence, extractor, strength, stability, last_activated, access_count \
                  FROM ns.main.graph_edges \
                  WHERE from_node_id = ?1 OR to_node_id = ?1 \
                  ORDER BY valid_from ASC, relation ASC, from_node_id ASC, to_node_id ASC",
@@ -354,7 +354,7 @@ impl DuckDbQuery {
             let rows = match as_of {
                 Some(ts) => {
                     let mut stmt = conn.prepare(
-                        "SELECT from_node_id, to_node_id, relation, valid_from, valid_to, confidence, extractor \
+                        "SELECT from_node_id, to_node_id, relation, valid_from, valid_to, confidence, extractor, strength, stability, last_activated, access_count \
                          FROM ns.main.graph_edges \
                          WHERE relation = ?1 \
                            AND valid_from <= ?2 \
@@ -370,7 +370,7 @@ impl DuckDbQuery {
                 }
                 None => {
                     let mut stmt = conn.prepare(
-                        "SELECT from_node_id, to_node_id, relation, valid_from, valid_to, confidence, extractor \
+                        "SELECT from_node_id, to_node_id, relation, valid_from, valid_to, confidence, extractor, strength, stability, last_activated, access_count \
                          FROM ns.main.graph_edges \
                          WHERE relation = ?1 \
                          ORDER BY valid_from ASC, from_node_id ASC, to_node_id ASC",
@@ -530,6 +530,10 @@ mod tests {
                 valid_to: None,
                 confidence: None,
                 extractor: None,
+                strength: None,
+                stability: None,
+                last_activated: None,
+                access_count: None,
             },
             GraphEdge {
                 from_node_id: "capability_capsule:c2".into(),
@@ -539,6 +543,10 @@ mod tests {
                 valid_to: None,
                 confidence: None,
                 extractor: None,
+                strength: None,
+                stability: None,
+                last_activated: None,
+                access_count: None,
             },
             GraphEdge {
                 from_node_id: "entity:e_alpha".into(),
@@ -548,6 +556,10 @@ mod tests {
                 valid_to: None,
                 confidence: None,
                 extractor: None,
+                strength: None,
+                stability: None,
+                last_activated: None,
+                access_count: None,
             },
             // Pre-closed historical edge — relevant for timeline ordering
             // and graph_stats `closed_edges` count.
@@ -559,6 +571,10 @@ mod tests {
                 valid_to: Some("00000001778000020000".into()),
                 confidence: None,
                 extractor: None,
+                strength: None,
+                stability: None,
+                last_activated: None,
+                access_count: None,
             },
         ];
         for e in &edges {
@@ -583,6 +599,10 @@ mod tests {
                 valid_to: None,
                 confidence: Some(0.6),
                 extractor: Some("caller".into()),
+                strength: None,
+                stability: None,
+                last_activated: None,
+                access_count: None,
             })
             .await
             .unwrap();
@@ -664,6 +684,10 @@ mod tests {
                 valid_to: None,
                 confidence: Some(0.9),
                 extractor: Some("caller".into()),
+                strength: None,
+                stability: None,
+                last_activated: None,
+                access_count: None,
             })
             .await
             .unwrap();
@@ -710,6 +734,10 @@ mod tests {
                     valid_to: None,
                     confidence: Some(0.42),
                     extractor: Some("ingest".into()),
+                    strength: None,
+                    stability: None,
+                    last_activated: None,
+                    access_count: None,
                 }],
                 "00000001778000099999",
             )
@@ -755,6 +783,10 @@ mod tests {
                 valid_to: Some("00000001778000010000".into()), // < valid_from
                 confidence: None,
                 extractor: None,
+                strength: None,
+                stability: None,
+                last_activated: None,
+                access_count: None,
             })
             .await;
         assert!(
@@ -772,9 +804,49 @@ mod tests {
                 valid_to: Some("00000001778000010000".into()),
                 confidence: None,
                 extractor: None,
+                strength: None,
+                stability: None,
+                last_activated: None,
+                access_count: None,
             })
             .await
             .expect("point-in-time edge (valid_to == valid_from) is allowed");
+    }
+
+    /// K9: the four dynamics fields (strength / stability /
+    /// last_activated / access_count) round-trip through the Lance
+    /// write path and the DuckDB read path.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn graph_edge_round_trips_dynamics_fields() {
+        let dir = tempdir().unwrap();
+        let store = LanceStore::open(dir.path()).await.unwrap();
+        store
+            .add_edge_direct(&GraphEdge {
+                from_node_id: "entity:k9a".into(),
+                to_node_id: "entity:k9b".into(),
+                relation: "co_occurs_with".into(),
+                valid_from: "00000001778000010000".into(),
+                valid_to: None,
+                confidence: None,
+                extractor: None,
+                strength: Some(2.5),
+                stability: Some(1.5),
+                last_activated: Some("00000001778000009999".into()),
+                access_count: Some(7),
+            })
+            .await
+            .unwrap();
+
+        let q = DuckDbQuery::open(dir.path()).await.unwrap();
+        let edges = q.neighbors_within("entity:k9a", 1, None).await.unwrap();
+        let e = edges
+            .iter()
+            .find(|e| e.from_node_id == "entity:k9a")
+            .expect("seeded edge must be present");
+        assert_eq!(e.strength, Some(2.5));
+        assert_eq!(e.stability, Some(1.5));
+        assert_eq!(e.last_activated.as_deref(), Some("00000001778000009999"));
+        assert_eq!(e.access_count, Some(7));
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -840,6 +912,10 @@ mod tests {
                 valid_to: None,
                 confidence: None,
                 extractor: None,
+                strength: None,
+                stability: None,
+                last_activated: None,
+                access_count: None,
             })
             .await
             .unwrap();
@@ -906,6 +982,10 @@ mod tests {
                 valid_to: None,
                 confidence: None,
                 extractor: None,
+                strength: None,
+                stability: None,
+                last_activated: None,
+                access_count: None,
             })
             .await
             .unwrap();
@@ -918,6 +998,10 @@ mod tests {
                 valid_to: None,
                 confidence: None,
                 extractor: None,
+                strength: None,
+                stability: None,
+                last_activated: None,
+                access_count: None,
             })
             .await
             .unwrap();
@@ -931,6 +1015,10 @@ mod tests {
                 valid_to: Some("00000001778000060000".into()),
                 confidence: None,
                 extractor: None,
+                strength: None,
+                stability: None,
+                last_activated: None,
+                access_count: None,
             })
             .await
             .unwrap();
