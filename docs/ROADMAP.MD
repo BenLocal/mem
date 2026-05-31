@@ -3,14 +3,15 @@
 > 本文件是三篇 mempalace 对照文档抽取出来的执行面板，便于单独维护与外发：
 > - [`mempalace-diff.md`](./mempalace-diff.md)（v1，~2026-05-06）—— 架构 / 数据模型 / 检索流水线层；产出 #1–#20
 > - [`mempalace-diff-v2.md`](./mempalace-diff-v2.md)（2026-05-12）—— MCP 工具表面层补审；产出 #16–#28（部分编号与 v1 §8 重叠，新条目 #21–#28）
-> - [`mempalace-diff-v3.md`](./mempalace-diff-v3.md)（2026-05-20）—— module / CLI 表面层补审；产出 **#29–#33**
+> - [`mempalace-diff-v3.md`](./mempalace-diff-v3.md)（2026-05-20）—— module / CLI 表面层补审；产出 **#29–#33** + KG 层 **K1–K8**
+> - [`mempalace-diff-v4.md`](./mempalace-diff-v4.md)（2026-05-31）—— 上游 v3.3.6 增量审计；产出 **K9–K12 / #34–#36**
 >
 > **新增 / 调整路线图项请先回对应 diff 文档改章节，再同步更新本文件。** 设计原则、每项的论证、不做的事见原文档对应章节号：
 > - v1：§5 / §7 / §8 / §11 / §12 / §13 / §14；"现在差异快照"看 v1 [§15](./mempalace-diff.md#15-当前差异快照2026-05-06)
 > - v2：§2（MCP 表面对照）/ §3（推荐路线）/ §4（#16 详化）
 > - v3：§2（CLI 对照）/ §3（module 对照）/ §4（推荐路线）/ §5（#29 详化）
 >
-> **状态（2026-05-21）**：v1 #1–#19 + v2 #16–#28 全部 ✅；v3 **#29 (fact_check API+MCP) + #30 (dedup worker) + #31 (`mem init` CLI) + #33 (privacy startup warn)** 已 ✅；**Incident TODO #3 (multi-process write guard) 已 ✅**（`storage::open_lock` 通过 fs4 advisory lock 兜底单写者契约）。剩 v1 #20（内容自动抽取实体，opt-in regex）+ v3 #32（per-session mining cursor，性能）待办。
+> **状态（2026-05-31）**：v1 #1–#19 + v2 #16–#28 + v3 **#29–#33**（含 #32 per-session mine cursor）+ KG 层 **K1–K5** 全部 ✅；**v4**（上游 v3.3.6 审计）的 **K9（边「活权重」动力学，4 阶段：列+迁移 / edge_dynamics 纯函数 / potentiation worker / retrieve 按 decayed_strength 加权）+ K12（写时拒绝倒置 valid 区间→HTTP 400）已 ✅ 并两次零停机上线**（K9 默认 OFF，`MEM_EDGE_DYNAMICS_ENABLED=1` 启用）。剩：**v1 #20**（内容抽实体，LATER）、**v4 K10/K11**（实体共现边及其 tunnel 提升）、**#34/#36**（office 挖掘 / gitignore 剪枝，暂缓）；**#35**（多语言 embedding）由默认 Qwen3-Embedding-0.6B 覆盖、不做。Incident TODO 见下（#2/#3/#4 已 ✅）。
 >
 > **平行工作线**：MemPalace 对齐之外，**Backend 存储抽象**走独立 workstream，路线图见 [`backend-coupling.md`](./backend-coupling.md) §6（Phase 0–5 已 shipped；DuckDbQuery / LanceStore 已收窄 `pub(crate)`）。两条线 commit message 用各自的 close 引用（`closes ROADMAP #N` / `closes mempalace-diff-v2 #N` / `closes mempalace-diff-v3 #N` vs `closes backend-coupling §6 Phase N`），不互相阻塞。
 
@@ -56,10 +57,14 @@
 
 ## 下一阶段
 
-v1 #1–#19 + v2 #16–#28 已完成；剩余待办：
+v1 #1–#19 + v2 #16–#28 + v3 #29–#33 + KG 层 K1–K5 + v4 K9/K12 已完成（K1/K3/K12/K9 已上线）；剩余待办：
 
-- **v1 #20** — 内容自动抽取实体（opt-in regex），风险高，需要先定 Verbatim 边界，暂缓。
-- **v3 #29–#33** — module / CLI 表面层补审产出，未开工。v3 §4 建议先做 **#29（fact_check API）+ #31（`mem init` CLI）**；#30（近似去重）次之；#32 / #33 延后。
+- **v1 #20** — 内容自动抽取实体（opt-in regex），风险高、需先定 Verbatim 边界，LATER。
+- **v4 K10** — scope 内实体共现边（hallway 等价 worker，仿 K2；K9 的 `strength` 列正好挂上）；**K11** — 共现 → 跨 scope tunnel 提升（等 K10 稳了再做）。
+- **v4 #34 / #36** — office 文档挖掘 / gitignore 剪枝，超 transcript 范围，暂缓。
+- **K6 / K7 / K8** — YAGNI 暂搁（`entities.properties` JSON / 图缓存 TTL / `mem init` 写 starter entities）。
+- **召回质量 bench** — #14/#15（recall ablation + LongMemEval parity）已在 `4df527b` **删除**（依赖旧 usearch HNSW，迁 Lance native ANN + Store API 时不可迁移）；`bench-fixtures/` 已空。要对 K9 等检索改动做量化评估需**重建**（移植 longmemeval harness 到新 API + 数据集）。`src/pipeline/eval_metrics.rs` 的指标函数（recall@k / ndcg / mrr）仍在、可复用。
+- **不做**：**#35** 多语言 embedding（默认 `Qwen/Qwen3-Embedding-0.6B` 已覆盖多语言）；spellcheck / llm_refine / dialect / repair（v3 §15.4 / §3 红线）。
 
 新对齐项触发条件按性质分两条：
 
@@ -70,7 +75,7 @@ v1 #1–#19 + v2 #16–#28 已完成；剩余待办：
 1. 找出 `embedding_jobs` orphan 行的产生路径（疑在某条 supersede / delete pipeline）
 2. ~~修复 `migrate_content_hash_to_sha256` 在带子表行时的 FK 失败~~ ✅ `6af5a3e`（load/delete/restore dance）
 3. ~~检测同一 `.duckdb` 文件多进程写入（advisory lock / pid file）~~ ✅ `1756033`（`storage::open_lock` — fs4 advisory lock at `Store::open`；sentinel `<path>.lock`；`MEM_OPEN_LOCK_DISABLED=1` 逃生口）
-4. **`accept_pending` 返回 HTTP 500 "column type mismatch"** —— 2026-05-21 review session 发现：6 个 capsule 全部 accept 时报 500，但实际写入成功（status flip 到 active，confidence bump 到 0.6）。500 是 phantom——response-decode 阶段 `record_batch_to_capability_capsules` 的某个 column downcast 失败。具体哪个 column 之前不可知（错误信息无 column 名）。**部分修复**：`8c39c3a`(待提交) 给 `record_batch_to_capability_capsules` 的 `col` helper 加结构化 `tracing::error!`，下次 fire 时日志里能看到 column 名 + expected / actual arrow 类型。**完整 fix 仍待**：(a) 需要 mem serve 重启加载新二进制 才能下次发生时看到日志细节；(b) sibling parsers 还没加同样的诊断；(c) 真根因（schema 漂移？stale binary？）仍未定位
+4. ~~**`accept_pending` 返回 HTTP 500 "column type mismatch"**~~ ✅ **已修复 `e0e0a5e`（fix(storage): tolerate UInt64 version column in legacy Lance dbs）并于本轮 2026-05-31 部署上线**——根因即遗留库 `version` 列是 UInt64、而 `record_batch_to_capability_capsules` 严格 downcast 到 Int64 失败（45c65f4 改 schema 但 `ensure_table` 不迁移老表）。以下为原始记录：2026-05-21 review session 发现：6 个 capsule 全部 accept 时报 500，但实际写入成功（status flip 到 active，confidence bump 到 0.6）。500 是 phantom——response-decode 阶段 `record_batch_to_capability_capsules` 的某个 column downcast 失败。具体哪个 column 之前不可知（错误信息无 column 名）。**部分修复**：`8c39c3a`(待提交) 给 `record_batch_to_capability_capsules` 的 `col` helper 加结构化 `tracing::error!`，下次 fire 时日志里能看到 column 名 + expected / actual arrow 类型。**完整 fix 仍待**：(a) 需要 mem serve 重启加载新二进制 才能下次发生时看到日志细节；(b) sibling parsers 还没加同样的诊断；(c) 真根因（schema 漂移？stale binary？）仍未定位
 
 详见 mem incident memory `mem_019dfba4-9e08-71b2-a676-f0218c01f9b6`。
 
