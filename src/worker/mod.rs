@@ -20,6 +20,12 @@
 //!   tunnel edge per shared topic between the two project entities.
 //!   Default OFF; opt in via `MEM_TOPIC_TUNNEL_ENABLED=1`. Mempalace
 //!   `compute_topic_tunnels` analogue, adapted to mem's edge-first KG.
+//! - `cooccurrence_worker` — K10 entity co-occurrence. Per project,
+//!   entity pairs co-occurring in ≥ `min_count` active capsules get a
+//!   `cooccurs_with` edge between the entity nodes. Default OFF; opt in
+//!   via `MEM_COOCCURRENCE_ENABLED=1`. Mempalace within-wing "hallway"
+//!   analogue. (Entity↔entity edges; surfaces via kg_query / multi-hop,
+//!   not the 1-hop retrieve boost.)
 //! - `potentiation_worker` — K9 edge dynamics (strategy B). Drains an
 //!   in-memory channel of graph-edge co-access events that retrieve
 //!   enqueues, dedups bursts, and applies one Hebbian potentiation per
@@ -45,6 +51,7 @@
 //! native FTS. Writes update the inverted index automatically.
 
 pub mod auto_promote_worker;
+pub mod cooccurrence_worker;
 pub mod decay_worker;
 pub mod dedup_worker;
 pub mod embedding_worker;

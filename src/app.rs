@@ -147,6 +147,15 @@ impl AppState {
             });
         }
 
+        if config.cooccurrence.enabled {
+            let store_co = store.clone();
+            let co_settings = config.cooccurrence.clone();
+            let tenant = std::env::var("MEM_TENANT").unwrap_or_else(|_| "local".to_string());
+            tokio::spawn(async move {
+                crate::worker::cooccurrence_worker::run(store_co, co_settings, tenant).await;
+            });
+        }
+
         if !config.embedding.transcript_disabled {
             let provider_transcript = provider.clone();
             let store_transcript = store.clone();

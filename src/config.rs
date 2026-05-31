@@ -252,6 +252,28 @@ pub struct EdgeDynamicsSettings {
     pub batch_interval_secs: u64,
 }
 
+/// K10 entity co-occurrence edges (closes mempalace-diff-v4 K10).
+/// **Default OFF.** When enabled, a worker scans each project's active
+/// capsules and, for entity pairs that co-occur in >= `min_count`
+/// capsules within that project, writes an auto-derived `cooccurs_with`
+/// edge between the two entity nodes (mempalace "hallway" analogue).
+/// Opt in via `MEM_COOCCURRENCE_ENABLED=1`. NB: the current retrieve
+/// graph expansion is 1-hop, so these entity↔entity edges surface via
+/// `kg_query` / multi-hop traversal, not the 1-hop recall boost.
+#[derive(Debug, Clone)]
+pub struct CooccurrenceSettings {
+    /// Worker not spawned when false. Default false (opt-in).
+    pub enabled: bool,
+    /// Sweep cadence in seconds. Default 6h (co-occurrence evolves
+    /// slowly, same cadence rationale as topic tunnels).
+    pub interval_secs: u64,
+    /// Minimum number of capsules (within one project) an entity pair
+    /// must co-occur in before an edge is created. Default 2.
+    pub min_count: usize,
+    /// Per-sweep cap on candidate capsules pulled. Default 2_000.
+    pub scan_limit: usize,
+}
+
 #[derive(Debug, Clone)]
 pub struct Config {
     pub bind_addr: String,
@@ -263,6 +285,7 @@ pub struct Config {
     pub topic_tunnel: TopicTunnelSettings,
     pub ingest: IngestSettings,
     pub edge_dynamics: EdgeDynamicsSettings,
+    pub cooccurrence: CooccurrenceSettings,
 }
 
 #[derive(Debug, Error)]
@@ -301,6 +324,8 @@ pub enum ConfigError {
     InvalidTopicTunnelIntervalSecs(String),
     #[error("invalid MEM_EDGE_DYNAMICS_BATCH_SECS: {0} (expected positive integer)")]
     InvalidEdgeDynamicsBatchSecs(String),
+    #[error("invalid MEM_COOCCURRENCE_* setting: {0} (expected positive integer)")]
+    InvalidCooccurrenceSetting(String),
     #[error("invalid MEM_TOPIC_TUNNEL_MIN_COUNT: {0}")]
     InvalidTopicTunnelMinCount(String),
     #[error("invalid MEM_TOPIC_TUNNEL_SCAN_LIMIT: {0}")]
@@ -710,6 +735,52 @@ impl EdgeDynamicsSettings {
     }
 }
 
+impl CooccurrenceSettings {
+    pub fn development_defaults() -> Self {
+        Self {
+            enabled: false,
+            interval_secs: 6 * 3_600,
+            min_count: 2,
+            scan_limit: 2_000,
+        }
+    }
+
+    pub fn from_env_vars(get: impl Fn(&str) -> Option<String>) -> Result<Self, ConfigError> {
+        let mut s = Self::development_defaults();
+        if let Some(raw) = get("MEM_COOCCURRENCE_ENABLED") {
+            s.enabled = matches!(raw.to_ascii_lowercase().as_str(), "1" | "true" | "yes");
+        }
+        if let Some(raw) = get("MEM_COOCCURRENCE_INTERVAL_SECS") {
+            let n: u64 = raw
+                .parse()
+                .map_err(|_| ConfigError::InvalidCooccurrenceSetting(raw.clone()))?;
+            if n == 0 {
+                return Err(ConfigError::InvalidCooccurrenceSetting(raw));
+            }
+            s.interval_secs = n;
+        }
+        if let Some(raw) = get("MEM_COOCCURRENCE_MIN_COUNT") {
+            let n: usize = raw
+                .parse()
+                .map_err(|_| ConfigError::InvalidCooccurrenceSetting(raw.clone()))?;
+            if n == 0 {
+                return Err(ConfigError::InvalidCooccurrenceSetting(raw));
+            }
+            s.min_count = n;
+        }
+        if let Some(raw) = get("MEM_COOCCURRENCE_SCAN_LIMIT") {
+            let n: usize = raw
+                .parse()
+                .map_err(|_| ConfigError::InvalidCooccurrenceSetting(raw.clone()))?;
+            if n == 0 {
+                return Err(ConfigError::InvalidCooccurrenceSetting(raw));
+            }
+            s.scan_limit = n;
+        }
+        Ok(s)
+    }
+}
+
 impl IngestSettings {
     pub fn development_defaults() -> Self {
         Self {
@@ -745,6 +816,7 @@ impl Config {
             topic_tunnel: TopicTunnelSettings::development_defaults(),
             ingest: IngestSettings::development_defaults(),
             edge_dynamics: EdgeDynamicsSettings::development_defaults(),
+            cooccurrence: CooccurrenceSettings::development_defaults(),
         }
     }
 
@@ -760,6 +832,7 @@ impl Config {
             topic_tunnel: TopicTunnelSettings::from_env_vars(|k| std::env::var(k).ok())?,
             ingest: IngestSettings::from_env_vars(|k| std::env::var(k).ok())?,
             edge_dynamics: EdgeDynamicsSettings::from_env_vars(|k| std::env::var(k).ok())?,
+            cooccurrence: CooccurrenceSettings::from_env_vars(|k| std::env::var(k).ok())?,
         })
     }
 }
