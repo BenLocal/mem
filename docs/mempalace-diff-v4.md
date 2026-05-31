@@ -48,8 +48,8 @@
 | K2 | topic-tunnel worker | ✅ | ✅ | `2a964ee` |
 | K4 | `kg_query_predicate` MCP | ❌ 未做 | ✅ **新闭环** | `15e51d6 feat(graph): K4 kg_query_predicate MCP + K5 …` |
 | K5 | fuzzy neighbor suggestions | ❌ 未做 | ✅ **新闭环** | 同上 `15e51d6` |
-| **K1** | 边 `confidence` 列 | ❌ 搁置 | ❌ **仍欠** → 见 **K9** | 需 schema 迁移 session |
-| **K3** | 边 `extractor`/provenance 列 | ❌ 搁置 | ❌ **仍欠** → 随 K1/K9 一起 | 同上 |
+| **K1** | 边 `confidence` 列 | ❌ 搁置 | ✅ 列 2026-05-31；retrieve 加权随 **K9** 落地 | 见 v3 §7.2 |
+| **K3** | 边 `extractor`/provenance 列 | ❌ 搁置 | ✅ 列 2026-05-31（随 K1） | 见 v3 §7.2 |
 
 > mem CLI 现 **6** 个子命令：`serve` / `mcp` / `mine` / `wake-up` / `feedback` / `init`（v3 时是 5 个，新增 `init`）。
 
@@ -93,7 +93,7 @@ v3.3.6：`compress hook init instructions mcp migrate mine repair repair_status 
 
 ### 4.1 图层动力学（本轮重点）
 
-#### K9 ✅建议做 — 边的"活权重"动力学（吸收 K1）
+#### K9 ✅ 已完成（2026-05-31，4 阶段 TDD）— 边的"活权重"动力学（吸收 K1，含其推迟的 retrieve 加权）
 
 **上游做法**（`dynamics.py`，纯数学，无 I/O）：给每条 hall/tunnel 记录加四个字段，调 `potentiate()` / `apply_decay()` 演化：
 
@@ -159,7 +159,7 @@ access_count: int      # 累计共激活次数
 | # | 题目 | 改动面 | 工作量 | 优先级 | 依赖 |
 |---|---|---|---|---|---|
 | **K12** ✅ | 边写时拒绝倒置 `valid_to<valid_from` | `add_edge_direct` 顶部校验 + `GraphError::InvalidInput` 变体 + AppError→400 + TDD | S（实际 ~30min） | **P1**（便宜防御） | 无 ✅ 2026-05-31 |
-| **K9** | 边「活权重」动力学（strength/stability/decay）+ 吸收 K1/K3 列 | `graph_edges` schema 迁移 + `domain/edge_dynamics.rs` + retrieve graph_boost + worker | L（~1 天） | **P1**（需专门 spec session） | schema 迁移 |
+| **K9** ✅ | 边「活权重」动力学（strength/stability/decay）+ 吸收 K1 retrieve 加权 | 4 列迁移(p1) + `edge_dynamics.rs` 纯函数(p2) + potentiation worker B1 内存 channel(p3) + retrieve 按 decayed_strength 加权+入队(p4) | L（多阶段） | **P1** | ✅ 2026-05-31，默认 OFF（MEM_EDGE_DYNAMICS_ENABLED） |
 | **K10** | scope 内实体共现边（hallway 等价） | `worker/cooccurrence_worker.rs`（仿 K2） | M（~3h） | **P2** | K9 列就位最佳 |
 | **K11** | 共现→跨 scope tunnel 提升 | 在 K10 sweep 上加提升逻辑 | S | **P3** | K10 |
 | **#35** | 确认/升级多语言 embedding 默认 | 先 confirm `EMBEDDING_MODEL`；必要时换默认模型 | S（确认）/ M（换模型） | 待定 | — |
@@ -167,7 +167,7 @@ access_count: int      # 累计共激活次数
 ### 决策点
 - **✅ 已完成（2026-05-31）**：**K12**——`GraphError::InvalidInput` 变体 + `add_edge_direct` 写时校验（拒 `valid_to<valid_from`，放行开区间与点事实）+ AppError 映 400 + TDD（RED→GREEN）。下一个独立可立刻做项已清空。
 - **✅ 已落地（2026-05-31）**：**K1 + K3 列**已独立实现——`graph_edges` 现有 `confidence Float32` + `extractor Utf8`（均 nullable），含 mem 首个 on-disk `add_columns(AllNulls)` 迁移、HTTP caller 声明、4 个 TDD 测试。详见 [`mempalace-diff-v3.md`](./mempalace-diff-v3.md) §7.2 K1/K3 行。
-- **下一次 schema session**：**K9** 现在**不再需要从零加列**——只在已落地的 `confidence` 列上叠加 `strength` / `stability` / `last_activated` / `access_count` 四个动力学字段 + Hebbian/Ebbinghaus 演化 + retrieve `graph_boost` 加权（K1 推迟的那部分）；落地后顺带 **K10**。
+- **✅ 已完成（2026-05-31）**：**K9** 四阶段全做完——4 列迁移 + `edge_dynamics.rs` 纯函数（potentiate/decayed_strength）+ potentiation worker（B1 内存 channel，drain 去重）+ retrieve 按 decayed_strength 加权 + 命中入队（含 K1 推迟的 retrieve 加权那部分）。默认 OFF（`MEM_EDGE_DYNAMICS_ENABLED`）。下一步可选 **K10**（scope 内实体共现边）。
 - **先确认再说**：**#35**——查 mem 默认 embedder 是不是已经多语言（大概率是 Qwen3，则此项作废）。
 - **不做**：#34 office 挖掘 / #36 gitignore 剪枝 / 虚拟行号 / COCA 过滤（理由见 §4）。
 

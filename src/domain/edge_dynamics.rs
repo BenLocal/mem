@@ -69,12 +69,17 @@ pub fn potentiate(edge: &mut GraphEdge, now: &str) {
 /// time-decayed strength `stored * exp(-days_since / stability)`, floored
 /// at [`STRENGTH_FLOOR`]. Higher stability = slower decay. Returns the
 /// stored (default-applied) strength when no time has elapsed, the clock
-/// can't be parsed, or the edge was never activated (decay is measured
-/// from `valid_from` in that case). `None` fields read as their defaults.
+/// can't be parsed, or the edge was **never potentiated**
+/// (`last_activated` None). Decay only tracks time since an actual
+/// potentiation, so pre-existing edges are not penalised for their age
+/// the moment dynamics is switched on — they stay neutral until they
+/// first enter the loop. `None` fields read as their defaults.
 pub fn decayed_strength(edge: &GraphEdge, now: &str) -> f32 {
     let strength = edge.strength.unwrap_or(DEFAULT_STRENGTH);
-    let baseline = edge.last_activated.as_deref().unwrap_or(&edge.valid_from);
-    let (Some(now_ms), Some(last_ms)) = (parse_ts_ms(now), parse_ts_ms(baseline)) else {
+    let Some(last) = edge.last_activated.as_deref() else {
+        return strength;
+    };
+    let (Some(now_ms), Some(last_ms)) = (parse_ts_ms(now), parse_ts_ms(last)) else {
         return strength;
     };
     if now_ms <= last_ms {
@@ -183,6 +188,15 @@ mod tests {
     fn decayed_strength_no_elapsed_time_returns_stored() {
         let e = edge(Some(2.0), Some(1.0), Some(T0));
         assert!((decayed_strength(&e, T0) - 2.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn decayed_strength_never_potentiated_does_not_decay() {
+        // last_activated None (a pre-dynamics edge) → neutral, no decay
+        // no matter how old, so enabling dynamics doesn't tank the boost
+        // of the existing graph.
+        let e = edge(Some(1.0), Some(1.0), None);
+        assert!((decayed_strength(&e, T0_100DAY) - 1.0).abs() < 1e-6);
     }
 
     #[test]

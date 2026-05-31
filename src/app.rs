@@ -71,6 +71,24 @@ impl AppState {
         // the row's provider column comes from this setter).
         store_concrete.set_transcript_job_provider(config.embedding.job_provider_id());
 
+        // ── K9 potentiation worker (strategy B, in-memory channel) ──
+        // Spawned BEFORE the upcast so the worker keeps a concrete
+        // `Arc<Store>` (it calls `Store::potentiate_edge`, a Store-level
+        // composition). The sender goes to the capsule service, which
+        // enqueues graph-edge co-access events during search. Default OFF
+        // (`MEM_EDGE_DYNAMICS_ENABLED`).
+        let edge_access_tx = if config.edge_dynamics.enabled {
+            let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+            let store_pot = store_concrete.clone();
+            let ed_settings = config.edge_dynamics.clone();
+            tokio::spawn(async move {
+                crate::worker::potentiation_worker::run(store_pot, rx, ed_settings).await;
+            });
+            Some(tx)
+        } else {
+            None
+        };
+
         // Erase to the umbrella trait. Every service / worker below
         // works through `Arc<dyn Backend>` — swap in a different
         // backend by changing this one binding.
@@ -151,10 +169,13 @@ impl AppState {
         ));
         let entity_service = EntityService::new(store.clone());
         let fact_check_service = FactCheckService::new(store.clone());
-        let capability_capsule_service =
+        let mut capability_capsule_service =
             CapabilityCapsuleService::with_providers(store, embedding_provider_id, Some(provider))
                 .with_transcript_service(transcript_service.clone())
                 .with_ingest_settings(config.ingest.clone());
+        if let Some(tx) = edge_access_tx {
+            capability_capsule_service = capability_capsule_service.with_potentiation_sender(tx);
+        }
 
         Ok(Self {
             capability_capsule_service,

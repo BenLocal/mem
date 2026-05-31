@@ -122,6 +122,12 @@ pub struct CapabilityCapsuleService {
     /// is `None` the counter is still maintained (cheap) but never
     /// consulted — the gate short-circuits.
     ingest_counters: Arc<Mutex<HashMap<String, usize>>>,
+    /// K9: when `Some` (set by `app` under `MEM_EDGE_DYNAMICS_ENABLED`),
+    /// `search` weights the graph boost by each edge's decayed strength
+    /// and enqueues co-access events to the potentiation worker via this
+    /// sender. `None` ⇒ flat graph boost, no potentiation (pre-K9).
+    edge_access_tx:
+        Option<tokio::sync::mpsc::UnboundedSender<crate::worker::potentiation_worker::EdgeAccess>>,
 }
 
 impl CapabilityCapsuleService {
@@ -136,7 +142,19 @@ impl CapabilityCapsuleService {
             transcript_service: None,
             ingest_settings: crate::config::IngestSettings::development_defaults(),
             ingest_counters: Arc::new(Mutex::new(HashMap::new())),
+            edge_access_tx: None,
         }
+    }
+
+    /// K9: attach the potentiation worker's channel sender so `search`
+    /// enables edge-dynamics weighting + co-access enqueue. Builder-style;
+    /// `app` calls this only when `MEM_EDGE_DYNAMICS_ENABLED`.
+    pub fn with_potentiation_sender(
+        mut self,
+        tx: tokio::sync::mpsc::UnboundedSender<crate::worker::potentiation_worker::EdgeAccess>,
+    ) -> Self {
+        self.edge_access_tx = Some(tx);
+        self
     }
 
     /// Constructor that derives `embedding_jobs.provider` from
@@ -154,6 +172,7 @@ impl CapabilityCapsuleService {
             transcript_service: None,
             ingest_settings: crate::config::IngestSettings::development_defaults(),
             ingest_counters: Arc::new(Mutex::new(HashMap::new())),
+            edge_access_tx: None,
         }
     }
 
@@ -172,6 +191,7 @@ impl CapabilityCapsuleService {
             transcript_service: None,
             ingest_settings: crate::config::IngestSettings::development_defaults(),
             ingest_counters: Arc::new(Mutex::new(HashMap::new())),
+            edge_access_tx: None,
         }
     }
 
@@ -1264,11 +1284,22 @@ impl CapabilityCapsuleService {
             .await
             .map_err(ServiceError::Storage)?;
 
+        // K9: when edge dynamics is enabled, weight the graph boost by
+        // each connecting edge's decayed strength and enqueue co-access
+        // events to the potentiation worker. `None` ⇒ pre-K9 flat boost.
+        let dynamics_ctx = self
+            .edge_access_tx
+            .as_ref()
+            .map(|tx| retrieve::EdgeDynamicsCtx {
+                now: crate::storage::current_timestamp(),
+                tx: tx.clone(),
+            });
         let ranked = match retrieve::rank_with_hybrid_and_graph(
             pool.clone(),
             hybrid_hits.clone(),
             &query,
             self.store.as_ref(),
+            dynamics_ctx.as_ref(),
         )
         .await
         {
@@ -1280,9 +1311,15 @@ impl CapabilityCapsuleService {
                 // skipped and the call cannot return a graph error.
                 let mut q2 = query.clone();
                 q2.expand_graph = false;
-                retrieve::rank_with_hybrid_and_graph(pool, hybrid_hits, &q2, self.store.as_ref())
-                    .await
-                    .unwrap_or_default()
+                retrieve::rank_with_hybrid_and_graph(
+                    pool,
+                    hybrid_hits,
+                    &q2,
+                    self.store.as_ref(),
+                    None,
+                )
+                .await
+                .unwrap_or_default()
             }
         };
 

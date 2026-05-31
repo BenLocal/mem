@@ -74,6 +74,7 @@ pub async fn rank_with_hybrid_and_graph(
     hybrid_hits: Vec<(CapabilityCapsuleRecord, f32)>,
     query: &SearchCapabilityCapsuleRequest,
     graph: &dyn GraphStore,
+    dynamics: Option<&EdgeDynamicsCtx>,
 ) -> Result<Vec<CapabilityCapsuleRecord>, crate::storage::GraphError> {
     let hybrid_scores: HashMap<String, f32> = hybrid_hits
         .iter()
@@ -92,39 +93,96 @@ pub async fn rank_with_hybrid_and_graph(
     }
     let candidates: Vec<CapabilityCapsuleRecord> = by_id.into_values().collect();
 
+    let empty_boosts: HashMap<String, i64> = HashMap::new();
     if !query.expand_graph {
         return Ok(finalize(score_with_hybrid(
             candidates,
             query,
             &hybrid_scores,
-            &HashSet::new(),
-            0,
+            &empty_boosts,
         )));
     }
 
     // Graph anchor derivation uses unfiltered top-N (floor is for the
     // user-visible result, not anchor selection).
-    let preliminary_scored = score_with_hybrid(
-        candidates.clone(),
-        query,
-        &hybrid_scores,
-        &HashSet::new(),
-        0,
-    );
+    let preliminary_scored =
+        score_with_hybrid(candidates.clone(), query, &hybrid_scores, &empty_boosts);
     let anchors = graph_anchor_nodes(&preliminary_scored);
     if anchors.is_empty() {
         return Ok(finalize(preliminary_scored));
     }
 
-    let related = graph.related_capability_capsule_ids(&anchors).await?;
-    let related_lookup: HashSet<String> = related.into_iter().collect();
+    let boost_by_id = compute_graph_boosts(graph, &anchors, dynamics).await?;
     Ok(finalize(score_with_hybrid(
         candidates,
         query,
         &hybrid_scores,
-        &related_lookup,
-        12,
+        &boost_by_id,
     )))
+}
+
+/// K9 context for edge-dynamics-aware graph ranking, threaded in by the
+/// service only when `MEM_EDGE_DYNAMICS_ENABLED`. `None` everywhere else
+/// → flat graph boost + no potentiation (the pre-K9 behaviour).
+pub struct EdgeDynamicsCtx {
+    /// `current_timestamp()` for read-time decay.
+    pub now: String,
+    /// Channel to the potentiation worker; co-access events are sent here
+    /// (best-effort, non-blocking) — never written on the read path.
+    pub tx: tokio::sync::mpsc::UnboundedSender<crate::worker::potentiation_worker::EdgeAccess>,
+}
+
+/// Base graph-expansion boost: a capsule reachable from an anchor in one
+/// hop gets this added to its score. K9 scales it by the connecting
+/// edge's time-decayed strength.
+const GRAPH_BOOST: i64 = 12;
+
+/// Build the per-capsule graph-boost map for the anchor set.
+///
+/// - Dynamics off (`None`): every 1-hop-related capsule gets the flat
+///   [`GRAPH_BOOST`] — byte-for-byte the pre-K9 behaviour.
+/// - Dynamics on (`Some`): walk each anchor's incident edges, scale the
+///   non-anchor capsule endpoint's boost by the edge's decayed strength
+///   (`round(GRAPH_BOOST * decayed_strength)`, max over connecting
+///   edges), and enqueue every touched edge for potentiation
+///   (best-effort — a closed channel never blocks or fails the read).
+async fn compute_graph_boosts(
+    graph: &dyn GraphStore,
+    anchors: &[String],
+    dynamics: Option<&EdgeDynamicsCtx>,
+) -> Result<HashMap<String, i64>, crate::storage::GraphError> {
+    let Some(ctx) = dynamics else {
+        let related = graph.related_capability_capsule_ids(anchors).await?;
+        return Ok(related.into_iter().map(|id| (id, GRAPH_BOOST)).collect());
+    };
+    let anchor_set: HashSet<&str> = anchors.iter().map(|s| s.as_str()).collect();
+    let mut boosts: HashMap<String, i64> = HashMap::new();
+    for anchor in anchors {
+        let edges = graph.neighbors_within(anchor, 1, None).await?;
+        for edge in &edges {
+            // Enqueue for potentiation off the read path; ignore send
+            // errors (worker absent / channel closed) — best-effort.
+            let _ = ctx.tx.send(crate::worker::potentiation_worker::EdgeAccess {
+                from_node_id: edge.from_node_id.clone(),
+                to_node_id: edge.to_node_id.clone(),
+                relation: edge.relation.clone(),
+            });
+            let strength = crate::domain::edge_dynamics::decayed_strength(edge, &ctx.now);
+            let boost = ((GRAPH_BOOST as f32) * strength).round() as i64;
+            for endpoint in [&edge.from_node_id, &edge.to_node_id] {
+                if anchor_set.contains(endpoint.as_str()) {
+                    continue;
+                }
+                if let Some(mid) = endpoint.strip_prefix("capability_capsule:") {
+                    boosts
+                        .entry(mid.to_string())
+                        .and_modify(|m| *m = (*m).max(boost))
+                        .or_insert(boost);
+                }
+            }
+        }
+    }
+    Ok(boosts)
 }
 
 /// Computes the additive non-recall portion of a memory's score (the
@@ -139,8 +197,7 @@ fn apply_lifecycle_score(
     query_terms: &[String],
     scope_filters: &HashMap<String, Vec<String>>,
     newest: u128,
-    related_capability_capsule_ids: &HashSet<String>,
-    graph_boost: i64,
+    graph_boost_by_id: &HashMap<String, i64>,
 ) -> i64 {
     let mut score = 0i64;
 
@@ -152,9 +209,10 @@ fn apply_lifecycle_score(
     score += freshness_score(newest, timestamp_score(&memory.updated_at));
     score -= staleness_penalty(memory.decay_score);
 
-    if related_capability_capsule_ids.contains(&memory.capability_capsule_id) {
-        score += graph_boost;
-    }
+    score += graph_boost_by_id
+        .get(&memory.capability_capsule_id)
+        .copied()
+        .unwrap_or(0);
 
     if matches!(
         memory.status,
@@ -176,8 +234,7 @@ fn score_with_hybrid(
     candidates: Vec<CapabilityCapsuleRecord>,
     query: &SearchCapabilityCapsuleRequest,
     hybrid_scores: &HashMap<String, f32>,
-    related_capability_capsule_ids: &HashSet<String>,
-    graph_boost: i64,
+    graph_boost_by_id: &HashMap<String, i64>,
 ) -> Vec<ScoredMemory> {
     let newest = candidates
         .iter()
@@ -211,8 +268,7 @@ fn score_with_hybrid(
                 &query_terms,
                 &scope_filters,
                 newest,
-                related_capability_capsule_ids,
-                graph_boost,
+                graph_boost_by_id,
             );
 
             ScoredMemory { memory, score }
@@ -568,7 +624,7 @@ mod tests {
         let mut hybrid = HashMap::new();
         hybrid.insert("mem_a".into(), sql_rrf(Some(1), None));
 
-        let scored = score_with_hybrid(vec![memory], &query, &hybrid, &HashSet::new(), 0);
+        let scored = score_with_hybrid(vec![memory], &query, &hybrid, &HashMap::new());
 
         // RRF contribution: 1000 * 1/(60+1) = 16.39 → round → 16.
         assert_eq!(scored[0].score - lifecycle_baseline, 16);
@@ -586,7 +642,7 @@ mod tests {
         let mut hybrid = HashMap::new();
         hybrid.insert("mem_top".into(), sql_rrf(Some(1), Some(1)));
 
-        let scored = score_with_hybrid(vec![memory], &query, &hybrid, &HashSet::new(), 0);
+        let scored = score_with_hybrid(vec![memory], &query, &hybrid, &HashMap::new());
 
         assert_eq!(scored[0].score - lifecycle_baseline, 33);
     }
@@ -606,7 +662,7 @@ mod tests {
         hybrid.insert("rank_50".into(), sql_rrf(None, Some(50)));
         hybrid.insert("rank_100".into(), sql_rrf(None, Some(100)));
 
-        let scored = score_with_hybrid(vec![m1, m50, m100], &query, &hybrid, &HashSet::new(), 0);
+        let scored = score_with_hybrid(vec![m1, m50, m100], &query, &hybrid, &HashMap::new());
 
         // After sort: rank_1 (highest RRF), rank_50, rank_100.
         // All share the same lifecycle baseline → ordering is determined by RRF alone.
@@ -631,7 +687,7 @@ mod tests {
         let mut hybrid = HashMap::new();
         hybrid.insert("lex_only".into(), sql_rrf(Some(1), None));
 
-        let scored = score_with_hybrid(vec![memory], &query, &hybrid, &HashSet::new(), 0);
+        let scored = score_with_hybrid(vec![memory], &query, &hybrid, &HashMap::new());
 
         assert!(
             scored[0].score > lifecycle_baseline,
@@ -651,8 +707,7 @@ mod tests {
             &[],
             &HashMap::new(),
             newest,
-            &HashSet::new(),
-            0,
+            &HashMap::new(),
         );
 
         let expected = memory_type_score(&memory.capability_capsule_type, &query.intent)
@@ -680,8 +735,7 @@ mod tests {
                 &[],
                 &HashMap::new(),
                 newest,
-                &HashSet::new(),
-                0,
+                &HashMap::new(),
             )
         };
 
@@ -691,8 +745,7 @@ mod tests {
             &[],
             &HashMap::new(),
             newest,
-            &HashSet::new(),
-            0,
+            &HashMap::new(),
         );
 
         assert_eq!(
@@ -714,20 +767,84 @@ mod tests {
             &[],
             &HashMap::new(),
             newest,
-            &HashSet::new(),
-            0,
+            &HashMap::new(),
         );
 
-        let mut related = HashSet::new();
-        related.insert("mem_with_neighbor".to_string());
+        let mut boosts = HashMap::new();
+        boosts.insert("mem_with_neighbor".to_string(), 12i64);
 
-        let actual =
-            apply_lifecycle_score(&memory, &query, &[], &HashMap::new(), newest, &related, 12);
+        let actual = apply_lifecycle_score(&memory, &query, &[], &HashMap::new(), newest, &boosts);
 
         assert_eq!(
             actual,
             baseline + 12,
-            "memory in related set must add graph_boost"
+            "memory's per-id graph boost must be added"
         );
+    }
+
+    /// K9 phase 4: with dynamics on, `compute_graph_boosts` scales each
+    /// related capsule's boost by the connecting edge's decayed strength
+    /// (`round(GRAPH_BOOST * strength)`) and enqueues every touched edge.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn compute_graph_boosts_weights_by_strength_and_enqueues() {
+        use crate::domain::capability_capsule::GraphEdge;
+        use crate::storage::Store;
+        use crate::worker::potentiation_worker::EdgeAccess;
+        use tempfile::tempdir;
+        use tokio::sync::mpsc;
+
+        let dir = tempdir().unwrap();
+        let store = Store::open(&dir.path().join("cgb.lance")).await.unwrap();
+        let mk = |to: &str, strength: f32| GraphEdge {
+            from_node_id: "capability_capsule:A".into(),
+            to_node_id: to.into(),
+            relation: "rel".into(),
+            valid_from: "00000001780000000000".into(),
+            valid_to: None,
+            confidence: None,
+            extractor: None,
+            strength: Some(strength),
+            stability: Some(1.0),
+            // last_activated == now below → no decay, so boost is a clean
+            // round(GRAPH_BOOST * strength).
+            last_activated: Some("00000001780000000000".into()),
+            access_count: Some(1),
+        };
+        store
+            .add_edge_direct(&mk("capability_capsule:strong", 4.0))
+            .await
+            .unwrap();
+        store
+            .add_edge_direct(&mk("capability_capsule:weak", 0.5))
+            .await
+            .unwrap();
+
+        let (tx, mut rx) = mpsc::unbounded_channel::<EdgeAccess>();
+        let ctx = EdgeDynamicsCtx {
+            now: "00000001780000000000".into(),
+            tx,
+        };
+        let graph: &dyn GraphStore = &store;
+        let boosts = compute_graph_boosts(graph, &["capability_capsule:A".to_string()], Some(&ctx))
+            .await
+            .unwrap();
+
+        assert_eq!(
+            boosts.get("strong"),
+            Some(&48),
+            "strength 4.0 → round(12*4.0)=48 (stronger than the flat 12)"
+        );
+        assert_eq!(
+            boosts.get("weak"),
+            Some(&6),
+            "strength 0.5 → round(12*0.5)=6 (weaker than the flat 12)"
+        );
+
+        let mut seen = std::collections::HashSet::new();
+        while let Ok(e) = rx.try_recv() {
+            seen.insert(e.to_node_id);
+        }
+        assert!(seen.contains("capability_capsule:strong"));
+        assert!(seen.contains("capability_capsule:weak"));
     }
 }
