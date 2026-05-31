@@ -1281,6 +1281,32 @@ impl Store {
         result
     }
 
+    /// K9: apply one Hebbian potentiation to the active
+    /// `(from, to, relation)` edge — read its current dynamics, run
+    /// [`crate::domain::edge_dynamics::potentiate`], write the four K9
+    /// columns back. Returns `false` (a dropped no-op) when the edge is
+    /// no longer active. Called by the potentiation worker, off the read
+    /// path.
+    pub async fn potentiate_edge(
+        &self,
+        from_node_id: &str,
+        to_node_id: &str,
+        relation: &str,
+        now: &str,
+    ) -> Result<bool, GraphError> {
+        let Some(mut edge) = self
+            .query
+            .get_active_edge(from_node_id, to_node_id, relation)
+            .await?
+        else {
+            return Ok(false);
+        };
+        crate::domain::edge_dynamics::potentiate(&mut edge, now);
+        let written = self.lance.update_edge_dynamics(&edge).await?;
+        self.query.mark_dirty();
+        Ok(written)
+    }
+
     /// Invalidate one specific `(from, predicate, to)` active edge by
     /// stamping `valid_to = ended_at`. Idempotent — returns 0 when
     /// the triple has no active edge.

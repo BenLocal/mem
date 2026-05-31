@@ -45,6 +45,38 @@ impl DuckDbQuery {
         .await
     }
 
+    /// Fetch the single active edge identified by `(from, to, relation)`
+    /// with its full K9 dynamics fields, or `None` if no active edge
+    /// matches. Used by the potentiation worker (K9) to read-modify-write
+    /// an edge's `strength` / `stability` / `last_activated` /
+    /// `access_count`.
+    pub async fn get_active_edge(
+        &self,
+        from_node_id: &str,
+        to_node_id: &str,
+        relation: &str,
+    ) -> Result<Option<GraphEdge>, GraphError> {
+        let conn = self.fresh_conn_for_graph().await?;
+        let from = from_node_id.to_string();
+        let to = to_node_id.to_string();
+        let rel = relation.to_string();
+        spawn_blocking_graph(move || {
+            let conn = conn.lock().expect("duckdb_query mutex poisoned");
+            let mut stmt = conn.prepare(
+                "SELECT from_node_id, to_node_id, relation, valid_from, valid_to, confidence, extractor, strength, stability, last_activated, access_count \
+                 FROM ns.main.graph_edges \
+                 WHERE from_node_id = ?1 AND to_node_id = ?2 AND relation = ?3 AND valid_to IS NULL \
+                 LIMIT 1",
+            )?;
+            let mut rows = stmt.query_map(params![from, to, rel], row_to_graph_edge)?;
+            match rows.next() {
+                Some(r) => Ok(Some(r?)),
+                None => Ok(None),
+            }
+        })
+        .await
+    }
+
     /// Multi-hop BFS from `node_id`. Returns every edge reachable in
     /// at most `max_hops` hops (clamped to `MAX_HOPS_CAP = 3`), with
     /// edge-set dedup (an edge that closes two different walks counts
@@ -811,6 +843,59 @@ mod tests {
             })
             .await
             .expect("point-in-time edge (valid_to == valid_from) is allowed");
+    }
+
+    /// K9: `Store::potentiate_edge` reads the active edge, applies the
+    /// pure potentiation, and writes the four dynamics columns back.
+    /// A non-existent edge is a dropped no-op.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn potentiate_edge_reads_modifies_writes_dynamics() {
+        use crate::storage::Store;
+        let dir = tempdir().unwrap();
+        let store = Store::open(&dir.path().join("p.lance")).await.unwrap();
+        store
+            .add_edge_direct(&GraphEdge {
+                from_node_id: "entity:a".into(),
+                to_node_id: "entity:b".into(),
+                relation: "rel".into(),
+                valid_from: "00000001780000000000".into(),
+                valid_to: None,
+                confidence: None,
+                extractor: None,
+                strength: None,
+                stability: None,
+                last_activated: None,
+                access_count: None,
+            })
+            .await
+            .unwrap();
+
+        // now is 2h past valid_from (the baseline) → spaced reinforcement.
+        let written = store
+            .potentiate_edge("entity:a", "entity:b", "rel", "00000001780007200000")
+            .await
+            .unwrap();
+        assert!(written, "active edge must potentiate");
+
+        let edges = store.neighbors_within("entity:a", 1, None).await.unwrap();
+        let e = edges
+            .iter()
+            .find(|e| e.from_node_id == "entity:a")
+            .expect("edge present");
+        assert!(
+            (e.strength.unwrap() - 1.05).abs() < 1e-6,
+            "strength grew from default 1.0 to 1.05: {:?}",
+            e.strength
+        );
+        assert_eq!(e.access_count, Some(1));
+        assert_eq!(e.last_activated.as_deref(), Some("00000001780007200000"));
+
+        // Potentiating a non-existent edge is a dropped no-op.
+        let written2 = store
+            .potentiate_edge("entity:x", "entity:y", "rel", "00000001780007200000")
+            .await
+            .unwrap();
+        assert!(!written2, "no active edge → false");
     }
 
     /// K9: the four dynamics fields (strength / stability /

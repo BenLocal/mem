@@ -166,6 +166,45 @@ impl LanceStore {
         Ok(usize::try_from(result.rows_updated).unwrap_or(count as usize))
     }
 
+    /// Overwrite the K9 dynamics columns of the active
+    /// `(from, to, relation)` edge. The caller computes the new values
+    /// via [`crate::domain::edge_dynamics::potentiate`]. Returns `false`
+    /// when no active edge matches (it was closed/superseded between the
+    /// access and the potentiation — the event is simply dropped). Only
+    /// the `Some` fields are written, as SQL update expressions.
+    pub async fn update_edge_dynamics(&self, edge: &GraphEdge) -> Result<bool, GraphError> {
+        let table = self
+            .conn
+            .open_table("graph_edges")
+            .execute()
+            .await
+            .map_err(|e| GraphError::Backend(e.to_string()))?;
+        let filter = format!(
+            "from_node_id = {} AND to_node_id = {} AND relation = {} AND valid_to IS NULL",
+            sql_quote(&edge.from_node_id),
+            sql_quote(&edge.to_node_id),
+            sql_quote(&edge.relation),
+        );
+        let mut upd = table.update().only_if(filter);
+        if let Some(v) = edge.strength {
+            upd = upd.column("strength", v.to_string());
+        }
+        if let Some(v) = edge.stability {
+            upd = upd.column("stability", v.to_string());
+        }
+        if let Some(v) = &edge.last_activated {
+            upd = upd.column("last_activated", sql_quote(v));
+        }
+        if let Some(v) = edge.access_count {
+            upd = upd.column("access_count", v.to_string());
+        }
+        let result = upd
+            .execute()
+            .await
+            .map_err(|e| GraphError::Backend(e.to_string()))?;
+        Ok(result.rows_updated > 0)
+    }
+
     pub async fn close_edges_for_capability_capsule(
         &self,
         capability_capsule_id: &str,
