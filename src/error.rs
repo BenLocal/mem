@@ -61,6 +61,11 @@ impl IntoResponse for AppError {
         if let Some(StorageError::InvalidInput(msg)) = self.0.downcast_ref::<StorageError>() {
             return (StatusCode::BAD_REQUEST, Json(json!({ "error": msg }))).into_response();
         }
+        // Graph-layer caller validation (K12: inverted bitemporal
+        // interval) is a client error, not a backend fault → 400.
+        if let Some(GraphError::InvalidInput(msg)) = self.0.downcast_ref::<GraphError>() {
+            return (StatusCode::BAD_REQUEST, Json(json!({ "error": msg }))).into_response();
+        }
         if let Some(StorageError::NotFound(_)) = self.0.downcast_ref::<StorageError>() {
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,

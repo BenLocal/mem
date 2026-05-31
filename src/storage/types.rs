@@ -116,6 +116,11 @@ pub enum StorageError {
 pub enum GraphError {
     #[error("graph backend error: {0}")]
     Backend(String),
+    /// K12 — a caller-supplied edge failed write-time validation (e.g.
+    /// an inverted bitemporal interval). Maps to HTTP 400, unlike
+    /// `Backend` which is a 500.
+    #[error("invalid graph input: {0}")]
+    InvalidInput(String),
 }
 
 impl From<StorageError> for GraphError {

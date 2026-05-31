@@ -76,6 +76,21 @@ impl LanceStore {
     /// Returns `true` if the edge was actually written, `false` if
     /// the idempotency check found a duplicate.
     pub async fn add_edge_direct(&self, edge: &GraphEdge) -> Result<bool, GraphError> {
+        // K12 (closes mempalace-diff-v4 K12): reject an inverted
+        // bitemporal interval. An edge whose `valid_to` precedes its
+        // `valid_from` can never satisfy the recall filter
+        // (`valid_from <= as_of AND (valid_to IS NULL OR valid_to > as_of)`),
+        // so it would be stored-but-permanently-invisible — the P0
+        // foot-gun mempalace fixed in #1214. Open intervals (`None`) and
+        // point-in-time facts (`valid_to == valid_from`) stay valid.
+        if let Some(valid_to) = &edge.valid_to {
+            if valid_to.as_str() < edge.valid_from.as_str() {
+                return Err(GraphError::InvalidInput(format!(
+                    "edge valid_to ({}) precedes valid_from ({}); a recall query would never match it",
+                    valid_to, edge.valid_from
+                )));
+            }
+        }
         let table = self
             .conn
             .open_table("graph_edges")

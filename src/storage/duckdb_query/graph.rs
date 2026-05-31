@@ -734,6 +734,49 @@ mod tests {
         );
     }
 
+    /// K12 (closes mempalace-diff-v4 K12): an edge whose `valid_to`
+    /// precedes its `valid_from` is durably invisible — the bitemporal
+    /// recall filter `valid_from <= as_of AND (valid_to IS NULL OR
+    /// valid_to > as_of)` matches no `as_of`, so the row is stored but
+    /// unreachable (mempalace #1214's P0 foot-gun). Reject it at write.
+    /// Open intervals (valid_to = None) and point-in-time facts
+    /// (valid_to == valid_from) remain allowed.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn add_edge_direct_rejects_inverted_valid_interval() {
+        let dir = tempdir().unwrap();
+        let store = LanceStore::open(dir.path()).await.unwrap();
+
+        let err = store
+            .add_edge_direct(&GraphEdge {
+                from_node_id: "entity:a".into(),
+                to_node_id: "entity:b".into(),
+                relation: "rel".into(),
+                valid_from: "00000001778000020000".into(),
+                valid_to: Some("00000001778000010000".into()), // < valid_from
+                confidence: None,
+                extractor: None,
+            })
+            .await;
+        assert!(
+            matches!(err, Err(GraphError::InvalidInput(_))),
+            "inverted valid interval must be rejected: {err:?}"
+        );
+
+        // Point-in-time fact (valid_to == valid_from) is allowed.
+        store
+            .add_edge_direct(&GraphEdge {
+                from_node_id: "entity:c".into(),
+                to_node_id: "entity:d".into(),
+                relation: "rel".into(),
+                valid_from: "00000001778000010000".into(),
+                valid_to: Some("00000001778000010000".into()),
+                confidence: None,
+                extractor: None,
+            })
+            .await
+            .expect("point-in-time edge (valid_to == valid_from) is allowed");
+    }
+
     #[tokio::test(flavor = "multi_thread")]
     async fn neighbors_within_walks_multi_hop_and_dedupes() {
         let dir = tempdir().unwrap();

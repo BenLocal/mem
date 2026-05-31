@@ -135,7 +135,7 @@ access_count: int      # 累计共激活次数
 
 **评估**：是 K10 的上层。**等 K10 落地、观察共现边质量后再做**，否则容易制造噪声跨边。**优先级 P3**，依赖 K10。
 
-#### K12 ✅建议做（小）— 写时拒绝倒置 valid 区间
+#### K12 ✅ 已完成（2026-05-31，小）— 写时拒绝倒置 valid 区间
 
 **上游做法**（3.3.5 #1214）：`add_triple()` 在写时拒绝 `valid_to < valid_from`——否则 `query(as_of)` 的 `valid_from<=as_of AND valid_to>=as_of` 永不命中，行**存了但永久不可见**，是 P0 数据完整性脚枪。
 
@@ -158,14 +158,14 @@ access_count: int      # 累计共激活次数
 
 | # | 题目 | 改动面 | 工作量 | 优先级 | 依赖 |
 |---|---|---|---|---|---|
-| **K12** | 边写时拒绝倒置 `valid_to<valid_from` | `add_edge_direct`/`invalidate_edge` + 校验 + 单测 | S（~30min） | **P1**（便宜防御） | 无 |
+| **K12** ✅ | 边写时拒绝倒置 `valid_to<valid_from` | `add_edge_direct` 顶部校验 + `GraphError::InvalidInput` 变体 + AppError→400 + TDD | S（实际 ~30min） | **P1**（便宜防御） | 无 ✅ 2026-05-31 |
 | **K9** | 边「活权重」动力学（strength/stability/decay）+ 吸收 K1/K3 列 | `graph_edges` schema 迁移 + `domain/edge_dynamics.rs` + retrieve graph_boost + worker | L（~1 天） | **P1**（需专门 spec session） | schema 迁移 |
 | **K10** | scope 内实体共现边（hallway 等价） | `worker/cooccurrence_worker.rs`（仿 K2） | M（~3h） | **P2** | K9 列就位最佳 |
 | **K11** | 共现→跨 scope tunnel 提升 | 在 K10 sweep 上加提升逻辑 | S | **P3** | K10 |
 | **#35** | 确认/升级多语言 embedding 默认 | 先 confirm `EMBEDDING_MODEL`；必要时换默认模型 | S（确认）/ M（换模型） | 待定 | — |
 
 ### 决策点
-- **可立刻做**：**K12**（独立、便宜、防数据脚枪）。
+- **✅ 已完成（2026-05-31）**：**K12**——`GraphError::InvalidInput` 变体 + `add_edge_direct` 写时校验（拒 `valid_to<valid_from`，放行开区间与点事实）+ AppError 映 400 + TDD（RED→GREEN）。下一个独立可立刻做项已清空。
 - **✅ 已落地（2026-05-31）**：**K1 + K3 列**已独立实现——`graph_edges` 现有 `confidence Float32` + `extractor Utf8`（均 nullable），含 mem 首个 on-disk `add_columns(AllNulls)` 迁移、HTTP caller 声明、4 个 TDD 测试。详见 [`mempalace-diff-v3.md`](./mempalace-diff-v3.md) §7.2 K1/K3 行。
 - **下一次 schema session**：**K9** 现在**不再需要从零加列**——只在已落地的 `confidence` 列上叠加 `strength` / `stability` / `last_activated` / `access_count` 四个动力学字段 + Hebbian/Ebbinghaus 演化 + retrieve `graph_boost` 加权（K1 推迟的那部分）；落地后顺带 **K10**。
 - **先确认再说**：**#35**——查 mem 默认 embedder 是不是已经多语言（大概率是 Qwen3，则此项作废）。
