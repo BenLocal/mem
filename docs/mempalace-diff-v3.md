@@ -196,9 +196,9 @@ mempalace HEAD 14 个 CLI 子命令；mem HEAD 5 个（`serve` / `mcp` / `mine` 
 
 | K# | 题目 | 工作量 | 状态 |
 |---|---|---|---|
-| **K1** | edge `confidence` 列 —— caller 可声明 "这条边 0.6 可信"，retrieve `graph_boost` 用它加权 | L（实测 ~1 天：schema 加列 + Lance `add_columns(AllNulls)` 迁移 + GraphEdge 22 处构造位 + 7 处 record_batch helper + DuckDB SELECT 投影 + 测试矩阵）| ❌ 未做。**K2 已用 relation prefix `user_tunnel:topic:%` 替代部分价值**；真正想做 K1 时需要单独排期一次 spec-then-implement session |
+| **K1** | edge `confidence` 列 —— caller 可声明 "这条边 0.6 可信"，retrieve `graph_boost` 用它加权 | L（实测 ~1 天：schema 加列 + Lance `add_columns(AllNulls)` 迁移 + GraphEdge 22 处构造位 + 7 处 record_batch helper + DuckDB SELECT 投影 + 测试矩阵）| ✅ **列+caller声明+持久化+读路径暴露已落地**（2026-05-31）：`graph_edges` 加 `confidence Float32 nullable`；`GraphEdge.confidence: Option<f32>`；Lance `add_columns(AllNulls)` 迁移老 5 列表（mem 首个 on-disk schema 迁移，在 `ensure_graph_edges_table`）；`AddEdgeRequest.confidence` 让 HTTP caller 声明。**retrieve `graph_boost` 加权按 v4 决策留给 K9**——K1 的 confidence∈[0,1] 公式会被 K9 strength∈[0.05,5] 取代，先写白写。TDD: round-trip / sync 透传 / 迁移 三测 green |
 | **K2** ✅ | `compute_topic_tunnels` 等价 worker —— 按 project 分组扫 active capsule，topic overlap >= `min_count` 时自动建 `user_tunnel:topic:<X>` 边；幂等via `add_edge_direct` | M（实际 ~3h）| ✅ `2a964ee` —— 6/6 unit tests green；默认 OFF + `MEM_TOPIC_TUNNEL_ENABLED=1` |
-| **K3** | edge `extractor` / `source_adapter` 字段 —— 标记每条边由哪条代码路径产生（`tagged_extractor` / `file_ref_extractor` / `caller_supplied` / `topic_tunnel_worker`）| S（~2h）| ❌ 未做。**当前用 relation 前缀间接区分**（K2 capsule `mem_019e497e` 详）；正式 column 等 K1 一起做 |
+| **K3** | edge `extractor` / `source_adapter` 字段 —— 标记每条边由哪条代码路径产生（`tagged_extractor` / `file_ref_extractor` / `caller_supplied` / `topic_tunnel_worker`）| S（~2h）| ✅ **`extractor Utf8 nullable` 列已落地**（2026-05-31，随 K1 同次 schema 迁移）。producer 打标：`topic_tunnel_worker` → `"topic_tunnel"`、HTTP caller 经 `AddEdgeRequest.extractor` 声明；ingest/service 路径暂 `None`（留待按需打标）。`source_adapter` 暂并入单列 `extractor`（YAGNI）。TDD: `two_projects…get_tunnels` 断言 worker 边带 `extractor="topic_tunnel"`（flip-verified）|
 | **K4** | `kg_query_predicate(predicate, as_of)` MCP —— 列所有 `predicate=X` 的活跃/历史边 | S（~1h）| ❌ 未做 |
 | **K5** | fuzzy match on `graph_neighbors` —— node_id 不存在时返回 `{neighbors: [], suggestions: [...]}`（复用 v3 #29 fact_check 的 Levenshtein）| S（~1h）| ❌ 未做 |
 | **K6** | `entities.properties` JSON 字段（caller 自由 metadata）| M | ⏸️ YAGNI，无具体场景 |
@@ -207,7 +207,6 @@ mempalace HEAD 14 个 CLI 子命令；mem HEAD 5 个（`serve` / `mcp` / `mine` 
 
 ### 7.3 决策点
 
-- **已完成**：K2（topic-tunnel worker auto-derived cross-project edges）
-- **下一波可选**：K4 + K5 一组（~2h，纯 MCP 补齐，不动 schema）
-- **正式 K1+K3 排期**：单独一次 session，先写 spec（schema migration 策略 + caller 更新清单 + 测试矩阵），再实现
+- **已完成**：K2（`2a964ee`）、K4 + K5（`15e51d6`）、**K1 + K3 列（2026-05-31，见上表）**——K1/K3 是本次单独 session 落地，引入 mem 首个 on-disk schema 迁移（`add_columns(AllNulls)`）
+- **K1 的 retrieve 加权 + 边动力学**：留待 **K9**（见 [`mempalace-diff-v4.md`](./mempalace-diff-v4.md) §4.1）—— 在已落地的 `confidence` 列上叠加 Hebbian/Ebbinghaus strength/stability/decay；K9 不再需要从零加列，只在现有列基础上扩展
 - **不做**：K6/K7/K8 暂搁；prose extraction + Wikipedia 已在 §15.4 / v1 #20 论证过
