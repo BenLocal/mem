@@ -314,6 +314,61 @@ impl LanceStore {
         Ok(())
     }
 
+    /// ③ chunked: delete all existing embedding rows for the message
+    /// once, then insert one row per chunk vector. Vectors share
+    /// `message_block_id`; `semantic_search_transcripts` dedups them
+    /// via GROUP BY. Takes raw `Vec<f32>` (no blob decode — the worker
+    /// has the vectors already). Empty `vectors` is a no-op (leaves the
+    /// message with no embedding rows). Mirrors
+    /// `MemoryRepository::upsert_capability_capsule_embedding_chunks`.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn upsert_conversation_message_embedding_chunks(
+        &self,
+        message_block_id: &str,
+        tenant: &str,
+        embedding_model: &str,
+        embedding_dim: i64,
+        vectors: &[Vec<f32>],
+        content_hash: &str,
+        source_updated_at: &str,
+        now: &str,
+    ) -> Result<(), StorageError> {
+        if vectors.is_empty() {
+            return Ok(());
+        }
+        let dim_i32 = i32::try_from(embedding_dim)
+            .map_err(|_| StorageError::InvalidData("embedding_dim does not fit in i32"))?;
+        ensure_conversation_message_embeddings_table(&self.conn, dim_i32).await?;
+        let table = self
+            .conn
+            .open_table("conversation_message_embeddings")
+            .execute()
+            .await
+            .map_err(lancedb_err)?;
+        // upsert = delete-then-insert once (Lance has no PK), then N adds.
+        table
+            .delete(&format!(
+                "message_block_id = {}",
+                sql_quote(message_block_id),
+            ))
+            .await
+            .map_err(lancedb_err)?;
+        for vector in vectors {
+            let batch = conversation_message_embedding_to_record_batch(
+                message_block_id,
+                tenant,
+                embedding_model,
+                embedding_dim,
+                vector,
+                content_hash,
+                source_updated_at,
+                now,
+            )?;
+            table.add(batch).execute().await.map_err(lancedb_err)?;
+        }
+        Ok(())
+    }
+
     /// Delete a transcript-block embedding by `message_block_id`.
     /// No-op if the lazy-created table doesn't exist yet.
     pub async fn delete_conversation_message_embedding(

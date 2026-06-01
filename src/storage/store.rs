@@ -1081,6 +1081,35 @@ impl Store {
         .await
     }
 
+    #[allow(clippy::too_many_arguments)]
+    pub async fn upsert_conversation_message_embedding_chunks(
+        &self,
+        message_block_id: &str,
+        tenant: &str,
+        embedding_model: &str,
+        embedding_dim: i64,
+        vectors: &[Vec<f32>],
+        content_hash: &str,
+        source_updated_at: &str,
+        now: &str,
+    ) -> Result<(), StorageError> {
+        self.commit_lance_write(
+            self.lance
+                .upsert_conversation_message_embedding_chunks(
+                    message_block_id,
+                    tenant,
+                    embedding_model,
+                    embedding_dim,
+                    vectors,
+                    content_hash,
+                    source_updated_at,
+                    now,
+                )
+                .await,
+        )
+        .await
+    }
+
     pub async fn delete_conversation_message_embedding(
         &self,
         message_block_id: &str,

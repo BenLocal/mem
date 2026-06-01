@@ -675,7 +675,11 @@ impl DuckDbQuery {
         let conn = self.fresh_conn().await?;
         let tenant = tenant.to_string();
         let lim = i64::try_from(limit).unwrap_or(64).clamp(1, 1024);
-        let oversample = lim.saturating_mul(2);
+        // ③ The embeddings table now holds N rows per message (one per
+        // content chunk) that collapse to fewer distinct messages after
+        // the GROUP BY below, so oversample the ANN branch harder than
+        // the historical ×2 to keep enough distinct messages.
+        let oversample = lim.saturating_mul(4);
         spawn_blocking_storage(move || {
             let conn = conn.lock().expect("duckdb_query mutex poisoned");
             let c_cols = CONVERSATION_COLS
@@ -683,16 +687,29 @@ impl DuckDbQuery {
                 .map(|c| format!("c.{}", c.trim()))
                 .collect::<Vec<_>>()
                 .join(", ");
+            // ③ A message with N chunk embeddings yields N rows from
+            // lance_vector_search; GROUP BY message_block_id with
+            // MIN(_distance) (best-matching chunk) collapses them to one
+            // hit before the JOIN, so a chunked message surfaces once at
+            // its best chunk distance instead of N times. Behaviour-
+            // preserving for single-embedding messages (GROUP BY is a
+            // no-op on one row). Mirrors the capsule-side aggregation in
+            // `hybrid_candidates`.
             let sql = format!(
-                "SELECT {c_cols}, e._distance \
-                 FROM lance_vector_search( \
-                        'ns.main.conversation_message_embeddings', 'embedding', \
-                        {vector_lit}, k => ?1 \
-                      ) AS e \
+                "SELECT {c_cols}, e.best_distance \
+                 FROM ( \
+                    SELECT lv.message_block_id AS message_block_id, \
+                           MIN(lv._distance) AS best_distance \
+                    FROM lance_vector_search( \
+                            'ns.main.conversation_message_embeddings', 'embedding', \
+                            {vector_lit}, k => ?1 \
+                          ) AS lv \
+                    GROUP BY lv.message_block_id \
+                 ) AS e \
                  JOIN ns.main.conversation_messages AS c \
                    ON c.message_block_id = e.message_block_id \
                  WHERE c.tenant = ?2 AND c.embed_eligible = true \
-                 ORDER BY e._distance ASC \
+                 ORDER BY e.best_distance ASC \
                  LIMIT ?3",
             );
             let mut stmt = conn.prepare(&sql)?;
@@ -1228,5 +1245,117 @@ mod tests {
         let page2_ids: Vec<&str> = page2.iter().map(|m| m.message_block_id.as_str()).collect();
         assert_eq!(page2_ids, vec!["blk_3"]);
         assert!(!more2);
+    }
+
+    /// ③ multi-chunk transcript blocks: a message embedded as N chunk
+    /// vectors (one per content window) must (a) be findable when the
+    /// query matches ANY chunk — including a *tail* chunk the old
+    /// single-vector scheme would have truncated away — and (b) surface
+    /// **exactly once**, not once per chunk row, because
+    /// `semantic_search_transcripts` collapses chunk-rows to one message
+    /// via GROUP BY. Transcript analog of
+    /// `duckdb_query_hybrid_candidates_dedups_multi_chunk_capsule`.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn semantic_search_transcripts_dedups_multi_chunk_message() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("store");
+        let lance = LanceStore::open(&path).await.unwrap();
+        lance.set_transcript_job_provider("fake-test");
+
+        // blk_long → two chunk vectors (head/tail, orthogonal);
+        // blk_short → one (distractor, third orthogonal direction).
+        let m_long = msg(
+            "blk_long",
+            "tenant-a",
+            Some("sess_a"),
+            10,
+            0,
+            BlockType::Text,
+            "long message head ... long message tail",
+            "00000001778000000010",
+        );
+        let m_short = msg(
+            "blk_short",
+            "tenant-a",
+            Some("sess_a"),
+            12,
+            0,
+            BlockType::Text,
+            "short distractor message",
+            "00000001778000000020",
+        );
+        lance.create_conversation_message(&m_long).await.unwrap();
+        lance.create_conversation_message(&m_short).await.unwrap();
+
+        let v_head = vec![1.0_f32, 0.0, 0.0, 0.0];
+        let v_tail = vec![0.0_f32, 0.0, 1.0, 0.0];
+        lance
+            .upsert_conversation_message_embedding_chunks(
+                "blk_long",
+                "tenant-a",
+                "fake-test",
+                4,
+                &[v_head, v_tail],
+                "hash_long",
+                "00000001778000000010",
+                "00000001778000000099",
+            )
+            .await
+            .unwrap();
+        lance
+            .upsert_conversation_message_embedding_chunks(
+                "blk_short",
+                "tenant-a",
+                "fake-test",
+                4,
+                std::slice::from_ref(&vec![0.0_f32, 1.0, 0.0, 0.0]),
+                "hash_short",
+                "00000001778000000020",
+                "00000001778000000099",
+            )
+            .await
+            .unwrap();
+
+        let q = DuckDbQuery::open(&path).await.unwrap();
+
+        // Query ≈ TAIL chunk. Under single-vector storage the tail had
+        // no embedding of its own, so blk_long would be unfindable here.
+        let query_tail = vec![0.0_f32, 0.0, 0.99, 0.14];
+        let tail_hits = q
+            .semantic_search_transcripts("tenant-a", &query_tail, 10)
+            .await
+            .unwrap();
+        let tail_long = tail_hits
+            .iter()
+            .filter(|(m, _)| m.message_block_id == "blk_long")
+            .count();
+        assert_eq!(
+            tail_long, 1,
+            "blk_long must appear exactly once for a tail query; got {tail_hits:?}"
+        );
+        assert_eq!(
+            tail_hits[0].0.message_block_id, "blk_long",
+            "tail query must rank blk_long (matched via tail chunk) first; got {tail_hits:?}"
+        );
+
+        // Query ≈ HEAD chunk also finds blk_long exactly once — proving
+        // both chunk rows coexist (not last-write-wins single-vector).
+        let query_head = vec![0.99_f32, 0.14, 0.0, 0.0];
+        let head_hits = q
+            .semantic_search_transcripts("tenant-a", &query_head, 10)
+            .await
+            .unwrap();
+        let head_long = head_hits
+            .iter()
+            .filter(|(m, _)| m.message_block_id == "blk_long")
+            .count();
+        assert_eq!(
+            head_long, 1,
+            "blk_long must appear exactly once for a head query; got {head_hits:?}"
+        );
+        assert_eq!(
+            head_hits[0].0.message_block_id, "blk_long",
+            "head query must rank blk_long (matched via head chunk) first; got {head_hits:?}"
+        );
     }
 }

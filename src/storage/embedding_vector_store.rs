@@ -95,6 +95,26 @@ pub trait EmbeddingVectorStore: Send + Sync {
         now: &str,
     ) -> Result<(), StorageError>;
 
+    /// ③ chunked: upsert a transcript-block embedding as N rows, one
+    /// per chunk vector. Deletes the message's existing rows **once**,
+    /// then inserts one row per vector — all sharing `message_block_id`
+    /// (`semantic_search_transcripts` dedups them via GROUP BY). Each
+    /// vector must be length `embedding_dim`. Empty `vectors` is a
+    /// no-op. Transcript analog of
+    /// `upsert_capability_capsule_embedding_chunks`.
+    #[allow(clippy::too_many_arguments)]
+    async fn upsert_conversation_message_embedding_chunks(
+        &self,
+        message_block_id: &str,
+        tenant: &str,
+        embedding_model: &str,
+        embedding_dim: i64,
+        vectors: &[Vec<f32>],
+        content_hash: &str,
+        source_updated_at: &str,
+        now: &str,
+    ) -> Result<(), StorageError>;
+
     /// Delete a transcript-block embedding row. Idempotent.
     async fn delete_conversation_message_embedding(
         &self,
@@ -197,6 +217,31 @@ impl EmbeddingVectorStore for Store {
             embedding_model,
             embedding_dim,
             embedding_blob,
+            content_hash,
+            source_updated_at,
+            now,
+        )
+        .await
+    }
+
+    async fn upsert_conversation_message_embedding_chunks(
+        &self,
+        message_block_id: &str,
+        tenant: &str,
+        embedding_model: &str,
+        embedding_dim: i64,
+        vectors: &[Vec<f32>],
+        content_hash: &str,
+        source_updated_at: &str,
+        now: &str,
+    ) -> Result<(), StorageError> {
+        Store::upsert_conversation_message_embedding_chunks(
+            self,
+            message_block_id,
+            tenant,
+            embedding_model,
+            embedding_dim,
+            vectors,
             content_hash,
             source_updated_at,
             now,

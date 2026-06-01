@@ -12,11 +12,17 @@
 //!   while a job is queued).
 //! - Embeds the message **content only** — no `summary` to
 //!   concatenate, since transcript rows have no derived summary
-//!   field.
-//! - Upserts to `conversation_message_embeddings` via Store. Lance
-//!   handles vector indexing internally — no separate HNSW sidecar
-//!   to update (the legacy DuckDB-as-storage backend maintained one
-//!   manually here; that whole code path is gone).
+//!   field. (③) Content is split into overlapping token windows
+//!   (`embed_input_chunks`) so a block longer than the embedder's
+//!   context window has its tail embedded instead of silently
+//!   truncated; short content stays a single chunk.
+//! - Upserts N chunk rows to `conversation_message_embeddings` via
+//!   `upsert_conversation_message_embedding_chunks` (one row per
+//!   chunk, all sharing `message_block_id`; `semantic_search_transcripts`
+//!   dedups them via GROUP BY). Lance handles vector indexing
+//!   internally — no separate HNSW sidecar (the legacy
+//!   DuckDB-as-storage backend maintained one manually; that whole
+//!   code path is gone).
 //!
 //! The provider-id sanity check, retry/backoff schedule, and error
 //! truncation mirror the memories worker — see
@@ -25,7 +31,6 @@
 use std::sync::Arc;
 
 use crate::config::EmbeddingSettings;
-use crate::embedding::wire::encode_f32_blob;
 use crate::embedding::EmbeddingProvider;
 use crate::service::embedding_helpers::{failure_backoff_ms, sha2_hex, truncate_error};
 use crate::storage::{current_timestamp, timestamp_add_ms, Backend, StorageError};
@@ -111,29 +116,52 @@ pub async fn tick(
 
     // Transcript embedding source is the verbatim message content.
     // Memories concatenate `summary + "\n" + content`, but transcripts
-    // have no derived summary — there is nothing to prefix.
-    let text = &message.content;
-    let embedding = match provider.embed_text(text).await {
+    // have no derived summary — there is nothing to prefix. (③) Long
+    // content is split into overlapping token windows so the tail is
+    // embedded instead of silently truncated; short content stays a
+    // single chunk equal to the original, one embedding row as before.
+    let chunks = embed_input_chunks(&message.content);
+    let chunk_refs: Vec<&str> = chunks.iter().map(|s| s.as_str()).collect();
+    let results = match provider.embed_batch(&chunk_refs).await {
         Ok(v) => v,
         Err(err) => {
             record_failure(store, &job, settings, &err.to_string()).await?;
             return Ok(());
         }
     };
-
-    if embedding.len() != provider.dim() {
-        record_failure(
-            store,
-            &job,
-            settings,
-            &format!(
-                "provider returned length {} (expected {})",
-                embedding.len(),
-                provider.dim()
-            ),
-        )
-        .await?;
+    if results.len() != chunk_refs.len() {
+        // Defensive: trait contract says "same length"; treat a breach
+        // as a whole-job failure to avoid persisting a partial chunk set.
+        record_failure(store, &job, settings, "provider batch length mismatch").await?;
         return Ok(());
+    }
+
+    // Regroup per chunk; the job succeeds only if every chunk embedded
+    // at the right dim (any error reschedules the whole job, so a block
+    // never persists a partial chunk set).
+    let mut vectors: Vec<Vec<f32>> = Vec::with_capacity(results.len());
+    for result in &results {
+        match result {
+            Ok(embedding) if embedding.len() == provider.dim() => vectors.push(embedding.clone()),
+            Ok(embedding) => {
+                record_failure(
+                    store,
+                    &job,
+                    settings,
+                    &format!(
+                        "provider returned length {} (expected {})",
+                        embedding.len(),
+                        provider.dim()
+                    ),
+                )
+                .await?;
+                return Ok(());
+            }
+            Err(err) => {
+                record_failure(store, &job, settings, &err.to_string()).await?;
+                return Ok(());
+            }
+        }
     }
 
     if store
@@ -145,16 +173,15 @@ pub async fn tick(
         return Ok(());
     }
 
-    let blob = encode_f32_blob(&embedding);
     let now = current_timestamp();
-    let content_hash = sha2_hex(text);
+    let content_hash = sha2_hex(&message.content);
     store
-        .upsert_conversation_message_embedding(
+        .upsert_conversation_message_embedding_chunks(
             &job.message_block_id,
             &job.tenant,
             provider.model(),
             provider.dim() as i64,
-            &blob,
+            &vectors,
             &content_hash,
             &message.created_at,
             &now,
@@ -205,4 +232,60 @@ async fn record_failure(
             .await?;
     }
     Ok(())
+}
+
+/// Build the per-chunk embed inputs for a transcript block. Unlike the
+/// memories worker there is no `summary` to prefix — the embed source is
+/// the verbatim message `content`. Long content is split into overlapping
+/// token windows (③) so a block longer than the embedder's context window
+/// has its tail embedded instead of silently truncated. Short content
+/// (`<= DEFAULT_CHUNK_TOKENS`) yields exactly one chunk equal to the
+/// original `content`, so the common case is one embedding row, byte-for-
+/// byte unchanged.
+fn embed_input_chunks(content: &str) -> Vec<String> {
+    crate::pipeline::chunk::chunk_text(
+        content,
+        crate::pipeline::chunk::DEFAULT_CHUNK_TOKENS,
+        crate::pipeline::chunk::DEFAULT_CHUNK_OVERLAP,
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn short_message_is_single_chunk_equal_to_content() {
+        // The common case must be byte-for-byte unchanged: one chunk
+        // equal to the verbatim block content (no summary prefix), so
+        // existing single-row transcript embeddings are unaffected.
+        let content = "DuckDB single mutex serializes writes";
+        let chunks = embed_input_chunks(content);
+        assert_eq!(chunks.len(), 1, "short content must stay one chunk");
+        assert_eq!(chunks[0], content);
+    }
+
+    #[test]
+    fn long_message_splits_into_multiple_chunks_covering_head_and_tail() {
+        // A block longer than one embedder window must split so the tail
+        // is embedded, not truncated — the bug ③ fixes for transcripts.
+        let content = format!(
+            "HEADMARKER {} TAILMARKER",
+            "lorem ipsum dolor sit amet ".repeat(2000)
+        );
+        let chunks = embed_input_chunks(&content);
+        assert!(
+            chunks.len() > 1,
+            "long content must split into >1 chunk, got {}",
+            chunks.len()
+        );
+        assert!(
+            chunks[0].contains("HEADMARKER"),
+            "content head must lead the first chunk"
+        );
+        assert!(
+            chunks.last().unwrap().contains("TAILMARKER"),
+            "content tail must survive in the last chunk (not truncated)"
+        );
+    }
 }
