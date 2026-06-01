@@ -30,10 +30,6 @@ const HYBRID_K: usize = 48;
 /// Cutoff for the rank-position metrics.
 const METRIC_K: usize = 10;
 
-/// `LexicalOnly`/`SemanticOnly` are constructed by the Task-6 entrypoint
-/// (`tests/recall_bench.rs`); not yet constructed in the non-`#[ignore]`'d
-/// tests, so the dead_code allow stays until Task 6 wires the full ladder.
-#[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Rung {
     LexicalOnly,

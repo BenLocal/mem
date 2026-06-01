@@ -5,7 +5,7 @@
 .PHONY: help build release install run serve mcp repair-check repair-rebuild \
         test test-unit test-fast fmt fmt-check clippy lint check watch watch-check \
         cross cross-linux-gnu cross-linux-musl cross-arm64 \
-        clean
+        clean bench-recall
 
 CARGO ?= cargo
 
@@ -96,3 +96,6 @@ cross-arm64: ## Release build for aarch64-unknown-linux-gnu
 
 clean: ## cargo clean
 	$(CARGO) clean
+
+bench-recall: ## Run the capsule recall ablation bench
+	cargo test --test recall_bench -- --ignored --nocapture
