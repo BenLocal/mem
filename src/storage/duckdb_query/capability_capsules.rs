@@ -961,13 +961,18 @@ impl DuckDbQuery {
                     let p_over = bind(Box::new(oversample));
                     format!(
                         "vec AS ( \
-                            SELECT e.capability_capsule_id, \
-                                   ROW_NUMBER() OVER (ORDER BY e._distance ASC, e.capability_capsule_id ASC) AS rank_sem \
-                            FROM lance_vector_search( \
-                                    'ns.main.capability_capsule_embeddings', 'embedding', \
-                                    {vector_lit}, k => ?{p_over} \
-                                  ) AS e \
-                            WHERE e.tenant = ?{p_tenant_v} \
+                            SELECT capability_capsule_id, \
+                                   ROW_NUMBER() OVER (ORDER BY best_distance ASC, capability_capsule_id ASC) AS rank_sem \
+                            FROM ( \
+                                SELECT e.capability_capsule_id AS capability_capsule_id, \
+                                       MIN(e._distance) AS best_distance \
+                                FROM lance_vector_search( \
+                                        'ns.main.capability_capsule_embeddings', 'embedding', \
+                                        {vector_lit}, k => ?{p_over} \
+                                      ) AS e \
+                                WHERE e.tenant = ?{p_tenant_v} \
+                                GROUP BY e.capability_capsule_id \
+                            ) \
                         )"
                     )
                 } else {
