@@ -82,7 +82,7 @@ v3.3.6：`compress hook init instructions mcp migrate mine repair repair_status 
 | module | 行数 | 做什么 | 归类 |
 |---|---|---|---|
 | **`dynamics.py`** | 256 | **纯函数**：Hebbian 增强 + Ebbinghaus 衰减 + Cepeda 间隔效应，作用于 hall/tunnel dict | → **K9**（建议做） |
-| **`hallways.py`** | 330 | wing 内**实体共现边**（co-occurrence ≥ `min_count`，默认 2），JSON 持久化 | → **K10**（建议做） |
+| **`hallways.py`** | 330 | wing 内**实体共现边**（co-occurrence ≥ `min_count`，默认 2），JSON 持久化 | → **K10** ✅（已落地 `af71bd3`） |
 | **`format_miner.py`** | 979 | office 文档挖掘（PDF/docx/pptx/xlsx/RTF/EPUB → MarkItDown / striprtf） | → **#34**（暂不做） |
 | **`sync.py`** | 321 | gitignore 感知 drawer 剪枝（源文件被 ignore/删除/移动则清） | → **#36**（暂不做） |
 | `_stdio.py` | 71 | Windows UTF-8 流重配（cp1252 mojibake 修复） | 🚫 不适用（mem = Rust/Linux） |
@@ -120,7 +120,7 @@ access_count: int      # 累计共激活次数
 - **默认 OFF**（`MEM_EDGE_DYNAMICS_ENABLED=1`），与 dedup/topic-tunnel 同样保守
 - **工作量**：L（schema 迁移是大头）。**优先级 P1，但必须单独排一次 spec→implement session**——和 v3 对 K1 的判断一致。
 
-#### K10 ✅建议做 — scope 内实体共现边（hallway 等价）
+#### K10 ✅ 已完成（2026-05-31，`af71bd3`）— scope 内实体共现边（hallway 等价）
 
 **上游做法**（`hallways.py::compute_hallways_for_wing`）：扫一个 wing 的所有 drawer，**同一 drawer 内每对不同实体**算一次共现；共现计数 ≥ `min_count`（默认 2）则物化一条 hallway 记录（带 pair + count + 出现的 rooms）。
 
@@ -128,6 +128,7 @@ access_count: int      # 累计共激活次数
 
 **落地形状**：新 `src/worker/cooccurrence_worker.rs`，按 `(project, repo)` 分组扫活跃 capsule 的 `topics`/entity，组内 pairwise 共现计数 ≥ 阈值 → `add_edge_direct` 写 `cooccur:entity:<a>↔<b>` 边（幂等）。复用 K2 的 sweep 骨架。默认 OFF。
 - **工作量**：M（对标 K2 ~3h）。**优先级 P2**——K2 的天然兄弟，可在 K9 schema 落地后顺手做（共现边正好挂 `strength`）。
+- **✅ 已落地** `af71bd3`：`src/worker/cooccurrence_worker.rs`，默认 OFF。
 
 #### K11 🟡谨慎 — 共现 → 跨 scope tunnel 提升
 
@@ -160,14 +161,15 @@ access_count: int      # 累计共激活次数
 |---|---|---|---|---|---|
 | **K12** ✅ | 边写时拒绝倒置 `valid_to<valid_from` | `add_edge_direct` 顶部校验 + `GraphError::InvalidInput` 变体 + AppError→400 + TDD | S（实际 ~30min） | **P1**（便宜防御） | 无 ✅ 2026-05-31 |
 | **K9** ✅ | 边「活权重」动力学（strength/stability/decay）+ 吸收 K1 retrieve 加权 | 4 列迁移(p1) + `edge_dynamics.rs` 纯函数(p2) + potentiation worker B1 内存 channel(p3) + retrieve 按 decayed_strength 加权+入队(p4) | L（多阶段） | **P1** | ✅ 2026-05-31，默认 OFF（MEM_EDGE_DYNAMICS_ENABLED） |
-| **K10** | scope 内实体共现边（hallway 等价） | `worker/cooccurrence_worker.rs`（仿 K2） | M（~3h） | **P2** | K9 列就位最佳 |
+| **K10** ✅ | scope 内实体共现边（hallway 等价） | `worker/cooccurrence_worker.rs`（仿 K2） | M（~3h） | **P2** | ✅ 2026-05-31 `af71bd3`，默认 OFF |
 | **K11** | 共现→跨 scope tunnel 提升 | 在 K10 sweep 上加提升逻辑 | S | **P3** | K10 |
 | **#35** | 确认/升级多语言 embedding 默认 | 先 confirm `EMBEDDING_MODEL`；必要时换默认模型 | S（确认）/ M（换模型） | 待定 | — |
 
 ### 决策点
 - **✅ 已完成（2026-05-31）**：**K12**——`GraphError::InvalidInput` 变体 + `add_edge_direct` 写时校验（拒 `valid_to<valid_from`，放行开区间与点事实）+ AppError 映 400 + TDD（RED→GREEN）。下一个独立可立刻做项已清空。
 - **✅ 已落地（2026-05-31）**：**K1 + K3 列**已独立实现——`graph_edges` 现有 `confidence Float32` + `extractor Utf8`（均 nullable），含 mem 首个 on-disk `add_columns(AllNulls)` 迁移、HTTP caller 声明、4 个 TDD 测试。详见 [`mempalace-diff-v3.md`](./mempalace-diff-v3.md) §7.2 K1/K3 行。
-- **✅ 已完成（2026-05-31）**：**K9** 四阶段全做完——4 列迁移 + `edge_dynamics.rs` 纯函数（potentiate/decayed_strength）+ potentiation worker（B1 内存 channel，drain 去重）+ retrieve 按 decayed_strength 加权 + 命中入队（含 K1 推迟的 retrieve 加权那部分）。默认 OFF（`MEM_EDGE_DYNAMICS_ENABLED`）。下一步可选 **K10**（scope 内实体共现边）。
+- **✅ 已完成（2026-05-31）**：**K9** 四阶段全做完——4 列迁移 + `edge_dynamics.rs` 纯函数（potentiate/decayed_strength）+ potentiation worker（B1 内存 channel，drain 去重）+ retrieve 按 decayed_strength 加权 + 命中入队（含 K1 推迟的 retrieve 加权那部分）。默认 OFF（`MEM_EDGE_DYNAMICS_ENABLED`）。
+- **✅ 已完成（2026-05-31）**：**K10**——`src/worker/cooccurrence_worker.rs`，按 `(project, repo)` 分组扫活跃 capsule 的 entity，组内 pairwise 共现计数 ≥ 阈值 → `add_edge_direct` 写共现边（幂等，仿 K2 sweep 骨架）。默认 OFF。下一步可选 **K11**（共现 → 跨 scope tunnel 提升，依赖 K10）。
 - **先确认再说**：**#35**——查 mem 默认 embedder 是不是已经多语言（大概率是 Qwen3，则此项作废）。
 - **不做**：#34 office 挖掘 / #36 gitignore 剪枝 / 虚拟行号 / COCA 过滤（理由见 §4）。
 

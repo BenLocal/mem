@@ -11,9 +11,9 @@
 > - v2：§2（MCP 表面对照）/ §3（推荐路线）/ §4（#16 详化）
 > - v3：§2（CLI 对照）/ §3（module 对照）/ §4（推荐路线）/ §5（#29 详化）
 >
-> **状态（2026-05-31）**：v1 #1–#19 + v2 #16–#28 + v3 **#29–#33**（含 #32 per-session mine cursor）+ KG 层 **K1–K5** 全部 ✅；**v4**（上游 v3.3.6 审计）的 **K9（边「活权重」动力学，4 阶段：列+迁移 / edge_dynamics 纯函数 / potentiation worker / retrieve 按 decayed_strength 加权）+ K12（写时拒绝倒置 valid 区间→HTTP 400）已 ✅ 并两次零停机上线**（K9 默认 OFF，`MEM_EDGE_DYNAMICS_ENABLED=1` 启用）。剩：**v1 #20**（内容抽实体，LATER）、**v4 K10/K11**（实体共现边及其 tunnel 提升）、**#34/#36**（office 挖掘 / gitignore 剪枝，暂缓）；**#35**（多语言 embedding）由默认 Qwen3-Embedding-0.6B 覆盖、不做。Incident TODO 见下（#2/#3/#4 已 ✅）。
+> **状态（2026-06-01）**：v1 #1–#19 + v2 #16–#28 + v3 **#29–#33**（含 #32 per-session mine cursor）+ KG 层 **K1–K5** 全部 ✅；**v4**（上游 v3.3.6 审计）的 **K9（边「活权重」动力学，4 阶段：列+迁移 / edge_dynamics 纯函数 / potentiation worker / retrieve 按 decayed_strength 加权）+ K12（写时拒绝倒置 valid 区间→HTTP 400）+ K10（scope 内实体共现边 worker，仿 K2）已 ✅ 并零停机上线**（K9 / K10 默认 OFF）。剩：**v1 #20**（内容抽实体，LATER）、**v4 K11**（共现 → 跨 scope tunnel 提升，依赖 K10）、**#34/#36**（office 挖掘 / gitignore 剪枝，暂缓）；**#35**（多语言 embedding）由默认 Qwen3-Embedding-0.6B 覆盖、不做。另起 **③ 长内容召回**平行工作线（chunked embeddings，详见 [`long-content-recall.md`](./long-content-recall.md)），4 phase 全 ✅。Incident TODO 见下（#2/#3/#4 已 ✅）。
 >
-> **平行工作线**：MemPalace 对齐之外，**Backend 存储抽象**走独立 workstream，路线图见 [`backend-coupling.md`](./backend-coupling.md) §6（Phase 0–5 已 shipped；DuckDbQuery / LanceStore 已收窄 `pub(crate)`）。两条线 commit message 用各自的 close 引用（`closes ROADMAP #N` / `closes mempalace-diff-v2 #N` / `closes mempalace-diff-v3 #N` vs `closes backend-coupling §6 Phase N`），不互相阻塞。
+> **平行工作线**：MemPalace 对齐（①）之外还有两条独立 workstream——**② Backend 存储抽象**（[`backend-coupling.md`](./backend-coupling.md) §6，Phase 0–5 已 shipped；DuckDbQuery / LanceStore 已收窄 `pub(crate)`）与 **③ 长内容召回**（[`long-content-recall.md`](./long-content-recall.md)，chunked embeddings 消除长内容尾部静默截断，4 phase 全 ✅）。三条线 commit message 用各自的 close 引用（`closes ROADMAP #N` / `closes mempalace-diff-v{2,3,4} #N|K#` vs `closes backend-coupling §6 Phase N` vs `refs long-content-recall ③ pN`），不互相阻塞。
 
 ## 路线图
 
@@ -57,13 +57,14 @@
 
 ## 下一阶段
 
-v1 #1–#19 + v2 #16–#28 + v3 #29–#33 + KG 层 K1–K5 + v4 K9/K12 已完成（K1/K3/K12/K9 已上线）；剩余待办：
+v1 #1–#19 + v2 #16–#28 + v3 #29–#33 + KG 层 K1–K5 + v4 K9/K10/K12 已完成（K1/K3/K12/K9/K10 已上线）；另有 **③ 长内容召回** 平行工作线 4 phase 全 ✅；剩余待办：
 
 - **v1 #20** — 内容自动抽取实体（opt-in regex），风险高、需先定 Verbatim 边界，LATER。
-- **v4 K10** — scope 内实体共现边（hallway 等价 worker，仿 K2；K9 的 `strength` 列正好挂上）；**K11** — 共现 → 跨 scope tunnel 提升（等 K10 稳了再做）。
+- **v4 K10** ✅ — scope 内实体共现边（hallway 等价 worker，仿 K2）已落地 `af71bd3`（`src/worker/cooccurrence_worker.rs`，默认 OFF）；**K11** — 共现 → 跨 scope tunnel 提升（K10 已就位，可评估质量后再做）。
+- **③ 长内容召回**（chunked embeddings）— 独立 workstream，4 phase 全 ✅（capsule + transcript 两条管线都已切片嵌入），详见 [`long-content-recall.md`](./long-content-recall.md)。剩：存量长内容回填（靠 `embeddings_rebuild` 重嵌，未自动化）。
 - **v4 #34 / #36** — office 文档挖掘 / gitignore 剪枝，超 transcript 范围，暂缓。
 - **K6 / K7 / K8** — YAGNI 暂搁（`entities.properties` JSON / 图缓存 TTL / `mem init` 写 starter entities）。
-- **召回质量 bench** — #14/#15（recall ablation + LongMemEval parity）已在 `4df527b` **删除**（依赖旧 usearch HNSW，迁 Lance native ANN + Store API 时不可迁移）；`bench-fixtures/` 已空。要对 K9 等检索改动做量化评估需**重建**（移植 longmemeval harness 到新 API + 数据集）。`src/pipeline/eval_metrics.rs` 的指标函数（recall@k / ndcg / mrr）仍在、可复用。
+- **召回质量 bench** — #14/#15（recall ablation + LongMemEval parity）已在 `4df527b` **删除**（依赖旧 usearch HNSW，迁 Lance native ANN + Store API 时不可迁移）；`bench-fixtures/` 已空。要对 K9 / K10 / ③ chunking 等检索改动做量化评估需**重建**（移植 longmemeval harness 到新 API + 数据集）。`src/pipeline/eval_metrics.rs` 的指标函数（recall@k / ndcg / mrr）仍在、可复用。
 - **不做**：**#35** 多语言 embedding（默认 `Qwen/Qwen3-Embedding-0.6B` 已覆盖多语言）；spellcheck / llm_refine / dialect / repair（v3 §15.4 / §3 红线）。
 
 新对齐项触发条件按性质分两条：
