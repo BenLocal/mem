@@ -87,6 +87,15 @@ Fully offline and reproducible: `GeometryProvider` is pure, fixed seed, fresh te
 ## 8. Out of scope → future rungs
 Transcript-path ablation (add a transcript loader + a `semantic_search_transcripts`/`bm25_transcript_candidates` rung), real-embedder fixture set (swap `GeometryProvider` for `embedanything`), LongMemEval parity, LLM judgment. `fixture`/`runner` interfaces stay generic (Fixture + Rung) so these slot in without restructuring.
 
-## 9. Known limitation (v1)
+## 9. Known limitation: K9/K10 not discriminable in the designed-geometry harness
 
-On the v1 designed-geometry fixture, the Graph (K10) and Dynamics (K9) rungs show Δ≈0 vs Hybrid because every capsule shares the same `project`/`repo` entity (uniform 1-hop boost) and topic-entity links only reinforce already-top capsules. The rungs execute the real K9/K10 code paths, but discriminating these features requires a v1.1 fixture with graph-bridge capsules relevant only via graph reachability + strength-bearing co-occurrence edges. The ③ chunking and Oracle rungs are fully discriminating in v1.
+The Graph (K10) and Dynamics (K9) rungs execute the real `compute_graph_boosts` / edge-dynamics code paths and report numbers, but on the designed-geometry fixture they do **not** produce a stable Δ vs Hybrid. ③ chunking and Oracle **are** fully discriminating.
+
+A v1.1 attempt (2026-06-01) added a graph-bridge scenario — a weakly-matched `cap_gbridge` made recallable via a written `cap_gseed → cap_gbridge` edge (`add_edge_direct`), plus weakly-linked distractors for K9 — and **was reverted** after empirically establishing it can't be made CI-stable. What the attempt pinned down about the production ranker (each correct, but jointly fatal for a synthetic signal):
+
+- **`graph_anchor_nodes` emits `capability_capsule:<top-5 id>` anchors**; a capsule→capsule edge carries the boost (ingest's `capsule→entity` edges are never anchored). Good — that part works.
+- **`GRAPH_BOOST` (12) < the relevance floor (25)** — graph can only *re-rank* above-floor capsules, never surface a zero-relevance one. So the bridge must be a weak-but-real match and the signal is rank (mrr/ndcg), not recall.
+- **`compute_graph_boosts` skips edges whose both endpoints are anchors** — the bridge must rank below the top-5 or the edge is a no-op; pushing it there with fillers, while keeping distractors non-anchors yet above the bridge, is a narrow window.
+- **The killer: non-determinism.** Same-topic designed-geometry vectors are near-identical (jitter only) and BM25 is identical, so scores *cluster and tie*; the `+12` boost lands the bridge inside those ties; and the final tie-break is the **random per-ingest UUID** (`capability_capsule_id`). The boost also saturates the single weakly-matched bridge to the top rank. Net effect: the aggregate K10/K9 delta flips sign run-to-run (observed graph.mrr both above and below hybrid across identical runs). Evidence bonuses, frequency tiers, and id renames could not overcome it.
+
+**Conclusion:** a stable K9/K10 ranking delta needs **real score spread**, i.e. the real-embedder fixture (§8, `embedanything` Qwen3) where neighbours aren't artificially clustered and the boost doesn't saturate — not a designed-geometry tweak. Tracked there; not a quick fixture change.
