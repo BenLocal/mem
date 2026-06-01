@@ -38,8 +38,13 @@ impl Default for SyntheticConfig {
     fn default() -> Self {
         Self {
             seed: 42,
+            // ≥ 12 short capsules per topic so a tail-targeted query has
+            // enough exact same-topic distractors to push a chunking-OFF
+            // long capsule (head-only embedding, orthogonal to the tail
+            // query) out of the top-10 — making recall@10 discriminate the
+            // ③ chunking effect instead of saturating at 1.0 on a tiny corpus.
             num_topics: 6,
-            capsules_per_topic: 4,
+            capsules_per_topic: 12,
             num_long: 3,
         }
     }
