@@ -30,8 +30,9 @@ const HYBRID_K: usize = 48;
 /// Cutoff for the rank-position metrics.
 const METRIC_K: usize = 10;
 
-/// Variants other than `Hybrid` are consumed by Tasks 4+ (full rung
-/// ladder); allow dead_code to keep the public API stable across tasks.
+/// `LexicalOnly`/`SemanticOnly` are constructed by the Task-6 entrypoint
+/// (`tests/recall_bench.rs`); not yet constructed in the non-`#[ignore]`'d
+/// tests, so the dead_code allow stays until Task 6 wires the full ladder.
 #[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Rung {
@@ -45,9 +46,6 @@ pub enum Rung {
     Oracle,
 }
 
-/// Report fields beyond `recall_at_10` are consumed by the Task 5 output
-/// layer (pretty table / JSON); allow dead_code until then.
-#[allow(dead_code)]
 #[derive(Debug, Clone)]
 pub struct RungReport {
     pub rung: Rung,
@@ -387,9 +385,114 @@ pub async fn run_bench(f: &Fixture, rungs: &[Rung]) -> BenchReport {
     BenchReport { reports }
 }
 
+fn rung_name(r: Rung) -> &'static str {
+    match r {
+        Rung::LexicalOnly => "LexicalOnly",
+        Rung::SemanticOnly => "SemanticOnly",
+        Rung::Hybrid => "Hybrid",
+        Rung::Graph => "Graph",
+        Rung::Dynamics => "Dynamics",
+        Rung::ChunkingOn => "ChunkingOn",
+        Rung::ChunkingOff => "ChunkingOff",
+        Rung::Oracle => "Oracle",
+    }
+}
+
+pub fn pretty_table(report: &BenchReport) -> String {
+    let baseline = report
+        .reports
+        .iter()
+        .find(|r| r.rung == Rung::Hybrid)
+        .map(|r| r.ndcg_at_10);
+    let mut out = String::from("rung          ndcg@10  mrr    recall@10  prec@10   Δndcg\n");
+    for r in &report.reports {
+        let delta = match baseline {
+            Some(b) => format!("{:+.3}", r.ndcg_at_10 - b),
+            None => String::new(),
+        };
+        out.push_str(&format!(
+            "{:<13} {:.3}    {:.3}  {:.3}      {:.3}     {}\n",
+            rung_name(r.rung),
+            r.ndcg_at_10,
+            r.mrr,
+            r.recall_at_10,
+            r.precision_at_10,
+            delta
+        ));
+    }
+    out
+}
+
+pub fn write_json(report: &BenchReport, path: &std::path::Path) -> std::io::Result<()> {
+    let mut s = String::from("{\"rungs\":[");
+    for (i, r) in report.reports.iter().enumerate() {
+        if i > 0 {
+            s.push(',');
+        }
+        s.push_str(&format!(
+            "{{\"rung\":\"{}\",\"ndcg_at_10\":{},\"mrr\":{},\"recall_at_10\":{},\"precision_at_10\":{}}}",
+            rung_name(r.rung),
+            r.ndcg_at_10,
+            r.mrr,
+            r.recall_at_10,
+            r.precision_at_10
+        ));
+    }
+    s.push_str("]}");
+    std::fs::write(path, s)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pretty_table_has_all_rungs_and_delta() {
+        let report = BenchReport {
+            reports: vec![
+                RungReport {
+                    rung: Rung::Hybrid,
+                    ndcg_at_10: 0.5,
+                    mrr: 0.5,
+                    recall_at_10: 0.5,
+                    precision_at_10: 0.5,
+                },
+                RungReport {
+                    rung: Rung::Graph,
+                    ndcg_at_10: 0.6,
+                    mrr: 0.5,
+                    recall_at_10: 0.6,
+                    precision_at_10: 0.5,
+                },
+            ],
+        };
+        let t = pretty_table(&report);
+        assert!(t.contains("Hybrid"));
+        assert!(t.contains("Graph"));
+        assert!(
+            t.contains("+0.100"),
+            "expected Δndcg vs hybrid baseline in:\n{t}"
+        );
+    }
+
+    #[test]
+    fn write_json_is_wellformed() {
+        let report = BenchReport {
+            reports: vec![RungReport {
+                rung: Rung::Hybrid,
+                ndcg_at_10: 0.5,
+                mrr: 0.5,
+                recall_at_10: 0.5,
+                precision_at_10: 0.5,
+            }],
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("r.json");
+        write_json(&report, &path).unwrap();
+        let s = std::fs::read_to_string(&path).unwrap();
+        assert!(s.contains("\"ndcg_at_10\""));
+        assert!(s.contains("\"Hybrid\""));
+    }
 
     #[tokio::test(flavor = "multi_thread")]
     #[ignore = "ablation bench — run with --ignored"]
