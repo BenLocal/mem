@@ -2,4 +2,5 @@
 //! docs/superpowers/specs/2026-06-01-recall-bench-rebuild-design.md.
 pub mod fixture;
 pub mod geometry;
+pub mod runner;
 pub mod synthetic;
