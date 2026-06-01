@@ -37,6 +37,25 @@ pub trait EmbeddingVectorStore: Send + Sync {
         now: &str,
     ) -> Result<(), StorageError>;
 
+    /// ③ chunked embeddings: upsert a capsule's embeddings as N rows,
+    /// one per chunk vector. Deletes any existing rows for the capsule
+    /// **once**, then inserts one row per vector — all sharing
+    /// `capability_capsule_id` (search dedups them via GROUP BY). Each
+    /// vector must be length `embedding_dim`. Empty `vectors` is a no-op
+    /// (leaves the capsule with no embedding rows).
+    #[allow(clippy::too_many_arguments)]
+    async fn upsert_capability_capsule_embedding_chunks(
+        &self,
+        capability_capsule_id: &str,
+        tenant: &str,
+        embedding_model: &str,
+        embedding_dim: i64,
+        vectors: &[Vec<f32>],
+        content_hash: &str,
+        source_updated_at: &str,
+        now: &str,
+    ) -> Result<(), StorageError>;
+
     /// Delete the embedding row for one capsule. Idempotent — no
     /// error if no row exists.
     async fn delete_capability_capsule_embedding(
@@ -103,6 +122,31 @@ impl EmbeddingVectorStore for Store {
             embedding_model,
             embedding_dim,
             embedding_blob,
+            content_hash,
+            source_updated_at,
+            now,
+        )
+        .await
+    }
+
+    async fn upsert_capability_capsule_embedding_chunks(
+        &self,
+        capability_capsule_id: &str,
+        tenant: &str,
+        embedding_model: &str,
+        embedding_dim: i64,
+        vectors: &[Vec<f32>],
+        content_hash: &str,
+        source_updated_at: &str,
+        now: &str,
+    ) -> Result<(), StorageError> {
+        Store::upsert_capability_capsule_embedding_chunks(
+            self,
+            capability_capsule_id,
+            tenant,
+            embedding_model,
+            embedding_dim,
+            vectors,
             content_hash,
             source_updated_at,
             now,

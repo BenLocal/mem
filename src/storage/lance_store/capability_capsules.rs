@@ -385,6 +385,57 @@ impl LanceStore {
         Ok(())
     }
 
+    /// ③ chunked: delete all existing embedding rows for the capsule
+    /// once, then insert one row per chunk vector. Vectors share
+    /// `capability_capsule_id`; search dedups via GROUP BY. Takes raw
+    /// `Vec<f32>` (no blob decode — the worker has the vectors already).
+    #[allow(clippy::too_many_arguments)]
+    pub async fn upsert_capability_capsule_embedding_chunks(
+        &self,
+        capability_capsule_id: &str,
+        tenant: &str,
+        embedding_model: &str,
+        embedding_dim: i64,
+        vectors: &[Vec<f32>],
+        content_hash: &str,
+        source_updated_at: &str,
+        now: &str,
+    ) -> Result<(), StorageError> {
+        if vectors.is_empty() {
+            return Ok(());
+        }
+        let dim_i32 = i32::try_from(embedding_dim)
+            .map_err(|_| StorageError::InvalidData("embedding_dim does not fit in i32"))?;
+        ensure_capability_capsule_embeddings_table(&self.conn, dim_i32).await?;
+        let table = self
+            .conn
+            .open_table("capability_capsule_embeddings")
+            .execute()
+            .await
+            .map_err(lancedb_err)?;
+        table
+            .delete(&format!(
+                "capability_capsule_id = {}",
+                sql_quote(capability_capsule_id)
+            ))
+            .await
+            .map_err(lancedb_err)?;
+        for vector in vectors {
+            let batch = capability_capsule_embedding_to_record_batch(
+                capability_capsule_id,
+                tenant,
+                embedding_model,
+                embedding_dim,
+                vector,
+                content_hash,
+                source_updated_at,
+                now,
+            )?;
+            table.add(batch).execute().await.map_err(lancedb_err)?;
+        }
+        Ok(())
+    }
+
     pub async fn delete_capability_capsule_embedding(
         &self,
         capability_capsule_id: &str,

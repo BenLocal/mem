@@ -850,9 +850,11 @@ impl DuckDbQuery {
     /// Items in only one source still get their partial score via
     /// `FULL OUTER JOIN`; items in both rank highest by construction.
     ///
-    /// **Inner-K oversample**: each lance table function gets `k * 2` so
-    /// the outer tenant + status filter doesn't truncate the result
-    /// below `k`. Same posture as `bm25_candidates`.
+    /// **Inner-K oversample**: the FTS table function gets `k * 2` so the
+    /// outer tenant + status filter doesn't truncate the result below `k`
+    /// (same posture as `bm25_candidates`); the ANN branch gets `k * 4`
+    /// because its embeddings table holds N chunk-rows per capsule (③),
+    /// which collapse to fewer distinct capsules after the GROUP BY.
     ///
     /// **Tenant filter pushdown**: applied to both inner CTEs (the
     /// embeddings table also carries `tenant` for early filtering) and
@@ -885,7 +887,15 @@ impl DuckDbQuery {
         let tenant = tenant.to_string();
         let query_text = query_text.to_string();
         let k_i = i64::try_from(k).unwrap_or(64).clamp(1, 1024);
+        // FTS runs over capability_capsules (one row per capsule), so k*2
+        // is enough headroom for the outer tenant/status filter.
         let oversample = k_i.saturating_mul(2);
+        // ③ The embeddings table now holds N rows per capsule (one per
+        // chunk), so lance_vector_search returns chunk-rows that collapse
+        // to fewer distinct capsules after GROUP BY. Oversample the ANN
+        // branch harder so a handful of long (many-chunk) capsules near
+        // the top can't crowd distinct capsules out of the k results.
+        let vec_oversample = k_i.saturating_mul(4);
         let rejected = enum_to_text(&CapabilityCapsuleStatus::Rejected)?;
         let archived = enum_to_text(&CapabilityCapsuleStatus::Archived)?;
         let active = enum_to_text(&CapabilityCapsuleStatus::Active)?;
@@ -958,7 +968,7 @@ impl DuckDbQuery {
                     // positional reuse, and CTE branches that don't run
                     // cost nothing.
                     let p_tenant_v = bind(Box::new(tenant.clone()));
-                    let p_over = bind(Box::new(oversample));
+                    let p_over = bind(Box::new(vec_oversample));
                     format!(
                         "vec AS ( \
                             SELECT capability_capsule_id, \
@@ -1687,6 +1697,103 @@ mod tests {
             .await
             .unwrap();
         assert!(zero.is_empty());
+    }
+
+    /// ③ multi-chunk capsules: a capsule with N embedding rows (one per
+    /// content chunk) must (a) be findable when the query matches ANY
+    /// chunk — including a *tail* chunk the single-vector scheme would
+    /// have truncated away — and (b) appear EXACTLY ONCE in results,
+    /// because `hybrid_candidates` collapses chunk-rows to one capsule
+    /// via GROUP BY. The discriminator vs the old single-vector store:
+    /// a query near the HEAD chunk *and* a query near the TAIL chunk both
+    /// find the same capsule, which last-write-wins single-vector storage
+    /// could never satisfy (it would keep only one of the two vectors).
+    #[tokio::test]
+    async fn duckdb_query_hybrid_candidates_dedups_multi_chunk_capsule() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("store");
+        let lance = LanceStore::open(&path).await.unwrap();
+
+        // c_long → two chunk vectors; c_short → one (distractor).
+        let long = fixture("c_long", "tenant-a");
+        let short = fixture("c_short", "tenant-a");
+        for m in [&long, &short] {
+            lance.insert_capability_capsule(m.clone()).await.unwrap();
+        }
+
+        let now = "00000001778000000000";
+        // c_long's two chunks point in orthogonal directions ("head" vs
+        // "tail"); each query below matches exactly one of them.
+        let v_head = vec![1.0_f32, 0.0, 0.0, 0.0];
+        let v_tail = vec![0.0_f32, 0.0, 1.0, 0.0];
+        lance
+            .upsert_capability_capsule_embedding_chunks(
+                "c_long",
+                "tenant-a",
+                "fake-test",
+                4,
+                &[v_head, v_tail],
+                "c-long-hash",
+                now,
+                now,
+            )
+            .await
+            .unwrap();
+        lance
+            .upsert_capability_capsule_embedding_chunks(
+                "c_short",
+                "tenant-a",
+                "fake-test",
+                4,
+                std::slice::from_ref(&vec![0.0_f32, 1.0, 0.0, 0.0]),
+                "c-short-hash",
+                now,
+                now,
+            )
+            .await
+            .unwrap();
+
+        let q = DuckDbQuery::open(&path).await.unwrap();
+
+        // Query ≈ TAIL chunk. Under single-vector storage the tail had no
+        // embedding of its own, so c_long would be unfindable here.
+        let query_tail = vec![0.0_f32, 0.0, 0.99, 0.14];
+        let tail_hits = q
+            .hybrid_candidates("tenant-a", "", &query_tail, 10)
+            .await
+            .unwrap();
+        assert_eq!(
+            tail_hits
+                .iter()
+                .filter(|(m, _)| m.capability_capsule_id == "c_long")
+                .count(),
+            1,
+            "tail query: c_long must appear exactly once (GROUP BY dedup); got {tail_hits:?}"
+        );
+        assert_eq!(
+            tail_hits[0].0.capability_capsule_id, "c_long",
+            "tail query must rank c_long (matched via tail chunk) first; got {tail_hits:?}"
+        );
+
+        // Query ≈ HEAD chunk also finds c_long exactly once — proving both
+        // chunk rows coexist (not last-write-wins single-vector storage).
+        let query_head = vec![0.99_f32, 0.14, 0.0, 0.0];
+        let head_hits = q
+            .hybrid_candidates("tenant-a", "", &query_head, 10)
+            .await
+            .unwrap();
+        assert_eq!(
+            head_hits
+                .iter()
+                .filter(|(m, _)| m.capability_capsule_id == "c_long")
+                .count(),
+            1,
+            "head query: c_long must appear exactly once; got {head_hits:?}"
+        );
+        assert_eq!(
+            head_hits[0].0.capability_capsule_id, "c_long",
+            "head query must rank c_long (matched via head chunk) first; got {head_hits:?}"
+        );
     }
 
     /// Fresh stores have no `capability_capsule_embeddings` table yet

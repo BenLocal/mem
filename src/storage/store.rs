@@ -296,6 +296,35 @@ impl Store {
         .await
     }
 
+    #[allow(clippy::too_many_arguments)]
+    pub async fn upsert_capability_capsule_embedding_chunks(
+        &self,
+        capability_capsule_id: &str,
+        tenant: &str,
+        embedding_model: &str,
+        embedding_dim: i64,
+        vectors: &[Vec<f32>],
+        content_hash: &str,
+        source_updated_at: &str,
+        now: &str,
+    ) -> Result<(), StorageError> {
+        self.commit_lance_write(
+            self.lance
+                .upsert_capability_capsule_embedding_chunks(
+                    capability_capsule_id,
+                    tenant,
+                    embedding_model,
+                    embedding_dim,
+                    vectors,
+                    content_hash,
+                    source_updated_at,
+                    now,
+                )
+                .await,
+        )
+        .await
+    }
+
     pub async fn delete_capability_capsule_embedding(
         &self,
         capability_capsule_id: &str,

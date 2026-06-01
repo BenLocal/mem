@@ -1,7 +1,6 @@
 use std::sync::Arc;
 
 use crate::config::EmbeddingSettings;
-use crate::embedding::wire::encode_f32_blob;
 use crate::embedding::EmbeddingProvider;
 use crate::service::embedding_helpers::{failure_backoff_ms, truncate_error};
 use crate::storage::{current_timestamp, timestamp_add_ms, Backend, StorageError};
@@ -57,7 +56,7 @@ pub async fn tick(
             "embedding worker claimed job"
         );
         match pre_embed(store, &job, settings).await? {
-            Some(text) => ready.push(PendingEmbed { job, text }),
+            Some(texts) => ready.push(PendingEmbed { job, texts }),
             None => continue,
         }
     }
@@ -65,25 +64,36 @@ pub async fn tick(
         return Ok(());
     }
 
-    // Batch embed. embed_batch returns Vec<Result<Vec<f32>>> of same
-    // length as inputs. Whole-batch failure → per-job reschedule.
-    let texts: Vec<&str> = ready.iter().map(|p| p.text.as_str()).collect();
-    let results = match provider.embed_batch(&texts).await {
+    // Batch embed across ALL chunks of ALL jobs in one provider call.
+    // Flatten each job's chunk texts into one batch, remembering each
+    // job's [start, start+len) slice so results regroup per job. (③: a
+    // long capsule contributes several chunk-rows; a short one keeps its
+    // single row.) embed_batch returns Vec<Result<Vec<f32>>> of the same
+    // length as inputs; whole-batch failure → per-job reschedule.
+    let mut flat: Vec<&str> = Vec::new();
+    let mut ranges: Vec<(usize, usize)> = Vec::with_capacity(ready.len());
+    for p in &ready {
+        let start = flat.len();
+        flat.extend(p.texts.iter().map(|s| s.as_str()));
+        ranges.push((start, p.texts.len()));
+    }
+
+    let results = match provider.embed_batch(&flat).await {
         Ok(v) => v,
         Err(err) => {
-            warn!(error = %err, batch = ready.len(), "embedding worker whole-batch failure; rescheduling each");
+            warn!(error = %err, batch = flat.len(), "embedding worker whole-batch failure; rescheduling each");
             for p in &ready {
                 record_failure(store, &p.job, settings, &err.to_string()).await?;
             }
             return Ok(());
         }
     };
-    if results.len() != ready.len() {
+    if results.len() != flat.len() {
         // Defensive: trait contract says "same length"; if a provider
         // breaks it, treat as whole-batch failure to avoid index
         // misalignment.
         warn!(
-            expected = ready.len(),
+            expected = flat.len(),
             got = results.len(),
             "embedding provider returned wrong batch length"
         );
@@ -93,15 +103,24 @@ pub async fn tick(
         return Ok(());
     }
 
-    // Post-embed phase.
-    for (p, result) in ready.into_iter().zip(results) {
-        match result {
-            Ok(embedding) => {
-                post_embed(store, &p.job, &embedding, provider, settings).await?;
+    // Post-embed phase. Regroup results per job; a job succeeds only if
+    // every one of its chunks embedded (any chunk error reschedules the
+    // whole job, so a capsule never persists a partial chunk set).
+    for (p, (start, len)) in ready.iter().zip(ranges) {
+        let mut vectors: Vec<Vec<f32>> = Vec::with_capacity(len);
+        let mut chunk_err: Option<String> = None;
+        for result in &results[start..start + len] {
+            match result {
+                Ok(embedding) => vectors.push(embedding.clone()),
+                Err(err) => {
+                    chunk_err = Some(err.to_string());
+                    break;
+                }
             }
-            Err(err) => {
-                record_failure(store, &p.job, settings, &err.to_string()).await?;
-            }
+        }
+        match chunk_err {
+            Some(err) => record_failure(store, &p.job, settings, &err).await?,
+            None => post_embed(store, &p.job, &vectors, provider, settings).await?,
         }
     }
     Ok(())
@@ -109,16 +128,17 @@ pub async fn tick(
 
 struct PendingEmbed {
     job: crate::storage::ClaimedEmbeddingJob,
-    text: String,
+    texts: Vec<String>,
 }
 
-/// Per-job pre-embed validation. Returns the embed-input text on
-/// success; `None` if the job was resolved inline.
+/// Per-job pre-embed validation. Returns the per-chunk embed inputs on
+/// success (one element for short content, several for long — see
+/// `embed_input_chunks`); `None` if the job was resolved inline.
 async fn pre_embed(
     store: &dyn Backend,
     job: &crate::storage::ClaimedEmbeddingJob,
     settings: &EmbeddingSettings,
-) -> Result<Option<String>, StorageError> {
+) -> Result<Option<Vec<String>>, StorageError> {
     if job.provider != settings.job_provider_id() {
         let now = current_timestamp();
         store
@@ -154,32 +174,35 @@ async fn pre_embed(
         return Ok(None);
     }
 
-    Ok(Some(format!("{}\n{}", memory.summary, memory.content)))
+    Ok(Some(embed_input_chunks(&memory.summary, &memory.content)))
 }
 
-/// Per-job post-embed finalization: dim check, re-fetch memory,
-/// upsert embedding row (lance handles vector indexing internally —
-/// no separate sidecar to update), complete the job.
+/// Per-job post-embed finalization: dim-check every chunk vector,
+/// re-fetch memory, upsert N embedding rows (one per chunk — lance
+/// handles vector indexing internally, no separate sidecar), complete
+/// the job. `embeddings` holds one vector per chunk from `pre_embed`.
 async fn post_embed(
     store: &dyn Backend,
     job: &crate::storage::ClaimedEmbeddingJob,
-    embedding: &[f32],
+    embeddings: &[Vec<f32>],
     provider: &dyn EmbeddingProvider,
     settings: &EmbeddingSettings,
 ) -> Result<(), StorageError> {
-    if embedding.len() != provider.dim() {
-        record_failure(
-            store,
-            job,
-            settings,
-            &format!(
-                "provider returned length {} (expected {})",
-                embedding.len(),
-                provider.dim()
-            ),
-        )
-        .await?;
-        return Ok(());
+    for embedding in embeddings {
+        if embedding.len() != provider.dim() {
+            record_failure(
+                store,
+                job,
+                settings,
+                &format!(
+                    "provider returned length {} (expected {})",
+                    embedding.len(),
+                    provider.dim()
+                ),
+            )
+            .await?;
+            return Ok(());
+        }
     }
 
     let Some(memory_after) = store
@@ -213,15 +236,14 @@ async fn post_embed(
         return Ok(());
     }
 
-    let blob = encode_f32_blob(embedding);
     let now = current_timestamp();
     store
-        .upsert_capability_capsule_embedding(
+        .upsert_capability_capsule_embedding_chunks(
             &job.capability_capsule_id,
             &job.tenant,
             provider.model(),
             provider.dim() as i64,
-            &blob,
+            embeddings,
             &job.target_content_hash,
             &memory_after.updated_at,
             &now,
@@ -270,4 +292,61 @@ async fn record_failure(
             .await?;
     }
     Ok(())
+}
+
+/// Build the per-chunk embed inputs for a capsule. Joins `summary` and
+/// `content` (the historical whole-capsule embed input) then splits the
+/// result into overlapping token windows (③) so a long capsule's tail is
+/// embedded instead of silently truncated by the embedder's context
+/// window. Short content yields exactly one chunk equal to the original
+/// `"{summary}\n{content}"` string, so the common case is byte-for-byte
+/// unchanged (one embedding row, today's behaviour).
+fn embed_input_chunks(summary: &str, content: &str) -> Vec<String> {
+    let combined = format!("{summary}\n{content}");
+    crate::pipeline::chunk::chunk_text(
+        &combined,
+        crate::pipeline::chunk::DEFAULT_CHUNK_TOKENS,
+        crate::pipeline::chunk::DEFAULT_CHUNK_OVERLAP,
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn short_capsule_is_single_chunk_equal_to_joined_input() {
+        // The common case must be byte-for-byte unchanged: one chunk
+        // equal to today's `"{summary}\n{content}"` embed input, so
+        // existing single-row capsules embed exactly as before.
+        let summary = "rust lance ANN ranking";
+        let content = "mem fuses BM25 and vector search with RRF in DuckDB.";
+        let chunks = embed_input_chunks(summary, content);
+        assert_eq!(chunks.len(), 1, "short content must stay one chunk");
+        assert_eq!(chunks[0], format!("{summary}\n{content}"));
+    }
+
+    #[test]
+    fn long_capsule_splits_into_multiple_chunks_covering_head_and_tail() {
+        // A capsule whose content blows past one embedder window must
+        // split so the tail is embedded, not truncated. The bug ③ fixes:
+        // semantic recall silently lost everything past the first window.
+        let summary = "HEADMARKER summary line";
+        // Far more than DEFAULT_CHUNK_TOKENS (2000) tokens of content.
+        let content = format!("{} TAILMARKER", "lorem ipsum dolor sit amet ".repeat(2000));
+        let chunks = embed_input_chunks(summary, &content);
+        assert!(
+            chunks.len() > 1,
+            "long content must split into >1 chunk, got {}",
+            chunks.len()
+        );
+        assert!(
+            chunks[0].contains("HEADMARKER"),
+            "summary must lead the first chunk"
+        );
+        assert!(
+            chunks.last().unwrap().contains("TAILMARKER"),
+            "content tail must survive in the last chunk (not truncated)"
+        );
+    }
 }
