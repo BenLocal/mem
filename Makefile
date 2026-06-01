@@ -98,4 +98,4 @@ clean: ## cargo clean
 	$(CARGO) clean
 
 bench-recall: ## Run the capsule recall ablation bench
-	cargo test --test recall_bench -- --ignored --nocapture
+	$(CARGO) test --test recall_bench -- --ignored --nocapture

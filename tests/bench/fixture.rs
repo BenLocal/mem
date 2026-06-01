@@ -15,8 +15,12 @@ pub struct CapsuleFixture {
     pub tail_topic: Option<String>,
 }
 
-/// All fields are part of the runner API consumed by Tasks 3+; allow dead_code
-/// for the ones not yet used in this task's tests.
+/// All fields are part of the fixture's public shape; some are reserved for
+/// future use and not read by the current runner.
+///
+/// `expand_graph`: populated by the synthetic generator but not read by
+/// `runner.rs` (which controls `expand_graph` uniformly per rung); reserved
+/// for a future per-query graph-toggle override.
 #[allow(dead_code)]
 #[derive(Debug, Clone)]
 pub struct QueryFixture {
@@ -29,7 +33,9 @@ pub struct QueryFixture {
 
 /// (from_topic, to_topic, strength) co-occurrence edge; strengths vary across
 /// edges so the K9 dynamics rung reorders vs the flat boost.
-/// Fields consumed by the runner in Tasks 3+; allow dead_code for now.
+/// Fields are part of the fixture's public shape; `edges` is populated by the
+/// synthetic generator but currently unused in the runner (writing edges to
+/// the store is deferred to the v1.1 fixture redesign).
 #[allow(dead_code)]
 #[derive(Debug, Clone)]
 pub struct EdgeFixture {
@@ -38,7 +44,8 @@ pub struct EdgeFixture {
     pub strength: f32,
 }
 
-/// Fields consumed by the runner in Tasks 3+; allow dead_code for now.
+/// Fields are part of the fixture's public shape; some (e.g. `edges`) are
+/// reserved for the v1.1 fixture redesign and not yet consumed by the runner.
 #[allow(dead_code)]
 #[derive(Debug, Clone)]
 pub struct Fixture {

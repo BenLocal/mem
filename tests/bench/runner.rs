@@ -3,10 +3,21 @@
 //! public ranker (`rank_with_hybrid_and_graph`). Each rung reports the
 //! standard IR metrics averaged over the fixture's queries.
 //!
-//! Every rung is an *input variation* of the same real ranker — lexical /
-//! semantic / hybrid arms, graph expansion (K10) and edge dynamics (K9)
-//! toggles, the chunking-on/off embedding contrast (③), and an achievable-
-//! ceiling Oracle. No rung forks into a parallel ranking implementation.
+//! Every **non-Oracle** rung is a pure input variation of the same real ranker
+//! — lexical / semantic / hybrid arms, graph expansion (K10) and edge dynamics
+//! (K9) toggles, and the chunking-on/off embedding contrast (③). The Oracle
+//! rung re-orders the candidate union by qrels to give the achievable ceiling;
+//! it does not call `rank_with_hybrid_and_graph`.
+//!
+//! **Why Graph (K10) and Dynamics (K9) show Δ≈0 vs Hybrid on the v1 fixture:**
+//! Every capsule is ingested with the same `project`/`repo` ("bench"), so all
+//! capsules are 1-hop from the same `project`/`repo` entity and graph expansion
+//! applies a near-uniform boost that preserves relative ordering — hence K10
+//! and K9 show Δ≈0 vs Hybrid. The rungs still execute the real
+//! `compute_graph_boosts` / edge-dynamics code path; demonstrating a non-zero
+//! K9/K10 delta needs a fixture with graph-bridge capsules that are relevant
+//! ONLY via graph reachability (no lexical/semantic match) plus strength-bearing
+//! edges — deferred to a v1.1 fixture redesign.
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
@@ -215,7 +226,7 @@ fn translate_qrels(
 /// Run a single ablation rung over the ingested fixture and return its
 /// query-averaged metrics.
 ///
-/// Each rung drives the *real* ranker as an input variation — no
+/// Each non-Oracle rung drives the *real* ranker as an input variation — no
 /// entity-id plumbing, no separate code path:
 /// - `LexicalOnly`: BM25 only (empty query vector ⇒ no vector arm).
 /// - `SemanticOnly`: vector only (empty query text ⇒ no BM25 arm).

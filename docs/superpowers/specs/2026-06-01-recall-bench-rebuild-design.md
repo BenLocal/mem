@@ -86,3 +86,7 @@ Fully offline and reproducible: `GeometryProvider` is pure, fixed seed, fresh te
 
 ## 8. Out of scope → future rungs
 Transcript-path ablation (add a transcript loader + a `semantic_search_transcripts`/`bm25_transcript_candidates` rung), real-embedder fixture set (swap `GeometryProvider` for `embedanything`), LongMemEval parity, LLM judgment. `fixture`/`runner` interfaces stay generic (Fixture + Rung) so these slot in without restructuring.
+
+## 9. Known limitation (v1)
+
+On the v1 designed-geometry fixture, the Graph (K10) and Dynamics (K9) rungs show Δ≈0 vs Hybrid because every capsule shares the same `project`/`repo` entity (uniform 1-hop boost) and topic-entity links only reinforce already-top capsules. The rungs execute the real K9/K10 code paths, but discriminating these features requires a v1.1 fixture with graph-bridge capsules relevant only via graph reachability + strength-bearing co-occurrence edges. The ③ chunking and Oracle rungs are fully discriminating in v1.

@@ -10,7 +10,8 @@ use bench::synthetic::{generate, SyntheticConfig};
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "ablation bench — run with --ignored"]
 async fn recall_ablation() {
-    let f = generate(&SyntheticConfig::default());
+    let cfg = SyntheticConfig::default();
+    let f = generate(&cfg);
     let rungs = [
         Rung::LexicalOnly,
         Rung::SemanticOnly,
@@ -25,5 +26,9 @@ async fn recall_ablation() {
     println!("\n{}", pretty_table(&report));
     let dir = std::path::Path::new("target/recall_bench");
     std::fs::create_dir_all(dir).unwrap();
-    write_json(&report, &dir.join(format!("{}.json", f.tenant))).unwrap();
+    write_json(
+        &report,
+        &dir.join(format!("{}-seed{}.json", f.tenant, cfg.seed)),
+    )
+    .unwrap();
 }

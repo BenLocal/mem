@@ -107,7 +107,6 @@ pub fn generate(cfg: &SyntheticConfig) -> Fixture {
     }
 
     // ── Long capsules & tail-targeted queries ─────────────────────────────────
-    let long_base_n = (cfg.num_topics * cfg.capsules_per_topic) as u64;
     for i in 0..cfg.num_long {
         let head_topic = &topics[i % cfg.num_topics];
         let tail_topic = &topics[(i + 1) % cfg.num_topics];
@@ -136,8 +135,6 @@ pub fn generate(cfg: &SyntheticConfig) -> Fixture {
         let mut tail_rel: HashSet<String> = HashSet::new();
         tail_rel.insert(id);
         qrels.insert(q_id, tail_rel);
-
-        let _ = long_base_n + i as u64; // keep n in scope for potential future use
     }
 
     // ── Co-occurrence edges ────────────────────────────────────────────────────
