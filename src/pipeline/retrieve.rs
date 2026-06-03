@@ -31,6 +31,29 @@ fn min_relevance_score() -> i64 {
         .unwrap_or(DEFAULT_MIN_RELEVANCE_SCORE)
 }
 
+/// Resolve the relevance floor for a request: an explicit per-request
+/// `min_score` wins; otherwise fall back to the process-wide
+/// `MEM_MIN_SCORE` / default. Keeps the override decision in one place.
+fn effective_floor(query: &SearchCapabilityCapsuleRequest) -> i64 {
+    query.min_score.unwrap_or_else(min_relevance_score)
+}
+
+/// Does `memory` satisfy the given scope filters? Uses the same
+/// `kind:value` grammar as search ranking (`repo:`, `project:`,
+/// `module:`, `scope:`, bare `tag`). Empty filters → always true (no
+/// scoping requested). Public so the wake-up path can float in-scope
+/// capsules to the front of the recent slice.
+pub fn matches_scope_filters(memory: &CapabilityCapsuleRecord, filters: &[String]) -> bool {
+    if filters.is_empty() {
+        return true;
+    }
+    parse_scope_filters(filters).iter().any(|(kind, values)| {
+        values
+            .iter()
+            .any(|value| scope_matches(memory, kind, value))
+    })
+}
+
 /// Filters scored candidates by the relevance floor and strips scores.
 /// Used at every user-visible exit point so empty results bubble up to
 /// `compress`, which renders them as empty sections.
@@ -40,8 +63,7 @@ fn min_relevance_score() -> i64 {
 /// background guidance / procedural defaults that should surface regardless
 /// of textual match with the current query. The relevance floor only gates
 /// the relevance-driven sections (Facts, Patterns).
-fn finalize(scored: Vec<ScoredMemory>) -> Vec<CapabilityCapsuleRecord> {
-    let floor = min_relevance_score();
+fn finalize(scored: Vec<ScoredMemory>, floor: i64) -> Vec<CapabilityCapsuleRecord> {
     scored
         .into_iter()
         .filter(|entry| {
@@ -93,14 +115,13 @@ pub async fn rank_with_hybrid_and_graph(
     }
     let candidates: Vec<CapabilityCapsuleRecord> = by_id.into_values().collect();
 
+    let floor = effective_floor(query);
     let empty_boosts: HashMap<String, i64> = HashMap::new();
     if !query.expand_graph {
-        return Ok(finalize(score_with_hybrid(
-            candidates,
-            query,
-            &hybrid_scores,
-            &empty_boosts,
-        )));
+        return Ok(finalize(
+            score_with_hybrid(candidates, query, &hybrid_scores, &empty_boosts),
+            floor,
+        ));
     }
 
     // Graph anchor derivation uses unfiltered top-N (floor is for the
@@ -109,16 +130,14 @@ pub async fn rank_with_hybrid_and_graph(
         score_with_hybrid(candidates.clone(), query, &hybrid_scores, &empty_boosts);
     let anchors = graph_anchor_nodes(&preliminary_scored);
     if anchors.is_empty() {
-        return Ok(finalize(preliminary_scored));
+        return Ok(finalize(preliminary_scored, floor));
     }
 
     let boost_by_id = compute_graph_boosts(graph, &anchors, dynamics).await?;
-    Ok(finalize(score_with_hybrid(
-        candidates,
-        query,
-        &hybrid_scores,
-        &boost_by_id,
-    )))
+    Ok(finalize(
+        score_with_hybrid(candidates, query, &hybrid_scores, &boost_by_id),
+        floor,
+    ))
 }
 
 /// K9 context for edge-dynamics-aware graph ranking, threaded in by the
@@ -592,6 +611,7 @@ mod tests {
             caller_agent: String::new(),
             expand_graph: false,
             tenant: None,
+            min_score: None,
         }
     }
 
@@ -612,6 +632,75 @@ mod tests {
         let lex = lex_rank.map(|r| 1.0 / (60.0 + r as f32)).unwrap_or(0.0);
         let sem = sem_rank.map(|r| 1.0 / (60.0 + r as f32)).unwrap_or(0.0);
         lex + sem
+    }
+
+    #[test]
+    fn effective_floor_prefers_request_min_score() {
+        let mut query = fixture_query();
+        query.min_score = Some(77);
+        assert_eq!(effective_floor(&query), 77);
+        // None delegates to the process-wide default / MEM_MIN_SCORE.
+        query.min_score = None;
+        assert_eq!(effective_floor(&query), min_relevance_score());
+    }
+
+    #[test]
+    fn finalize_filters_relevance_types_by_floor() {
+        let mut low = fixture_memory("low");
+        low.capability_capsule_type = CapabilityCapsuleType::Implementation;
+        let mut high = fixture_memory("high");
+        high.capability_capsule_type = CapabilityCapsuleType::Implementation;
+        let scored = vec![
+            ScoredMemory {
+                memory: low,
+                score: 30,
+            },
+            ScoredMemory {
+                memory: high,
+                score: 50,
+            },
+        ];
+        // A higher per-request floor (40) drops the 30-scorer.
+        let kept = finalize(scored, 40);
+        assert_eq!(kept.len(), 1);
+        assert_eq!(kept[0].capability_capsule_id, "high");
+    }
+
+    #[test]
+    fn finalize_exempts_preference_and_workflow() {
+        let mut pref = fixture_memory("pref");
+        pref.capability_capsule_type = CapabilityCapsuleType::Preference;
+        let mut wf = fixture_memory("wf");
+        wf.capability_capsule_type = CapabilityCapsuleType::Workflow;
+        let scored = vec![
+            ScoredMemory {
+                memory: pref,
+                score: 0,
+            },
+            ScoredMemory {
+                memory: wf,
+                score: 0,
+            },
+        ];
+        // Always-applicable types survive even a floor far above their score.
+        let kept = finalize(scored, 999);
+        assert_eq!(kept.len(), 2);
+    }
+
+    #[test]
+    fn matches_scope_filters_repo_project_any() {
+        let mut m = fixture_memory("m");
+        m.repo = Some("mem".into());
+        m.project = Some("mem".into());
+        assert!(matches_scope_filters(&m, &[])); // no scoping → always in
+        assert!(matches_scope_filters(&m, &["repo:mem".to_string()]));
+        assert!(matches_scope_filters(&m, &["project:mem".to_string()]));
+        assert!(!matches_scope_filters(&m, &["repo:other".to_string()]));
+        // Any-match across multiple filters.
+        assert!(matches_scope_filters(
+            &m,
+            &["repo:other".to_string(), "project:mem".to_string()]
+        ));
     }
 
     #[test]

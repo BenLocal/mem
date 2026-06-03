@@ -31,6 +31,15 @@ pub struct WakeUpArgs {
     /// touching `jq`.
     #[arg(long, value_enum, default_value_t = WakeUpFormat::Plain)]
     pub format: WakeUpFormat,
+
+    /// Scope filter(s) in `kind:value` form (`repo:mem`, `project:mem`,
+    /// `module:…`, `scope:repo`, or a bare `tag`). Repeatable. When set,
+    /// the wake-up path floats matching capsules to the front of the
+    /// recent slice so SessionStart context is about the current repo
+    /// rather than whatever was globally freshest. Empty (default) keeps
+    /// the legacy tenant-wide recency behavior.
+    #[arg(long = "scope")]
+    pub scope: Vec<String>,
 }
 
 /// Build the SessionStart hook envelope. Public so other CLI flows
@@ -84,7 +93,7 @@ async fn build_body(args: &WakeUpArgs) -> Result<String> {
         "tenant": args.remote.tenant,
         "query": "",
         "intent": "wake_up",
-        "scope_filters": [],
+        "scope_filters": args.scope,
         "token_budget": args.token_budget,
         "caller_agent": "claude-code",
         "expand_graph": false,

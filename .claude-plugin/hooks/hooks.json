@@ -7,6 +7,13 @@
         ]
       }
     ],
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          { "type": "command", "command": "bash ${CLAUDE_PLUGIN_ROOT}/hooks/claude_code_user_prompt_submit.sh" }
+        ]
+      }
+    ],
     "PreCompact": [
       {
         "hooks": [
@@ -25,7 +32,8 @@
       {
         "matcher": "Bash",
         "hooks": [
-          { "type": "command", "command": "bash ${CLAUDE_PLUGIN_ROOT}/hooks/claude_code_post_tool_use.sh" }
+          { "type": "command", "command": "bash ${CLAUDE_PLUGIN_ROOT}/hooks/claude_code_post_tool_use.sh" },
+          { "type": "command", "command": "bash ${CLAUDE_PLUGIN_ROOT}/hooks/claude_code_post_tool_use_error.sh" }
         ]
       }
     ]

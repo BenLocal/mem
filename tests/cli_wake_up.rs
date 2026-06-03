@@ -8,6 +8,7 @@ async fn test_wake_up_format() {
         },
         token_budget: 800,
         format: mem::cli::wake_up::WakeUpFormat::Plain,
+        scope: vec![],
     })
     .await;
 

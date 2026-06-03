@@ -142,6 +142,7 @@ async fn hybrid_search_surfaces_semantic_match_without_lexical_overlap() {
             caller_agent: "test".into(),
             expand_graph: false,
             tenant: Some("t1".into()),
+            min_score: None,
         })
         .await
         .unwrap();

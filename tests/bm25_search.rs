@@ -74,6 +74,7 @@ async fn bm25_ranks_textual_match_to_top() {
             caller_agent: "test".into(),
             expand_graph: false,
             tenant: Some("t1".into()),
+            min_score: None,
         })
         .await
         .unwrap();
@@ -135,6 +136,7 @@ async fn unrelated_query_returns_empty_sections() {
             caller_agent: "test".into(),
             expand_graph: false,
             tenant: Some("t1".into()),
+            min_score: None,
         })
         .await
         .unwrap();

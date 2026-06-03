@@ -1232,11 +1232,32 @@ impl CapabilityCapsuleService {
                 (query.token_budget, 0)
             };
 
-            let candidates = self
-                .store
-                .recent_active_capability_capsules(tenant, WAKE_UP_LIMIT)
-                .await
-                .map_err(ServiceError::Storage)?;
+            let candidates = if query.scope_filters.is_empty() {
+                self.store
+                    .recent_active_capability_capsules(tenant, WAKE_UP_LIMIT)
+                    .await
+                    .map_err(ServiceError::Storage)?
+            } else {
+                // Repo-scoped wake-up: the SessionStart hook passes
+                // `repo:<dir>` / `project:<dir>` so the boot context is
+                // about THIS project, not whatever was globally freshest.
+                // Fetch a wider recent slice, float in-scope capsules to
+                // the front, then truncate — backfilling with recent
+                // global rows so a brand-new repo still gets useful seed
+                // context instead of an empty block.
+                let widened = (WAKE_UP_LIMIT * 4).min(512);
+                let recent = self
+                    .store
+                    .recent_active_capability_capsules(tenant, widened)
+                    .await
+                    .map_err(ServiceError::Storage)?;
+                let (mut in_scope, rest): (Vec<_>, Vec<_>) = recent.into_iter().partition(|c| {
+                    crate::pipeline::retrieve::matches_scope_filters(c, &query.scope_filters)
+                });
+                in_scope.extend(rest);
+                in_scope.truncate(WAKE_UP_LIMIT);
+                in_scope
+            };
             let mut response = compress::compress(&candidates, capsule_budget);
 
             if let Some(transcripts) = self.transcript_service.as_ref() {

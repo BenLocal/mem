@@ -17,6 +17,12 @@ pub struct SearchCapabilityCapsuleRequest {
     pub expand_graph: bool,
     #[serde(skip_serializing_if = "skip_none")]
     pub tenant: Option<String>,
+    /// Per-request relevance floor for the Facts / Patterns sections.
+    /// `None` falls back to the process-wide `MEM_MIN_SCORE` (default 25).
+    /// Lets a noisy auto-recall caller (e.g. the UserPromptSubmit hook)
+    /// raise the bar without globally starving explicit searches.
+    #[serde(default, skip_serializing_if = "skip_none")]
+    pub min_score: Option<i64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

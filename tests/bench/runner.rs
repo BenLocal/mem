@@ -338,6 +338,7 @@ async fn run_rung(ing: &IngestedFixture, f: &Fixture, rung: Rung) -> RungReport 
                 caller_agent: "bench".into(),
                 expand_graph,
                 tenant: Some(ing.tenant.clone()),
+                min_score: None,
             };
             let graph: &dyn GraphStore = ing.store.as_ref();
             let ranked = rank_with_hybrid_and_graph(pool, hybrid_hits, &request, graph, dynamics)
