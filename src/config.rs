@@ -458,16 +458,21 @@ impl EmbeddingSettings {
 }
 
 impl AutoPromoteSettings {
-    /// Development / test defaults: feature ON, 7-day idle threshold,
+    /// Development / test defaults: feature ON, 3-day idle threshold,
     /// hourly cadence, default type allowlist (Experience /
     /// Implementation / Episode / Diary — Preference + Workflow
     /// excluded because they're durable commitments that warrant a
     /// human read), decay threshold 0.5. Opt OUT via
     /// `MEM_AUTO_PROMOTE_DISABLED=1`.
+    ///
+    /// `age_days` was 7 until 2026-06-04; lowered to 3 so the
+    /// PendingConfirmation backlog (which the always-on `propose` path
+    /// floods) drains in days, not a week. The decay-threshold + type
+    /// allowlist guardrails still gate what promotes.
     pub fn development_defaults() -> Self {
         Self {
             enabled: true,
-            age_days: 7,
+            age_days: 3,
             interval_secs: 3600,
             types: vec![
                 CapabilityCapsuleType::Experience,
@@ -978,7 +983,7 @@ mod tests {
         // Worker ON by default — the MCP propose path floods
         // PendingConfirmation, so the sweep needs to keep up.
         assert!(s.enabled);
-        assert_eq!(s.age_days, 7);
+        assert_eq!(s.age_days, 3);
         assert_eq!(s.interval_secs, 3600);
         assert_eq!(s.decay_threshold, 0.5);
         assert_eq!(
