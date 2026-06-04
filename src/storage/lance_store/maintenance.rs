@@ -11,6 +11,7 @@
 //! `crate::worker::vacuum_worker` and exposed on-demand via
 //! `POST /admin/vacuum`.
 
+use lancedb::index::scalar::BTreeIndexBuilder;
 use lancedb::index::vector::IvfPqIndexBuilder;
 use lancedb::index::Index;
 use lancedb::table::{CompactionOptions, Duration, OptimizeAction, OptimizeStats};
@@ -43,17 +44,44 @@ pub struct VacuumStats {
     pub fragments_added: u64,
 }
 
-/// Embedding tables that benefit from an ANN index, with their vector
-/// column. `lance_vector_search` does a brute-force flat scan when the
-/// column has no ANN index; on `conversation_message_embeddings` (118MB,
-/// ~28k×1024-dim) that made transcript search 5–11s vs 0.6s for the tiny
-/// capsule table. Lance does NOT auto-build ANN indexes (the comment in
-/// `mod.rs` claiming so was wrong; the usearch sidecar that used to
-/// maintain one was removed in QW-4 and never replaced) — this is that
-/// replacement.
-const VECTOR_INDEX_TABLES: &[(&str, &str)] = &[
-    ("conversation_message_embeddings", "embedding"),
-    ("capability_capsule_embeddings", "embedding"),
+/// Index type to build for a managed column.
+#[derive(Debug, Clone, Copy)]
+enum IndexKind {
+    /// IVF_PQ ANN index on a vector column (semantic search). Without it
+    /// `lance_vector_search` brute-force flat-scans the column.
+    Vector,
+    /// BTree scalar index on a high-cardinality column. Without it,
+    /// equality / JOIN predicates on the column flat-scan the table.
+    Scalar,
+}
+
+/// Every index `ensure_query_indexes` keeps current, as `(table, column,
+/// kind)`. Lance does NOT auto-build these (the `mod.rs` comment claiming
+/// "ANN is auto-maintained" was wrong; the usearch sidecar that used to
+/// maintain the vector index was removed in QW-4 and never replaced).
+/// - The two `embedding` ANN indexes: `lance_vector_search` over an
+///   unindexed `conversation_message_embeddings` (118MB, ~28k×1024-dim)
+///   made transcript search 5–11s vs 0.6s for the tiny capsule table.
+/// - `conversation_messages.message_block_id` scalar index: the transcript
+///   semantic query JOINs the ANN hits back to `conversation_messages` on
+///   `message_block_id`, and `fetch_conversation_messages_by_ids` filters
+///   by it — both flat-scan the 106MB table without an index.
+const MANAGED_INDEXES: &[(&str, &str, IndexKind)] = &[
+    (
+        "conversation_message_embeddings",
+        "embedding",
+        IndexKind::Vector,
+    ),
+    (
+        "capability_capsule_embeddings",
+        "embedding",
+        IndexKind::Vector,
+    ),
+    (
+        "conversation_messages",
+        "message_block_id",
+        IndexKind::Scalar,
+    ),
 ];
 
 /// Below this row count a brute-force flat scan is already sub-second, so
@@ -66,7 +94,7 @@ const MIN_ROWS_TO_INDEX: usize = 5_000;
 /// rebuild so the whole table is covered again.
 const REINDEX_DELTA_THRESHOLD: usize = 4_096;
 
-/// What [`LanceStore::ensure_vector_indexes`] should do for one table,
+/// What [`LanceStore::ensure_query_indexes`] should do for one table,
 /// factored out as a pure decision so it can be unit-tested without a
 /// live Lance dataset.
 #[derive(Debug, PartialEq, Eq)]
@@ -89,9 +117,9 @@ fn decide_index_action(row_count: usize, unindexed: Option<usize>) -> IndexActio
     }
 }
 
-/// Outcome of one [`LanceStore::ensure_vector_indexes`] pass.
+/// Outcome of one [`LanceStore::ensure_query_indexes`] pass.
 #[derive(Debug, Default, Clone, serde::Serialize)]
-pub struct VectorIndexStats {
+pub struct IndexMaintenanceStats {
     pub indexes_built: u64,
     pub indexes_rebuilt: u64,
     pub tables_skipped: u64,
@@ -208,8 +236,8 @@ impl LanceStore {
         Ok(agg)
     }
 
-    /// Ensure each embedding table has an up-to-date ANN index on its
-    /// vector column. Builds the index on first run; rebuilds once the
+    /// Ensure every [`MANAGED_INDEXES`] entry (vector ANN + scalar BTree)
+    /// is up to date. Builds the index on first run; rebuilds once the
     /// unindexed delta grows past [`REINDEX_DELTA_THRESHOLD`]. Idempotent
     /// and read-safe with concurrent queries (Lance datasets are MVCC):
     /// readers keep using the prior version until the new index commits.
@@ -220,9 +248,9 @@ impl LanceStore {
     /// this off the request path (the vacuum worker). lancedb-created
     /// indexes ARE visible to the DuckDB lance extension's
     /// `lance_vector_search` — same as `ensure_fts_index` / `lance_fts`.
-    pub async fn ensure_vector_indexes(&self) -> Result<VectorIndexStats, StorageError> {
-        let mut agg = VectorIndexStats::default();
-        for (table_name, column) in VECTOR_INDEX_TABLES {
+    pub async fn ensure_query_indexes(&self) -> Result<IndexMaintenanceStats, StorageError> {
+        let mut agg = IndexMaintenanceStats::default();
+        for (table_name, column, kind) in MANAGED_INDEXES {
             let table = match self.conn.open_table(*table_name).execute().await {
                 Ok(t) => t,
                 Err(lancedb::Error::TableNotFound { .. }) => {
@@ -232,8 +260,8 @@ impl LanceStore {
                 Err(e) => return Err(lancedb_err(e)),
             };
             let row_count = table.count_rows(None).await.map_err(lancedb_err)?;
-            // Find an existing index on the vector column and read its
-            // unindexed-row delta (rows appended since the last build).
+            // Find an existing index on the column and read its unindexed-row
+            // delta (rows appended since the last build).
             let indices = table.list_indices().await.map_err(lancedb_err)?;
             let existing = indices
                 .iter()
@@ -255,11 +283,15 @@ impl LanceStore {
                 continue;
             }
             // `replace(true)` creates when absent and overwrites when
-            // rebuilding. IvfPqIndexBuilder::default() leaves
-            // num_partitions / num_sub_vectors unset so Lance derives
-            // safe values from the row count + vector dim.
+            // rebuilding. The builders' defaults leave their tuning unset
+            // so Lance derives safe values (IVF partitions / sub-vectors
+            // from row count + dim; BTree needs no tuning).
+            let index = match kind {
+                IndexKind::Vector => Index::IvfPq(IvfPqIndexBuilder::default()),
+                IndexKind::Scalar => Index::BTree(BTreeIndexBuilder::default()),
+            };
             table
-                .create_index(&[*column], Index::IvfPq(IvfPqIndexBuilder::default()))
+                .create_index(&[*column], index)
                 .replace(true)
                 .execute()
                 .await

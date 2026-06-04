@@ -18,7 +18,7 @@
 use async_trait::async_trait;
 
 use crate::domain::capability_capsule::{CapabilityCapsuleRecord, CapabilityCapsuleType};
-use crate::storage::lance_store::{VacuumStats, VectorIndexStats};
+use crate::storage::lance_store::{IndexMaintenanceStats, VacuumStats};
 use crate::storage::types::StorageError;
 use crate::storage::Store;
 
@@ -61,8 +61,8 @@ pub trait MaintenanceStore: Send + Sync {
     /// (the transcript-search 5–11s root cause). Lance-specific; the
     /// default is a zero-stats no-op so non-Lance backends compile
     /// unchanged. Driven on a cadence by `crate::worker::vacuum_worker`.
-    async fn ensure_vector_indexes(&self) -> Result<VectorIndexStats, StorageError> {
-        Ok(VectorIndexStats::default())
+    async fn ensure_query_indexes(&self) -> Result<IndexMaintenanceStats, StorageError> {
+        Ok(IndexMaintenanceStats::default())
     }
 
     /// Capsules eligible for auto-promote: `status=pending`,
@@ -105,10 +105,10 @@ impl MaintenanceStore for Store {
         .await
     }
 
-    async fn ensure_vector_indexes(&self) -> Result<VectorIndexStats, StorageError> {
+    async fn ensure_query_indexes(&self) -> Result<IndexMaintenanceStats, StorageError> {
         // commit_lance_write marks the DuckDB snapshot dirty so the next
         // read refreshes and `lance_vector_search` picks up the new index.
-        self.commit_lance_write(self.lance.ensure_vector_indexes().await)
+        self.commit_lance_write(self.lance.ensure_query_indexes().await)
             .await
     }
 

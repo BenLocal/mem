@@ -65,7 +65,7 @@ pub(crate) mod mine_cursors;
 mod sessions;
 mod transcripts;
 
-pub use maintenance::{VacuumStats, VectorIndexStats};
+pub use maintenance::{IndexMaintenanceStats, VacuumStats};
 
 use crate::domain::capability_capsule::{CapabilityCapsuleRecord, GraphEdge};
 use crate::domain::Entity;
