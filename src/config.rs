@@ -127,18 +127,21 @@ pub struct VacuumSettings {
     pub interval_secs: u64,
     /// Minimum age of a Lance manifest before it qualifies for
     /// pruning. Default 0 — vacuum every manifest that LanceDB's
-    /// pruner deems removable. Combined with [`Self::aggressive`]
-    /// (true by default), this clears every old version including
-    /// the last 7 days.
+    /// pruner deems removable. With the default non-aggressive
+    /// [`Self::aggressive`], Lance still keeps the in-flight-window
+    /// manifests its commit path needs; only verified-unreferenced
+    /// versions are removed.
     pub older_than_days: u64,
     /// When true, vacuum calls `Prune` with `delete_unverified=true`,
-    /// bypassing Lance's hard 7-day floor for in-flight transactions.
-    /// Default true — mem is single-writer (one `mem serve` per DB
-    /// path), so the floor that protects multi-writer crash recovery
-    /// is over-conservative for the local-first deployment shape.
-    /// Set `MEM_VACUUM_PRESERVE_UNVERIFIED=1` to opt OUT and restore
-    /// the 7-day floor (useful when running mem on top of a shared
-    /// lance dataset that another writer touches concurrently).
+    /// bypassing Lance's floor for in-flight transactions. **Default
+    /// false** since 2026-06-04 — bypassing the floor deletes manifests
+    /// the in-flight commit path still references, and lance 3.0.1's
+    /// `conflict_resolver` `.unwrap()`s the resulting `NotFound`,
+    /// core-dumping the whole serve. `mem serve` is NOT single-writer
+    /// (embedding worker, auto-promote, request handlers, vacuum all
+    /// write concurrently), so the floor must stay. Opt back in with
+    /// `MEM_VACUUM_AGGRESSIVE=1` only when nothing writes the lance dir
+    /// concurrently.
     pub aggressive: bool,
 }
 
@@ -563,18 +566,27 @@ impl AutoPromoteSettings {
 
 impl VacuumSettings {
     /// Development / test defaults: worker ON, **hourly** cadence,
-    /// **aggressive** prune (0-day cutoff + `delete_unverified=true`).
-    /// These defaults assume the single-writer local-first
-    /// deployment shape — one `mem serve` per DB path, no other
-    /// process touching the lance dir. For shared deployments set
-    /// `MEM_VACUUM_PRESERVE_UNVERIFIED=1` to restore the 7-day
-    /// in-flight safety floor.
+    /// 0-day cutoff, prune **non-aggressively** (keep Lance's in-flight
+    /// safety floor).
+    ///
+    /// `aggressive` was `true` until 2026-06-04, on a "single-writer
+    /// local-first" assumption. That assumption was WRONG: one `mem serve`
+    /// runs many CONCURRENT writer tasks (embedding worker, transcript
+    /// embedding worker, auto-promote sweep, request handlers, the vacuum
+    /// worker itself). Aggressive prune (`delete_unverified=true`) deletes
+    /// manifests the in-flight commit path still needs, and lance 3.0.1's
+    /// `conflict_resolver` does `.unwrap()` on the resulting `NotFound` →
+    /// the whole serve panics + core-dumps. Observed crash:
+    /// `DatasetNotFound .../capability_capsules.lance/_versions/1768.manifest`.
+    /// Non-aggressive prune still reclaims the bulk of old manifests; it
+    /// just keeps the recent (in-flight-window) ones. Opt back into the
+    /// risky behavior with `MEM_VACUUM_AGGRESSIVE=1`.
     pub fn development_defaults() -> Self {
         Self {
             disabled: false,
             interval_secs: 3_600,
             older_than_days: 0,
-            aggressive: true,
+            aggressive: false,
         }
     }
 
@@ -605,11 +617,19 @@ impl VacuumSettings {
             s.older_than_days = n;
         }
 
-        // Opt-OUT of aggressive prune by setting
-        // MEM_VACUUM_PRESERVE_UNVERIFIED=1 (or true/yes). Default
-        // aggressive=true assumes single-writer local-first; shared
-        // / multi-writer deployments should opt out to keep the
-        // 7-day in-flight safety floor.
+        // Default is non-aggressive (keep Lance's in-flight floor) — the
+        // safe behavior after the conflict_resolver crash. `MEM_VACUUM_AGGRESSIVE=1`
+        // opts BACK IN to `delete_unverified=true` (bypass the floor). Only
+        // safe when truly nothing writes the lance dir concurrently — which
+        // a normal `mem serve` is NOT (it has several concurrent writer
+        // tasks). The legacy `MEM_VACUUM_PRESERVE_UNVERIFIED=1` is still
+        // honored (now redundant: it forces the new default) and wins over
+        // `MEM_VACUUM_AGGRESSIVE` so an explicit "stay safe" always holds.
+        if let Some(raw) = get("MEM_VACUUM_AGGRESSIVE") {
+            if matches!(raw.to_ascii_lowercase().as_str(), "1" | "true" | "yes") {
+                s.aggressive = true;
+            }
+        }
         if let Some(raw) = get("MEM_VACUUM_PRESERVE_UNVERIFIED") {
             if matches!(raw.to_ascii_lowercase().as_str(), "1" | "true" | "yes") {
                 s.aggressive = false;
@@ -1096,11 +1116,12 @@ mod tests {
     fn vacuum_defaults_on() {
         let s = VacuumSettings::from_env_vars(|_| None).unwrap();
         assert!(!s.disabled);
-        // Hourly cadence + aggressive 0-day cutoff + bypass-the-7-day-
-        // floor — the single-writer local-first defaults.
+        // Hourly cadence + 0-day cutoff, but NON-aggressive prune (keep
+        // Lance's in-flight floor) — aggressive bypassed the floor and
+        // raced the conflict_resolver into a core dump.
         assert_eq!(s.interval_secs, 3_600);
         assert_eq!(s.older_than_days, 0);
-        assert!(s.aggressive);
+        assert!(!s.aggressive);
     }
 
     #[test]
@@ -1133,20 +1154,34 @@ mod tests {
     }
 
     #[test]
-    fn vacuum_preserve_unverified_opts_out_of_aggressive() {
-        // Default is aggressive=true; the env flag flips it to false
-        // to restore Lance's hard 7-day in-flight safety floor for
-        // multi-writer / shared-dataset deployments.
+    fn vacuum_aggressive_is_opt_in() {
+        // Default is non-aggressive (safe). MEM_VACUUM_AGGRESSIVE=1 opts in.
         for raw in ["1", "true", "yes", "TRUE"] {
-            let s = VacuumSettings::from_env_vars(env(&[("MEM_VACUUM_PRESERVE_UNVERIFIED", raw)]))
-                .unwrap();
-            assert!(!s.aggressive, "{raw:?} should opt out of aggressive");
+            let s = VacuumSettings::from_env_vars(env(&[("MEM_VACUUM_AGGRESSIVE", raw)])).unwrap();
+            assert!(s.aggressive, "{raw:?} should opt INTO aggressive");
         }
         for raw in ["0", "false", "no", ""] {
-            let s = VacuumSettings::from_env_vars(env(&[("MEM_VACUUM_PRESERVE_UNVERIFIED", raw)]))
-                .unwrap();
-            assert!(s.aggressive, "{raw:?} should leave aggressive on");
+            let s = VacuumSettings::from_env_vars(env(&[("MEM_VACUUM_AGGRESSIVE", raw)])).unwrap();
+            assert!(!s.aggressive, "{raw:?} should leave the safe default");
         }
+    }
+
+    #[test]
+    fn vacuum_preserve_unverified_wins_over_aggressive() {
+        // Back-compat: PRESERVE_UNVERIFIED forces the safe default and
+        // overrides an explicit MEM_VACUUM_AGGRESSIVE so "stay safe" holds.
+        let s =
+            VacuumSettings::from_env_vars(env(&[("MEM_VACUUM_PRESERVE_UNVERIFIED", "1")])).unwrap();
+        assert!(!s.aggressive);
+        let s = VacuumSettings::from_env_vars(env(&[
+            ("MEM_VACUUM_AGGRESSIVE", "1"),
+            ("MEM_VACUUM_PRESERVE_UNVERIFIED", "1"),
+        ]))
+        .unwrap();
+        assert!(
+            !s.aggressive,
+            "PRESERVE_UNVERIFIED must win over AGGRESSIVE"
+        );
     }
 
     #[test]
