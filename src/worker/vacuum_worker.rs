@@ -35,6 +35,11 @@ pub async fn run(store: Arc<dyn Backend>, settings: VacuumSettings) {
         aggressive = settings.aggressive,
         "vacuum_worker started",
     );
+    // Build the ANN vector indexes promptly at startup (before the first
+    // sleep) — without them `lance_vector_search` brute-forces the large
+    // transcript embeddings table (5–11s). One-time on a fresh build,
+    // skipped thereafter; the in-loop call below folds in later growth.
+    ensure_vector_indexes_once(&*store).await;
     loop {
         sleep(interval).await;
         match sweep_once(
@@ -58,6 +63,22 @@ pub async fn run(store: Arc<dyn Backend>, settings: VacuumSettings) {
             Ok(_) => {}
             Err(e) => warn!(error = %e, "vacuum sweep failed"),
         }
+        ensure_vector_indexes_once(&*store).await;
+    }
+}
+
+/// Build/refresh ANN vector indexes once, logging the outcome. Errors are
+/// logged and swallowed — index maintenance must never take down the
+/// worker loop (a failed build just leaves the prior/flat behavior).
+async fn ensure_vector_indexes_once(store: &dyn Backend) {
+    match store.ensure_vector_indexes().await {
+        Ok(stats) if stats.indexes_built + stats.indexes_rebuilt > 0 => info!(
+            indexes_built = stats.indexes_built,
+            indexes_rebuilt = stats.indexes_rebuilt,
+            "vacuum: vector ANN index built/rebuilt",
+        ),
+        Ok(_) => {}
+        Err(e) => warn!(error = %e, "vector-index maintenance failed"),
     }
 }
 

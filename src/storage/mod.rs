@@ -49,7 +49,7 @@ pub use embedding_job_store::EmbeddingJobStore;
 pub use embedding_vector_store::EmbeddingVectorStore;
 pub use entity_registry::EntityRegistry;
 pub use graph_store::GraphStore;
-pub use lance_store::VacuumStats;
+pub use lance_store::{VacuumStats, VectorIndexStats};
 pub use maintenance_store::MaintenanceStore;
 pub use mine_cursor_store::{MineCursor, MineCursorStore};
 #[cfg(feature = "postgres")]

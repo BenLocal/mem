@@ -11,6 +11,8 @@
 //! `crate::worker::vacuum_worker` and exposed on-demand via
 //! `POST /admin/vacuum`.
 
+use lancedb::index::vector::IvfPqIndexBuilder;
+use lancedb::index::Index;
 use lancedb::table::{CompactionOptions, Duration, OptimizeAction, OptimizeStats};
 
 use super::{lancedb_err, LanceStore};
@@ -39,6 +41,60 @@ pub struct VacuumStats {
     pub tables_skipped: u64,
     pub fragments_removed: u64,
     pub fragments_added: u64,
+}
+
+/// Embedding tables that benefit from an ANN index, with their vector
+/// column. `lance_vector_search` does a brute-force flat scan when the
+/// column has no ANN index; on `conversation_message_embeddings` (118MB,
+/// ~28k×1024-dim) that made transcript search 5–11s vs 0.6s for the tiny
+/// capsule table. Lance does NOT auto-build ANN indexes (the comment in
+/// `mod.rs` claiming so was wrong; the usearch sidecar that used to
+/// maintain one was removed in QW-4 and never replaced) — this is that
+/// replacement.
+const VECTOR_INDEX_TABLES: &[(&str, &str)] = &[
+    ("conversation_message_embeddings", "embedding"),
+    ("capability_capsule_embeddings", "embedding"),
+];
+
+/// Below this row count a brute-force flat scan is already sub-second, so
+/// skip indexing — building an IVF/PQ index on a tiny table is pointless
+/// and PQ training wants a few thousand rows anyway.
+const MIN_ROWS_TO_INDEX: usize = 5_000;
+
+/// A Lance ANN index does NOT cover rows appended after it was built —
+/// those fall back to brute-force. Once the unindexed delta passes this,
+/// rebuild so the whole table is covered again.
+const REINDEX_DELTA_THRESHOLD: usize = 4_096;
+
+/// What [`LanceStore::ensure_vector_indexes`] should do for one table,
+/// factored out as a pure decision so it can be unit-tested without a
+/// live Lance dataset.
+#[derive(Debug, PartialEq, Eq)]
+enum IndexAction {
+    Skip,
+    Build,
+    Rebuild,
+}
+
+/// Pure policy: given a table's row count and (if an index exists) its
+/// unindexed-row delta, decide whether to build, rebuild, or skip.
+fn decide_index_action(row_count: usize, unindexed: Option<usize>) -> IndexAction {
+    if row_count < MIN_ROWS_TO_INDEX {
+        return IndexAction::Skip;
+    }
+    match unindexed {
+        None => IndexAction::Build,
+        Some(n) if n > REINDEX_DELTA_THRESHOLD => IndexAction::Rebuild,
+        Some(_) => IndexAction::Skip,
+    }
+}
+
+/// Outcome of one [`LanceStore::ensure_vector_indexes`] pass.
+#[derive(Debug, Default, Clone, serde::Serialize)]
+pub struct VectorIndexStats {
+    pub indexes_built: u64,
+    pub indexes_rebuilt: u64,
+    pub tables_skipped: u64,
 }
 
 /// All Lance tables managed by mem. Order matches `LanceStore::open_inner`'s
@@ -150,5 +206,106 @@ impl LanceStore {
             agg.tables_pruned += 1;
         }
         Ok(agg)
+    }
+
+    /// Ensure each embedding table has an up-to-date ANN index on its
+    /// vector column. Builds the index on first run; rebuilds once the
+    /// unindexed delta grows past [`REINDEX_DELTA_THRESHOLD`]. Idempotent
+    /// and read-safe with concurrent queries (Lance datasets are MVCC):
+    /// readers keep using the prior version until the new index commits.
+    /// Lazy/absent tables and tables below [`MIN_ROWS_TO_INDEX`] are
+    /// skipped without erroring.
+    ///
+    /// The build itself can take seconds on a large table, so callers run
+    /// this off the request path (the vacuum worker). lancedb-created
+    /// indexes ARE visible to the DuckDB lance extension's
+    /// `lance_vector_search` — same as `ensure_fts_index` / `lance_fts`.
+    pub async fn ensure_vector_indexes(&self) -> Result<VectorIndexStats, StorageError> {
+        let mut agg = VectorIndexStats::default();
+        for (table_name, column) in VECTOR_INDEX_TABLES {
+            let table = match self.conn.open_table(*table_name).execute().await {
+                Ok(t) => t,
+                Err(lancedb::Error::TableNotFound { .. }) => {
+                    agg.tables_skipped += 1;
+                    continue;
+                }
+                Err(e) => return Err(lancedb_err(e)),
+            };
+            let row_count = table.count_rows(None).await.map_err(lancedb_err)?;
+            // Find an existing index on the vector column and read its
+            // unindexed-row delta (rows appended since the last build).
+            let indices = table.list_indices().await.map_err(lancedb_err)?;
+            let existing = indices
+                .iter()
+                .find(|c| c.columns.iter().any(|col| col == column));
+            let unindexed = match existing {
+                Some(cfg) => Some(
+                    table
+                        .index_stats(&cfg.name)
+                        .await
+                        .map_err(lancedb_err)?
+                        .map(|s| s.num_unindexed_rows)
+                        .unwrap_or(0),
+                ),
+                None => None,
+            };
+            let action = decide_index_action(row_count, unindexed);
+            if action == IndexAction::Skip {
+                agg.tables_skipped += 1;
+                continue;
+            }
+            // `replace(true)` creates when absent and overwrites when
+            // rebuilding. IvfPqIndexBuilder::default() leaves
+            // num_partitions / num_sub_vectors unset so Lance derives
+            // safe values from the row count + vector dim.
+            table
+                .create_index(&[*column], Index::IvfPq(IvfPqIndexBuilder::default()))
+                .replace(true)
+                .execute()
+                .await
+                .map_err(lancedb_err)?;
+            match action {
+                IndexAction::Build => agg.indexes_built += 1,
+                IndexAction::Rebuild => agg.indexes_rebuilt += 1,
+                IndexAction::Skip => unreachable!("skip handled above"),
+            }
+        }
+        Ok(agg)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn tiny_tables_are_skipped() {
+        assert_eq!(decide_index_action(0, None), IndexAction::Skip);
+        assert_eq!(
+            decide_index_action(MIN_ROWS_TO_INDEX - 1, None),
+            IndexAction::Skip
+        );
+    }
+
+    #[test]
+    fn large_unindexed_table_builds() {
+        assert_eq!(
+            decide_index_action(MIN_ROWS_TO_INDEX, None),
+            IndexAction::Build
+        );
+        assert_eq!(decide_index_action(1_000_000, None), IndexAction::Build);
+    }
+
+    #[test]
+    fn fresh_index_is_left_alone_until_delta_grows() {
+        assert_eq!(decide_index_action(50_000, Some(0)), IndexAction::Skip);
+        assert_eq!(
+            decide_index_action(50_000, Some(REINDEX_DELTA_THRESHOLD)),
+            IndexAction::Skip
+        );
+        assert_eq!(
+            decide_index_action(50_000, Some(REINDEX_DELTA_THRESHOLD + 1)),
+            IndexAction::Rebuild
+        );
     }
 }
