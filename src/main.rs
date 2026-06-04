@@ -25,6 +25,12 @@ enum Command {
     Init(mem::cli::init::InitArgs),
     /// Mine memories from Claude Code transcript.
     Mine(mem::cli::mine::MineArgs),
+    /// Claude Code hook entry points. Each subcommand reads the hook's
+    /// JSON payload on stdin and prints the hook-output envelope (or `{}`).
+    /// The shell hooks `exec mem hook <event>` instead of parsing payloads
+    /// in jq. Always exits 0 — a hook must not block the user's work.
+    #[command(subcommand)]
+    Hook(mem::cli::hook::HookCommand),
     /// Query and format memories for session start injection.
     WakeUp(mem::cli::wake_up::WakeUpArgs),
     /// Scan a transcript and POST `applies_here` feedback for memories
@@ -50,6 +56,10 @@ async fn main() -> error::Result<()> {
         }
         Command::Mine(args) => {
             let code = mem::cli::mine::run(args).await;
+            std::process::exit(code);
+        }
+        Command::Hook(command) => {
+            let code = mem::cli::hook::run(command).await;
             std::process::exit(code);
         }
         Command::WakeUp(args) => match mem::cli::wake_up::run(args).await {
