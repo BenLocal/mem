@@ -15,6 +15,9 @@
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
+use std::time::Instant;
+
+use tracing::debug;
 
 use crate::domain::{BlockType, ConversationMessage, MessageRole};
 use crate::embedding::EmbeddingProvider;
@@ -289,6 +292,14 @@ impl TranscriptService {
         let oversample = limit * oversample_factor;
         let context_window = opts.context_window.unwrap_or(2).min(10);
 
+        // Phase-timing breakdown for profiling (debug! — off at the default
+        // info level). Surfaced that BM25 over a stale FTS index cost ~455ms
+        // and query embedding ~420ms dominate the residual transcript latency.
+        let t_total = Instant::now();
+        let mut bm25_ms = 0u128;
+        let mut embed_ms = 0u128;
+        let mut sem_ms = 0u128;
+
         // ─── Phase 1: gather candidate ids and per-channel ranks.
         let mut lexical_ranks: HashMap<String, usize> = HashMap::new();
         let mut semantic_ranks: HashMap<String, usize> = HashMap::new();
@@ -296,10 +307,12 @@ impl TranscriptService {
 
         if !query.trim().is_empty() {
             // BM25 channel — always available.
+            let t = Instant::now();
             let bm25_hits = self
                 .store
                 .bm25_transcript_candidates(tenant, query, oversample)
                 .await?;
+            bm25_ms = t.elapsed().as_millis();
             for (rank0, m) in bm25_hits.iter().enumerate() {
                 lexical_ranks.insert(m.message_block_id.clone(), rank0 + 1);
                 all_ids.insert(m.message_block_id.clone());
@@ -313,14 +326,18 @@ impl TranscriptService {
             // the message_block_id + rank position, so we discard
             // the message body and similarity score here.
             if let Some(provider) = &self.provider {
+                let t = Instant::now();
                 let q_vec = provider
                     .embed_text(query)
                     .await
                     .map_err(|e| StorageError::InvalidInput(format!("query embed failed: {e}")))?;
+                embed_ms = t.elapsed().as_millis();
+                let t = Instant::now();
                 let sem_hits = self
                     .store
                     .semantic_search_transcripts(tenant, &q_vec, oversample)
                     .await?;
+                sem_ms = t.elapsed().as_millis();
                 for (rank0, (msg, _sim)) in sem_hits.iter().enumerate() {
                     semantic_ranks.insert(msg.message_block_id.clone(), rank0 + 1);
                     all_ids.insert(msg.message_block_id.clone());
@@ -354,10 +371,13 @@ impl TranscriptService {
 
         // ─── Phase 2: hydrate.
         let id_vec: Vec<String> = all_ids.into_iter().collect();
+        let n_ids = id_vec.len();
+        let t = Instant::now();
         let candidates = self
             .store
             .fetch_conversation_messages_by_ids(tenant, &id_vec)
             .await?;
+        let hydrate_ms = t.elapsed().as_millis();
 
         // ─── Phase 3: score.
         let scoring_opts = ScoringOpts {
@@ -389,6 +409,7 @@ impl TranscriptService {
         // ─── Phase 5: take top-`limit` as primaries; hydrate context.
         scored.truncate(limit);
 
+        let t = Instant::now();
         let mut items: Vec<PrimaryWithContext> = Vec::with_capacity(scored.len());
         for sb in scored {
             let cw: ContextWindow = self
@@ -407,6 +428,21 @@ impl TranscriptService {
                 after: cw.after,
             });
         }
+        let ctx_ms = t.elapsed().as_millis();
+        let n_ctx = items.len();
+
+        debug!(
+            total_ms = t_total.elapsed().as_millis() as u64,
+            bm25_ms = bm25_ms as u64,
+            embed_ms = embed_ms as u64,
+            sem_ms = sem_ms as u64,
+            hydrate_ms = hydrate_ms as u64,
+            ctx_ms = ctx_ms as u64,
+            n_ids,
+            n_ctx,
+            oversample,
+            "transcript_search phase timings",
+        );
 
         // ─── Phase 6: merge windows.
         let windows = merge_windows(items);

@@ -11,7 +11,7 @@
 //! `crate::worker::vacuum_worker` and exposed on-demand via
 //! `POST /admin/vacuum`.
 
-use lancedb::index::scalar::BTreeIndexBuilder;
+use lancedb::index::scalar::{BTreeIndexBuilder, FtsIndexBuilder};
 use lancedb::index::vector::IvfPqIndexBuilder;
 use lancedb::index::Index;
 use lancedb::table::{CompactionOptions, Duration, OptimizeAction, OptimizeStats};
@@ -53,6 +53,13 @@ enum IndexKind {
     /// BTree scalar index on a high-cardinality column. Without it,
     /// equality / JOIN predicates on the column flat-scan the table.
     Scalar,
+    /// FTS (BM25 inverted) index on a text column. `ensure_fts_index`
+    /// builds this once at table-open, but only *if absent* — so once a
+    /// stale index exists from when the table was small it is never
+    /// refreshed, and `lance_fts` returns hits only from the originally
+    /// indexed rows (BM25 recall silently rots as the table grows). This
+    /// rebuilds it on the same delta policy as the others.
+    Fts,
 }
 
 /// Every index `ensure_query_indexes` keeps current, as `(table, column,
@@ -82,6 +89,12 @@ const MANAGED_INDEXES: &[(&str, &str, IndexKind)] = &[
         "message_block_id",
         IndexKind::Scalar,
     ),
+    // FTS on the BM25 channel. The open-time `ensure_fts_index` built this
+    // when conversation_messages was tiny and never refreshed it; profiling
+    // showed an 8KB index over 110MB of text (i.e. covering ~no rows) while
+    // the BM25 phase still cost ~455ms — recall over recent transcripts was
+    // silently broken. Rebuild it here when the unindexed delta grows.
+    ("conversation_messages", "content", IndexKind::Fts),
 ];
 
 /// Below this row count a brute-force flat scan is already sub-second, so
@@ -289,6 +302,7 @@ impl LanceStore {
             let index = match kind {
                 IndexKind::Vector => Index::IvfPq(IvfPqIndexBuilder::default()),
                 IndexKind::Scalar => Index::BTree(BTreeIndexBuilder::default()),
+                IndexKind::Fts => Index::FTS(FtsIndexBuilder::default()),
             };
             table
                 .create_index(&[*column], index)
