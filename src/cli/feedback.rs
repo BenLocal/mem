@@ -66,6 +66,57 @@ fn is_capsule_search_tool(name: &str) -> bool {
     )
 }
 
+/// True if `name` is the capsule/memory GET MCP tool. A deliberate fetch
+/// of a capsule's verbatim content is a strong "I'm using this" signal —
+/// the recall hooks even instruct it ("`capability_capsule_get` it for the
+/// verbatim content"). Same prefix matrix as [`is_capsule_search_tool`].
+fn is_capsule_get_tool(name: &str) -> bool {
+    let Some(suffix) = name
+        .strip_prefix("mcp__mem__")
+        .or_else(|| name.strip_prefix("mcp__plugin_mem_mem__"))
+    else {
+        return false;
+    };
+    matches!(suffix, "memory_get" | "capability_capsule_get")
+}
+
+/// Pull `mem_…` capsule ids out of a hook-injected recall block. The
+/// auto-recall (UserPromptSubmit) and error-recall (PostToolUseFailure)
+/// hooks inject `additionalContext` into the transcript as user/system
+/// blocks, rendering each hit as `` - <snippet> `[mem_…]` ``. The
+/// MCP-search scanner never sees these (they aren't tool calls), so the
+/// feedback loop stayed open for the entire hook-driven recall path —
+/// extracting the ids here is what re-closes it.
+fn extract_injected_ids(line: &str) -> Vec<String> {
+    let mut ids = Vec::new();
+    let mut rest = line;
+    while let Some(pos) = rest.find("[mem_") {
+        let after = &rest[pos + 1..]; // skip the '['
+        match after.find(']') {
+            Some(end) => {
+                let id = &after[..end];
+                if is_valid_capsule_id(id) {
+                    ids.push(id.to_string());
+                }
+                rest = &after[end + 1..];
+            }
+            None => break,
+        }
+    }
+    ids
+}
+
+/// `mem_` + a UUIDv7 (8 hex digits then `-`). Guards against placeholder /
+/// templated `[mem_xxx]` strings that appear in docs or tool output — those
+/// would otherwise be POSTed as feedback and 404.
+fn is_valid_capsule_id(id: &str) -> bool {
+    let Some(rest) = id.strip_prefix("mem_") else {
+        return false;
+    };
+    let b = rest.as_bytes();
+    b.len() >= 9 && b[8] == b'-' && b[..8].iter().all(u8::is_ascii_hexdigit)
+}
+
 /// Minimum char count for a kept ASCII-alphanumeric run. Shorter
 /// (1-3 char) tokens are mostly stopwords / particles and would
 /// dominate false positives.
@@ -201,9 +252,15 @@ pub async fn run_with_counts(args: FeedbackFromTranscriptArgs) -> anyhow::Result
 }
 
 /// One pass over the JSONL transcript; returns the set of
-/// capability_capsule_ids that were both retrieved by a capsule-search
-/// MCP call (see [`is_capsule_search_tool`]) AND whose `text`
-/// reappears in a subsequent assistant `text`/`thinking` block.
+/// capability_capsule_ids that were retrieved AND used. A capsule counts
+/// as **retrieved** if it came back from a capsule-search MCP call
+/// ([`is_capsule_search_tool`]) OR was hook-injected into a user/system
+/// block ([`extract_injected_ids`] — the auto-recall / error-recall path,
+/// which is now how most recall happens). A retrieved capsule counts as
+/// **used** if the agent later `capability_capsule_get`s it
+/// ([`is_capsule_get_tool`] — a deliberate fetch) OR its `text` reappears
+/// in a subsequent assistant `text`/`thinking` block. Crediting only
+/// *retrieved* gets (not bare inspection gets) keeps precision.
 fn scan_transcript(args: &FeedbackFromTranscriptArgs) -> Result<HashSet<String>> {
     let file = File::open(&args.transcript_path)?;
     let reader = BufReader::new(file);
@@ -214,6 +271,8 @@ fn scan_transcript(args: &FeedbackFromTranscriptArgs) -> Result<HashSet<String>>
     let mut assistant_corpus: Vec<(usize, String)> = Vec::new();
     // tool_use_id → line index where the search call was issued.
     let mut search_calls: HashMap<String, usize> = HashMap::new();
+    // capsule ids the agent deliberately fetched via capability_capsule_get.
+    let mut fetched: HashSet<String> = HashSet::new();
 
     for (line_idx, line) in reader.lines().enumerate() {
         let line = line?;
@@ -250,36 +309,61 @@ fn scan_transcript(args: &FeedbackFromTranscriptArgs) -> Result<HashSet<String>>
                         if let Some(id) = item["id"].as_str() {
                             search_calls.insert(id.to_string(), line_idx);
                         }
+                    } else if is_capsule_get_tool(name) {
+                        if let Some(cid) = item["input"]["capability_capsule_id"].as_str() {
+                            fetched.insert(cid.to_string());
+                        }
                     }
                 }
                 "tool_result" => {
                     let tool_use_id = item["tool_use_id"].as_str().unwrap_or("");
-                    if !search_calls.contains_key(tool_use_id) {
-                        continue;
-                    }
-                    // Result content is either a string (older) or an
-                    // array of `{type, text}` chunks. The MCP wrapper
-                    // emits a single text chunk holding the JSON-encoded
-                    // SearchCapabilityCapsuleResponse — extract that string before
-                    // re-parsing.
+                    // Content is a string (older) or an array of `{type, text}`
+                    // chunks — flatten to a string either way.
                     let inner = extract_tool_result_text(&item["content"]);
-                    let Ok(resp) = serde_json::from_str::<Value>(&inner) else {
-                        continue;
-                    };
-                    for section in ["directives", "relevant_facts", "reusable_patterns"] {
-                        if let Some(arr) = resp[section].as_array() {
-                            for entry in arr {
-                                let mid = entry["capability_capsule_id"].as_str().unwrap_or("");
-                                let text = entry["text"].as_str().unwrap_or("");
-                                if mid.is_empty() {
-                                    continue;
+                    if search_calls.contains_key(tool_use_id) {
+                        // MCP capsule-search result: a single text chunk holding
+                        // the JSON-encoded SearchCapabilityCapsuleResponse.
+                        let Ok(resp) = serde_json::from_str::<Value>(&inner) else {
+                            continue;
+                        };
+                        for section in ["directives", "relevant_facts", "reusable_patterns"] {
+                            if let Some(arr) = resp[section].as_array() {
+                                for entry in arr {
+                                    let mid = entry["capability_capsule_id"].as_str().unwrap_or("");
+                                    let text = entry["text"].as_str().unwrap_or("");
+                                    if mid.is_empty() {
+                                        continue;
+                                    }
+                                    let fp = if args.all {
+                                        Vec::new()
+                                    } else {
+                                        fingerprint(text)
+                                    };
+                                    retrieved.push((mid.to_string(), fp, line_idx));
                                 }
-                                let fp = if args.all {
-                                    Vec::new()
-                                } else {
-                                    fingerprint(text)
-                                };
-                                retrieved.push((mid.to_string(), fp, line_idx));
+                            }
+                        }
+                    } else if inner.contains("mem auto-recall")
+                        || inner.contains("related incidents/fixes")
+                    {
+                        // Hook-injected recall block. The UserPromptSubmit /
+                        // PostToolUseFailure `additionalContext` lands in the
+                        // transcript as a tool_result (NOT a text block), with
+                        // each hit as `` - <snippet> `[mem_…]` ``. Treat each
+                        // bullet as a retrieval driving the same consumed
+                        // heuristic as MCP-search hits.
+                        for ln in inner.lines() {
+                            let ids = extract_injected_ids(ln);
+                            if ids.is_empty() {
+                                continue;
+                            }
+                            let fp = if args.all {
+                                Vec::new()
+                            } else {
+                                fingerprint(ln)
+                            };
+                            for id in ids {
+                                retrieved.push((id, fp.clone(), line_idx));
                             }
                         }
                     }
@@ -309,6 +393,13 @@ fn scan_transcript(args: &FeedbackFromTranscriptArgs) -> Result<HashSet<String>>
     let mut used: HashSet<String> = HashSet::new();
     for (mid, fp, ridx) in &retrieved {
         if used.contains(mid) {
+            continue;
+        }
+        // Strong signal: the agent fetched this recalled capsule's verbatim
+        // content via capability_capsule_get — credit without needing a
+        // fingerprint match.
+        if fetched.contains(mid) {
+            used.insert(mid.clone());
             continue;
         }
         if args.all || fp.is_empty() {
@@ -583,5 +674,48 @@ mod tests {
         ));
         // empty
         assert!(!is_capsule_search_tool(""));
+    }
+
+    #[test]
+    fn is_capsule_get_tool_accepts_variants_rejects_others() {
+        assert!(is_capsule_get_tool("mcp__mem__capability_capsule_get"));
+        assert!(is_capsule_get_tool(
+            "mcp__plugin_mem_mem__capability_capsule_get"
+        ));
+        assert!(is_capsule_get_tool("mcp__mem__memory_get"));
+        // not a get
+        assert!(!is_capsule_get_tool(
+            "mcp__plugin_mem_mem__capability_capsule_search"
+        ));
+        assert!(!is_capsule_get_tool(
+            "mcp__plugin_mem_mem__capability_capsule_ingest"
+        ));
+        assert!(!is_capsule_get_tool("capability_capsule_get")); // missing prefix
+        assert!(!is_capsule_get_tool(""));
+    }
+
+    #[test]
+    fn extract_injected_ids_parses_recall_bullets() {
+        // The shape the recall hooks inject.
+        let line = "- the fix is X (src/a.rs)  `[mem_019e8cf8-56f8-7c42-b4eb-ff60cce4900c]`";
+        assert_eq!(
+            extract_injected_ids(line),
+            vec!["mem_019e8cf8-56f8-7c42-b4eb-ff60cce4900c".to_string()]
+        );
+        // Multiple ids on one line are all pulled.
+        let two = "see `[mem_aaaa1111-0000]` and `[mem_bbbb2222-9999]`";
+        assert_eq!(
+            extract_injected_ids(two),
+            vec![
+                "mem_aaaa1111-0000".to_string(),
+                "mem_bbbb2222-9999".to_string()
+            ]
+        );
+        // No id / unterminated → empty, no panic.
+        assert!(extract_injected_ids("plain assistant text, no ids").is_empty());
+        assert!(extract_injected_ids("dangling [mem_no_close").is_empty());
+        // Placeholder / templated ids (not a hex UUIDv7) are rejected.
+        assert!(extract_injected_ids("see `[mem_xxx]` placeholder").is_empty());
+        assert!(extract_injected_ids("`[mem_notahexuuid]`").is_empty());
     }
 }
