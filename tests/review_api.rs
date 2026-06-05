@@ -50,6 +50,7 @@ fn sample_memory(
         created_at: format!("2026-03-21T00:00:{capability_capsule_id}Z"),
         updated_at: format!("2026-03-21T00:05:{capability_capsule_id}Z"),
         last_validated_at: None,
+        last_used_at: None,
     }
 }
 

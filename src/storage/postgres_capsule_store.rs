@@ -132,13 +132,15 @@ fn row_to_record(row: &sqlx::postgres::PgRow) -> Result<CapabilityCapsuleRecord,
         created_at: row.try_get("created_at").map_err(sqlx_err)?,
         updated_at: row.try_get("updated_at").map_err(sqlx_err)?,
         last_validated_at: row.try_get("last_validated_at").map_err(sqlx_err)?,
+        last_used_at: row.try_get("last_used_at").map_err(sqlx_err)?,
     })
 }
 
 const SELECT_COLUMNS: &str = "capability_capsule_id, tenant, capability_capsule_type, status, \
     scope, visibility, version, summary, content, evidence, code_refs, project, repo, module, \
     task_type, tags, topics, confidence, decay_score, content_hash, idempotency_key, session_id, \
-    supersedes_capability_capsule_id, source_agent, created_at, updated_at, last_validated_at";
+    supersedes_capability_capsule_id, source_agent, created_at, updated_at, last_validated_at, \
+    last_used_at";
 
 #[async_trait]
 impl CapsuleStore for PostgresCapsuleStore {
@@ -151,9 +153,9 @@ impl CapsuleStore for PostgresCapsuleStore {
             version, summary, content, evidence, code_refs, project, repo, module, task_type, \
             tags, topics, confidence, decay_score, content_hash, idempotency_key, session_id, \
             supersedes_capability_capsule_id, source_agent, created_at, updated_at, \
-            last_validated_at) \
+            last_validated_at, last_used_at) \
             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, \
-                    $18, $19, $20, $21, $22, $23, $24, $25, $26, $27)";
+                    $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28)";
         sqlx::query(sql)
             .bind(&memory.capability_capsule_id)
             .bind(&memory.tenant)
@@ -182,6 +184,7 @@ impl CapsuleStore for PostgresCapsuleStore {
             .bind(&memory.created_at)
             .bind(&memory.updated_at)
             .bind(&memory.last_validated_at)
+            .bind(&memory.last_used_at)
             .execute(&self.pool)
             .await
             .map_err(sqlx_err)?;
@@ -210,9 +213,9 @@ impl CapsuleStore for PostgresCapsuleStore {
                     visibility, version, summary, content, evidence, code_refs, project, repo, \
                     module, task_type, tags, topics, confidence, decay_score, content_hash, \
                     idempotency_key, session_id, supersedes_capability_capsule_id, source_agent, \
-                    created_at, updated_at, last_validated_at) \
+                    created_at, updated_at, last_validated_at, last_used_at) \
                     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, \
-                            $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27)",
+                            $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28)",
             )
             .bind(&m.capability_capsule_id)
             .bind(&m.tenant)
@@ -241,6 +244,7 @@ impl CapsuleStore for PostgresCapsuleStore {
             .bind(&m.created_at)
             .bind(&m.updated_at)
             .bind(&m.last_validated_at)
+            .bind(&m.last_used_at)
             .execute(&mut *tx)
             .await
             .map_err(sqlx_err)?;
@@ -483,9 +487,9 @@ impl CapsuleStore for PostgresCapsuleStore {
                 visibility, version, summary, content, evidence, code_refs, project, repo, \
                 module, task_type, tags, topics, confidence, decay_score, content_hash, \
                 idempotency_key, session_id, supersedes_capability_capsule_id, source_agent, \
-                created_at, updated_at, last_validated_at) \
+                created_at, updated_at, last_validated_at, last_used_at) \
                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, \
-                        $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27)",
+                        $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28)",
         )
         .bind(&successor.capability_capsule_id)
         .bind(&successor.tenant)
@@ -514,6 +518,7 @@ impl CapsuleStore for PostgresCapsuleStore {
         .bind(&successor.created_at)
         .bind(&successor.updated_at)
         .bind(&successor.last_validated_at)
+        .bind(&successor.last_used_at)
         .execute(&mut *tx)
         .await
         .map_err(sqlx_err)?;

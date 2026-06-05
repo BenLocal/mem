@@ -66,6 +66,7 @@ async fn hybrid_search_surfaces_semantic_match_without_lexical_overlap() {
         created_at: "1".into(),
         updated_at: "1".into(),
         last_validated_at: None,
+        last_used_at: None,
     };
 
     let mem_hit = CapabilityCapsuleRecord {
@@ -96,6 +97,7 @@ async fn hybrid_search_surfaces_semantic_match_without_lexical_overlap() {
         created_at: "2".into(),
         updated_at: "2".into(),
         last_validated_at: None,
+        last_used_at: None,
     };
 
     repo.insert_capability_capsule(mem_noise.clone())

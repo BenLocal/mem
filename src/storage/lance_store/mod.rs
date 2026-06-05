@@ -369,11 +369,13 @@ fn capability_capsules_schema() -> Schema {
         Field::new("created_at", DataType::Utf8, false),
         Field::new("updated_at", DataType::Utf8, false),
         Field::new("last_validated_at", DataType::Utf8, true),
+        Field::new("last_used_at", DataType::Utf8, true),
     ])
 }
 
 async fn ensure_capability_capsules_table(conn: &Connection) -> Result<(), StorageError> {
-    ensure_table(conn, "capability_capsules", capability_capsules_schema()).await
+    ensure_table(conn, "capability_capsules", capability_capsules_schema()).await?;
+    migrate_capability_capsules_add_columns(conn).await
 }
 
 async fn ensure_feedback_events_table(conn: &Connection) -> Result<(), StorageError> {
@@ -466,6 +468,37 @@ async fn migrate_graph_edges_add_columns(conn: &Connection) -> Result<(), Storag
     table
         .add_columns(
             NewColumnTransform::AllNulls(Arc::new(Schema::new(missing))),
+            None,
+        )
+        .await
+        .map_err(lancedb_err)?;
+    Ok(())
+}
+
+/// Migration (roadmap O1): pre-O1 `capability_capsules` tables on disk
+/// lack the `last_used_at` column. Add it nullable, backfilled NULL via
+/// `add_columns(AllNulls)` — so the decay sweep's
+/// `COALESCE(last_used_at, updated_at)` anchor falls back to `updated_at`
+/// for legacy rows. Idempotent: a freshly-created table already carries
+/// the column, so this no-ops there. Same pattern as
+/// [`migrate_graph_edges_add_columns`].
+async fn migrate_capability_capsules_add_columns(conn: &Connection) -> Result<(), StorageError> {
+    let table = conn
+        .open_table("capability_capsules")
+        .execute()
+        .await
+        .map_err(lancedb_err)?;
+    let schema = table.schema().await.map_err(lancedb_err)?;
+    if schema.field_with_name("last_used_at").is_ok() {
+        return Ok(());
+    }
+    table
+        .add_columns(
+            NewColumnTransform::AllNulls(Arc::new(Schema::new(vec![Field::new(
+                "last_used_at",
+                DataType::Utf8,
+                true,
+            )]))),
             None,
         )
         .await
@@ -1472,6 +1505,7 @@ pub(super) fn capability_capsules_to_record_batch(
     let mut created_at = StringBuilder::new();
     let mut updated_at = StringBuilder::new();
     let mut last_validated_at = StringBuilder::new();
+    let mut last_used_at = StringBuilder::new();
 
     for m in memories {
         capability_capsule_id.append_value(&m.capability_capsule_id);
@@ -1537,6 +1571,10 @@ pub(super) fn capability_capsules_to_record_batch(
             Some(s) => last_validated_at.append_value(s),
             None => last_validated_at.append_null(),
         }
+        match &m.last_used_at {
+            Some(s) => last_used_at.append_value(s),
+            None => last_used_at.append_null(),
+        }
     }
 
     let schema = Arc::new(capability_capsules_schema());
@@ -1568,6 +1606,7 @@ pub(super) fn capability_capsules_to_record_batch(
         Arc::new(created_at.finish()),
         Arc::new(updated_at.finish()),
         Arc::new(last_validated_at.finish()),
+        Arc::new(last_used_at.finish()),
     ];
     RecordBatch::try_new(schema, columns)
         .map_err(|e| StorageError::InvalidInput(format!("memories record batch: {e}")))
@@ -1615,6 +1654,7 @@ pub(super) fn record_batch_to_capability_capsules(
     let created_at = parse_col::<StringArray>(batch, TABLE, "created_at")?;
     let updated_at = parse_col::<StringArray>(batch, TABLE, "updated_at")?;
     let last_validated_at = parse_col::<StringArray>(batch, TABLE, "last_validated_at")?;
+    let last_used_at = parse_col::<StringArray>(batch, TABLE, "last_used_at")?;
 
     fn list_at(arr: &ListArray, i: usize) -> Result<Vec<String>, StorageError> {
         let inner = arr.value(i);
@@ -1662,6 +1702,7 @@ pub(super) fn record_batch_to_capability_capsules(
             created_at: created_at.value(i).to_string(),
             updated_at: updated_at.value(i).to_string(),
             last_validated_at: opt(last_validated_at, i),
+            last_used_at: opt(last_used_at, i),
         });
     }
     Ok(out)

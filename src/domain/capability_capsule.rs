@@ -225,6 +225,15 @@ pub struct CapabilityCapsuleRecord {
     pub updated_at: String,
     #[serde(skip_serializing_if = "skip_none")]
     pub last_validated_at: Option<String>,
+    /// Last time this capsule was *used* — emitted into a compressed
+    /// retrieval response (`pipeline/compress.rs`), not merely scanned.
+    /// Bumped asynchronously off the read path. Anchors the decay
+    /// clock in the decay worker (`COALESCE(last_used_at, updated_at)`)
+    /// so frequently-retrieved capsules decay slower than untouched
+    /// ones. `None` on legacy rows → the sweep falls back to
+    /// `updated_at`. See roadmap O1.
+    #[serde(default, skip_serializing_if = "skip_none")]
+    pub last_used_at: Option<String>,
 }
 
 impl Default for CapabilityCapsuleRecord {
@@ -257,6 +266,7 @@ impl Default for CapabilityCapsuleRecord {
             created_at: String::new(),
             updated_at: String::new(),
             last_validated_at: None,
+            last_used_at: None,
         }
     }
 }

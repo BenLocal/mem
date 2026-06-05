@@ -134,6 +134,7 @@ fn sample_memory(
         created_at: format!("2026-03-21T00:00:0{version}Z"),
         updated_at: format!("2026-03-21T00:05:0{version}Z"),
         last_validated_at: None,
+        last_used_at: None,
     }
 }
 
@@ -276,6 +277,7 @@ async fn repository_dedupe_lookup_prefers_same_tenant_memory() {
             created_at: "1".into(),
             updated_at: "1".into(),
             last_validated_at: None,
+            last_used_at: None,
         }
     };
 

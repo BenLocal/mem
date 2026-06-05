@@ -1486,6 +1486,7 @@ mod tests {
             created_at: "00000001778000000000".into(),
             updated_at: "00000001778000000000".into(),
             last_validated_at: None,
+            last_used_at: None,
         }
     }
 

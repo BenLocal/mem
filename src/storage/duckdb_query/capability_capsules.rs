@@ -22,16 +22,16 @@ fn is_capability_capsule_embeddings_missing(err: &duckdb::Error) -> bool {
     msg.contains("Failed to open Lance dataset") && msg.contains("capability_capsule_embeddings")
 }
 
-/// 27-column projection shared by every memory-row read method.
+/// 28-column projection shared by every memory-row read method.
 /// Order must match `row_to_capability_capsule_record` below — keep in sync.
 const CAPABILITY_CAPSULE_COLS: &str =
     "capability_capsule_id, tenant, capability_capsule_type, status, scope, visibility, version, \
     summary, content, evidence, code_refs, project, repo, module, task_type, \
     tags, topics, confidence, decay_score, content_hash, idempotency_key, \
     session_id, supersedes_capability_capsule_id, source_agent, created_at, updated_at, \
-    last_validated_at";
+    last_validated_at, last_used_at";
 
-/// Parse one row of the 27-column SELECT above into a [`CapabilityCapsuleRecord`].
+/// Parse one row of the 28-column SELECT above into a [`CapabilityCapsuleRecord`].
 ///
 /// Type expectations (Lance Arrow → DuckDB SQL via the lance extension):
 ///   - `Utf8` → `VARCHAR` → `String` / `Option<String>`
@@ -75,6 +75,7 @@ fn row_to_capability_capsule_record(
         created_at: row.get(24)?,
         updated_at: row.get(25)?,
         last_validated_at: row.get(26)?,
+        last_used_at: row.get(27)?,
     })
 }
 
@@ -1041,7 +1042,11 @@ impl DuckDbQuery {
                 let mut stmt = conn.prepare(&sql)?;
                 let rows = stmt.query_map(params_refs.as_slice(), |row| {
                     let mem = row_to_capability_capsule_record(row)?;
-                    let rrf: f32 = row.get(27)?;
+                    // rrf_score is the column *after* the 28 capsule
+                    // columns of `m_cols` (indices 0..=27), so it sits at
+                    // index 28. Bump this in lockstep with the capsule
+                    // column count whenever a column is added/removed.
+                    let rrf: f32 = row.get(28)?;
                     Ok((mem, rrf))
                 })?;
                 let mut out = Vec::new();
@@ -1182,6 +1187,7 @@ mod tests {
             created_at: "00000001778000000000".into(),
             updated_at: "00000001778000000000".into(),
             last_validated_at: None,
+            last_used_at: None,
         }
     }
 

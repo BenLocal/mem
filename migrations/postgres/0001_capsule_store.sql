@@ -73,7 +73,10 @@ CREATE TABLE IF NOT EXISTS capability_capsules (
     source_agent                     TEXT NOT NULL,
     created_at                       TEXT NOT NULL,
     updated_at                       TEXT NOT NULL,
-    last_validated_at                TEXT
+    last_validated_at                TEXT,
+    -- roadmap O1: last time this capsule was emitted into a retrieval
+    -- response; anchors the decay clock via COALESCE(last_used_at, updated_at).
+    last_used_at                     TEXT
 );
 
 -- Common query patterns used by CapsuleStore reads.

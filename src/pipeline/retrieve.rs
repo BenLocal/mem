@@ -599,6 +599,7 @@ mod tests {
             created_at: String::new(),
             updated_at: String::new(),
             last_validated_at: None,
+            last_used_at: None,
         }
     }
 

@@ -63,6 +63,7 @@ fn capsule(
         created_at: "00000000000000000001".into(),
         updated_at: "00000000000000000001".into(),
         last_validated_at: None,
+        last_used_at: None,
     }
 }
 

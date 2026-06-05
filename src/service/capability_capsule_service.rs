@@ -340,6 +340,7 @@ impl CapabilityCapsuleService {
             created_at: now.clone(),
             updated_at: now.clone(),
             last_validated_at: None,
+            last_used_at: None,
         };
 
         let stored = self.store.insert_capability_capsule(memory).await?;
@@ -533,6 +534,7 @@ impl CapabilityCapsuleService {
             created_at: now.to_string(),
             updated_at: now.to_string(),
             last_validated_at: None,
+            last_used_at: None,
         };
         Ok(PreparedIngest::New {
             record: Box::new(record),
@@ -1041,6 +1043,7 @@ impl CapabilityCapsuleService {
             created_at: now.clone(),
             updated_at: now,
             last_validated_at: None,
+            last_used_at: None,
         }
     }
 

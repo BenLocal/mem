@@ -74,6 +74,7 @@ fn sample(
         created_at: ts.clone(),
         updated_at: ts,
         last_validated_at: None,
+        last_used_at: None,
     }
 }
 
