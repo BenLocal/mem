@@ -17,7 +17,7 @@ agent (Claude Code / Codex / 其它 MCP 客户端)
 ┌────────────────────────────┐
 │ mem mcp                    │   一进程，stdio in/out
 │ MemMcpServer               │
-│   tool_router (27 tools)   │
+│   tool_router (43 tools)   │
 │   MemHttpClient (reqwest)  │
 └─────────────┬──────────────┘
               │   HTTP（默认 127.0.0.1:3000）
@@ -44,7 +44,7 @@ agent (Claude Code / Codex / 其它 MCP 客户端)
 - 成功：`Content::text(<JSON>)`，body 是 `serde_json::to_string_pretty(...)` 的产物
 - 失败：`is_error = Some(true) + Content::text(<人读错误信息>)`，**不抛 McpError**（外层永远 `Ok(...)`），所以客户端必须看 `is_error` 字段
 
-写入类工具（`capability_capsule_ingest` / `_commit_fact` / `_propose_preference` / `_propose_experience` / `episode_ingest`）成功时通过 `ok_json_with_content` 在 JSON 前加一行 `✓ <notice>: <content>` 摘要，便于 agent 在 transcript 里直接看到 "保存了什么"。
+写入类工具（`capability_capsule_ingest` / `_commit_fact` / `_propose_preference` / `episode_ingest`）成功时通过 `ok_json_with_content` 在 JSON 前加一行 `✓ <notice>: <content>` 摘要，便于 agent 在 transcript 里直接看到 "保存了什么"。
 
 ### 默认 tenant 解析
 
@@ -74,10 +74,10 @@ override_value
 | 6 | `capability_capsule_batch_ingest` | 写入（批量） | `POST /capability_capsules/batch` | — |
 | 7 | `capability_capsule_commit_fact` | 写入（受验事实） | `POST /capability_capsules` | — |
 | 8 | `capability_capsule_propose_preference` | 写入（提案） | `POST /capability_capsules` (write_mode=propose) | — |
-| 9 | `capability_capsule_propose_experience` | 写入（经验提案） | `POST /episodes` | — |
+| ~~9~~ | ~~`capability_capsule_propose_experience`~~ | **已移除** → `episode_ingest` | — | — |
 | 10 | `capability_capsule_get` | 详情 | `GET /capability_capsules/{id}?tenant=…` | — |
 | 11 | `capability_capsule_feedback` | 反馈 | `POST /capability_capsules/feedback` | — |
-| 12 | `capability_capsule_apply_feedback` | 反馈（含 note 转发） | `POST /capability_capsules/feedback` | — |
+| ~~12~~ | ~~`capability_capsule_apply_feedback`~~ | **已移除** → `capability_capsule_feedback`（now 带 `note`） | — | — |
 | 13 | `capability_capsule_list_pending_review` | 评审 | `GET /reviews/pending?tenant=…` | — |
 | 14 | `capability_capsule_review_accept` | 评审 | `POST /reviews/pending/accept` | — |
 | 15 | `capability_capsule_review_reject` | 评审 | `POST /reviews/pending/reject` | — |
@@ -277,27 +277,9 @@ tags                    = [...] + ["caller_agent:<caller_agent>"]
 
 ---
 
-### 2.9 `capability_capsule_propose_experience`
+### 2.9 `capability_capsule_propose_experience` — **已移除（2026-06-05，oss MCP 瘦身）**
 
-**描述**：`Propose a candidate experience by recording it as an episode instead of a strong fact.`
-
-**参数**：同 2.7。
-
-**HTTP**：`POST /episodes`，body 含：
-
-```
-goal     = <summary>
-steps    = []         (空 step 数组)
-outcome  = <content>
-scope    = "project"
-visibility = "private"
-project  = …
-tags     = ["caller_agent:<caller_agent>"]
-```
-
-**Service**：`CapabilityCapsuleService::ingest_episode`（写 episode 行 + 触发 `workflow::maybe_extract_workflow`）。
-
-**典型用法**：弱版本的 commit_fact——把"这次试着做了什么、结果如何"留个流水账，不像 fact 那样带强语义。
+它只是 `episode_ingest` 的"steps=[] + project 作用域"预设，名字却带 capsule/experience 误导（实际写 `episodes` 表，不进 capsule review 队列，历史上让 agent 误用）。→ 直接用 `episode_ingest`（episode/workflow 提取），或 `capability_capsule_ingest` `write_mode=propose`（要人审的 experience capsule）。
 
 ---
 
@@ -328,8 +310,9 @@ tags     = ["caller_agent:<caller_agent>"]
 | `capability_capsule_id` | ✔ | |
 | `feedback_kind` | ✔ | `useful` / `outdated` / `incorrect` / `applies_here` / `does_not_apply_here` |
 | `tenant` | | |
+| `note` | | 可选自由文本，verbatim 写入 `feedback_events.note`（原 `_apply_feedback` 的能力，2026-06-05 并入本工具） |
 
-**HTTP**：`POST /capability_capsules/feedback`，body：`{tenant, capability_capsule_id, feedback_kind}`。
+**HTTP**：`POST /capability_capsules/feedback`，body：`{tenant, capability_capsule_id, feedback_kind, note?}`。
 
 **Service**：`CapabilityCapsuleService::submit_feedback` → `Store::apply_feedback`（写 `feedback_events` + 调 `confidence/decay/status`）。
 
@@ -347,15 +330,9 @@ tags     = ["caller_agent:<caller_agent>"]
 
 ---
 
-### 2.12 `capability_capsule_apply_feedback`
+### 2.12 `capability_capsule_apply_feedback` — **已移除（2026-06-05，oss MCP 瘦身）**
 
-**描述**：`Apply limited feedback on a memory while keeping the existing POST /capability_capsules/feedback backend contract. Optional 'note' is persisted verbatim on the resulting feedback_events row.`
-
-**参数** (`CapabilityCapsuleApplyFeedbackArgs`)：与 2.11 相同的 backend，但参数命名不同：`kind` (vs `feedback_kind`) + 多了 `project` / `caller_agent` / `note`。`note` 字段会随转发 body 一起 POST 到 `/capability_capsules/feedback`，server 端写入 `feedback_events.note`（nullable Utf8 列；详见 [`database-schema.md §2.6`](./database-schema.md)）。`project` / `caller_agent` 仅作客户端自描述，不进 body。
-
-**HTTP**：`POST /capability_capsules/feedback`，body：`{tenant, capability_capsule_id, feedback_kind, note?}`。
-
-**典型用法**：与 2.11 同语义但带可选注释。新代码可二选一：要附说明（"过期：2026 Q2 重构后路径变了"）就用 2.12；纯打分用 2.11。
+它与 2.11 `capability_capsule_feedback` 转发到**同一条** `POST /capability_capsules/feedback`，只是参数名 `kind` vs `feedback_kind`（`project`/`caller_agent` 仅自描述、不进 body）。唯一实际差异 `note` 已并入 2.11（`feedback` 现接受可选 `note`，写 `feedback_events.note`）。→ 统一用 `capability_capsule_feedback`。
 
 ---
 
@@ -393,7 +370,7 @@ tags     = ["caller_agent:<caller_agent>"]
 
 **参数 / HTTP / Service**：与 2.13 同形，端点为 `POST /reviews/pending/reject`，状态迁移 pending → rejected。
 
-**典型用法**：人审驳回。**这是软删除**（保留行 + status=rejected），与 `capability_capsule_apply_feedback kind=incorrect` 的归档语义不同（后者是反馈链路触发）。
+**典型用法**：人审驳回。**这是软删除**（保留行 + status=rejected），与 `capability_capsule_feedback feedback_kind=incorrect` 的归档语义不同（后者是反馈链路触发）。
 
 ---
 
@@ -652,7 +629,7 @@ tags     = ["caller_agent:<caller_agent>"]
 | `/capability_capsules/{id}` | GET | `capability_capsule_get` |
 | `/capability_capsules/{id}` | DELETE | （admin Web 独享，MCP 未暴露） |
 | `/capability_capsules/feedback` | POST | `capability_capsule_feedback` / `_apply_feedback` |
-| `/episodes` | POST | `episode_ingest` / `_propose_experience` |
+| `/episodes` | POST | `episode_ingest` |
 | `/reviews/pending` | GET | `capability_capsule_list_pending_review` |
 | `/reviews/pending/accept` | POST | `capability_capsule_review_accept` |
 | `/reviews/pending/reject` | POST | `capability_capsule_review_reject` |

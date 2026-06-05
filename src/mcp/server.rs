@@ -249,23 +249,6 @@ pub struct CapabilityCapsuleProposePreferenceArgs {
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
-pub struct CapabilityCapsuleProposeExperienceArgs {
-    #[serde(default)]
-    pub tenant: Option<String>,
-    pub project: String,
-    #[serde(default)]
-    pub repo: Option<String>,
-    #[serde(default)]
-    pub module: Option<String>,
-    pub caller_agent: String,
-    pub source_agent: String,
-    pub summary: String,
-    pub content: String,
-    #[serde(default)]
-    pub evidence: Option<Vec<String>>,
-}
-
-#[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct CapabilityCapsuleGetArgs {
     pub capability_capsule_id: String,
     /// Defaults to MEM_TENANT when omitted.
@@ -310,17 +293,8 @@ pub struct CapabilityCapsuleFeedbackArgs {
     pub capability_capsule_id: String,
     /// One of: useful | outdated | incorrect | applies_here | does_not_apply_here
     pub feedback_kind: String,
-}
-
-#[derive(Debug, Deserialize, schemars::JsonSchema)]
-pub struct CapabilityCapsuleApplyFeedbackArgs {
-    #[serde(default)]
-    pub tenant: Option<String>,
-    pub project: String,
-    pub caller_agent: String,
-    pub capability_capsule_id: String,
-    /// One of: useful | outdated | incorrect
-    pub kind: String,
+    /// Optional free-text note, persisted verbatim on the resulting
+    /// feedback_events row.
     #[serde(default)]
     pub note: Option<String>,
 }
@@ -1098,48 +1072,6 @@ impl MemMcpServer {
         }
     }
 
-    // ------------------- capability_capsule_propose_experience -------------------
-    #[tool(
-        description = "Propose a CANDIDATE experience (unverified, low-confidence hunch) by recording it as an Episode. If the episode set yields a workflow, the derived Workflow capsule lands as `PendingConfirmation`. For verified lessons-learned that should be active immediately (e.g. a bug you just fixed and confirmed, a pattern you just validated), use `capability_capsule_ingest` with `capability_capsule_type=experience` and `write_mode=auto` instead — that bypasses the review queue."
-    )]
-    async fn capability_capsule_propose_experience(
-        &self,
-        Parameters(args): Parameters<CapabilityCapsuleProposeExperienceArgs>,
-    ) -> Result<CallToolResult, McpError> {
-        let mut body = Map::new();
-        body.insert(
-            "tenant".into(),
-            json!(self.resolve_tenant(args.tenant.as_ref())),
-        );
-        body.insert("goal".into(), json!(args.summary));
-        body.insert("steps".into(), json!(Vec::<String>::new()));
-        body.insert("outcome".into(), json!(args.content));
-        body.insert("evidence".into(), json!(args.evidence.unwrap_or_default()));
-        body.insert("scope".into(), json!("project"));
-        body.insert("visibility".into(), json!("private"));
-        body.insert("project".into(), json!(args.project));
-        if let Some(v) = args.repo {
-            body.insert("repo".into(), json!(v));
-        }
-        if let Some(v) = args.module {
-            body.insert("module".into(), json!(v));
-        }
-        body.insert(
-            "tags".into(),
-            json!(vec![format!("caller_agent:{}", args.caller_agent)]),
-        );
-        body.insert("source_agent".into(), json!(args.source_agent));
-        let content = args.content.clone();
-        match self
-            .client
-            .request_json(Method::POST, "episodes", Some(&Value::Object(body)))
-            .await
-        {
-            Ok(v) => Ok(ok_json_with_content("✓ Experience proposed", &content, &v)),
-            Err(e) => Ok(err_text(e.to_string())),
-        }
-    }
-
     // ------------------- memory_get -------------------
     #[tool(
         description = "Fetch one memory by id (detail, version chain, graph links, embedding metadata)."
@@ -1240,26 +1172,12 @@ impl MemMcpServer {
     }
 
     // ------------------- capability_capsule_feedback -------------------
-    #[tool(description = "Record feedback on a memory to adjust future ranking.")]
+    #[tool(
+        description = "Record feedback on a memory to adjust future ranking. `feedback_kind` is one of useful | applies_here | outdated | does_not_apply_here | incorrect. Optional `note` is persisted verbatim on the feedback_events row."
+    )]
     async fn capability_capsule_feedback(
         &self,
         Parameters(args): Parameters<CapabilityCapsuleFeedbackArgs>,
-    ) -> Result<CallToolResult, McpError> {
-        let body = json!({
-            "tenant": self.resolve_tenant(args.tenant.as_ref()),
-            "capability_capsule_id": args.capability_capsule_id,
-            "feedback_kind": args.feedback_kind,
-        });
-        self.post_json("capability_capsules/feedback", &body).await
-    }
-
-    // ------------------- capability_capsule_apply_feedback -------------------
-    #[tool(
-        description = "Apply limited feedback on a memory while keeping the existing POST /capability_capsules/feedback backend contract. Optional `note` is persisted verbatim on the resulting feedback_events row."
-    )]
-    async fn capability_capsule_apply_feedback(
-        &self,
-        Parameters(args): Parameters<CapabilityCapsuleApplyFeedbackArgs>,
     ) -> Result<CallToolResult, McpError> {
         let mut body = Map::new();
         body.insert(
@@ -1270,7 +1188,7 @@ impl MemMcpServer {
             "capability_capsule_id".into(),
             json!(args.capability_capsule_id),
         );
-        body.insert("feedback_kind".into(), json!(args.kind));
+        body.insert("feedback_kind".into(), json!(args.feedback_kind));
         if let Some(note) = args.note.filter(|s| !s.is_empty()) {
             body.insert("note".into(), json!(note));
         }

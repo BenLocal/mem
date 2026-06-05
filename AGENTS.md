@@ -62,9 +62,7 @@ cross build --release                          # cross-compile (reads ./Cross.to
 
 When using `mem`'s MCP tools, **closing the feedback loop is part of the contract** — the lifecycle (`confidence` ↑, `decay_score` ↑, status → `Archived`) only moves when callers send signals back. A read-only consumer that never calls back means every memory's score is frozen at ingest, and ranking quality stops compounding.
 
-The two MCP entry points are equivalent over the same `POST /memories/feedback` backend:
-- `mcp__mem__memory_feedback` — canonical name; argument is `feedback_kind: string`.
-- `mcp__mem__memory_apply_feedback` — same body, argument renamed `kind`. Use either; pick one per session for consistency.
+The single MCP entry point is `mcp__mem__capability_capsule_feedback` (`POST /capability_capsules/feedback`): argument `feedback_kind: string`, plus an optional `note: string` persisted verbatim on the `feedback_events` row. (The old `capability_capsule_apply_feedback` alias — same backend, arg renamed `kind` — was removed; its `note` capability folded into `capability_capsule_feedback`.)
 
 The five `feedback_kind` values and what each does (`src/domain/memory.rs::FeedbackKind`):
 
