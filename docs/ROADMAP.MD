@@ -5,9 +5,9 @@
 > **平行工作线**（互不阻塞，各用各自的 close 引用）：
 > - **② Backend 存储抽象** —— [`backend-coupling.md`](./backend-coupling.md) §6，Phase 0–5 已 shipped（DuckDbQuery / LanceStore 已收窄 `pub(crate)`）；引用 `closes backend-coupling §6 Phase N`
 > - **③ 长内容召回** —— [`long-content-recall.md`](./long-content-recall.md)，chunked embeddings 消除长内容尾部静默截断，4 phase 全 ✅；引用 `refs long-content-recall ③ pN`
-> - **④ OSS 记忆引擎对照** —— [`oss-memory-diff.md`](./oss-memory-diff.md)，参照 mem0 / agentmemory 沿 write→recall→feedback 主轴补审，产出 O1–O5（**O1 ✅ / O2 ✅**，O3–O5 待办，见下「OSS 对照路线」表）；引用 `closes oss-memory-diff O#`
+> - **④ OSS 记忆引擎对照** —— [`oss-memory-diff.md`](./oss-memory-diff.md)，参照 mem0 / agentmemory 沿 write→recall→feedback 主轴补审，产出 O1–O5（**O1 ✅ / O2 ✅ / O3 ✅**，O4–O5 待办，见下「OSS 对照路线」表）；引用 `closes oss-memory-diff O#`
 >
-> **状态（2026-06-05）**：核心改造 #1–#19 全部 ✅，#20（内容抽实体）LATER；③ 长内容召回 4 phase 全 ✅；④ OSS 对照 **O1 ✅**（检索使用强化 + 衰减时钟重置，`808cb59`+`709c648`）/ **O2 ✅**（写时近邻去重 → PendingConfirmation + suspected_supersede 边，`b7b9528`+embedding worker），O3–O5 待办。Incident TODO 见文末（#2/#3/#4 已 ✅）。本文件「路线图」表的项用 `closes ROADMAP #N` 引用。
+> **状态（2026-06-05）**：核心改造 #1–#19 全部 ✅，#20（内容抽实体）LATER；③ 长内容召回 4 phase 全 ✅；④ OSS 对照 **O1 ✅**（检索使用强化 + 衰减时钟重置，`808cb59`+`709c648`）/ **O2 ✅**（写时近邻去重 → PendingConfirmation + suspected_supersede 边，`b7b9528`+embedding worker）/ **O3 ✅**（capsule recall 多样化 / per-source 软配额，`pipeline/retrieve.rs`），O4–O5 待办。Incident TODO 见文末（#2/#3/#4 已 ✅）。本文件「路线图」表的项用 `closes ROADMAP #N` 引用。
 
 ## 路线图
 
@@ -51,13 +51,13 @@
 
 ## OSS 对照路线（O 系列）
 
-> 来源 [`oss-memory-diff.md`](./oss-memory-diff.md)（④，2026-06-05）。参照 mem0 / agentmemory 沿 **write → recall → feedback** 主轴补审，每项论证 / 触点 / 风险见原文 §5。**O1 ✅（`808cb59`+`709c648`）/ O2 ✅（`b7b9528`+worker），O3–O5 待办。** close 引用用 `closes oss-memory-diff O#`。
+> 来源 [`oss-memory-diff.md`](./oss-memory-diff.md)（④，2026-06-05）。参照 mem0 / agentmemory 沿 **write → recall → feedback** 主轴补审，每项论证 / 触点 / 风险见原文 §5。**O1 ✅（`808cb59`+`709c648`）/ O2 ✅（`b7b9528`+worker）/ O3 ✅（`retrieve.rs`），O4–O5 待办。** close 引用用 `closes oss-memory-diff O#`。
 
 | # | 层 | 项 | 价值 | 工作量 | 风险 | 触点 |
 |---|---|---|---|---|---|---|
 | O1 | 🔍 | ✅（P0，`808cb59`+`709c648`）**检索使用强化 + 衰减时钟重置**。加 `last_used_at` 列；`search` 把真正写进输出的 capsule 经 channel 异步交给 always-on `last_used_worker` bump（"used"语义，非"retrieved"）；`decay_worker` 锚改"最后一次触碰"（用过锚 `last_used_at`、没用过锚 `updated_at`），用过即重置衰减时钟。**落地偏离**（lance UPDATE 限制，以代码为权威，详见 [`oss-memory-diff.md`](./oss-memory-diff.md) §O1「已落地」）：bump 在 service 层而非 `compress.rs` 内；decay 因 lance 不支持 SET 里 `COALESCE`/多值 `IN` 拆成两条 WHERE 互斥 UPDATE；retrieve freshness bonus 标 optional 未做。 | 🟠 直击最大结构性弱点：ranking 在无显式回调时自主生长 | M | 中（bump 异步、读路径外；攒批 coalesce 收口写放大） | capsule schema、`worker/last_used_worker.rs`、`worker/decay_worker.rs`+`duckdb_query/decay.rs`、`service/capability_capsule_service.rs` |
 | O2 | 🔍 | ✅（P1，`b7b9528`+worker）**write 时近邻去重 / 矛盾检测**。`content_hash` 仅完全一致去重，同义改写落新行。落地：embedding worker 嵌完新 `Active` capsule 后做 semantic top-k 近邻，cosine 超阈值（默认 0.92）则 `set_capsule_status(.., PendingConfirmation)` + 写 `suspected_supersede` 图边（不自动覆盖，守 verbatim）。**落地偏离**（详见 [`oss-memory-diff.md`](./oss-memory-diff.md) §O2「已落地」）：标注用图边而非 tag（lance 改不了 List 列）；检查在异步 worker 非 ingest 同步路。opt-in `MEM_INGEST_NEARDUP_ENABLED`。 | 🟠 预防膨胀与矛盾并存 | M | 低-中（阈值保守，异步、读路径外） | `worker/embedding_worker.rs`、`storage/*`（`set_capsule_status`）、复用 hybrid 近邻 + review 队列 |
-| O3 | 🔍 | ⬜（P1）**capsule recall 多样化（MMR / per-source cap）**。现状 transcript 侧有 session co-occurrence（加权，非去重），capsule 侧无任何多样化；同 supersede 链 / 同 session 批量 ingest 的近似条目霸占头部。改法：`finalize` 排序后截断前加 per-source 配额裁剪或 MMR 去冗。借 agentmemory `max 3 per session`。 | 🟡 头部去冗 | S | 低（软上限，不足回填） | `pipeline/retrieve.rs::finalize` |
+| O3 | 🔍 | ✅（P1，`retrieve.rs`）**capsule recall 多样化（per-source cap）**。落地：`finalize` floor 过滤后调 `diversify_by_source`——source=`session_id`（无则自身 id），每 source 在 head 至多 `cap`（默认 3），超额按原排名挪尾部不丢（软上限，compress 按 budget 仍纳）。同 supersede 链那路 `hybrid_candidates` SQL 早已版本链去重，故只治"同 session 批量霸占头部"。选轻量配额非 MMR。默认开 `MEM_RECALL_PER_SOURCE_CAP`（=0 关）。借 agentmemory `max 3 per session`。 | 🟡 头部去冗 | S | 低（软上限，不足回填） | `pipeline/retrieve.rs::finalize` |
 | O4 | 🔍 | ⬜（P2）**graph boost 按 degree 衰减**。现状 `graph_boost_by_id` 不看 entity 度数，热门 entity（`project:`/`repo:`）下一大批 capsule 被一刀切 boost。改法：按锚 entity 邻居数反比衰减。借 mem0 spread 衰减 `boost / (1 + 0.001*(num_linked-1)^2)`。 | 🟡 抑制高扇出节点过度 boost | S（一行式） | 极小 | `score_with_hybrid` / `graph_anchor_nodes` 下游 |
 | O5 | 📦/⚙️ | ⬜（P2）**ingest secret 脱敏**。现状 transcript 整段 verbatim 存，verbatim 抬高密钥泄露面。改法（两层守 verbatim）：原文 access-control 下原样保留，仅在索引/输出层 redact 高置信密钥模式（`sk-`、AWS AKIA、私钥块、`<private>`）；不就地改写 `content`。借 agentmemory privacy filter。 | 🟡 降低泄露面 | M（先定密钥白名单边界） | 中（误 redact 风险，与 verbatim 边界强相关，落地前单独定调） | index/输出侧（`pipeline/compress.rs`、嵌入前文本），不动落盘 content |
 
@@ -70,7 +70,7 @@
 - **#20** — 内容自动抽取实体（opt-in regex），风险高、需先定 Verbatim 边界，LATER。
 - **跨 scope tunnel 提升** — scope 内实体共现边已落地 `af71bd3`（`src/worker/cooccurrence_worker.rs`，默认 OFF）；下一步「共现 → 跨 scope tunnel 提升」可评估质量后再做。
 - **③ 长内容召回**（chunked embeddings）— 独立 workstream，4 phase 全 ✅（capsule + transcript 两条管线都已切片嵌入），详见 [`long-content-recall.md`](./long-content-recall.md)。剩：存量长内容回填（靠 `embeddings_rebuild` 重嵌，未自动化）。
-- **④ OSS 对照（O1–O5）** — 参照 mem0 / agentmemory，**O1 ✅**（检索使用强化 + 衰减时钟重置，`808cb59`+`709c648`）/ **O2 ✅**（写时近邻去重 → PendingConfirmation + suspected_supersede 边，`b7b9528`+embedding worker），**O3–O5 待办**，详见上「OSS 对照路线」表 + [`oss-memory-diff.md`](./oss-memory-diff.md)。O1 让生命周期在 agent 不回调时也能自主生长（`search` 命中即异步回写 `last_used_at`）；O2 在写入侧防膨胀（同义改写不再静默落新行，落审而非自动合并，守 verbatim）。
+- **④ OSS 对照（O1–O5）** — 参照 mem0 / agentmemory，**O1 ✅**（检索使用强化 + 衰减时钟重置，`808cb59`+`709c648`）/ **O2 ✅**（写时近邻去重 → PendingConfirmation + suspected_supersede 边，`b7b9528`+embedding worker）/ **O3 ✅**（capsule recall 多样化 / per-source 软配额，`pipeline/retrieve.rs`），**O4–O5 待办**，详见上「OSS 对照路线」表 + [`oss-memory-diff.md`](./oss-memory-diff.md)。O1 让生命周期在 agent 不回调时也能自主生长（`search` 命中即异步回写 `last_used_at`）；O2 在写入侧防膨胀（同义改写不再静默落新行，落审而非自动合并，守 verbatim）；O3 在读出侧防一源霸榜（同 session 批量不再霸占头部）。
 - **召回质量 bench** — #14/#15（recall ablation + LongMemEval parity）已在 `4df527b` **删除**（依赖旧 usearch HNSW，迁 Lance native ANN + Store API 时不可迁移）；`bench-fixtures/` 已空。要对 ③ chunking / O 系列等检索改动做量化评估需**重建**（移植 longmemeval harness 到新 API + 数据集）。`src/pipeline/eval_metrics.rs` 的指标函数（recall@k / ndcg / mrr）仍在、可复用。
 - **不做**：多语言 embedding（默认 `Qwen/Qwen3-Embedding-0.6B` 已覆盖多语言）；spellcheck / llm_refine / dialect / repair。
 

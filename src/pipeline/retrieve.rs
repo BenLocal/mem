@@ -38,6 +38,19 @@ fn effective_floor(query: &SearchCapabilityCapsuleRequest) -> i64 {
     query.min_score.unwrap_or_else(min_relevance_score)
 }
 
+/// O3 per-source diversity cap: the max number of capsules from a single
+/// *source* allowed in the head of a ranked result before the rest are
+/// deferred to the tail (see [`diversify_by_source`]). Default **3**
+/// (agentmemory's "max 3 per session"); set `MEM_RECALL_PER_SOURCE_CAP=0`
+/// to disable. Read live so it can be tuned without a restart; an
+/// invalid value falls back to the default.
+fn per_source_cap() -> usize {
+    std::env::var("MEM_RECALL_PER_SOURCE_CAP")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or(3)
+}
+
 /// Does `memory` satisfy the given scope filters? Uses the same
 /// `kind:value` grammar as search ranking (`repo:`, `project:`,
 /// `module:`, `scope:`, bare `tag`). Empty filters → always true (no
@@ -64,7 +77,7 @@ pub fn matches_scope_filters(memory: &CapabilityCapsuleRecord, filters: &[String
 /// of textual match with the current query. The relevance floor only gates
 /// the relevance-driven sections (Facts, Patterns).
 fn finalize(scored: Vec<ScoredMemory>, floor: i64) -> Vec<CapabilityCapsuleRecord> {
-    scored
+    let filtered: Vec<CapabilityCapsuleRecord> = scored
         .into_iter()
         .filter(|entry| {
             matches!(
@@ -73,7 +86,51 @@ fn finalize(scored: Vec<ScoredMemory>, floor: i64) -> Vec<CapabilityCapsuleRecor
             ) || entry.score > floor
         })
         .map(|entry| entry.memory)
-        .collect()
+        .collect();
+    // O3: diversify the ranked head so one session's batch of near-dup
+    // capsules can't dominate the top (and thus the token budget) of the
+    // result.
+    diversify_by_source(filtered, per_source_cap())
+}
+
+/// O3 (closes oss-memory-diff O3) — per-source diversity cap. Walk the
+/// already-ranked list and admit at most `cap` capsules per *source*
+/// into the head, deferring any overflow (in rank order) to the tail. A
+/// **soft** cap: nothing is dropped, so a token budget that reaches the
+/// tail still includes the overflow — it just stops a batch of
+/// near-identical capsules ingested in one session from monopolising the
+/// top. Source = `session_id` when set, else the capsule's own id (so a
+/// capsule with no session is its own source and is never capped).
+/// `cap == 0` disables and returns the input unchanged.
+///
+/// Note: this is the *opposite* direction from transcript-side session
+/// co-occurrence (`transcript_recall.rs`, which up-weights same-session
+/// blocks) — kept as a separate function on purpose.
+fn diversify_by_source(
+    ranked: Vec<CapabilityCapsuleRecord>,
+    cap: usize,
+) -> Vec<CapabilityCapsuleRecord> {
+    if cap == 0 {
+        return ranked;
+    }
+    let mut counts: HashMap<String, usize> = HashMap::new();
+    let mut head: Vec<CapabilityCapsuleRecord> = Vec::with_capacity(ranked.len());
+    let mut overflow: Vec<CapabilityCapsuleRecord> = Vec::new();
+    for memory in ranked {
+        let source = match memory.session_id.as_deref().filter(|s| !s.is_empty()) {
+            Some(sid) => format!("session:{sid}"),
+            None => format!("id:{}", memory.capability_capsule_id),
+        };
+        let seen = counts.entry(source).or_insert(0);
+        if *seen < cap {
+            *seen += 1;
+            head.push(memory);
+        } else {
+            overflow.push(memory);
+        }
+    }
+    head.extend(overflow);
+    head
 }
 
 /// Top-level hybrid entry: take the lifecycle pool (e.g. all active
@@ -936,5 +993,50 @@ mod tests {
         }
         assert!(seen.contains("capability_capsule:strong"));
         assert!(seen.contains("capability_capsule:weak"));
+    }
+
+    // ── O3: per-source diversity cap ────────────────────────────────
+    fn sess(id: &str, session: &str) -> CapabilityCapsuleRecord {
+        let mut m = fixture_memory(id);
+        m.session_id = Some(session.to_string());
+        m
+    }
+
+    fn ids(ms: &[CapabilityCapsuleRecord]) -> Vec<&str> {
+        ms.iter()
+            .map(|m| m.capability_capsule_id.as_str())
+            .collect()
+    }
+
+    #[test]
+    fn diversify_floats_a_distinct_source_above_same_session_overflow() {
+        // a,b,c,d from session s1; x from s2. cap 2 → s1 keeps a,b in the
+        // head; c,d overflow to the tail; x (originally last) floats up
+        // above the s1 overflow. The whole set survives (soft cap).
+        let ranked = vec![
+            sess("a", "s1"),
+            sess("b", "s1"),
+            sess("c", "s1"),
+            sess("d", "s1"),
+            sess("x", "s2"),
+        ];
+        let out = diversify_by_source(ranked, 2);
+        assert_eq!(ids(&out), vec!["a", "b", "x", "c", "d"]);
+    }
+
+    #[test]
+    fn diversify_leaves_distinct_and_sessionless_capsules_untouched() {
+        // Two session-less capsules (each its own source) + one in a
+        // session: cap 1 caps nothing because no source repeats.
+        let ranked = vec![fixture_memory("a"), fixture_memory("b"), sess("c", "s1")];
+        let out = diversify_by_source(ranked, 1);
+        assert_eq!(ids(&out), vec!["a", "b", "c"]);
+    }
+
+    #[test]
+    fn diversify_cap_zero_is_a_noop() {
+        let ranked = vec![sess("a", "s1"), sess("b", "s1"), sess("c", "s1")];
+        let out = diversify_by_source(ranked, 0);
+        assert_eq!(ids(&out), vec!["a", "b", "c"]);
     }
 }

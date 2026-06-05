@@ -155,7 +155,7 @@ FEEDBACK  ── 隐式 / 自动 ──
 
 **已落地（以代码为权威）**：检查放在**异步 embedding worker** 里（用户拍板）——`post_embed` 完成 job 后，对刚嵌入的 `Active` capsule 用 `hybrid_candidates(空 text + 新向量)` 取 top-k、排除自身、逐候选取存量向量算精确 cosine；最高者 ≥ 阈值则 `set_capsule_status(.., PendingConfirmation)` + 写一条 `suspected_supersede` 图边。两处偏离原 (改法)：① **标注从 tag 改成图边**——lance 的 `.update()` 改不了 List 列（tags），且检查在 capsule 已落库后跑、只能事后写；图边是 mem 里 memory→memory 指针的惯用且安全表达（与 `contradicts`/`supersedes` 同族）。② 触发点**没放进 `compress.rs`/ingest 同步路**（那要每次 ingest 多一次同步嵌入）；放异步 worker 后零 ingest 延迟、且复用 worker 刚算出的向量。前置：把 `accept_pending`/`reject_pending` 合并成 `set_capsule_status` 单一原语（`b7b9528`），O2 的翻转直接复用、无需新 trait 方法。opt-in `MEM_INGEST_NEARDUP_ENABLED`，阈值 `MEM_INGEST_NEARDUP_THRESHOLD`（默认 0.92）。
 
-### O3 🔍 — capsule recall 多样化（MMR / per-source cap）（P1）
+### O3 🔍 — capsule recall 多样化（MMR / per-source cap）（P1）✅ done（`pipeline/retrieve.rs`，2026-06-05）
 
 **现状（code）**：transcript 侧有 session **co-occurrence**（`transcript_recall.rs::score_candidates` 的 `session_counts`，那是**加权**，不是去重）；**capsule 侧没有任何多样化**。同一 supersede 链派生、或同 session 批量 ingest 的近似 capsule 可能霸占头部。
 
@@ -165,6 +165,8 @@ FEEDBACK  ── 隐式 / 自动 ──
 
 **触点**：`pipeline/retrieve.rs::finalize`。
 **风险**：低。配额是软上限，命中不足时回填。
+
+**已落地**：选了**轻量 per-source 配额裁剪**（非 MMR——MMR 要 pairwise 相似度、更重，收益边际）。`retrieve.rs::finalize` 在 floor 过滤后调 `diversify_by_source(ranked, per_source_cap())`：source key = `session_id`（没有则用 capsule 自身 id，即不分组），每 source 在 head 至多 `cap`（默认 3）条，超额按原排名挪到**尾部不丢弃**（软上限，compress 仍可按 budget 纳入）。`supersedes` 链那一路问题其实 `hybrid_candidates` 的 SQL 早已做版本链去重（`NOT EXISTS superseded-by-active`），所以这里只需治"同 session 批量 ingest 霸占头部"。默认开 `MEM_RECALL_PER_SOURCE_CAP`（=0 关），与 transcript 侧 session co-occurrence 是相反方向、独立函数。
 
 ### O4 🔍 — graph boost 按 degree 衰减（P2）
 
@@ -204,7 +206,7 @@ FEEDBACK  ── 隐式 / 自动 ──
 |---|---|---|---|---|
 | **P0 ✅** | O1 使用强化 + 衰减重置（`808cb59`+`709c648`） | 🔍 | M（加列 + last_used worker + decay 锚） | 直击 mem 最大结构性弱点：让 ranking 在 agent 不回调时也能自主生长 |
 | P1 ✅ | O2 write 近邻去重/矛盾（`b7b9528`+worker） | 🔍 | M | 预防膨胀与矛盾并存（异步 worker，落 PendingConfirmation + suspected_supersede 边，守 verbatim） |
-| P1 | O3 capsule 多样化 | 🔍 | S | 消除头部近似条目霸占 |
+| P1 ✅ | O3 capsule 多样化（`retrieve.rs`） | 🔍 | S | 消除头部近似条目霸占（per-source 软配额，默认 3，session 为 key） |
 | P2 | O4 graph degree 衰减 | 🔍 | S（一行式） | 抑制热门节点过度 boost |
 | P2 | O5 secret 脱敏 | 📦/⚙️ | M（两层设计，先定边界） | 降低 verbatim 带来的泄露面 |
 
