@@ -691,21 +691,19 @@ impl LanceStore {
         Ok(None)
     }
 
-    pub async fn accept_pending(
+    /// Set status from a [`CapabilityCapsuleStatus`] enum. The single
+    /// transition primitive — `accept_pending` / `reject_pending` and
+    /// the O2 review-flag path call this. Routes through
+    /// [`Self::update_status`] (lance `.update()` with a tenant+id
+    /// filter; reliable `rows_updated`).
+    pub async fn set_capsule_status(
         &self,
         tenant: &str,
         capability_capsule_id: &str,
+        status: crate::domain::capability_capsule::CapabilityCapsuleStatus,
     ) -> Result<CapabilityCapsuleRecord, StorageError> {
-        self.update_status(tenant, capability_capsule_id, "active")
-            .await
-    }
-
-    pub async fn reject_pending(
-        &self,
-        tenant: &str,
-        capability_capsule_id: &str,
-    ) -> Result<CapabilityCapsuleRecord, StorageError> {
-        self.update_status(tenant, capability_capsule_id, "rejected")
+        let status_str = enum_to_str(&status)?;
+        self.update_status(tenant, capability_capsule_id, &status_str)
             .await
     }
 
@@ -1296,12 +1294,18 @@ mod tests {
         }
 
         // accept_pending → status active
-        let accepted = repo.accept_pending("tenant", "mem_p").await.unwrap();
+        let accepted = repo
+            .set_capsule_status("tenant", "mem_p", CapabilityCapsuleStatus::Active)
+            .await
+            .unwrap();
         assert_eq!(accepted.status, CapabilityCapsuleStatus::Active);
         assert_eq!(accepted.capability_capsule_id, "mem_p");
 
         // reject_pending → status rejected
-        let rejected = repo.reject_pending("tenant", "mem_q").await.unwrap();
+        let rejected = repo
+            .set_capsule_status("tenant", "mem_q", CapabilityCapsuleStatus::Rejected)
+            .await
+            .unwrap();
         assert_eq!(rejected.status, CapabilityCapsuleStatus::Rejected);
 
         // (The previous `list_pending_review` follow-up assertion was

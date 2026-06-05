@@ -147,10 +147,12 @@ mod tests {
         // table by inserting + updating a row repeatedly.
         store.insert_capability_capsule(fixture("a")).await.unwrap();
         for _ in 0..20 {
-            // accept_pending is a no-op when already active, but
-            // still writes a new manifest version. (Same as the
-            // production workload from the embedding worker.)
-            let _ = store.accept_pending("t", "a").await;
+            // Re-setting Active is a no-op state-wise but still writes a
+            // new manifest version. (Same as the production workload
+            // from the embedding worker.)
+            let _ = store
+                .set_capsule_status("t", "a", CapabilityCapsuleStatus::Active)
+                .await;
         }
         let before = sweep_once(&store, 999_999, true).await.unwrap();
         assert_eq!(before.bytes_removed, 0, "high cutoff must remove nothing");

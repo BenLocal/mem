@@ -75,7 +75,9 @@ async fn seeded_app() -> TestApp {
     // capability_capsules table.
     store.insert_capability_capsule(fixture("a")).await.unwrap();
     for _ in 0..15 {
-        let _ = store.accept_pending("local", "a").await;
+        let _ = store
+            .set_capsule_status("local", "a", CapabilityCapsuleStatus::Active)
+            .await;
     }
 
     let state = common::test_app_state(

@@ -397,43 +397,18 @@ impl CapsuleStore for PostgresCapsuleStore {
         rows.iter().map(row_to_record).collect()
     }
 
-    async fn accept_pending(
+    async fn set_capsule_status(
         &self,
         tenant: &str,
         capability_capsule_id: &str,
+        status: CapabilityCapsuleStatus,
     ) -> Result<CapabilityCapsuleRecord, StorageError> {
         let now = crate::storage::current_timestamp();
         let rows_affected = sqlx::query(
-            "UPDATE capability_capsules SET status = 'active', updated_at = $1 \
-             WHERE tenant = $2 AND capability_capsule_id = $3",
+            "UPDATE capability_capsules SET status = $1, updated_at = $2 \
+             WHERE tenant = $3 AND capability_capsule_id = $4",
         )
-        .bind(&now)
-        .bind(tenant)
-        .bind(capability_capsule_id)
-        .execute(&self.pool)
-        .await
-        .map_err(sqlx_err)?
-        .rows_affected();
-        if rows_affected == 0 {
-            return Err(StorageError::InvalidData("memory not found"));
-        }
-        self.get_capability_capsule_for_tenant(tenant, capability_capsule_id)
-            .await?
-            .ok_or(StorageError::InvalidData(
-                "memory missing after status update",
-            ))
-    }
-
-    async fn reject_pending(
-        &self,
-        tenant: &str,
-        capability_capsule_id: &str,
-    ) -> Result<CapabilityCapsuleRecord, StorageError> {
-        let now = crate::storage::current_timestamp();
-        let rows_affected = sqlx::query(
-            "UPDATE capability_capsules SET status = 'rejected', updated_at = $1 \
-             WHERE tenant = $2 AND capability_capsule_id = $3",
-        )
+        .bind(enum_to_str(&status)?)
         .bind(&now)
         .bind(tenant)
         .bind(capability_capsule_id)

@@ -404,27 +404,18 @@ impl Store {
         .await
     }
 
-    pub async fn accept_pending(
+    /// The single status-transition primitive (LanceStore +
+    /// DuckDbQuery dirty-mark). `accept_pending` / `reject_pending` /
+    /// O2 review-flagging are thin callers.
+    pub async fn set_capsule_status(
         &self,
         tenant: &str,
         capability_capsule_id: &str,
+        status: crate::domain::capability_capsule::CapabilityCapsuleStatus,
     ) -> Result<CapabilityCapsuleRecord, StorageError> {
         self.commit_lance_write(
             self.lance
-                .accept_pending(tenant, capability_capsule_id)
-                .await,
-        )
-        .await
-    }
-
-    pub async fn reject_pending(
-        &self,
-        tenant: &str,
-        capability_capsule_id: &str,
-    ) -> Result<CapabilityCapsuleRecord, StorageError> {
-        self.commit_lance_write(
-            self.lance
-                .reject_pending(tenant, capability_capsule_id)
+                .set_capsule_status(tenant, capability_capsule_id, status)
                 .await,
         )
         .await
@@ -1561,10 +1552,13 @@ mod tests {
             .expect("pending row visible after second insert + refresh");
         assert_eq!(pre.status, CapabilityCapsuleStatus::PendingConfirmation);
 
-        // UPDATE via accept_pending (lance Table::update) — the
+        // UPDATE via set_capsule_status (lance Table::update) — the
         // hardest case: lance UPDATE wasn't visible at all without
         // refresh.
-        let accepted = store.accept_pending("tenant-a", "m_pending").await.unwrap();
+        let accepted = store
+            .set_capsule_status("tenant-a", "m_pending", CapabilityCapsuleStatus::Active)
+            .await
+            .unwrap();
         assert_eq!(accepted.status, CapabilityCapsuleStatus::Active);
         let post = store
             .get_capability_capsule_for_tenant("tenant-a", "m_pending")

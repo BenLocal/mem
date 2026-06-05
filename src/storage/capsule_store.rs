@@ -10,11 +10,13 @@
 //!   queues, graph edges, transcripts, entities, sessions, vacuum —
 //!   all belong to other sub-traits that will land in Phase 3+. This
 //!   trait is intentionally narrow to keep the validation tractable.
-//! - **No defaults**. Every method is required. Optional defaults
-//!   (e.g. deriving `list_pending_review` from `list_for_tenant` +
-//!   a status filter) were considered but deferred — the in-memory
-//!   backend is small enough that hand-writing each method is
-//!   clearer than wiring default impls.
+//! - **Mostly no defaults**. Methods are required per backend, with one
+//!   exception: `accept_pending` / `reject_pending` are default wrappers
+//!   over the single `set_capsule_status` transition primitive (so a
+//!   backend implements one status setter, not three). Other candidate
+//!   defaults (e.g. deriving `list_pending_review` from
+//!   `list_for_tenant` + a status filter) stay hand-written — the
+//!   in-memory backend is small enough that explicit is clearer.
 //! - **Service migrated in Phase 5**: `capability_capsule_service`
 //!   now holds `Arc<dyn Backend>` (umbrella supertrait); this trait
 //!   is one of the nine that compose it.
@@ -106,21 +108,50 @@ pub trait CapsuleStore: Send + Sync {
         ids: &[&str],
     ) -> Result<Vec<CapabilityCapsuleRecord>, StorageError>;
 
-    /// `PendingConfirmation → Active` transition. Returns the row
-    /// post-update.
+    /// Set a capsule's `status` and return the updated row. The single
+    /// status-transition primitive — `accept_pending` (→ Active),
+    /// `reject_pending` (→ Rejected) and O2 near-dup review flagging
+    /// (→ PendingConfirmation) are all thin callers of this. The write
+    /// is **unconditional** on the current status (callers that need a
+    /// from-guard read first), matching the historical
+    /// accept/reject behaviour. Errors `NotFound` when `(tenant, id)`
+    /// has no row.
+    async fn set_capsule_status(
+        &self,
+        tenant: &str,
+        capability_capsule_id: &str,
+        status: CapabilityCapsuleStatus,
+    ) -> Result<CapabilityCapsuleRecord, StorageError>;
+
+    /// `→ Active` transition (review accept). Default wrapper over
+    /// [`Self::set_capsule_status`].
     async fn accept_pending(
         &self,
         tenant: &str,
         capability_capsule_id: &str,
-    ) -> Result<CapabilityCapsuleRecord, StorageError>;
+    ) -> Result<CapabilityCapsuleRecord, StorageError> {
+        self.set_capsule_status(
+            tenant,
+            capability_capsule_id,
+            CapabilityCapsuleStatus::Active,
+        )
+        .await
+    }
 
-    /// `PendingConfirmation → Rejected` transition. Returns the row
-    /// post-update.
+    /// `→ Rejected` transition (review reject). Default wrapper over
+    /// [`Self::set_capsule_status`].
     async fn reject_pending(
         &self,
         tenant: &str,
         capability_capsule_id: &str,
-    ) -> Result<CapabilityCapsuleRecord, StorageError>;
+    ) -> Result<CapabilityCapsuleRecord, StorageError> {
+        self.set_capsule_status(
+            tenant,
+            capability_capsule_id,
+            CapabilityCapsuleStatus::Rejected,
+        )
+        .await
+    }
 
     /// Supersede a pending row with an edited active successor.
     /// Two-op semantics (mark old + insert new) — see the
@@ -344,20 +375,13 @@ impl CapsuleStore for Store {
         Store::fetch_capability_capsules_by_ids(self, tenant, ids).await
     }
 
-    async fn accept_pending(
+    async fn set_capsule_status(
         &self,
         tenant: &str,
         capability_capsule_id: &str,
+        status: CapabilityCapsuleStatus,
     ) -> Result<CapabilityCapsuleRecord, StorageError> {
-        Store::accept_pending(self, tenant, capability_capsule_id).await
-    }
-
-    async fn reject_pending(
-        &self,
-        tenant: &str,
-        capability_capsule_id: &str,
-    ) -> Result<CapabilityCapsuleRecord, StorageError> {
-        Store::reject_pending(self, tenant, capability_capsule_id).await
+        Store::set_capsule_status(self, tenant, capability_capsule_id, status).await
     }
 
     async fn replace_pending_with_successor(
@@ -616,10 +640,11 @@ impl CapsuleStore for InMemoryCapsuleStore {
         }))
     }
 
-    async fn accept_pending(
+    async fn set_capsule_status(
         &self,
         tenant: &str,
         capability_capsule_id: &str,
+        status: CapabilityCapsuleStatus,
     ) -> Result<CapabilityCapsuleRecord, StorageError> {
         self.with_state(|s| {
             let r = s
@@ -627,24 +652,7 @@ impl CapsuleStore for InMemoryCapsuleStore {
                 .get_mut(capability_capsule_id)
                 .filter(|r| r.tenant == tenant)
                 .ok_or(StorageError::InvalidData("memory not found"))?;
-            r.status = CapabilityCapsuleStatus::Active;
-            r.updated_at = crate::storage::current_timestamp();
-            Ok(r.clone())
-        })
-    }
-
-    async fn reject_pending(
-        &self,
-        tenant: &str,
-        capability_capsule_id: &str,
-    ) -> Result<CapabilityCapsuleRecord, StorageError> {
-        self.with_state(|s| {
-            let r = s
-                .capsules
-                .get_mut(capability_capsule_id)
-                .filter(|r| r.tenant == tenant)
-                .ok_or(StorageError::InvalidData("memory not found"))?;
-            r.status = CapabilityCapsuleStatus::Rejected;
+            r.status = status;
             r.updated_at = crate::storage::current_timestamp();
             Ok(r.clone())
         })
