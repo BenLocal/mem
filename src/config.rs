@@ -50,6 +50,19 @@ pub struct EmbeddingSettings {
     /// case-insensitive). Used by the cli/mine.rs offline pipeline and tests
     /// that want transcript ingest without a background worker.
     pub transcript_disabled: bool,
+    /// O2 — write-time near-duplicate review flagging. When `true`, the
+    /// embedding worker, right after it embeds a freshly-ingested
+    /// `Active` capsule, checks whether a near-identical capsule already
+    /// exists (cosine ≥ `neardup_threshold`); if so it flips the new
+    /// capsule to `PendingConfirmation` and records a
+    /// `suspected_supersede` graph edge for review. Default OFF
+    /// (opt in via `MEM_INGEST_NEARDUP_ENABLED=1`) — conservative, like
+    /// the other write-affecting workers.
+    pub neardup_enabled: bool,
+    /// Cosine threshold for O2 near-dup flagging. Default 0.92 — kept
+    /// conservative (prefer missing a dup to false-flagging a distinct
+    /// capsule). Tune via `MEM_INGEST_NEARDUP_THRESHOLD`.
+    pub neardup_threshold: f32,
     // Vestigial usearch sidecar tuning fields (`vector_index_flush_every`,
     // `vector_index_oversample`, `vector_index_use_legacy`,
     // `transcript_vector_index_flush_every`, `transcript_search_oversample`)
@@ -372,6 +385,9 @@ impl EmbeddingSettings {
             batch_size: 8,
             openai_api_key: None,
             transcript_disabled: false,
+            // O2 near-dup review flagging — opt-in, conservative threshold.
+            neardup_enabled: false,
+            neardup_threshold: 0.92,
         }
     }
 
@@ -445,6 +461,21 @@ impl EmbeddingSettings {
         if let Some(raw) = get("MEM_TRANSCRIPT_EMBED_DISABLED") {
             s.transcript_disabled =
                 matches!(raw.to_ascii_lowercase().as_str(), "1" | "true" | "yes");
+        }
+
+        if let Some(raw) = get("MEM_INGEST_NEARDUP_ENABLED") {
+            s.neardup_enabled = matches!(raw.to_ascii_lowercase().as_str(), "1" | "true" | "yes");
+        }
+
+        if let Some(raw) = get("MEM_INGEST_NEARDUP_THRESHOLD") {
+            // Invalid / out-of-range values silently fall back to the
+            // default (0.92) — same lenient pattern as
+            // MEM_TRANSCRIPT_OVERSAMPLE; near-dup flagging is best-effort.
+            if let Ok(t) = raw.parse::<f32>() {
+                if (0.0..=1.0).contains(&t) {
+                    s.neardup_threshold = t;
+                }
+            }
         }
 
         Ok(s)

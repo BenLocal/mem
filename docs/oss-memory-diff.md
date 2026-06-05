@@ -142,7 +142,7 @@ FEEDBACK  ── 隐式 / 自动 ──
 - (c) decay 锚**不能直接写 `COALESCE(last_used_at, updated_at)`**：lance UPDATE 的 SET 表达式不支持 `COALESCE`（"Not implemented"），且 WHERE 不支持多值 `IN`（"pushed table filters"）。改成：decay sweep 拆**两条 WHERE 互斥的 UPDATE**（`last_used_at IS NOT NULL` 锚 last_used_at、`IS NULL` 锚 updated_at，每行只命中一次）；bump 逐 id 单等值 UPDATE。额外精化：sweep 的**每 tick 重置列从 `updated_at` 改成 `last_used_at`**，于是 `updated_at` 回归纯写时间 freshness（旧账：原本被 sweep 每小时刷平），`decay_score` 仍是累加器、feedback delta 不被抹。可选的 retrieve freshness bonus **未做**（标 optional，留待后续）。
 - 旧表迁移：`migrate_capability_capsules_add_columns`（`add_columns(AllNulls)`）回填旧行 NULL → sweep 回落 `updated_at`，由 `legacy_uint64_version_compat` 端到端验证。新增 env `MEM_LAST_USED_FLUSH_SECS`（默认 5）。
 
-### O2 🔍 — write 时近邻去重 / 矛盾检测（P1）
+### O2 🔍 — write 时近邻去重 / 矛盾检测（P1）✅ done（`b7b9528` refactor + worker，2026-06-05）
 
 **现状（code）**：`pipeline/ingest.rs` 去重只有 `content_hash` 完全一致；同义改写直接落新行，矛盾并存，要等 agent 手动 `supersede`。
 
@@ -152,6 +152,8 @@ FEEDBACK  ── 隐式 / 自动 ──
 
 **触点**：`pipeline/ingest.rs`（hash 检查后加近邻照会）、复用既有 semantic search + review 队列。
 **风险**：低-中。阈值要保守（宁可漏判不可误并）；近邻查询走异步，别拖 ingest 延迟。
+
+**已落地（以代码为权威）**：检查放在**异步 embedding worker** 里（用户拍板）——`post_embed` 完成 job 后，对刚嵌入的 `Active` capsule 用 `hybrid_candidates(空 text + 新向量)` 取 top-k、排除自身、逐候选取存量向量算精确 cosine；最高者 ≥ 阈值则 `set_capsule_status(.., PendingConfirmation)` + 写一条 `suspected_supersede` 图边。两处偏离原 (改法)：① **标注从 tag 改成图边**——lance 的 `.update()` 改不了 List 列（tags），且检查在 capsule 已落库后跑、只能事后写；图边是 mem 里 memory→memory 指针的惯用且安全表达（与 `contradicts`/`supersedes` 同族）。② 触发点**没放进 `compress.rs`/ingest 同步路**（那要每次 ingest 多一次同步嵌入）；放异步 worker 后零 ingest 延迟、且复用 worker 刚算出的向量。前置：把 `accept_pending`/`reject_pending` 合并成 `set_capsule_status` 单一原语（`b7b9528`），O2 的翻转直接复用、无需新 trait 方法。opt-in `MEM_INGEST_NEARDUP_ENABLED`，阈值 `MEM_INGEST_NEARDUP_THRESHOLD`（默认 0.92）。
 
 ### O3 🔍 — capsule recall 多样化（MMR / per-source cap）（P1）
 
@@ -201,7 +203,7 @@ FEEDBACK  ── 隐式 / 自动 ──
 | 优先 | 项 | 层 | 工作量 | 价值 |
 |---|---|---|---|---|
 | **P0 ✅** | O1 使用强化 + 衰减重置（`808cb59`+`709c648`） | 🔍 | M（加列 + last_used worker + decay 锚） | 直击 mem 最大结构性弱点：让 ranking 在 agent 不回调时也能自主生长 |
-| P1 | O2 write 近邻去重/矛盾 | 🔍 | M | 预防膨胀与矛盾并存 |
+| P1 ✅ | O2 write 近邻去重/矛盾（`b7b9528`+worker） | 🔍 | M | 预防膨胀与矛盾并存（异步 worker，落 PendingConfirmation + suspected_supersede 边，守 verbatim） |
 | P1 | O3 capsule 多样化 | 🔍 | S | 消除头部近似条目霸占 |
 | P2 | O4 graph degree 衰减 | 🔍 | S（一行式） | 抑制热门节点过度 boost |
 | P2 | O5 secret 脱敏 | 📦/⚙️ | M（两层设计，先定边界） | 降低 verbatim 带来的泄露面 |

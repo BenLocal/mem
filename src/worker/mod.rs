@@ -47,7 +47,11 @@
 //! - `embedding_worker` — drains `embedding_jobs`, calls
 //!   `embed_batch`, upserts to `capability_capsule_embeddings`. Lance handles
 //!   vector indexing internally — no separate HNSW sidecar to
-//!   update.
+//!   update. Also hosts roadmap O2 near-dup review flagging
+//!   (`flag_if_near_duplicate`): right after embedding a fresh `Active`
+//!   capsule it checks the nearest neighbor and, if cosine ≥
+//!   `neardup_threshold`, flips it to `PendingConfirmation` + writes a
+//!   `suspected_supersede` edge. Opt-in (`MEM_INGEST_NEARDUP_ENABLED`).
 //! - `transcript_embedding_worker` — same shape for
 //!   `transcript_embedding_jobs` → `conversation_message_embeddings`.
 //!

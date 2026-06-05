@@ -262,7 +262,152 @@ async fn post_embed(
         capability_capsule_id = %job.capability_capsule_id,
         "embedding worker completed job"
     );
+
+    // O2 (closes oss-memory-diff O2): write-time near-duplicate review
+    // flagging. The capsule's embedding now exists (just upserted), so
+    // we can find its nearest neighbor without re-embedding. Only an
+    // `Active` capsule is eligible — a Pending / Provisional / Archived
+    // row is left alone. Best-effort: an error here is logged but never
+    // fails the (already completed) embedding job. `embeddings[0]` is the
+    // summary+head chunk — the representative vector for a multi-chunk
+    // capsule.
+    if settings.neardup_enabled
+        && memory_after.status == crate::domain::capability_capsule::CapabilityCapsuleStatus::Active
+        && !embeddings.is_empty()
+    {
+        if let Err(e) = flag_if_near_duplicate(
+            store,
+            &job.tenant,
+            &job.capability_capsule_id,
+            &embeddings[0],
+            settings.neardup_threshold,
+        )
+        .await
+        {
+            warn!(
+                error = %e,
+                capability_capsule_id = %job.capability_capsule_id,
+                "O2 near-dup check failed (capsule still active)"
+            );
+        }
+    }
     Ok(())
+}
+
+/// O2: find the nearest *other* active capsule to `vector`; if its
+/// cosine ≥ `threshold`, flip `capsule_id` to `PendingConfirmation` and
+/// record a `suspected_supersede` graph edge (new → neighbor) for human
+/// / agent review. No-op when nothing clears the bar. Runs off the
+/// ingest path in the embedding worker.
+async fn flag_if_near_duplicate(
+    store: &dyn Backend,
+    tenant: &str,
+    capsule_id: &str,
+    vector: &[f32],
+    threshold: f32,
+) -> Result<(), StorageError> {
+    let Some((neighbor_id, cosine)) =
+        nearest_other_capsule(store, tenant, capsule_id, vector, threshold).await?
+    else {
+        return Ok(());
+    };
+
+    // Active → PendingConfirmation. The caller pre-checked Active; the
+    // setter is unconditional (a concurrent status change is rare and
+    // the flag is advisory, not load-bearing).
+    store
+        .set_capsule_status(
+            tenant,
+            capsule_id,
+            crate::domain::capability_capsule::CapabilityCapsuleStatus::PendingConfirmation,
+        )
+        .await?;
+
+    // Record the suspected supersede as a graph edge — a memory→memory
+    // pointer in the same family as `supersedes` / `contradicts`, which
+    // review tooling and graph queries can read. Edge write is
+    // best-effort (the status flip is the load-bearing part).
+    let now = current_timestamp();
+    let edge = crate::domain::capability_capsule::GraphEdge {
+        from_node_id: crate::pipeline::ingest::memory_node_id(capsule_id),
+        to_node_id: crate::pipeline::ingest::memory_node_id(&neighbor_id),
+        relation: "suspected_supersede".to_string(),
+        valid_from: now,
+        valid_to: None,
+        confidence: Some(cosine),
+        extractor: Some("o2_neardup".to_string()),
+        strength: None,
+        stability: None,
+        last_activated: None,
+        access_count: None,
+    };
+    if let Err(e) = store.add_edge_direct(&edge).await {
+        warn!(error = %e, "O2: suspected_supersede edge write failed");
+    }
+    info!(
+        capability_capsule_id = %capsule_id,
+        neighbor = %neighbor_id,
+        cosine = cosine,
+        "O2: flagged near-duplicate for review"
+    );
+    Ok(())
+}
+
+/// Vector-search the top-K nearest capsules (empty query text → the
+/// vector-only branch of `hybrid_candidates`), skip self, then compute
+/// exact cosine against each candidate's stored vector and return the
+/// best `(id, cosine)` at or above `threshold`.
+async fn nearest_other_capsule(
+    store: &dyn Backend,
+    tenant: &str,
+    self_id: &str,
+    vector: &[f32],
+    threshold: f32,
+) -> Result<Option<(String, f32)>, StorageError> {
+    const K: usize = 5;
+    let candidates = store.hybrid_candidates(tenant, "", vector, K).await?;
+    let mut best: Option<(String, f32)> = None;
+    for (cand, _rrf) in candidates {
+        if cand.capability_capsule_id == self_id {
+            continue;
+        }
+        let Some(cand_vec) = store
+            .get_capability_capsule_embedding_vector(&cand.capability_capsule_id)
+            .await?
+        else {
+            continue;
+        };
+        let c = cosine(vector, &cand_vec);
+        let better = match &best {
+            None => true,
+            Some((_, bc)) => c > *bc,
+        };
+        if c >= threshold && better {
+            best = Some((cand.capability_capsule_id.clone(), c));
+        }
+    }
+    Ok(best)
+}
+
+/// Standard cosine similarity: `dot / (|a| · |b|)`. Returns 0 on a
+/// length mismatch or a zero-norm vector. (Mirrors `dedup_worker`'s
+/// private helper; kept local to avoid coupling the two workers.)
+fn cosine(a: &[f32], b: &[f32]) -> f32 {
+    if a.len() != b.len() || a.is_empty() {
+        return 0.0;
+    }
+    let mut dot = 0.0f32;
+    let mut na = 0.0f32;
+    let mut nb = 0.0f32;
+    for (x, y) in a.iter().zip(b.iter()) {
+        dot += x * y;
+        na += x * x;
+        nb += y * y;
+    }
+    if na == 0.0 || nb == 0.0 {
+        return 0.0;
+    }
+    dot / (na.sqrt() * nb.sqrt())
 }
 
 async fn record_failure(
@@ -347,6 +492,131 @@ mod tests {
         assert!(
             chunks.last().unwrap().contains("TAILMARKER"),
             "content tail must survive in the last chunk (not truncated)"
+        );
+    }
+
+    // ── O2: near-duplicate review flagging ──────────────────────────
+    use crate::domain::capability_capsule::{
+        CapabilityCapsuleRecord, CapabilityCapsuleStatus, CapabilityCapsuleType, Scope, Visibility,
+    };
+    use crate::pipeline::ingest::memory_node_id;
+    use crate::storage::Store;
+    use tempfile::tempdir;
+
+    fn active_capsule(id: &str) -> CapabilityCapsuleRecord {
+        CapabilityCapsuleRecord {
+            capability_capsule_id: id.into(),
+            tenant: "local".into(),
+            capability_capsule_type: CapabilityCapsuleType::Experience,
+            status: CapabilityCapsuleStatus::Active,
+            scope: Scope::Repo,
+            visibility: Visibility::Shared,
+            version: 1,
+            summary: format!("summary-{id}"),
+            content: format!("content-{id}"),
+            content_hash: format!("hash-{id}"),
+            source_agent: "test".into(),
+            created_at: "00000000000000000001".into(),
+            updated_at: "00000000000000000001".into(),
+            ..Default::default()
+        }
+    }
+
+    async fn put_embedding(store: &Store, id: &str, vector: &[f32]) {
+        store
+            .upsert_capability_capsule_embedding_chunks(
+                id,
+                "local",
+                "fake-test",
+                vector.len() as i64,
+                &[vector.to_vec()],
+                "h",
+                "00000000000000000001",
+                "00000000000000000002",
+            )
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn near_duplicate_flags_for_review_and_records_edge() {
+        let dir = tempdir().unwrap();
+        let store = Store::open(&dir.path().join("o2.lance")).await.unwrap();
+        store
+            .insert_capability_capsule(active_capsule("orig"))
+            .await
+            .unwrap();
+        store
+            .insert_capability_capsule(active_capsule("dup"))
+            .await
+            .unwrap();
+        // Identical vectors → cosine 1.0, well above the 0.9 threshold.
+        let v = vec![0.10f32, 0.20, 0.30, 0.40];
+        put_embedding(&store, "orig", &v).await;
+        put_embedding(&store, "dup", &v).await;
+
+        flag_if_near_duplicate(&store, "local", "dup", &v, 0.90)
+            .await
+            .unwrap();
+
+        // dup flipped to PendingConfirmation; orig left Active.
+        let dup = store
+            .get_capability_capsule_for_tenant("local", "dup")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(dup.status, CapabilityCapsuleStatus::PendingConfirmation);
+        let orig = store
+            .get_capability_capsule_for_tenant("local", "orig")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(orig.status, CapabilityCapsuleStatus::Active);
+
+        // A suspected_supersede edge dup → orig was recorded.
+        let edges = store
+            .neighbors_within(&memory_node_id("dup"), 1, None)
+            .await
+            .unwrap();
+        assert!(
+            edges
+                .iter()
+                .any(|e| e.relation == "suspected_supersede"
+                    && e.to_node_id == memory_node_id("orig")),
+            "expected a suspected_supersede edge dup→orig, got {edges:?}",
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn distinct_capsule_is_not_flagged() {
+        let dir = tempdir().unwrap();
+        let store = Store::open(&dir.path().join("o2b.lance")).await.unwrap();
+        store
+            .insert_capability_capsule(active_capsule("a"))
+            .await
+            .unwrap();
+        store
+            .insert_capability_capsule(active_capsule("b"))
+            .await
+            .unwrap();
+        // Orthogonal vectors → cosine 0, below threshold.
+        put_embedding(&store, "a", &[1.0, 0.0, 0.0, 0.0]).await;
+        let vb = vec![0.0f32, 1.0, 0.0, 0.0];
+        put_embedding(&store, "b", &vb).await;
+
+        flag_if_near_duplicate(&store, "local", "b", &vb, 0.90)
+            .await
+            .unwrap();
+
+        let b = store
+            .get_capability_capsule_for_tenant("local", "b")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            b.status,
+            CapabilityCapsuleStatus::Active,
+            "a distinct capsule must not be flagged for review",
         );
     }
 }
