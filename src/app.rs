@@ -89,6 +89,28 @@ impl AppState {
             None
         };
 
+        // ── O1 last-used worker (retrieval reinforcement, always on) ──
+        // Spawned BEFORE the upcast so the worker keeps a concrete
+        // `Arc<Store>` (it calls `Store::bump_last_used_at`). The sender
+        // goes to the capsule service, which enqueues a capsule-used
+        // event for every capsule emitted into a search response; the
+        // worker coalesces them off the read path and stamps
+        // `last_used_at`, which anchors the decay clock.
+        let (capsule_used_tx, capsule_used_rx) = tokio::sync::mpsc::unbounded_channel();
+        {
+            let store_lu = store_concrete.clone();
+            // Drain cadence; coalescing within a window bounds write
+            // pressure to one batched UPDATE per tenant per tick.
+            let flush_secs = std::env::var("MEM_LAST_USED_FLUSH_SECS")
+                .ok()
+                .and_then(|v| v.parse::<u64>().ok())
+                .filter(|&v| v > 0)
+                .unwrap_or(5);
+            tokio::spawn(async move {
+                crate::worker::last_used_worker::run(store_lu, capsule_used_rx, flush_secs).await;
+            });
+        }
+
         // Erase to the umbrella trait. Every service / worker below
         // works through `Arc<dyn Backend>` — swap in a different
         // backend by changing this one binding.
@@ -185,6 +207,8 @@ impl AppState {
         if let Some(tx) = edge_access_tx {
             capability_capsule_service = capability_capsule_service.with_potentiation_sender(tx);
         }
+        capability_capsule_service =
+            capability_capsule_service.with_last_used_sender(capsule_used_tx);
 
         Ok(Self {
             capability_capsule_service,

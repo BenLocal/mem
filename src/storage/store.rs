@@ -886,6 +886,24 @@ impl Store {
             .await
     }
 
+    /// Stamp `last_used_at = now` on a batch of capsules (roadmap O1
+    /// retrieval reinforcement). Routes to DuckDbQuery — a single SQL
+    /// UPDATE via the lance extension, which invalidates the
+    /// connection's own cache, so no `Store::refresh` is needed (same
+    /// model as [`Self::apply_time_decay`]). Driven off the read path by
+    /// `crate::worker::last_used_worker`. Best-effort — see
+    /// `DuckDbQuery::bump_last_used_at` for why no rowcount is returned.
+    pub async fn bump_last_used_at(
+        &self,
+        tenant: &str,
+        capability_capsule_ids: &[String],
+        now_ms_str: &str,
+    ) -> Result<(), StorageError> {
+        self.query
+            .bump_last_used_at(tenant, capability_capsule_ids, now_ms_str)
+            .await
+    }
+
     /// Session lifecycle (touch / open / close) — all mutations.
     /// Routed to LanceStore + DuckDbQuery refresh.
     pub async fn touch_session(

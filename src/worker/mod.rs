@@ -32,6 +32,12 @@
 //!   unique edge via `Store::potentiate_edge` — off the read path.
 //!   Default OFF; opt in via `MEM_EDGE_DYNAMICS_ENABLED=1`. Mempalace
 //!   `dynamics.py` analogue.
+//! - `last_used_worker` — roadmap O1 retrieval reinforcement. Drains an
+//!   in-memory channel of capsule-used events that `search` enqueues for
+//!   every capsule emitted into a response, coalesces bursts, and stamps
+//!   `last_used_at = now` via `Store::bump_last_used_at` — off the read
+//!   path. `last_used_at` anchors the decay clock so retrieved capsules
+//!   decay slower than untouched ones. Always on.
 //! - `vacuum_worker` — daily Lance manifest pruning across every
 //!   managed table. Always-on maintenance (reclaims accumulated
 //!   copy-on-write history); opt out with `MEM_VACUUM_DISABLED=1`.
@@ -55,6 +61,7 @@ pub mod cooccurrence_worker;
 pub mod decay_worker;
 pub mod dedup_worker;
 pub mod embedding_worker;
+pub mod last_used_worker;
 pub mod potentiation_worker;
 pub mod topic_tunnel_worker;
 pub mod transcript_embedding_worker;

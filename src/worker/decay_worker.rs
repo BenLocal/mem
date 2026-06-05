@@ -113,13 +113,21 @@ mod tests {
         };
 
         let m_active = read("m-active").await;
-        // ~10 days * 0.01/day ≈ 0.1
+        // ~10 days * 0.01/day ≈ 0.1. last_used_at is NULL here, so the
+        // decay clock falls back to updated_at (10 days ago).
         assert!(
             (0.05..=0.15).contains(&(m_active.decay_score as f64)),
             "active decay ≈ 0.1; got {}",
             m_active.decay_score
         );
-        assert_ne!(m_active.updated_at, ten_days_ago);
+        // O1: the sweep advances the decay clock via `last_used_at`, not
+        // `updated_at`. `updated_at` is now the pure write clock and
+        // stays put; `last_used_at` is stamped to the sweep's `now`.
+        assert_eq!(m_active.updated_at, ten_days_ago);
+        assert!(
+            m_active.last_used_at.is_some(),
+            "sweep must stamp last_used_at as the decay clock"
+        );
 
         let m_prov = read("m-prov").await;
         // Non-active row should not move (status filter).
@@ -130,5 +138,80 @@ mod tests {
         // Saturated row should not move (decay_score < 1.0 filter).
         assert_eq!(m_sat.decay_score, 1.0);
         assert_eq!(m_sat.updated_at, ten_days_ago);
+    }
+
+    /// O1 retrieval reinforcement: two same-age active rows decay
+    /// differently when one has been *used* recently. The used row's
+    /// `last_used_at` resets the decay clock, so the sweep accrues ~0
+    /// for it while the untouched row accrues its full 10-day slice.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn used_capsule_decays_slower_than_untouched() {
+        let dir = tempdir().unwrap();
+        let store = Store::open(&dir.path().join("decay2.lance")).await.unwrap();
+
+        let now_ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_millis();
+        let ten_days_ago = ms_string(now_ms - 10 * MS_PER_DAY as u128);
+
+        // Two active rows, both written 10 days ago, both decay 0.
+        store
+            .insert_capability_capsule(fixture(
+                "m-used",
+                CapabilityCapsuleStatus::Active,
+                0.0,
+                &ten_days_ago,
+            ))
+            .await
+            .unwrap();
+        store
+            .insert_capability_capsule(fixture(
+                "m-untouched",
+                CapabilityCapsuleStatus::Active,
+                0.0,
+                &ten_days_ago,
+            ))
+            .await
+            .unwrap();
+
+        // Simulate a retrieval that emitted m-used: stamp last_used_at = now.
+        let now_str = crate::storage::current_timestamp();
+        store
+            .bump_last_used_at("t", &["m-used".to_string()], &now_str)
+            .await
+            .unwrap();
+
+        apply_time_decay(&store).await.expect("decay must run");
+
+        let used = store
+            .get_capability_capsule_for_tenant("t", "m-used")
+            .await
+            .unwrap()
+            .unwrap();
+        let untouched = store
+            .get_capability_capsule_for_tenant("t", "m-untouched")
+            .await
+            .unwrap()
+            .unwrap();
+
+        // Recently-used → decay clock reset → accrues ~0. Untouched →
+        // anchored on its 10-day-old updated_at → ~0.1.
+        assert!(
+            used.decay_score < 0.01,
+            "used capsule barely decays; got {}",
+            used.decay_score
+        );
+        assert!(
+            (0.05..=0.15).contains(&(untouched.decay_score as f64)),
+            "untouched ≈ 0.1; got {}",
+            untouched.decay_score
+        );
+        assert!(
+            used.decay_score < untouched.decay_score,
+            "use must slow decay: used {} vs untouched {}",
+            used.decay_score,
+            untouched.decay_score
+        );
     }
 }

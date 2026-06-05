@@ -112,3 +112,80 @@ pub struct SearchCapabilityCapsuleResponse {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub recent_conversations: Vec<ConversationSnippet>,
 }
+
+impl SearchCapabilityCapsuleResponse {
+    /// The distinct capability_capsule_ids actually *emitted* into this
+    /// response (directives + facts + patterns). This is the "used" set
+    /// the last-used worker stamps `last_used_at` on (roadmap O1) — the
+    /// load-bearing capsules the agent received, not the wider candidate
+    /// pool that was merely scanned during ranking. Order-preserving,
+    /// first occurrence wins. `recent_conversations` carry no capsule id
+    /// and are excluded.
+    pub fn emitted_capsule_ids(&self) -> Vec<String> {
+        let mut seen = std::collections::HashSet::new();
+        let mut out = Vec::new();
+        let ids = self
+            .directives
+            .iter()
+            .map(|d| &d.capability_capsule_id)
+            .chain(self.relevant_facts.iter().map(|f| &f.capability_capsule_id))
+            .chain(
+                self.reusable_patterns
+                    .iter()
+                    .map(|p| &p.capability_capsule_id),
+            );
+        for id in ids {
+            if seen.insert(id.clone()) {
+                out.push(id.clone());
+            }
+        }
+        out
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn emitted_capsule_ids_dedups_across_sections_order_preserving() {
+        let resp = SearchCapabilityCapsuleResponse {
+            directives: vec![DirectiveItem {
+                capability_capsule_id: "a".into(),
+                text: String::new(),
+                source_summary: String::new(),
+            }],
+            relevant_facts: vec![
+                FactItem {
+                    capability_capsule_id: "b".into(),
+                    text: String::new(),
+                    code_refs: vec![],
+                    source_summary: String::new(),
+                },
+                // duplicate of a directive → must collapse.
+                FactItem {
+                    capability_capsule_id: "a".into(),
+                    text: String::new(),
+                    code_refs: vec![],
+                    source_summary: String::new(),
+                },
+            ],
+            reusable_patterns: vec![PatternItem {
+                capability_capsule_id: "c".into(),
+                text: String::new(),
+                applicability: None,
+                source_summary: String::new(),
+            }],
+            ..Default::default()
+        };
+        // First-occurrence order across directives → facts → patterns,
+        // each id once.
+        assert_eq!(resp.emitted_capsule_ids(), vec!["a", "b", "c"]);
+    }
+
+    #[test]
+    fn emitted_capsule_ids_empty_response_is_empty() {
+        let resp = SearchCapabilityCapsuleResponse::default();
+        assert!(resp.emitted_capsule_ids().is_empty());
+    }
+}

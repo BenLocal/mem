@@ -128,6 +128,13 @@ pub struct CapabilityCapsuleService {
     /// sender. `None` ⇒ flat graph boost, no potentiation (pre-K9).
     edge_access_tx:
         Option<tokio::sync::mpsc::UnboundedSender<crate::worker::potentiation_worker::EdgeAccess>>,
+    /// O1: when `Some` (set by `app`), `search` enqueues a capsule-used
+    /// event for every capsule emitted into its response. The last-used
+    /// worker drains the channel off the read path and stamps
+    /// `last_used_at`, which anchors the decay clock. `None` ⇒ no
+    /// reinforcement (the response is unaffected either way).
+    capsule_used_tx:
+        Option<tokio::sync::mpsc::UnboundedSender<crate::worker::last_used_worker::CapsuleUsed>>,
 }
 
 impl CapabilityCapsuleService {
@@ -143,6 +150,7 @@ impl CapabilityCapsuleService {
             ingest_settings: crate::config::IngestSettings::development_defaults(),
             ingest_counters: Arc::new(Mutex::new(HashMap::new())),
             edge_access_tx: None,
+            capsule_used_tx: None,
         }
     }
 
@@ -155,6 +163,35 @@ impl CapabilityCapsuleService {
     ) -> Self {
         self.edge_access_tx = Some(tx);
         self
+    }
+
+    /// O1: attach the last-used worker's channel sender so `search`
+    /// enqueues a capsule-used event for each emitted capsule (retrieval
+    /// reinforcement). Builder-style; `app` always calls this.
+    pub fn with_last_used_sender(
+        mut self,
+        tx: tokio::sync::mpsc::UnboundedSender<crate::worker::last_used_worker::CapsuleUsed>,
+    ) -> Self {
+        self.capsule_used_tx = Some(tx);
+        self
+    }
+
+    /// O1: enqueue a capsule-used event for every capsule emitted into
+    /// `response`, for the last-used worker to stamp off the read path.
+    /// Best-effort and non-blocking — an absent or closed channel is
+    /// silently ignored, so the read path never blocks on (or fails for)
+    /// reinforcement bookkeeping.
+    fn enqueue_capsules_used(&self, tenant: &str, response: &SearchCapabilityCapsuleResponse) {
+        let Some(tx) = self.capsule_used_tx.as_ref() else {
+            return;
+        };
+        for id in response.emitted_capsule_ids() {
+            // Unbounded send never blocks; drop SendError (worker gone).
+            let _ = tx.send(crate::worker::last_used_worker::CapsuleUsed {
+                tenant: tenant.to_string(),
+                capability_capsule_id: id,
+            });
+        }
     }
 
     /// Constructor that derives `embedding_jobs.provider` from
@@ -173,6 +210,7 @@ impl CapabilityCapsuleService {
             ingest_settings: crate::config::IngestSettings::development_defaults(),
             ingest_counters: Arc::new(Mutex::new(HashMap::new())),
             edge_access_tx: None,
+            capsule_used_tx: None,
         }
     }
 
@@ -192,6 +230,7 @@ impl CapabilityCapsuleService {
             ingest_settings: crate::config::IngestSettings::development_defaults(),
             ingest_counters: Arc::new(Mutex::new(HashMap::new())),
             edge_access_tx: None,
+            capsule_used_tx: None,
         }
     }
 
@@ -1278,6 +1317,7 @@ impl CapabilityCapsuleService {
                 }
             }
 
+            self.enqueue_capsules_used(tenant, &response);
             return Ok(response);
         }
 
@@ -1347,7 +1387,9 @@ impl CapabilityCapsuleService {
             }
         };
 
-        Ok(compress::compress(&ranked, query.token_budget))
+        let response = compress::compress(&ranked, query.token_budget);
+        self.enqueue_capsules_used(tenant, &response);
+        Ok(response)
     }
 
     async fn enqueue_embedding_job_for_memory(
