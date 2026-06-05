@@ -213,38 +213,69 @@ pub struct EdgeDynamicsCtx {
 /// edge's time-decayed strength.
 const GRAPH_BOOST: i64 = 12;
 
+/// O4 (closes oss-memory-diff O4) — spread decay: dilute an anchor's
+/// graph boost by its *fanout* (the number of capsules linked to it),
+/// mem0's `1 / (1 + 0.001·(degree-1)²)`. A narrow anchor (a module, a
+/// specific topic) keeps ~full boost; a high-fanout hub (`repo:` /
+/// `project:` linked to hundreds of capsules) contributes almost
+/// nothing — so a generic anchor can't blanket-boost everything beneath
+/// it over the genuinely relevant hits. `degree ≤ 1` → no dilution.
+fn spread_decay(degree: usize) -> f32 {
+    let d = degree.saturating_sub(1) as f32;
+    1.0 / (1.0 + 0.001 * d * d)
+}
+
 /// Build the per-capsule graph-boost map for the anchor set.
 ///
-/// - Dynamics off (`None`): every 1-hop-related capsule gets the flat
-///   [`GRAPH_BOOST`] — byte-for-byte the pre-K9 behaviour.
-/// - Dynamics on (`Some`): walk each anchor's incident edges, scale the
-///   non-anchor capsule endpoint's boost by the edge's decayed strength
-///   (`round(GRAPH_BOOST * decayed_strength)`, max over connecting
-///   edges), and enqueue every touched edge for potentiation
-///   (best-effort — a closed channel never blocks or fails the read).
+/// Each anchor's contribution is diluted by its fanout
+/// ([`spread_decay`], O4): a 1-hop-linked capsule gets
+/// `round(GRAPH_BOOST · spread(anchor_degree))`, maxed across the
+/// anchors that reach it. With dynamics on (`Some`), the connecting
+/// edge's time-decayed strength multiplies in as well and every touched
+/// edge is enqueued for potentiation (best-effort — a closed channel
+/// never blocks or fails the read). Both paths walk each anchor's
+/// incident edges (the dynamics path always did; the flat path now does
+/// too, so it can see each anchor's degree) — fine at mem's local-first
+/// graph scale; the anchor set is bounded to the top-5 capsules' entities.
 async fn compute_graph_boosts(
     graph: &dyn GraphStore,
     anchors: &[String],
     dynamics: Option<&EdgeDynamicsCtx>,
 ) -> Result<HashMap<String, i64>, crate::storage::GraphError> {
-    let Some(ctx) = dynamics else {
-        let related = graph.related_capability_capsule_ids(anchors).await?;
-        return Ok(related.into_iter().map(|id| (id, GRAPH_BOOST)).collect());
-    };
     let anchor_set: HashSet<&str> = anchors.iter().map(|s| s.as_str()).collect();
     let mut boosts: HashMap<String, i64> = HashMap::new();
     for anchor in anchors {
         let edges = graph.neighbors_within(anchor, 1, None).await?;
+        // O4: degree = the anchor's fanout to capsule nodes (mem0's
+        // `num_linked`). Count only capsule endpoints so entity↔entity
+        // edges (co-occurrence / tunnels) don't inflate the fanout.
+        let degree = edges
+            .iter()
+            .filter(|edge| {
+                let other = if edge.from_node_id == *anchor {
+                    &edge.to_node_id
+                } else {
+                    &edge.from_node_id
+                };
+                other.starts_with("capability_capsule:")
+            })
+            .count();
+        let spread = spread_decay(degree);
         for edge in &edges {
-            // Enqueue for potentiation off the read path; ignore send
-            // errors (worker absent / channel closed) — best-effort.
-            let _ = ctx.tx.send(crate::worker::potentiation_worker::EdgeAccess {
-                from_node_id: edge.from_node_id.clone(),
-                to_node_id: edge.to_node_id.clone(),
-                relation: edge.relation.clone(),
-            });
-            let strength = crate::domain::edge_dynamics::decayed_strength(edge, &ctx.now);
-            let boost = ((GRAPH_BOOST as f32) * strength).round() as i64;
+            if let Some(ctx) = dynamics {
+                // Enqueue for potentiation off the read path; ignore send
+                // errors (worker absent / channel closed) — best-effort.
+                let _ = ctx.tx.send(crate::worker::potentiation_worker::EdgeAccess {
+                    from_node_id: edge.from_node_id.clone(),
+                    to_node_id: edge.to_node_id.clone(),
+                    relation: edge.relation.clone(),
+                });
+            }
+            let strength = match dynamics {
+                Some(ctx) => crate::domain::edge_dynamics::decayed_strength(edge, &ctx.now),
+                None => 1.0,
+            };
+            let boost = ((GRAPH_BOOST as f32) * spread * strength).round() as i64;
             for endpoint in [&edge.from_node_id, &edge.to_node_id] {
                 if anchor_set.contains(endpoint.as_str()) {
                     continue;
@@ -1038,5 +1069,72 @@ mod tests {
         let ranked = vec![sess("a", "s1"), sess("b", "s1"), sess("c", "s1")];
         let out = diversify_by_source(ranked, 0);
         assert_eq!(ids(&out), vec!["a", "b", "c"]);
+    }
+
+    // ── O4: graph-boost spread decay by anchor fanout ───────────────
+    #[test]
+    fn spread_decay_dilutes_high_fanout_monotonically() {
+        // degree ≤ 1 → no dilution.
+        assert!((spread_decay(0) - 1.0).abs() < 1e-6);
+        assert!((spread_decay(1) - 1.0).abs() < 1e-6);
+        // small fanout barely moves; large fanout heavily dilutes.
+        assert!(spread_decay(2) > 0.99);
+        assert!(spread_decay(50) < 0.5);
+        // strictly decreasing in degree.
+        assert!(spread_decay(50) < spread_decay(10));
+        assert!(spread_decay(10) < spread_decay(3));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn graph_boost_dilutes_high_fanout_anchor() {
+        use crate::domain::capability_capsule::GraphEdge;
+        use crate::storage::Store;
+        use tempfile::tempdir;
+
+        let dir = tempdir().unwrap();
+        let store = Store::open(&dir.path().join("o4.lance")).await.unwrap();
+        let edge = |capsule: &str, entity: &str| GraphEdge {
+            from_node_id: format!("capability_capsule:{capsule}"),
+            to_node_id: entity.to_string(),
+            relation: "applies_to".into(),
+            valid_from: "00000001780000000000".into(),
+            valid_to: None,
+            confidence: None,
+            extractor: None,
+            strength: None,
+            stability: None,
+            last_activated: None,
+            access_count: None,
+        };
+        // project:hub has 20 linked capsules (high fanout); project:narrow
+        // has 1.
+        for i in 0..20 {
+            store
+                .add_edge_direct(&edge(&format!("h{i}"), "project:hub"))
+                .await
+                .unwrap();
+        }
+        store
+            .add_edge_direct(&edge("n0", "project:narrow"))
+            .await
+            .unwrap();
+
+        let graph: &dyn GraphStore = &store;
+        let boosts = compute_graph_boosts(
+            graph,
+            &["project:hub".to_string(), "project:narrow".to_string()],
+            None,
+        )
+        .await
+        .unwrap();
+
+        // Narrow anchor (degree 1) → full flat boost.
+        assert_eq!(boosts.get("n0"), Some(&GRAPH_BOOST));
+        // High-fanout anchor (degree 20) → diluted below flat, still > 0.
+        let hub_boost = *boosts.get("h0").expect("hub capsule must be boosted");
+        assert!(
+            hub_boost < GRAPH_BOOST && hub_boost > 0,
+            "degree-20 anchor must dilute below flat {GRAPH_BOOST}, got {hub_boost}",
+        );
     }
 }

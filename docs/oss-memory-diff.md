@@ -168,7 +168,7 @@ FEEDBACK  ── 隐式 / 自动 ──
 
 **已落地**：选了**轻量 per-source 配额裁剪**（非 MMR——MMR 要 pairwise 相似度、更重，收益边际）。`retrieve.rs::finalize` 在 floor 过滤后调 `diversify_by_source(ranked, per_source_cap())`：source key = `session_id`（没有则用 capsule 自身 id，即不分组），每 source 在 head 至多 `cap`（默认 3）条，超额按原排名挪到**尾部不丢弃**（软上限，compress 仍可按 budget 纳入）。`supersedes` 链那一路问题其实 `hybrid_candidates` 的 SQL 早已做版本链去重（`NOT EXISTS superseded-by-active`），所以这里只需治"同 session 批量 ingest 霸占头部"。默认开 `MEM_RECALL_PER_SOURCE_CAP`（=0 关），与 transcript 侧 session co-occurrence 是相反方向、独立函数。
 
-### O4 🔍 — graph boost 按 degree 衰减（P2）
+### O4 🔍 — graph boost 按 degree 衰减（P2）✅ done（`retrieve.rs::compute_graph_boosts`，2026-06-05）
 
 **现状（code）**：`score_with_hybrid` 吃 `graph_boost_by_id`，但 boost **不看 entity 的度数**。挂在热门 entity（如 `project:` / `repo:` 节点）下的一大批 capsule 会被一刀切 boost，把真正相关的压下去。
 
@@ -178,6 +178,8 @@ FEEDBACK  ── 隐式 / 自动 ──
 
 **触点**：graph boost 计算处（`graph_anchor_nodes` 下游、`score_with_hybrid`）。
 **风险**：极小（基本是一个除式）。
+
+**已落地**：`compute_graph_boosts` 加 `spread_decay(degree) = 1/(1+0.001·(degree-1)²)`，`boost = round(GRAPH_BOOST·spread·strength)`，max-over-anchors。`degree` = 锚 entity 的 **capsule fanout**（只数 capsule 端点，entity↔entity 的共现/tunnel 边不计）。比"一行式"略多一处结构改动：原 dynamics-OFF 路用扁平批量 `related_capability_capsule_ids`（丢了 per-anchor 归属），改成和 dynamics-ON 路一样**逐 anchor 走 `neighbors_within`**，才能拿到每个 anchor 的 degree——mem 是 local-first、图规模适中，N 个 anchor（top-5 capsule 的实体，有界）的额外 round-trip 可忽略。degree≤1 不衰减；现有 dynamics 测试 degree=2、spread≈0.999 四舍五入到原值，无回归。无 env 开关（公式固定）。
 
 ### O5 📦/⚙️ — ingest secret 脱敏（P2）
 
@@ -207,7 +209,7 @@ FEEDBACK  ── 隐式 / 自动 ──
 | **P0 ✅** | O1 使用强化 + 衰减重置（`808cb59`+`709c648`） | 🔍 | M（加列 + last_used worker + decay 锚） | 直击 mem 最大结构性弱点：让 ranking 在 agent 不回调时也能自主生长 |
 | P1 ✅ | O2 write 近邻去重/矛盾（`b7b9528`+worker） | 🔍 | M | 预防膨胀与矛盾并存（异步 worker，落 PendingConfirmation + suspected_supersede 边，守 verbatim） |
 | P1 ✅ | O3 capsule 多样化（`retrieve.rs`） | 🔍 | S | 消除头部近似条目霸占（per-source 软配额，默认 3，session 为 key） |
-| P2 | O4 graph degree 衰减 | 🔍 | S（一行式） | 抑制热门节点过度 boost |
+| P2 ✅ | O4 graph degree 衰减（`retrieve.rs`） | 🔍 | S | 抑制热门节点过度 boost（spread_decay，按锚 fanout 反比） |
 | P2 | O5 secret 脱敏 | 📦/⚙️ | M（两层设计，先定边界） | 降低 verbatim 带来的泄露面 |
 
 > commit close 引用：O1 已落地 = `feat(schema): add last_used_at column` (`808cb59`) + `feat(lifecycle): retrieval reinforcement resets the decay clock via last_used_at` (`709c648`) + `docs(agents)` (`181fe67`)。
