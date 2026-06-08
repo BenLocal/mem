@@ -51,6 +51,27 @@ cross build --release --target x86_64-unknown-linux-musl
 
 CI（`.github/workflows/ci.yml`）在 PR / push 上会跑 **`cross build --release`**，目标为 **`x86_64-unknown-linux-gnu`** 与 **`x86_64-unknown-linux-musl`**（与 `Cross.toml` / Docker builder 一致）。打 `v*.*.*` tag 时 Release 工作流会把 **`mem-<tag>-x86_64-unknown-linux-gnu`** 与 **`mem-<tag>-x86_64-unknown-linux-musl`** 一并上传到 GitHub Release。
 
+## Service install (systemd / supervisor)
+
+[`scripts/install.sh`](scripts/install.sh) installs `mem serve` as a managed
+background service. It auto-detects the init system (systemd if present, else
+supervisor), builds (or takes a prebuilt) binary, creates a dedicated `mem`
+system user + `/var/lib/mem` data dir + `config.env`, writes the unit, then
+enables, starts, and health-checks it.
+
+```bash
+sudo ./scripts/install.sh                          # build + systemd, fake embeddings
+sudo ./scripts/install.sh --init-system supervisor --bind 0.0.0.0:3000
+sudo ./scripts/install.sh --binary /path/to/mem --no-build   # use a cross-built binary
+sudo ./scripts/install.sh --provider embedanything # local Qwen3 (download model first)
+sudo ./scripts/install.sh --uninstall              # stop + remove (keeps the data dir)
+```
+
+Re-running is idempotent (`config.env` is never overwritten); see
+`./scripts/install.sh --help` for all flags. `Restart=on-failure` /
+`autorestart=true` keeps the single-writer service up; never point two
+instances at the same `MEM_DB_PATH`.
+
 ## Docker (mem HTTP only)
 
 Build and run locally（构建阶段使用与 `Cross.toml` 一致的 **cross-rs** `x86_64-unknown-linux-gnu` 镜像）：
