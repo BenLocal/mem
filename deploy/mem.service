@@ -1,0 +1,43 @@
+# mem — systemd service template (manual deployment).
+#
+# This is the unit `scripts/install.sh` generates; provided here so you
+# can deploy by hand. Steps:
+#   1. Put the binary at /usr/local/bin/mem (build: `cargo build --release`,
+#      or use a `cross`/Release artifact).
+#   2. Create the service user + data dir:
+#        sudo useradd --system --home-dir /var/lib/mem --shell /usr/sbin/nologin mem
+#        sudo install -d -m 0750 -o mem -g mem /var/lib/mem /var/lib/mem/hf-cache /var/log/mem
+#   3. Drop deploy/mem.config.env.example at /var/lib/mem/config.env (edit it).
+#   4. Copy this file to /etc/systemd/system/mem.service, then:
+#        sudo systemctl daemon-reload && sudo systemctl enable --now mem
+#        sudo systemctl status mem ; journalctl -u mem -f
+#
+# Adjust User=, paths and BIND_ADDR (in config.env) to taste. DuckDB is
+# single-writer — never run two units against the same MEM_DB_PATH.
+
+[Unit]
+Description=mem — local-first memory service for multi-agent workflows
+Documentation=https://github.com/BenLocal/mem
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=mem
+Group=mem
+WorkingDirectory=/var/lib/mem
+EnvironmentFile=/var/lib/mem/config.env
+ExecStart=/usr/local/bin/mem serve
+# mem serve has crashed before (a Lance vacuum edge case); always recover.
+Restart=on-failure
+RestartSec=3
+TimeoutStopSec=15
+# Hardening — the service only needs its own data dir writable.
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+ReadWritePaths=/var/lib/mem /var/log/mem
+
+[Install]
+WantedBy=multi-user.target

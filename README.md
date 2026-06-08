@@ -72,6 +72,82 @@ Re-running is idempotent (`config.env` is never overwritten); see
 `autorestart=true` keeps the single-writer service up; never point two
 instances at the same `MEM_DB_PATH`.
 
+### Manual setup
+
+Prefer wiring it up by hand? The script just emits the following — copy a
+binary to `/usr/local/bin/mem`, create a `mem` user + `/var/lib/mem`, then
+drop in the env + unit. Ready-to-copy templates (with step-by-step header
+comments) live in [`deploy/`](deploy/): [`mem.config.env.example`](deploy/mem.config.env.example),
+[`mem.service`](deploy/mem.service), [`mem.supervisor.conf`](deploy/mem.supervisor.conf).
+
+`/var/lib/mem/config.env` (values **unquoted** so both systemd
+`EnvironmentFile=` and a shell `source` read them identically):
+
+```ini
+MEM_DB_PATH=/var/lib/mem/mem.duckdb
+MEM_TENANT=local
+BIND_ADDR=127.0.0.1:3000
+EMBEDDING_PROVIDER=fake        # fake | embedanything | openai
+HF_HOME=/var/lib/mem/hf-cache  # model cache for embedanything
+# OPENAI_API_KEY=
+```
+
+**systemd** — `/etc/systemd/system/mem.service`:
+
+```ini
+[Unit]
+Description=mem — local-first memory service for multi-agent workflows
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=mem
+Group=mem
+WorkingDirectory=/var/lib/mem
+EnvironmentFile=/var/lib/mem/config.env
+ExecStart=/usr/local/bin/mem serve
+Restart=on-failure
+RestartSec=3
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+ReadWritePaths=/var/lib/mem /var/log/mem
+
+[Install]
+WantedBy=multi-user.target
+```
+
+```bash
+sudo systemctl daemon-reload && sudo systemctl enable --now mem
+sudo systemctl status mem ; journalctl -u mem -f
+```
+
+**supervisor** — `/etc/supervisor/conf.d/mem.conf` (no `EnvironmentFile`, so
+`source` the env file in a wrapper):
+
+```ini
+[program:mem]
+command=/bin/sh -c 'set -a; . /var/lib/mem/config.env; set +a; exec /usr/local/bin/mem serve'
+directory=/var/lib/mem
+user=mem
+autostart=true
+autorestart=true
+startsecs=3
+stopwaitsecs=15
+stopsignal=TERM
+stdout_logfile=/var/log/mem/mem.out.log
+stderr_logfile=/var/log/mem/mem.err.log
+```
+
+```bash
+sudo supervisorctl reread && sudo supervisorctl update
+sudo supervisorctl status mem ; sudo supervisorctl tail -f mem
+```
+
+Verify either with `curl http://127.0.0.1:3000/health`.
+
 ## Docker (mem HTTP only)
 
 Build and run locally（构建阶段使用与 `Cross.toml` 一致的 **cross-rs** `x86_64-unknown-linux-gnu` 镜像）：
