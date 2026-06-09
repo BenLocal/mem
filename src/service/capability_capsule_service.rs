@@ -1317,7 +1317,13 @@ impl CapabilityCapsuleService {
                 }
             }
 
-            self.enqueue_capsules_used(tenant, &response);
+            // O1: do NOT bump last_used here. Wake-up is automatic boot
+            // context (recent-active capsules surfaced every session
+            // start), not query-driven *use* by the agent. Bumping it
+            // would reset the decay clock on the newest cohort on every
+            // session start, self-reinforcing them so they never decay
+            // regardless of whether they were used. Only the explicit
+            // query path below counts as "used".
             return Ok(response);
         }
 
