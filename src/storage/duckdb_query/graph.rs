@@ -535,6 +535,52 @@ impl DuckDbQuery {
         })
         .await
     }
+
+    /// O4 (perf): return every active 1-hop edge incident to any node in
+    /// `node_ids`, as raw `(from_node_id, to_node_id)` pairs, in ONE
+    /// query. `compute_graph_boosts` uses this to compute each anchor's
+    /// fanout degree + the degree-decayed boost in Rust, replacing one
+    /// `neighbors_within` round-trip per anchor (which on a large graph
+    /// re-fetched a high-fanout hub's edges N times). Same edge set the
+    /// per-anchor walks produced — only the round-trips collapse.
+    pub async fn incident_edges_for_nodes(
+        &self,
+        node_ids: &[String],
+    ) -> Result<Vec<(String, String)>, GraphError> {
+        if node_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let conn = self.fresh_conn_for_graph().await?;
+        let node_ids: Vec<String> = node_ids.to_vec();
+        spawn_blocking_graph(move || {
+            let conn = conn.lock().expect("duckdb_query mutex poisoned");
+            let placeholders = (1..=node_ids.len())
+                .map(|i| format!("?{i}"))
+                .collect::<Vec<_>>()
+                .join(", ");
+            let sql = format!(
+                "SELECT from_node_id, to_node_id FROM ns.main.graph_edges \
+                 WHERE (from_node_id IN ({placeholders}) OR to_node_id IN ({placeholders})) \
+                   AND valid_to IS NULL"
+            );
+            let mut stmt = conn.prepare(&sql)?;
+            let mut params_vec: Vec<Box<dyn duckdb::ToSql>> = Vec::with_capacity(node_ids.len());
+            for n in &node_ids {
+                params_vec.push(Box::new(n.clone()));
+            }
+            let params_refs: Vec<&dyn duckdb::ToSql> =
+                params_vec.iter().map(|b| b.as_ref()).collect();
+            let rows = stmt.query_map(params_refs.as_slice(), |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })?;
+            let mut out = Vec::new();
+            for r in rows {
+                out.push(r?);
+            }
+            Ok(out)
+        })
+        .await
+    }
 }
 
 #[cfg(test)]

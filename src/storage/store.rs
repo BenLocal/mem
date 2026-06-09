@@ -1327,6 +1327,13 @@ impl Store {
         self.query.related_capability_capsule_ids(node_ids).await
     }
 
+    pub async fn incident_edges_for_nodes(
+        &self,
+        node_ids: &[String],
+    ) -> Result<Vec<(String, String)>, GraphError> {
+        self.query.incident_edges_for_nodes(node_ids).await
+    }
+
     pub async fn sync_memory_edges(
         &self,
         edges: &[GraphEdge],

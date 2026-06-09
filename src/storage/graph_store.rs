@@ -75,6 +75,16 @@ pub trait GraphStore: Send + Sync {
         node_ids: &[String],
     ) -> Result<Vec<String>, GraphError>;
 
+    /// O4 (perf): every active 1-hop edge incident to any node in
+    /// `node_ids`, as raw `(from, to)` pairs, in one query. Lets
+    /// `compute_graph_boosts` derive per-anchor fanout degree + the
+    /// degree-decayed boost without a `neighbors_within` round-trip per
+    /// anchor.
+    async fn incident_edges_for_nodes(
+        &self,
+        node_ids: &[String],
+    ) -> Result<Vec<(String, String)>, GraphError>;
+
     /// Idempotent edge upsert for memory-derived edges. Writes
     /// active edges (`valid_from = now`, `valid_to = NULL`); a
     /// `(from, to, relation)` triple with an existing active edge
@@ -164,6 +174,13 @@ impl GraphStore for Store {
         node_ids: &[String],
     ) -> Result<Vec<String>, GraphError> {
         Store::related_capability_capsule_ids(self, node_ids).await
+    }
+
+    async fn incident_edges_for_nodes(
+        &self,
+        node_ids: &[String],
+    ) -> Result<Vec<(String, String)>, GraphError> {
+        Store::incident_edges_for_nodes(self, node_ids).await
     }
 
     async fn sync_memory_edges(&self, edges: &[GraphEdge], now: &str) -> Result<(), GraphError> {

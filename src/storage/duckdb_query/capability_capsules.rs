@@ -92,6 +92,27 @@ where
     Ok(out)
 }
 
+/// Build the optional `search_candidates` lifecycle-pool cap clause
+/// (`MEM_RECALL_POOL_LIMIT`). `None` → empty string → the unbounded full
+/// pool (default). `Some(n)` → keep all `preference` / `workflow`
+/// guidance plus the `n` most-recently-written other rows. `n` is a
+/// parsed `usize`, safe to interpolate; the subquery reuses the outer
+/// `?1`/`?2`/`?3` binds (tenant / rejected / archived). Pure for testing.
+fn pool_bound_clause(pool_limit: Option<usize>) -> String {
+    match pool_limit {
+        Some(n) => format!(
+            "AND (c.capability_capsule_type IN ('preference', 'workflow') \
+                  OR c.capability_capsule_id IN ( \
+                      SELECT capability_capsule_id FROM ns.main.capability_capsules \
+                      WHERE tenant = ?1 AND status NOT IN (?2, ?3) \
+                        AND capability_capsule_type != 'diary' \
+                      ORDER BY updated_at DESC LIMIT {n} \
+                  )) ",
+        ),
+        None => String::new(),
+    }
+}
+
 impl DuckDbQuery {
     pub async fn list_capability_capsules_for_tenant(
         &self,
@@ -591,6 +612,20 @@ impl DuckDbQuery {
         let rejected = enum_to_text(&CapabilityCapsuleStatus::Rejected)?;
         let archived = enum_to_text(&CapabilityCapsuleStatus::Archived)?;
         let active = enum_to_text(&CapabilityCapsuleStatus::Active)?;
+        // Optional lifecycle-pool cap (perf at scale). `MEM_RECALL_POOL_LIMIT`
+        // unset / 0 / invalid → unbounded (the full active pool — default,
+        // unchanged behaviour). When set to N>0, only the N most-recently-
+        // written non-guidance rows enter the pool; `Preference` / `Workflow`
+        // capsules are ALWAYS included (they are floor-exempt "always
+        // applicable" guidance — capping them would silently drop directives).
+        // The trade-off: a very old capsule that matches only via Rust-side
+        // lexical / scope / graph (not the BM25/ANN hybrid hits, which are
+        // unionised in separately by retrieve) drops out of the lifecycle
+        // fallback. Bounds the per-search row fetch as the corpus grows.
+        let pool_limit = std::env::var("MEM_RECALL_POOL_LIMIT")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .filter(|&n| n > 0);
         spawn_blocking_storage(move || {
             let conn = conn.lock().expect("duckdb_query mutex poisoned");
             // Outer alias `c` so the NOT EXISTS subquery can correlate
@@ -601,6 +636,7 @@ impl DuckDbQuery {
             // Browsing paths (`list_capability_capsule_ids_for_tenant`,
             // `list_in_scope`, `fetch_capability_capsules_by_ids`) are
             // deliberately NOT filtered — admin reads want every row.
+            let bound_clause = pool_bound_clause(pool_limit);
             let sql = format!(
                 "SELECT {cols_c} FROM ns.main.capability_capsules c \
                  WHERE c.tenant = ?1 AND c.status NOT IN (?2, ?3) \
@@ -611,6 +647,7 @@ impl DuckDbQuery {
                          AND s.tenant = c.tenant \
                          AND s.status = ?4 \
                    ) \
+                   {bound_clause}\
                  ORDER BY c.updated_at DESC, c.version DESC, c.capability_capsule_id ASC",
                 cols_c = CAPABILITY_CAPSULE_COLS
                     .split(',')
@@ -1157,6 +1194,23 @@ mod tests {
     };
     use crate::storage::lance_store::LanceStore;
     use tempfile::tempdir;
+
+    #[test]
+    fn pool_bound_clause_off_by_default_caps_with_guidance_exempt() {
+        // Unset / 0 → empty → unbounded full pool (default behaviour).
+        assert_eq!(pool_bound_clause(None), "");
+        // Set → cap the non-guidance rows, always keep preference/workflow.
+        let c = pool_bound_clause(Some(500));
+        assert!(c.contains("LIMIT 500"), "the cap is applied: {c}");
+        assert!(
+            c.contains("'preference'") && c.contains("'workflow'"),
+            "guidance types are exempt from the cap: {c}"
+        );
+        assert!(
+            c.contains("capability_capsule_id IN ("),
+            "non-guidance rows bounded by a recency subquery: {c}"
+        );
+    }
 
     fn fixture(capability_capsule_id: &str, tenant: &str) -> CapabilityCapsuleRecord {
         CapabilityCapsuleRecord {

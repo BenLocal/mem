@@ -230,25 +230,34 @@ fn spread_decay(degree: usize) -> f32 {
 /// Each anchor's contribution is diluted by its fanout
 /// ([`spread_decay`], O4): a 1-hop-linked capsule gets
 /// `round(GRAPH_BOOST · spread(anchor_degree))`, maxed across the
-/// anchors that reach it. With dynamics on (`Some`), the connecting
-/// edge's time-decayed strength multiplies in as well and every touched
-/// edge is enqueued for potentiation (best-effort — a closed channel
-/// never blocks or fails the read). Both paths walk each anchor's
-/// incident edges (the dynamics path always did; the flat path now does
-/// too, so it can see each anchor's degree) — fine at mem's local-first
-/// graph scale; the anchor set is bounded to the top-5 capsules' entities.
+/// anchors that reach it.
+///
+/// - **Dynamics off** (`None`, the default): one batched
+///   [`GraphStore::incident_edges_for_nodes`] query for the whole anchor
+///   set, then [`graph_boosts_from_edges`] computes degrees + boosts in
+///   Rust. Avoids one `neighbors_within` round-trip per anchor (which
+///   re-fetched a high-fanout hub's edges once per anchor).
+/// - **Dynamics on** (`Some`): still walks per anchor, because it needs
+///   each edge's time-decayed strength and enqueues every touched edge
+///   for potentiation (best-effort — a closed channel never blocks the
+///   read).
 async fn compute_graph_boosts(
     graph: &dyn GraphStore,
     anchors: &[String],
     dynamics: Option<&EdgeDynamicsCtx>,
 ) -> Result<HashMap<String, i64>, crate::storage::GraphError> {
     let anchor_set: HashSet<&str> = anchors.iter().map(|s| s.as_str()).collect();
+
+    let Some(ctx) = dynamics else {
+        // Flat path: one query, all the math in Rust.
+        let edges = graph.incident_edges_for_nodes(anchors).await?;
+        return Ok(graph_boosts_from_edges(&edges, &anchor_set));
+    };
+
+    // Dynamics path: per-anchor walk (needs decayed strength + potentiation).
     let mut boosts: HashMap<String, i64> = HashMap::new();
     for anchor in anchors {
         let edges = graph.neighbors_within(anchor, 1, None).await?;
-        // O4: degree = the anchor's fanout to capsule nodes (mem0's
-        // `num_linked`). Count only capsule endpoints so entity↔entity
-        // edges (co-occurrence / tunnels) don't inflate the fanout.
         let degree = edges
             .iter()
             .filter(|edge| {
@@ -262,19 +271,14 @@ async fn compute_graph_boosts(
             .count();
         let spread = spread_decay(degree);
         for edge in &edges {
-            if let Some(ctx) = dynamics {
-                // Enqueue for potentiation off the read path; ignore send
-                // errors (worker absent / channel closed) — best-effort.
-                let _ = ctx.tx.send(crate::worker::potentiation_worker::EdgeAccess {
-                    from_node_id: edge.from_node_id.clone(),
-                    to_node_id: edge.to_node_id.clone(),
-                    relation: edge.relation.clone(),
-                });
-            }
-            let strength = match dynamics {
-                Some(ctx) => crate::domain::edge_dynamics::decayed_strength(edge, &ctx.now),
-                None => 1.0,
-            };
+            // Enqueue for potentiation off the read path; ignore send
+            // errors (worker absent / channel closed) — best-effort.
+            let _ = ctx.tx.send(crate::worker::potentiation_worker::EdgeAccess {
+                from_node_id: edge.from_node_id.clone(),
+                to_node_id: edge.to_node_id.clone(),
+                relation: edge.relation.clone(),
+            });
+            let strength = crate::domain::edge_dynamics::decayed_strength(edge, &ctx.now);
             let boost = ((GRAPH_BOOST as f32) * spread * strength).round() as i64;
             for endpoint in [&edge.from_node_id, &edge.to_node_id] {
                 if anchor_set.contains(endpoint.as_str()) {
@@ -290,6 +294,47 @@ async fn compute_graph_boosts(
         }
     }
     Ok(boosts)
+}
+
+/// O4 flat-path core: derive per-capsule graph boosts from the raw
+/// `(from, to)` edges incident to the anchor set. Behaviourally identical
+/// to the per-anchor walk (just fed from one batched query): each
+/// anchor's *capsule fanout degree* dilutes the boost it confers
+/// ([`spread_decay`]), and each non-anchor capsule endpoint takes the max
+/// over the anchors that reach it. Pure for testability.
+fn graph_boosts_from_edges(
+    edges: &[(String, String)],
+    anchor_set: &HashSet<&str>,
+) -> HashMap<String, i64> {
+    // Pass 1: per-anchor capsule fanout degree (count edges whose *other*
+    // endpoint is a capsule — entity↔entity edges don't inflate it).
+    let mut degree: HashMap<&str, usize> = HashMap::new();
+    for (from, to) in edges {
+        for (endpoint, other) in [(from.as_str(), to.as_str()), (to.as_str(), from.as_str())] {
+            if anchor_set.contains(endpoint) && other.starts_with("capability_capsule:") {
+                *degree.entry(endpoint).or_insert(0) += 1;
+            }
+        }
+    }
+    // Pass 2: boost each non-anchor capsule endpoint by spread(degree) of
+    // the anchor it links to, maxed across anchors.
+    let mut boosts: HashMap<String, i64> = HashMap::new();
+    for (from, to) in edges {
+        for (anchor, other) in [(from.as_str(), to.as_str()), (to.as_str(), from.as_str())] {
+            if !anchor_set.contains(anchor) || anchor_set.contains(other) {
+                continue;
+            }
+            if let Some(mid) = other.strip_prefix("capability_capsule:") {
+                let d = degree.get(anchor).copied().unwrap_or(0);
+                let boost = ((GRAPH_BOOST as f32) * spread_decay(d)).round() as i64;
+                boosts
+                    .entry(mid.to_string())
+                    .and_modify(|m| *m = (*m).max(boost))
+                    .or_insert(boost);
+            }
+        }
+    }
+    boosts
 }
 
 /// Computes the additive non-recall portion of a memory's score (the
@@ -1083,6 +1128,46 @@ mod tests {
         // strictly decreasing in degree.
         assert!(spread_decay(50) < spread_decay(10));
         assert!(spread_decay(10) < spread_decay(3));
+    }
+
+    #[test]
+    fn graph_boosts_from_edges_degree_max_and_anchor_skip() {
+        use std::collections::HashSet;
+        // anchor entities: a high-fanout hub (degree 20) + a narrow one
+        // (degree 1). Capsule c1 is linked to BOTH; it must take the max
+        // (the narrow anchor's higher spread). c2 sits only under the hub.
+        // An anchor→anchor edge confers no boost.
+        let anchors: HashSet<&str> = [
+            "project:hub",
+            "module:narrow",
+            "capability_capsule:anchorcap",
+        ]
+        .into_iter()
+        .collect();
+        let e = |a: String, b: &str| (a, b.to_string());
+        let mut edges: Vec<(String, String)> = (1..=20)
+            .map(|i| e(format!("capability_capsule:c{i}"), "project:hub"))
+            .collect(); // hub fanout degree = 20
+        edges.push(e("capability_capsule:c1".into(), "module:narrow")); // narrow degree = 1
+        edges.push(e("capability_capsule:anchorcap".into(), "module:narrow")); // anchor endpoint
+        edges.reverse(); // order must not matter
+
+        let boosts = graph_boosts_from_edges(&edges, &anchors);
+
+        // c1 (under both) → max(spread(20), spread(1)) = narrow's full boost.
+        assert_eq!(
+            boosts.get("c1"),
+            Some(&GRAPH_BOOST),
+            "c1 takes the max over anchors = narrow's full boost"
+        );
+        // c2 (hub-only, degree 20) → diluted below flat.
+        let c2 = *boosts.get("c2").expect("c2 boosted under hub");
+        assert!(
+            c2 < GRAPH_BOOST && c2 > 0,
+            "c2 (hub degree 20) must dilute below flat {GRAPH_BOOST}, got {c2}"
+        );
+        // anchorcap is itself an anchor → never boosted.
+        assert_eq!(boosts.get("anchorcap"), None);
     }
 
     #[tokio::test(flavor = "multi_thread")]
