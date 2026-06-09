@@ -207,7 +207,7 @@ pub async fn run(args: FeedbackFromTranscriptArgs) -> i32 {
 /// hook handlers). Errors only surface for unrecoverable transcript-
 /// parse failures; per-row HTTP errors are counted in `failed`.
 pub async fn run_with_counts(args: FeedbackFromTranscriptArgs) -> anyhow::Result<FeedbackCounts> {
-    let consumed = scan_transcript(&args)?;
+    let consumed = scan_transcript(&args.transcript_path, args.all)?;
     if consumed.is_empty() {
         return Ok(FeedbackCounts {
             kind: args.kind,
@@ -261,8 +261,8 @@ pub async fn run_with_counts(args: FeedbackFromTranscriptArgs) -> anyhow::Result
 /// ([`is_capsule_get_tool`] — a deliberate fetch) OR its `text` reappears
 /// in a subsequent assistant `text`/`thinking` block. Crediting only
 /// *retrieved* gets (not bare inspection gets) keeps precision.
-fn scan_transcript(args: &FeedbackFromTranscriptArgs) -> Result<HashSet<String>> {
-    let file = File::open(&args.transcript_path)?;
+fn scan_transcript(transcript_path: &std::path::Path, all: bool) -> Result<HashSet<String>> {
+    let file = File::open(transcript_path)?;
     let reader = BufReader::new(file);
 
     // (capability_capsule_id, text-prefix snippet, line index where retrieval happened)
@@ -280,6 +280,44 @@ fn scan_transcript(args: &FeedbackFromTranscriptArgs) -> Result<HashSet<String>>
             Ok(v) => v,
             Err(_) => continue,
         };
+
+        // Hook-injected recall now lands as a `type:"attachment"` line
+        // with `attachment.type == "hook_additional_context"` and the
+        // text under `attachment.content` (a list of strings). Claude
+        // Code changed this from the old user/system-block injection, so
+        // the `tool_result` branch below no longer sees it — handle it
+        // here, extracting the `[mem_…]` ids the same way. Without this,
+        // the feedback loop is silently dead for hook-driven recall (the
+        // dominant recall path).
+        if value["type"].as_str() == Some("attachment") {
+            let attachment = &value["attachment"];
+            if attachment["type"].as_str() == Some("hook_additional_context") {
+                let texts: Vec<&str> = match &attachment["content"] {
+                    Value::Array(arr) => arr.iter().filter_map(|v| v.as_str()).collect(),
+                    Value::String(s) => vec![s.as_str()],
+                    _ => Vec::new(),
+                };
+                for inner in texts {
+                    if !(inner.contains("mem auto-recall")
+                        || inner.contains("related incidents/fixes"))
+                    {
+                        continue;
+                    }
+                    for ln in inner.lines() {
+                        let ids = extract_injected_ids(ln);
+                        if ids.is_empty() {
+                            continue;
+                        }
+                        let fp = if all { Vec::new() } else { fingerprint(ln) };
+                        for id in ids {
+                            retrieved.push((id, fp.clone(), line_idx));
+                        }
+                    }
+                }
+            }
+            continue; // attachment lines carry no `message.content`
+        }
+
         let role = match value["type"].as_str() {
             Some(r @ ("user" | "assistant" | "system")) => r,
             _ => continue,
@@ -334,11 +372,7 @@ fn scan_transcript(args: &FeedbackFromTranscriptArgs) -> Result<HashSet<String>>
                                     if mid.is_empty() {
                                         continue;
                                     }
-                                    let fp = if args.all {
-                                        Vec::new()
-                                    } else {
-                                        fingerprint(text)
-                                    };
+                                    let fp = if all { Vec::new() } else { fingerprint(text) };
                                     retrieved.push((mid.to_string(), fp, line_idx));
                                 }
                             }
@@ -357,11 +391,7 @@ fn scan_transcript(args: &FeedbackFromTranscriptArgs) -> Result<HashSet<String>>
                             if ids.is_empty() {
                                 continue;
                             }
-                            let fp = if args.all {
-                                Vec::new()
-                            } else {
-                                fingerprint(ln)
-                            };
+                            let fp = if all { Vec::new() } else { fingerprint(ln) };
                             for id in ids {
                                 retrieved.push((id, fp.clone(), line_idx));
                             }
@@ -402,7 +432,7 @@ fn scan_transcript(args: &FeedbackFromTranscriptArgs) -> Result<HashSet<String>>
             used.insert(mid.clone());
             continue;
         }
-        if args.all || fp.is_empty() {
+        if all || fp.is_empty() {
             // `--all` or no usable fingerprint → accept.
             used.insert(mid.clone());
             continue;
@@ -717,5 +747,58 @@ mod tests {
         // Placeholder / templated ids (not a hex UUIDv7) are rejected.
         assert!(extract_injected_ids("see `[mem_xxx]` placeholder").is_empty());
         assert!(extract_injected_ids("`[mem_notahexuuid]`").is_empty());
+    }
+
+    /// Regression: hook recall now lands as a `type:"attachment"` /
+    /// `hook_additional_context` line, not a user/system block. A capsule
+    /// injected that way and then reused by a later assistant block MUST be
+    /// credited as consumed — before the attachment branch existed,
+    /// `scan_transcript` `continue`d past it and returned an empty set, so
+    /// the whole hook-driven feedback loop was silently dead.
+    #[test]
+    fn scan_transcript_credits_hook_attachment_recall_consumed_by_assistant() {
+        use std::io::Write;
+
+        let id = "mem_019e9999-aaaa-7bbb-8ccc-dddddddddddd";
+        // The attachment banner carries the recall header (passes the
+        // `mem auto-recall` guard) plus one `[mem_…]` bullet whose
+        // distinctive tokens the assistant later reuses.
+        let banner = format!(
+            "🧠 mem auto-recall — memories relevant to this prompt\n\
+             - DuckDB single-writer MVCC concurrency lock contention `[{id}]`"
+        );
+        let attachment = serde_json::json!({
+            "type": "attachment",
+            "attachment": { "type": "hook_additional_context", "content": [banner] },
+        });
+        let assistant = serde_json::json!({
+            "type": "assistant",
+            "message": { "role": "assistant", "content": [{
+                "type": "text",
+                "text": "Right — DuckDB is single-writer, so MVCC concurrency and \
+                         lock contention bite when two writers share one file.",
+            }]},
+        });
+
+        let mut f = tempfile::NamedTempFile::new().unwrap();
+        writeln!(f, "{attachment}").unwrap();
+        writeln!(f, "{assistant}").unwrap();
+
+        let consumed = scan_transcript(f.path(), false).unwrap();
+        assert!(
+            consumed.contains(id),
+            "hook-attachment recall reused by a later assistant block must be \
+             credited as consumed, got {consumed:?}"
+        );
+
+        // A banner with NO subsequent reuse stays uncredited (the heuristic
+        // is not just "id appeared in an attachment").
+        let mut g = tempfile::NamedTempFile::new().unwrap();
+        writeln!(g, "{attachment}").unwrap();
+        let unconsumed = scan_transcript(g.path(), false).unwrap();
+        assert!(
+            !unconsumed.contains(id),
+            "an un-reused recalled capsule must not be credited, got {unconsumed:?}"
+        );
     }
 }
