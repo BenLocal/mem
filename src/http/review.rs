@@ -18,6 +18,7 @@ pub fn router() -> Router<AppState> {
             post(edit_and_accept_pending),
         )
         .route("/reviews/auto_promote", post(auto_promote))
+        .route("/reviews/idle_archive", post(idle_archive))
 }
 
 #[derive(Debug, Deserialize)]
@@ -142,6 +143,47 @@ async fn auto_promote(
         .auto_promote_sweep(&request.tenant, &app.config.auto_promote, request.dry_run)
         .await?;
     Ok(Json(AutoPromoteResponse {
+        dry_run: request.dry_run,
+        capability_capsule_ids: ids,
+    }))
+}
+
+/// Manual / cron trigger for the idle-archive sweep (governance Step 2).
+/// Body shape: `{"tenant": "local", "dry_run": true}`.
+///
+/// `dry_run` defaults to `true` — preview the ids that *would* be archived
+/// on the next real sweep without writing. `dry_run=false` actually
+/// archives, but only when the worker is enabled
+/// (`MEM_IDLE_ARCHIVE_ENABLED=1`); while disabled, a real run is a no-op and
+/// returns an empty list (the destructive path is gated on the master switch
+/// — unlike auto_promote, which is non-destructive). So the safe operator
+/// flow is: hit this with `dry_run:true`, review, then enable the worker.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "snake_case")]
+struct IdleArchiveRequest {
+    #[serde(default = "default_tenant")]
+    tenant: String,
+    #[serde(default = "default_true")]
+    dry_run: bool,
+}
+
+#[derive(Debug, Serialize)]
+struct IdleArchiveResponse {
+    dry_run: bool,
+    /// When `dry_run=true`, ids that *would* be archived on the next real
+    /// sweep. When `dry_run=false`, ids actually archived in this call.
+    capability_capsule_ids: Vec<String>,
+}
+
+async fn idle_archive(
+    State(app): State<AppState>,
+    Json(request): Json<IdleArchiveRequest>,
+) -> Result<Json<IdleArchiveResponse>, AppError> {
+    let ids = app
+        .capability_capsule_service
+        .idle_archive_sweep(&request.tenant, &app.config.idle_archive, request.dry_run)
+        .await?;
+    Ok(Json(IdleArchiveResponse {
         dry_run: request.dry_run,
         capability_capsule_ids: ids,
     }))

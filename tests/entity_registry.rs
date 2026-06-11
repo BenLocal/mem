@@ -99,6 +99,7 @@ fn baseline_memory(id: &str) -> CapabilityCapsuleRecord {
         updated_at: NOW.to_string(),
         last_validated_at: None,
         last_used_at: None,
+        last_recalled_at: None,
     }
 }
 

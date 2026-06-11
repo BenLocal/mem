@@ -54,6 +54,7 @@ fn capsule(id: &str, content: &str, supersedes: Option<&str>) -> CapabilityCapsu
         updated_at: format!("0000000000000000{:04}", id.len()),
         last_validated_at: None,
         last_used_at: None,
+        last_recalled_at: None,
     }
 }
 

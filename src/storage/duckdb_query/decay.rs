@@ -83,7 +83,9 @@ impl DuckDbQuery {
         .await
     }
 
-    /// Mark a set of capsules as *used* by stamping `last_used_at = now`.
+    /// Mark a set of capsules as *used* by stamping `last_used_at = now`
+    /// (the decay clock) **and** `last_recalled_at = now` (the durable,
+    /// sweep-proof recall signal — only this path writes it).
     /// Called off the read path by the last-used worker
     /// (`crate::worker::last_used_worker`), which coalesces the
     /// capability_capsule_ids emitted into retrieval responses over a
@@ -124,8 +126,15 @@ impl DuckDbQuery {
             // the supported shape. Batches are coalesced upstream, so the
             // id count per call is small.
             for id in &ids {
+                // Stamp BOTH columns on a real recall: `last_used_at` is the
+                // decay clock (the hourly sweep also writes it, for O1
+                // reinforcement), while `last_recalled_at` is the durable,
+                // sweep-proof recall signal — only this path ever writes it,
+                // so `last_recalled_at IS NULL` reliably means "never
+                // recalled since creation" (Step-1 governance fix).
                 conn.execute(
-                    "UPDATE ns.main.capability_capsules SET last_used_at = ?1 \
+                    "UPDATE ns.main.capability_capsules \
+                     SET last_used_at = ?1, last_recalled_at = ?1 \
                      WHERE tenant = ?2 AND capability_capsule_id = ?3",
                     params![now, tenant, id],
                 )

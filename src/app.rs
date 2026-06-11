@@ -160,6 +160,16 @@ impl AppState {
             });
         }
 
+        if config.idle_archive.enabled {
+            let store_idle = store.clone();
+            let idle_settings = config.idle_archive.clone();
+            // Same single-tenant MVP scope as dedup / auto_promote.
+            let tenant = std::env::var("MEM_TENANT").unwrap_or_else(|_| "local".to_string());
+            tokio::spawn(async move {
+                crate::worker::idle_archive_worker::run(store_idle, idle_settings, tenant).await;
+            });
+        }
+
         if config.topic_tunnel.enabled {
             let store_tt = store.clone();
             let tt_settings = config.topic_tunnel.clone();

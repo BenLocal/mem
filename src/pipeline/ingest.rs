@@ -50,6 +50,81 @@ pub fn validate_scope_boundary(
     Ok(())
 }
 
+/// Structural low-value test for an `experience` capsule — the shared core
+/// of both the Step-3 ingest gate and the Step-2 idle-archive sub-filter.
+/// Returns `Some(reason)` when the capsule is structurally junk, `None`
+/// when it carries real substance. **Pure**, depends on no enabled flag —
+/// each caller decides *when* to apply it.
+///
+/// Two independent junk signals (both conservative):
+///   1. **Too short** — trimmed content shorter than `min_content_len` chars
+///      is a fragment, not a lesson.
+///   2. **Bare commit title** — a *single-line* capsule with *no* evidence
+///      and *no* code_refs, shorter than `min_content_len * 3`, is a commit
+///      subject masquerading as a reusable experience. The length ceiling
+///      means a long single-line lesson, or one carrying evidence / code
+///      refs, always returns `None` — that's what keeps real capsules safe.
+///
+/// Every non-`experience` type returns `None`: this only targets the
+/// per-commit `experience` stream.
+pub fn low_value_experience_reason(
+    capsule_type: &crate::domain::capability_capsule::CapabilityCapsuleType,
+    content: &str,
+    evidence: &[String],
+    code_refs: &[String],
+    min_content_len: usize,
+) -> Option<String> {
+    use crate::domain::capability_capsule::CapabilityCapsuleType;
+    if *capsule_type != CapabilityCapsuleType::Experience {
+        return None;
+    }
+    let trimmed = content.trim();
+    let len = trimmed.chars().count();
+    if len < min_content_len {
+        return Some(format!(
+            "experience content too short ({len} chars < min {min_content_len}): record the \
+             lesson / why, not just a one-line title",
+        ));
+    }
+    let single_line = !trimmed.contains('\n');
+    let no_support = evidence.is_empty() && code_refs.is_empty();
+    if single_line && no_support && len < min_content_len.saturating_mul(3) {
+        return Some(
+            "experience is a single line with no evidence or code_refs — looks like a bare \
+             commit subject, not a reusable lesson (add the takeaway, evidence, or code refs)"
+                .to_string(),
+        );
+    }
+    None
+}
+
+/// Governance Step 3 — source quality gate. Reject structurally low-value
+/// `experience` capsules at ingest so the active pool isn't fed bare commit
+/// subjects that nothing ever prunes. Returns `Err(reason)` to refuse the
+/// ingest, `Ok(())` to accept. Thin wrapper over
+/// [`low_value_experience_reason`], gated on `settings.quality_gate_enabled`.
+pub fn assess_ingest_quality(
+    capsule_type: &crate::domain::capability_capsule::CapabilityCapsuleType,
+    content: &str,
+    evidence: &[String],
+    code_refs: &[String],
+    settings: &crate::config::IngestSettings,
+) -> Result<(), String> {
+    if !settings.quality_gate_enabled {
+        return Ok(());
+    }
+    match low_value_experience_reason(
+        capsule_type,
+        content,
+        evidence,
+        code_refs,
+        settings.min_content_len,
+    ) {
+        Some(reason) => Err(reason),
+        None => Ok(()),
+    }
+}
+
 /// Compute the initial `status` for a freshly-ingested capsule.
 ///
 /// Status routing table:
@@ -514,7 +589,117 @@ pub fn extract_graph_edges(memory: &CapabilityCapsuleRecord) -> Vec<GraphEdge> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::domain::capability_capsule::{CapabilityCapsuleStatus, Scope, Visibility};
+    use crate::config::IngestSettings;
+    use crate::domain::capability_capsule::{
+        CapabilityCapsuleStatus, CapabilityCapsuleType, Scope, Visibility,
+    };
+
+    fn gate_on() -> IngestSettings {
+        IngestSettings {
+            max_per_session: None,
+            quality_gate_enabled: true,
+            min_content_len: 40,
+        }
+    }
+
+    #[test]
+    fn quality_gate_disabled_accepts_anything() {
+        let mut s = gate_on();
+        s.quality_gate_enabled = false;
+        assert!(assess_ingest_quality(
+            &CapabilityCapsuleType::Experience,
+            "x", // far below min, but gate is off
+            &[],
+            &[],
+            &s,
+        )
+        .is_ok());
+    }
+
+    #[test]
+    fn quality_gate_only_touches_experience() {
+        // A too-short Preference passes — only `experience` is gated.
+        assert!(assess_ingest_quality(
+            &CapabilityCapsuleType::Preference,
+            "short",
+            &[],
+            &[],
+            &gate_on(),
+        )
+        .is_ok());
+    }
+
+    #[test]
+    fn quality_gate_rejects_too_short_experience() {
+        let err = assess_ingest_quality(
+            &CapabilityCapsuleType::Experience,
+            "too short to be a lesson",
+            &[],
+            &[],
+            &gate_on(),
+        )
+        .unwrap_err();
+        assert!(err.contains("too short"), "got: {err}");
+    }
+
+    #[test]
+    fn quality_gate_rejects_bare_commit_title() {
+        // 50 chars: passes the length floor, but single-line + no support
+        // under the 3× ceiling → bare title.
+        let bare = "a".repeat(50);
+        let err = assess_ingest_quality(
+            &CapabilityCapsuleType::Experience,
+            &bare,
+            &[],
+            &[],
+            &gate_on(),
+        )
+        .unwrap_err();
+        assert!(err.contains("commit subject"), "got: {err}");
+    }
+
+    #[test]
+    fn quality_gate_accepts_experience_with_code_refs() {
+        // Same single line, but carrying a code ref → real, kept.
+        let bare = "a".repeat(50);
+        assert!(assess_ingest_quality(
+            &CapabilityCapsuleType::Experience,
+            &bare,
+            &[],
+            &["src/pipeline/ingest.rs:42".to_string()],
+            &gate_on(),
+        )
+        .is_ok());
+    }
+
+    #[test]
+    fn quality_gate_accepts_multiline_experience() {
+        let lesson = "Bug: the sweep overwrote last_used_at.\nFix: add a \
+                      separate last_recalled_at column written only on recall.";
+        assert!(assess_ingest_quality(
+            &CapabilityCapsuleType::Experience,
+            lesson,
+            &[],
+            &[],
+            &gate_on(),
+        )
+        .is_ok());
+    }
+
+    #[test]
+    fn quality_gate_accepts_long_single_line_lesson() {
+        // 130 chars, single line, no support — above the 3× ceiling, so it
+        // reads as a substantive one-liner, not a bare title.
+        let long = "a".repeat(130);
+        assert!(assess_ingest_quality(
+            &CapabilityCapsuleType::Experience,
+            &long,
+            &[],
+            &[],
+            &gate_on(),
+        )
+        .is_ok());
+    }
 
     fn baseline_memory(id: &str) -> CapabilityCapsuleRecord {
         CapabilityCapsuleRecord {

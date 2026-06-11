@@ -248,6 +248,19 @@ pub struct TopicTunnelSettings {
 pub struct IngestSettings {
     /// Max accepted ingests per session_id. `None` = unlimited.
     pub max_per_session: Option<usize>,
+    /// Governance Step 3 — source quality gate. When true, an `experience`
+    /// capsule whose content is too short, or is a bare commit subject with
+    /// no supporting evidence / code_refs, is rejected at ingest with a
+    /// clear reason (instead of accumulating as dead weight). **Default
+    /// OFF** — opt in via `MEM_INGEST_QUALITY_GATE_ENABLED=1`. Only
+    /// `experience` capsules are gated; every other type passes untouched.
+    pub quality_gate_enabled: bool,
+    /// Minimum trimmed content length (in chars) for a gated `experience`
+    /// capsule. Also the basis for the "bare commit title" ceiling
+    /// (`min_content_len * 3`): a single-line, support-free capsule longer
+    /// than that is treated as a real one-line lesson, not a title.
+    /// Default 40. Tune via `MEM_INGEST_MIN_CONTENT_LEN`.
+    pub min_content_len: usize,
 }
 
 /// K9 edge-dynamics potentiation (closes mempalace-diff-v4 K9).
@@ -298,6 +311,7 @@ pub struct Config {
     pub auto_promote: AutoPromoteSettings,
     pub vacuum: VacuumSettings,
     pub dedup: DedupSettings,
+    pub idle_archive: IdleArchiveSettings,
     pub topic_tunnel: TopicTunnelSettings,
     pub ingest: IngestSettings,
     pub edge_dynamics: EdgeDynamicsSettings,
@@ -336,6 +350,18 @@ pub enum ConfigError {
     InvalidDedupThreshold(String),
     #[error("invalid MEM_DEDUP_SCAN_LIMIT: {0}")]
     InvalidDedupScanLimit(String),
+    #[error("invalid MEM_IDLE_ARCHIVE_INTERVAL_SECS: {0}")]
+    InvalidIdleArchiveIntervalSecs(String),
+    #[error("invalid MEM_IDLE_ARCHIVE_AGE_DAYS: {0}")]
+    InvalidIdleArchiveAgeDays(String),
+    #[error("invalid MEM_IDLE_ARCHIVE_DECAY_THRESHOLD: {0} (expected float in [0, 1])")]
+    InvalidIdleArchiveDecayThreshold(String),
+    #[error("invalid MEM_IDLE_ARCHIVE_CONFIDENCE: {0} (expected float in [0, 1])")]
+    InvalidIdleArchiveConfidence(String),
+    #[error("invalid MEM_IDLE_ARCHIVE_MIN_CONTENT_LEN: {0}")]
+    InvalidIdleArchiveMinContentLen(String),
+    #[error("invalid MEM_IDLE_ARCHIVE_SCAN_LIMIT: {0}")]
+    InvalidIdleArchiveScanLimit(String),
     #[error("invalid MEM_TOPIC_TUNNEL_INTERVAL_SECS: {0}")]
     InvalidTopicTunnelIntervalSecs(String),
     #[error("invalid MEM_EDGE_DYNAMICS_BATCH_SECS: {0} (expected positive integer)")]
@@ -348,6 +374,8 @@ pub enum ConfigError {
     InvalidTopicTunnelScanLimit(String),
     #[error("invalid MEM_MAX_INGEST_PER_SESSION: {0}")]
     InvalidMaxIngestPerSession(String),
+    #[error("invalid MEM_INGEST_MIN_CONTENT_LEN: {0}")]
+    InvalidMinContentLen(String),
 }
 
 impl EmbeddingSettings {
@@ -719,6 +747,133 @@ impl DedupSettings {
     }
 }
 
+/// Settings for the idle-archive sweep (governance Step 2) — periodically
+/// archives `Active` capsules that are demonstrably dead weight: never
+/// recalled since creation, aged out, never positively reinforced, and
+/// decayed past a floor. Archival reuses the dedup `apply_feedback(Incorrect)`
+/// path, so rows are kept verbatim — only search drops them.
+///
+/// **Default OFF.** Like dedup, this worker archives rows, so it is opt-in
+/// (`MEM_IDLE_ARCHIVE_ENABLED=1`). The HTTP dry-run preview
+/// (`POST /reviews/idle_archive {dry_run:true}`) works regardless of the
+/// switch; only the destructive path is gated on it.
+#[derive(Debug, Clone)]
+pub struct IdleArchiveSettings {
+    /// Master switch. Worker is not spawned, and a real (non-dry-run)
+    /// sweep is a no-op, when false. Default `false`.
+    pub enabled: bool,
+    /// Sweep cadence in seconds. Default 24 hours — idle capsules age
+    /// slowly, so there is no value in a tight loop.
+    pub interval_secs: u64,
+    /// Minimum age (since `created_at`, in days) before a capsule can be
+    /// archived. `created_at` (not `updated_at`) so a recent metadata
+    /// touch doesn't reset the idle clock. Default 14.
+    pub age_days: u64,
+    /// Minimum `decay_score` a candidate must have reached. Pairs with
+    /// `age_days`: a capsule must be both old AND decayed. Default 0.15 —
+    /// chosen against the decay worker's 1%/day rate so the gate is
+    /// reachable within ~2 weeks rather than the ~50 days a 0.5 floor would
+    /// need (0.5 is effectively dormant on a young pool).
+    pub decay_threshold: f32,
+    /// The ingest-default confidence. A capsule is "never positively
+    /// reinforced" when its confidence is still at (or below) this value
+    /// — feedback only ever raises confidence, so equality means no
+    /// `useful` / `applies_here` ever landed. Default 0.6 (must match the
+    /// ingest default in `pipeline::ingest::initial_status`'s sibling).
+    pub default_confidence: f32,
+    /// Structural-junk sub-filter floor, reused from the Step-3 ingest gate
+    /// (`pipeline::ingest::low_value_experience_reason`). A candidate must
+    /// be not just idle but also *structurally low-value* (too short, or a
+    /// bare single-line commit subject with no evidence / code_refs) — so a
+    /// long, structured, reference-carrying lesson is **never** archived no
+    /// matter how idle it is. This is what stops the sweep from deleting
+    /// substantive memories whose recall/feedback signals are simply blank
+    /// (e.g. an existing pool predating the `last_recalled_at` column).
+    /// Default 40 (matches the ingest gate's `min_content_len`).
+    pub min_content_len: usize,
+    /// Per-sweep cap on candidate capsules pulled. Default 2_000.
+    pub scan_limit: usize,
+}
+
+impl IdleArchiveSettings {
+    /// Default: worker OFF, 24-hour cadence, 14-day age floor, decay ≥ 0.15,
+    /// default-confidence 0.6, structural floor 40 chars, 2_000 cap. Opt in
+    /// via `MEM_IDLE_ARCHIVE_ENABLED=1`.
+    pub fn development_defaults() -> Self {
+        Self {
+            enabled: false,
+            interval_secs: 24 * 3_600,
+            age_days: 14,
+            decay_threshold: 0.15,
+            default_confidence: 0.6,
+            min_content_len: 40,
+            scan_limit: 2_000,
+        }
+    }
+
+    pub fn from_env_vars(get: impl Fn(&str) -> Option<String>) -> Result<Self, ConfigError> {
+        let mut s = Self::development_defaults();
+        if let Some(raw) = get("MEM_IDLE_ARCHIVE_ENABLED") {
+            s.enabled = matches!(raw.to_ascii_lowercase().as_str(), "1" | "true" | "yes");
+        }
+        if let Some(raw) = get("MEM_IDLE_ARCHIVE_INTERVAL_SECS") {
+            let n: u64 = raw
+                .parse()
+                .map_err(|_| ConfigError::InvalidIdleArchiveIntervalSecs(raw.clone()))?;
+            if n == 0 {
+                return Err(ConfigError::InvalidIdleArchiveIntervalSecs(raw));
+            }
+            s.interval_secs = n;
+        }
+        if let Some(raw) = get("MEM_IDLE_ARCHIVE_AGE_DAYS") {
+            let n: u64 = raw
+                .parse()
+                .map_err(|_| ConfigError::InvalidIdleArchiveAgeDays(raw.clone()))?;
+            if n == 0 {
+                return Err(ConfigError::InvalidIdleArchiveAgeDays(raw));
+            }
+            s.age_days = n;
+        }
+        if let Some(raw) = get("MEM_IDLE_ARCHIVE_DECAY_THRESHOLD") {
+            let n: f32 = raw
+                .parse()
+                .map_err(|_| ConfigError::InvalidIdleArchiveDecayThreshold(raw.clone()))?;
+            if !(0.0..=1.0).contains(&n) {
+                return Err(ConfigError::InvalidIdleArchiveDecayThreshold(raw));
+            }
+            s.decay_threshold = n;
+        }
+        if let Some(raw) = get("MEM_IDLE_ARCHIVE_CONFIDENCE") {
+            let n: f32 = raw
+                .parse()
+                .map_err(|_| ConfigError::InvalidIdleArchiveConfidence(raw.clone()))?;
+            if !(0.0..=1.0).contains(&n) {
+                return Err(ConfigError::InvalidIdleArchiveConfidence(raw));
+            }
+            s.default_confidence = n;
+        }
+        if let Some(raw) = get("MEM_IDLE_ARCHIVE_MIN_CONTENT_LEN") {
+            let n: usize = raw
+                .parse()
+                .map_err(|_| ConfigError::InvalidIdleArchiveMinContentLen(raw.clone()))?;
+            if n == 0 {
+                return Err(ConfigError::InvalidIdleArchiveMinContentLen(raw));
+            }
+            s.min_content_len = n;
+        }
+        if let Some(raw) = get("MEM_IDLE_ARCHIVE_SCAN_LIMIT") {
+            let n: usize = raw
+                .parse()
+                .map_err(|_| ConfigError::InvalidIdleArchiveScanLimit(raw.clone()))?;
+            if n == 0 {
+                return Err(ConfigError::InvalidIdleArchiveScanLimit(raw));
+            }
+            s.scan_limit = n;
+        }
+        Ok(s)
+    }
+}
+
 impl TopicTunnelSettings {
     pub fn development_defaults() -> Self {
         Self {
@@ -841,6 +996,8 @@ impl IngestSettings {
     pub fn development_defaults() -> Self {
         Self {
             max_per_session: None,
+            quality_gate_enabled: false,
+            min_content_len: 40,
         }
     }
 
@@ -856,6 +1013,18 @@ impl IngestSettings {
             // want zero ingests, kill the service.
             s.max_per_session = if n == 0 { None } else { Some(n) };
         }
+        if let Some(raw) = get("MEM_INGEST_QUALITY_GATE_ENABLED") {
+            s.quality_gate_enabled = matches!(raw.to_ascii_lowercase().as_str(), "1" | "true" | "yes");
+        }
+        if let Some(raw) = get("MEM_INGEST_MIN_CONTENT_LEN") {
+            let n: usize = raw
+                .parse()
+                .map_err(|_| ConfigError::InvalidMinContentLen(raw.clone()))?;
+            if n == 0 {
+                return Err(ConfigError::InvalidMinContentLen(raw));
+            }
+            s.min_content_len = n;
+        }
         Ok(s)
     }
 }
@@ -869,6 +1038,7 @@ impl Config {
             auto_promote: AutoPromoteSettings::development_defaults(),
             vacuum: VacuumSettings::development_defaults(),
             dedup: DedupSettings::development_defaults(),
+            idle_archive: IdleArchiveSettings::development_defaults(),
             topic_tunnel: TopicTunnelSettings::development_defaults(),
             ingest: IngestSettings::development_defaults(),
             edge_dynamics: EdgeDynamicsSettings::development_defaults(),
@@ -885,6 +1055,7 @@ impl Config {
             auto_promote: AutoPromoteSettings::from_env_vars(|k| std::env::var(k).ok())?,
             vacuum: VacuumSettings::from_env_vars(|k| std::env::var(k).ok())?,
             dedup: DedupSettings::from_env_vars(|k| std::env::var(k).ok())?,
+            idle_archive: IdleArchiveSettings::from_env_vars(|k| std::env::var(k).ok())?,
             topic_tunnel: TopicTunnelSettings::from_env_vars(|k| std::env::var(k).ok())?,
             ingest: IngestSettings::from_env_vars(|k| std::env::var(k).ok())?,
             edge_dynamics: EdgeDynamicsSettings::from_env_vars(|k| std::env::var(k).ok())?,

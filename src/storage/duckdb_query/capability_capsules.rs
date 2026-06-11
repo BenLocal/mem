@@ -29,9 +29,9 @@ const CAPABILITY_CAPSULE_COLS: &str =
     summary, content, evidence, code_refs, project, repo, module, task_type, \
     tags, topics, confidence, decay_score, content_hash, idempotency_key, \
     session_id, supersedes_capability_capsule_id, source_agent, created_at, updated_at, \
-    last_validated_at, last_used_at";
+    last_validated_at, last_used_at, last_recalled_at";
 
-/// Parse one row of the 28-column SELECT above into a [`CapabilityCapsuleRecord`].
+/// Parse one row of the 29-column SELECT above into a [`CapabilityCapsuleRecord`].
 ///
 /// Type expectations (Lance Arrow → DuckDB SQL via the lance extension):
 ///   - `Utf8` → `VARCHAR` → `String` / `Option<String>`
@@ -76,6 +76,7 @@ fn row_to_capability_capsule_record(
         updated_at: row.get(25)?,
         last_validated_at: row.get(26)?,
         last_used_at: row.get(27)?,
+        last_recalled_at: row.get(28)?,
     })
 }
 
@@ -920,6 +921,11 @@ impl DuckDbQuery {
             .map(|c| format!("m.{}", c.trim()))
             .collect::<Vec<_>>()
             .join(", ");
+        // The appended `rrf_score` sits at the column index *after* all the
+        // capsule columns. Derive it from the column count so adding/removing
+        // a capsule column can never drift this index again (it has twice
+        // before: last_used_at, then last_recalled_at).
+        let rrf_col_idx = CAPABILITY_CAPSULE_COLS.split(',').count();
 
         let conn = self.fresh_conn().await?;
         let tenant = tenant.to_string();
@@ -1079,11 +1085,10 @@ impl DuckDbQuery {
                 let mut stmt = conn.prepare(&sql)?;
                 let rows = stmt.query_map(params_refs.as_slice(), |row| {
                     let mem = row_to_capability_capsule_record(row)?;
-                    // rrf_score is the column *after* the 28 capsule
-                    // columns of `m_cols` (indices 0..=27), so it sits at
-                    // index 28. Bump this in lockstep with the capsule
-                    // column count whenever a column is added/removed.
-                    let rrf: f32 = row.get(28)?;
+                    // rrf_score is the column right after the capsule columns
+                    // of `m_cols`; `rrf_col_idx` is derived from the column
+                    // count so it can't drift when columns change.
+                    let rrf: f32 = row.get(rrf_col_idx)?;
                     Ok((mem, rrf))
                 })?;
                 let mut out = Vec::new();
@@ -1242,6 +1247,7 @@ mod tests {
             updated_at: "00000001778000000000".into(),
             last_validated_at: None,
             last_used_at: None,
+            last_recalled_at: None,
         }
     }
 

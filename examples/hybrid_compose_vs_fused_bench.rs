@@ -220,6 +220,7 @@ fn make_capsule(i: usize) -> CapabilityCapsuleRecord {
         updated_at: now,
         last_validated_at: None,
         last_used_at: None,
+        last_recalled_at: None,
     }
 }
 

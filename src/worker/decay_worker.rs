@@ -128,6 +128,16 @@ mod tests {
             m_active.last_used_at.is_some(),
             "sweep must stamp last_used_at as the decay clock"
         );
+        // Step-1 fix: the sweep stamps the *decay clock* (last_used_at) but
+        // must NOT fabricate a *recall* signal. `last_recalled_at` is written
+        // only on a real retrieval, so a never-recalled row stays None across
+        // any number of hourly sweeps — this is the durable, sweep-proof
+        // "was this ever recalled?" signal the idle-archive sweep relies on.
+        assert!(
+            m_active.last_recalled_at.is_none(),
+            "decay sweep must not set last_recalled_at; got {:?}",
+            m_active.last_recalled_at
+        );
 
         let m_prov = read("m-prov").await;
         // Non-active row should not move (status filter).
@@ -212,6 +222,18 @@ mod tests {
             "use must slow decay: used {} vs untouched {}",
             used.decay_score,
             untouched.decay_score
+        );
+        // Step-1 fix: a real recall stamped `last_recalled_at`, and it
+        // SURVIVES the subsequent decay sweep — unlike `last_used_at`, the
+        // sweep never overwrites it. The untouched row, never recalled, keeps
+        // a None recall signal.
+        assert!(
+            used.last_recalled_at.is_some(),
+            "recall must stamp last_recalled_at and survive the sweep"
+        );
+        assert!(
+            untouched.last_recalled_at.is_none(),
+            "never-recalled row must keep last_recalled_at = None"
         );
     }
 }

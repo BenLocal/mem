@@ -120,6 +120,7 @@ fn memory(spec: CapabilityCapsuleSpec<'_>) -> CapabilityCapsuleRecord {
         updated_at: spec.updated_at.into(),
         last_validated_at: None,
         last_used_at: None,
+        last_recalled_at: None,
     }
 }
 

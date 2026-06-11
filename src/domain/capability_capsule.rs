@@ -234,6 +234,16 @@ pub struct CapabilityCapsuleRecord {
     /// `updated_at`. See roadmap O1.
     #[serde(default, skip_serializing_if = "skip_none")]
     pub last_used_at: Option<String>,
+    /// Step-1 governance fix — the durable, sweep-proof recall signal.
+    /// Stamped to `current_timestamp()` **only** by the real recall path
+    /// (the last-used worker, alongside `last_used_at`); the hourly decay
+    /// sweep never writes it. So `last_recalled_at IS NULL` means
+    /// "never surfaced in a retrieval response since creation" — the
+    /// signal the idle-archive sweep needs, which `last_used_at` cannot
+    /// provide because the decay sweep overwrites that column every tick.
+    /// `None` on legacy / never-recalled rows.
+    #[serde(default, skip_serializing_if = "skip_none")]
+    pub last_recalled_at: Option<String>,
 }
 
 impl Default for CapabilityCapsuleRecord {
@@ -267,6 +277,7 @@ impl Default for CapabilityCapsuleRecord {
             updated_at: String::new(),
             last_validated_at: None,
             last_used_at: None,
+            last_recalled_at: None,
         }
     }
 }

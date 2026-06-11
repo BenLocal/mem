@@ -370,6 +370,7 @@ fn capability_capsules_schema() -> Schema {
         Field::new("updated_at", DataType::Utf8, false),
         Field::new("last_validated_at", DataType::Utf8, true),
         Field::new("last_used_at", DataType::Utf8, true),
+        Field::new("last_recalled_at", DataType::Utf8, true),
     ])
 }
 
@@ -475,34 +476,42 @@ async fn migrate_graph_edges_add_columns(conn: &Connection) -> Result<(), Storag
     Ok(())
 }
 
-/// Migration (roadmap O1): pre-O1 `capability_capsules` tables on disk
-/// lack the `last_used_at` column. Add it nullable, backfilled NULL via
-/// `add_columns(AllNulls)` — so the decay sweep's
-/// `COALESCE(last_used_at, updated_at)` anchor falls back to `updated_at`
-/// for legacy rows. Idempotent: a freshly-created table already carries
-/// the column, so this no-ops there. Same pattern as
+/// Migration: older `capability_capsules` tables on disk lack columns
+/// added after their creation. Each nullable column is added
+/// independently (backfilled NULL via `add_columns(AllNulls)`) only when
+/// absent — so a table that already has some-but-not-all of the newer
+/// columns still picks up the rest. Idempotent: a freshly-created table
+/// carries them all, so every check no-ops. Same pattern as
 /// [`migrate_graph_edges_add_columns`].
+///
+///   - `last_used_at` (roadmap O1): decay-clock anchor; legacy rows fall
+///     back to `updated_at` via the sweep's `COALESCE`.
+///   - `last_recalled_at` (Step-1 governance fix): the sweep-proof recall
+///     signal. NULL on legacy rows = "never recalled" — exactly the clean
+///     slate the idle-archive sweep wants for the existing pool.
 async fn migrate_capability_capsules_add_columns(conn: &Connection) -> Result<(), StorageError> {
     let table = conn
         .open_table("capability_capsules")
         .execute()
         .await
         .map_err(lancedb_err)?;
-    let schema = table.schema().await.map_err(lancedb_err)?;
-    if schema.field_with_name("last_used_at").is_ok() {
-        return Ok(());
+    for col in ["last_used_at", "last_recalled_at"] {
+        let schema = table.schema().await.map_err(lancedb_err)?;
+        if schema.field_with_name(col).is_ok() {
+            continue;
+        }
+        table
+            .add_columns(
+                NewColumnTransform::AllNulls(Arc::new(Schema::new(vec![Field::new(
+                    col,
+                    DataType::Utf8,
+                    true,
+                )]))),
+                None,
+            )
+            .await
+            .map_err(lancedb_err)?;
     }
-    table
-        .add_columns(
-            NewColumnTransform::AllNulls(Arc::new(Schema::new(vec![Field::new(
-                "last_used_at",
-                DataType::Utf8,
-                true,
-            )]))),
-            None,
-        )
-        .await
-        .map_err(lancedb_err)?;
     Ok(())
 }
 
@@ -1506,6 +1515,7 @@ pub(super) fn capability_capsules_to_record_batch(
     let mut updated_at = StringBuilder::new();
     let mut last_validated_at = StringBuilder::new();
     let mut last_used_at = StringBuilder::new();
+    let mut last_recalled_at = StringBuilder::new();
 
     for m in memories {
         capability_capsule_id.append_value(&m.capability_capsule_id);
@@ -1575,6 +1585,10 @@ pub(super) fn capability_capsules_to_record_batch(
             Some(s) => last_used_at.append_value(s),
             None => last_used_at.append_null(),
         }
+        match &m.last_recalled_at {
+            Some(s) => last_recalled_at.append_value(s),
+            None => last_recalled_at.append_null(),
+        }
     }
 
     let schema = Arc::new(capability_capsules_schema());
@@ -1607,6 +1621,7 @@ pub(super) fn capability_capsules_to_record_batch(
         Arc::new(updated_at.finish()),
         Arc::new(last_validated_at.finish()),
         Arc::new(last_used_at.finish()),
+        Arc::new(last_recalled_at.finish()),
     ];
     RecordBatch::try_new(schema, columns)
         .map_err(|e| StorageError::InvalidInput(format!("memories record batch: {e}")))
@@ -1655,6 +1670,7 @@ pub(super) fn record_batch_to_capability_capsules(
     let updated_at = parse_col::<StringArray>(batch, TABLE, "updated_at")?;
     let last_validated_at = parse_col::<StringArray>(batch, TABLE, "last_validated_at")?;
     let last_used_at = parse_col::<StringArray>(batch, TABLE, "last_used_at")?;
+    let last_recalled_at = parse_col::<StringArray>(batch, TABLE, "last_recalled_at")?;
 
     fn list_at(arr: &ListArray, i: usize) -> Result<Vec<String>, StorageError> {
         let inner = arr.value(i);
@@ -1703,6 +1719,7 @@ pub(super) fn record_batch_to_capability_capsules(
             updated_at: updated_at.value(i).to_string(),
             last_validated_at: opt(last_validated_at, i),
             last_used_at: opt(last_used_at, i),
+            last_recalled_at: opt(last_recalled_at, i),
         });
     }
     Ok(out)

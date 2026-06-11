@@ -76,7 +76,11 @@ CREATE TABLE IF NOT EXISTS capability_capsules (
     last_validated_at                TEXT,
     -- roadmap O1: last time this capsule was emitted into a retrieval
     -- response; anchors the decay clock via COALESCE(last_used_at, updated_at).
-    last_used_at                     TEXT
+    last_used_at                     TEXT,
+    -- Step-1 governance fix: durable, sweep-proof recall signal. Written
+    -- ONLY by the real recall path (never by the decay sweep), so
+    -- `last_recalled_at IS NULL` == "never recalled since creation".
+    last_recalled_at                 TEXT
 );
 
 -- Common query patterns used by CapsuleStore reads.

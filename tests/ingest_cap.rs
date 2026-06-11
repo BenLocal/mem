@@ -71,8 +71,23 @@ async fn make_service(
 ) -> (tempfile::TempDir, CapabilityCapsuleService) {
     let dir = tempdir().unwrap();
     let store = Arc::new(Store::open(&dir.path().join("ic.lance")).await.unwrap());
-    let svc = CapabilityCapsuleService::new(store)
-        .with_ingest_settings(IngestSettings { max_per_session });
+    let svc = CapabilityCapsuleService::new(store).with_ingest_settings(IngestSettings {
+        max_per_session,
+        ..IngestSettings::development_defaults()
+    });
+    (dir, svc)
+}
+
+/// Service with the Step-3 source quality gate enabled (default
+/// `min_content_len`), used by the gate-wiring tests below.
+async fn make_gated_service() -> (tempfile::TempDir, CapabilityCapsuleService) {
+    let dir = tempdir().unwrap();
+    let store = Arc::new(Store::open(&dir.path().join("ig.lance")).await.unwrap());
+    let svc = CapabilityCapsuleService::new(store).with_ingest_settings(IngestSettings {
+        max_per_session: None,
+        quality_gate_enabled: true,
+        min_content_len: 40,
+    });
     (dir, svc)
 }
 
@@ -160,4 +175,43 @@ async fn idempotency_short_circuit_does_not_consume_cap_slot() {
     svc.ingest(request("third unique", Some("idemp-3")))
         .await
         .expect_err("third unique should hit cap=2");
+}
+
+// ────────────────────── Step-3 quality gate (wiring) ──────────────────────
+
+#[tokio::test(flavor = "multi_thread")]
+async fn quality_gate_rejects_bare_experience_at_ingest() {
+    let (_dir, svc) = make_gated_service().await;
+    // A short single-line experience with no evidence / code_refs — the
+    // exact shape of a per-commit subject. Must be refused with a reason.
+    let err = svc
+        .ingest(request("fix login bug", None))
+        .await
+        .expect_err("bare experience must be rejected by the gate");
+    let msg = format!("{err}");
+    assert!(
+        msg.contains("too short") || msg.contains("commit subject"),
+        "gate error must explain why: {msg}",
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn quality_gate_default_off_accepts_bare_experience() {
+    // Default service (gate disabled) must keep accepting the same capsule —
+    // the gate is strictly opt-in, no behavior change by default.
+    let (_dir, svc) = make_service(None).await;
+    svc.ingest(request("fix login bug", None))
+        .await
+        .expect("with gate off, ingest is unchanged");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn quality_gate_accepts_substantive_experience() {
+    let (_dir, svc) = make_gated_service().await;
+    // A real lesson with a body — comfortably over the floor, multi-line.
+    let lesson = "Decay sweep overwrote last_used_at every hour, destroying the \
+                  recall signal.\nFix: add a separate last_recalled_at column.";
+    svc.ingest(request(lesson, None))
+        .await
+        .expect("substantive experience must pass the gate");
 }

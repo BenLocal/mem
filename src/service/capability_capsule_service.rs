@@ -326,6 +326,14 @@ impl CapabilityCapsuleService {
             request.project.as_deref(),
         )
         .map_err(|e| ServiceError::Storage(StorageError::InvalidInput(e)))?;
+        crate::pipeline::ingest::assess_ingest_quality(
+            &request.capability_capsule_type,
+            &request.content,
+            &request.evidence,
+            &request.code_refs,
+            &self.ingest_settings,
+        )
+        .map_err(|e| ServiceError::Storage(StorageError::InvalidInput(e)))?;
 
         let summary = request
             .summary
@@ -380,6 +388,7 @@ impl CapabilityCapsuleService {
             updated_at: now.clone(),
             last_validated_at: None,
             last_used_at: None,
+            last_recalled_at: None,
         };
 
         let stored = self.store.insert_capability_capsule(memory).await?;
@@ -529,6 +538,14 @@ impl CapabilityCapsuleService {
             request.project.as_deref(),
         )
         .map_err(|e| ServiceError::Storage(StorageError::InvalidInput(e)))?;
+        crate::pipeline::ingest::assess_ingest_quality(
+            &request.capability_capsule_type,
+            &request.content,
+            &request.evidence,
+            &request.code_refs,
+            &self.ingest_settings,
+        )
+        .map_err(|e| ServiceError::Storage(StorageError::InvalidInput(e)))?;
         let summary = request
             .summary
             .as_deref()
@@ -574,6 +591,7 @@ impl CapabilityCapsuleService {
             updated_at: now.to_string(),
             last_validated_at: None,
             last_used_at: None,
+            last_recalled_at: None,
         };
         Ok(PreparedIngest::New {
             record: Box::new(record),
@@ -942,6 +960,22 @@ impl CapabilityCapsuleService {
             .map_err(ServiceError::Storage)
     }
 
+    /// Service entry point for the idle-archive sweep (governance Step 2).
+    /// Delegates to `idle_archive_worker::sweep_once`. Backs
+    /// `POST /reviews/idle_archive` — `dry_run=true` previews candidate ids
+    /// without writing; `dry_run=false` archives (and is a no-op while the
+    /// worker is disabled, per the worker's safety gate).
+    pub async fn idle_archive_sweep(
+        &self,
+        tenant: &str,
+        settings: &crate::config::IdleArchiveSettings,
+        dry_run: bool,
+    ) -> Result<Vec<String>, ServiceError> {
+        crate::worker::idle_archive_worker::sweep_once(&*self.store, settings, tenant, dry_run)
+            .await
+            .map_err(ServiceError::Storage)
+    }
+
     /// Service entry point for the Lance vacuum sweep — delegates to
     /// `MaintenanceStore::vacuum_old_versions_with` via the worker
     /// helper. Used by `POST /admin/vacuum` for on-demand operator
@@ -1083,6 +1117,7 @@ impl CapabilityCapsuleService {
             updated_at: now,
             last_validated_at: None,
             last_used_at: None,
+            last_recalled_at: None,
         }
     }
 

@@ -65,6 +65,7 @@ pub mod cooccurrence_worker;
 pub mod decay_worker;
 pub mod dedup_worker;
 pub mod embedding_worker;
+pub mod idle_archive_worker;
 pub mod last_used_worker;
 pub mod potentiation_worker;
 pub mod topic_tunnel_worker;

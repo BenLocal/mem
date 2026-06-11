@@ -75,6 +75,7 @@ fn sample(
         updated_at: ts,
         last_validated_at: None,
         last_used_at: None,
+        last_recalled_at: None,
     }
 }
 
