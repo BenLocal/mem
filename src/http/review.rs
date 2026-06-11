@@ -19,6 +19,7 @@ pub fn router() -> Router<AppState> {
         )
         .route("/reviews/auto_promote", post(auto_promote))
         .route("/reviews/idle_archive", post(idle_archive))
+        .route("/reviews/evolution", post(evolution))
 }
 
 #[derive(Debug, Deserialize)]
@@ -187,6 +188,31 @@ async fn idle_archive(
         dry_run: request.dry_run,
         capability_capsule_ids: ids,
     }))
+}
+
+/// Capsule self-evolution sweep (doc `docs/evolution-worker.md` §9).
+/// `dry_run` defaults to true — same operator flow as idle-archive:
+/// preview, review the proposals, then enable the worker. The dry-run
+/// preview works regardless of `MEM_EVOLUTION_ENABLED`; a real sweep
+/// is a no-op while the switch is off.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "snake_case")]
+struct EvolutionRequest {
+    #[serde(default = "default_tenant")]
+    tenant: String,
+    #[serde(default = "default_true")]
+    dry_run: bool,
+}
+
+async fn evolution(
+    State(app): State<AppState>,
+    Json(request): Json<EvolutionRequest>,
+) -> Result<Json<crate::worker::evolution_worker::EvolutionReport>, AppError> {
+    Ok(Json(
+        app.capability_capsule_service
+            .evolution_sweep(&request.tenant, &app.config.evolution, request.dry_run)
+            .await?,
+    ))
 }
 
 fn default_tenant() -> String {

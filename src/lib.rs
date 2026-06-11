@@ -4,6 +4,7 @@ pub mod config;
 pub mod domain;
 pub mod embedding;
 pub mod error;
+pub mod evolution;
 pub mod http;
 pub mod mcp;
 pub mod pipeline;

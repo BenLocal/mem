@@ -978,6 +978,23 @@ impl CapabilityCapsuleService {
             .map_err(ServiceError::Storage)
     }
 
+    /// Service entry point for the capsule self-evolution sweep (doc
+    /// `docs/evolution-worker.md` E1). Delegates to
+    /// `evolution_worker::sweep_once`. Backs `POST /reviews/evolution`
+    /// — `dry_run=true` previews proposals without writing anything;
+    /// `dry_run=false` runs a real cycle (and is a no-op while the
+    /// worker is disabled, per the worker's safety gate).
+    pub async fn evolution_sweep(
+        &self,
+        tenant: &str,
+        settings: &crate::config::EvolutionSettings,
+        dry_run: bool,
+    ) -> Result<crate::worker::evolution_worker::EvolutionReport, ServiceError> {
+        crate::worker::evolution_worker::sweep_once(&*self.store, settings, tenant, dry_run)
+            .await
+            .map_err(ServiceError::Storage)
+    }
+
     /// Service entry point for the Lance vacuum sweep — delegates to
     /// `MaintenanceStore::vacuum_old_versions_with` via the worker
     /// helper. Used by `POST /admin/vacuum` for on-demand operator

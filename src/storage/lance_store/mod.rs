@@ -59,6 +59,7 @@ mod capability_capsules;
 mod embedding;
 mod entities;
 mod episodes;
+pub(crate) mod evolution;
 mod graph;
 mod maintenance;
 pub(crate) mod mine_cursors;
@@ -157,6 +158,7 @@ impl LanceStore {
         ensure_sessions_table(&conn).await?;
         ensure_episodes_table(&conn).await?;
         ensure_mine_cursors_table(&conn).await?;
+        ensure_evolution_candidates_table(&conn).await?;
         // capability_capsule_embeddings is lazy-created on first upsert (dim is
         // provider-dependent and unknown here without provider).
 
@@ -573,6 +575,34 @@ fn mine_cursors_schema() -> Schema {
         Field::new("transcript_path", DataType::Utf8, false),
         Field::new("last_line_number", DataType::Int64, false),
         Field::new("updated_at", DataType::Utf8, false),
+    ])
+}
+
+pub(super) async fn ensure_evolution_candidates_table(
+    conn: &Connection,
+) -> Result<(), StorageError> {
+    ensure_table(conn, "evolution_candidates", evolution_candidates_schema()).await
+}
+
+/// Arrow schema for `evolution_candidates` — durable anti-jitter state
+/// for the self-evolution worker (doc `docs/evolution-worker.md` §8.2).
+/// `member_ids` / `result_capsule_ids` are JSON-encoded string arrays:
+/// the table is only read in worker sweeps (never hot-path), so a flat
+/// schema beats Arrow list columns in parser complexity.
+fn evolution_candidates_schema() -> Schema {
+    Schema::new(vec![
+        Field::new("candidate_id", DataType::Utf8, false),
+        Field::new("tenant", DataType::Utf8, false),
+        Field::new("op_kind", DataType::Utf8, false),
+        Field::new("member_ids", DataType::Utf8, false),
+        Field::new("params", DataType::Utf8, false),
+        Field::new("evidence", DataType::Float32, false),
+        Field::new("consecutive_cycles", DataType::Int64, false),
+        Field::new("status", DataType::Utf8, false),
+        Field::new("first_proposed_at", DataType::Utf8, false),
+        Field::new("last_signal_at", DataType::Utf8, false),
+        Field::new("executed_at", DataType::Utf8, true),
+        Field::new("result_capsule_ids", DataType::Utf8, false),
     ])
 }
 

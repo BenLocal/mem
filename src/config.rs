@@ -303,6 +303,67 @@ pub struct CooccurrenceSettings {
     pub scan_limit: usize,
 }
 
+/// Capsule self-evolution worker (doc `docs/evolution-worker.md` §9).
+/// **Default OFF.** When enabled, a worker periodically maps active
+/// capsules in embedding space (union-find clustering over existing
+/// vectors — zero LLM), aligns clusters across cycles, accumulates
+/// per-candidate evidence with a K-consecutive-cycle anti-jitter gate
+/// (EvoMap-inspired temporal smoothing), and proposes / executes
+/// evolution operators: ① merge (keep-longest + `merged_into` lineage
+/// edges) and ② generalize (episodic→semantic proposal capsule into
+/// the pending-review queue; sources stay Active). Opt in via
+/// `MEM_EVOLUTION_ENABLED=1`. The HTTP dry-run preview
+/// (`POST /reviews/evolution {dry_run:true}`) works regardless of the
+/// switch — idle-archive precedent: only the destructive path is gated.
+#[derive(Debug, Clone)]
+pub struct EvolutionSettings {
+    /// Master switch. Worker is not spawned, and a real (non-dry-run)
+    /// sweep is a no-op, when false. Default `false`.
+    pub enabled: bool,
+    /// Sweep cadence in seconds — one sweep is one "cycle" for the
+    /// K-cycle gate. Default 24h: evolution is deliberately slow.
+    pub interval_secs: u64,
+    /// Anti-jitter gate: a candidate operation executes only after its
+    /// signal held for this many CONSECUTIVE cycles. Default 3.
+    pub k_cycles: u32,
+    /// β in `E_t = β·E_{t-1} + s_t` — evidence retention across cycles.
+    /// In `[0, 1)`. Default 0.7.
+    pub evidence_decay: f32,
+    /// Hysteresis: a pending candidate is cancelled only when its
+    /// decayed evidence drops below this floor — so the cancel
+    /// threshold sits below the propose threshold and borderline
+    /// signals don't flap. In `(0, 1]`. Default 0.5.
+    pub hysteresis: f32,
+    /// Map-layer cosine threshold for cluster membership (union-find).
+    /// Looser than `merge_threshold` — clusters are "same topic",
+    /// merge sub-groups are "near-same content". Default 0.80.
+    pub cluster_threshold: f32,
+    /// Cosine threshold for the ① merge operator's sub-grouping inside
+    /// a cluster. Between the 0.80 map floor and the dedup worker's
+    /// 0.92 near-duplicate floor. Default 0.88.
+    pub merge_threshold: f32,
+    /// Minimum number of episodic capsules a stable cluster needs
+    /// before the ② generalize operator proposes an abstraction.
+    /// Default 4 (must be ≥ 2; 1 would "generalize" a singleton).
+    pub generalize_min_n: usize,
+    /// Per-sweep cap on candidate capsules pulled. Default 2_000.
+    pub scan_limit: usize,
+    /// Phase-2 synthesis backend selection (doc §6.2). E1 implements
+    /// `off` (detect-only placeholders) and `review` (defer content to
+    /// the pending-review queue — zero LLM in the worker). `local` /
+    /// `api` are designed but unimplemented and rejected at parse.
+    pub synthesis: EvolutionSynthesisMode,
+}
+
+/// `MEM_EVOLUTION_SYNTHESIS` values implemented in E1. The worker is
+/// LLM-free in both modes; `Review` routes generative work to the
+/// pending-review queue where the interactive agent writes content.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EvolutionSynthesisMode {
+    Off,
+    Review,
+}
+
 #[derive(Debug, Clone)]
 pub struct Config {
     pub bind_addr: String,
@@ -316,6 +377,7 @@ pub struct Config {
     pub ingest: IngestSettings,
     pub edge_dynamics: EdgeDynamicsSettings,
     pub cooccurrence: CooccurrenceSettings,
+    pub evolution: EvolutionSettings,
 }
 
 #[derive(Debug, Error)]
@@ -350,6 +412,8 @@ pub enum ConfigError {
     InvalidDedupThreshold(String),
     #[error("invalid MEM_DEDUP_SCAN_LIMIT: {0}")]
     InvalidDedupScanLimit(String),
+    #[error("invalid {var}: {value}")]
+    InvalidEvolutionSetting { var: &'static str, value: String },
     #[error("invalid MEM_IDLE_ARCHIVE_INTERVAL_SECS: {0}")]
     InvalidIdleArchiveIntervalSecs(String),
     #[error("invalid MEM_IDLE_ARCHIVE_AGE_DAYS: {0}")]
@@ -992,6 +1056,114 @@ impl CooccurrenceSettings {
     }
 }
 
+impl EvolutionSettings {
+    /// Default: worker OFF, daily cadence, K=3 gate, β=0.7, hysteresis
+    /// 0.5, cluster 0.80 / merge 0.88, generalize_min_n 4, 2_000 cap,
+    /// synthesis off. Opt in via `MEM_EVOLUTION_ENABLED=1`.
+    pub fn development_defaults() -> Self {
+        Self {
+            enabled: false,
+            interval_secs: 86_400,
+            k_cycles: 3,
+            evidence_decay: 0.7,
+            hysteresis: 0.5,
+            cluster_threshold: 0.80,
+            merge_threshold: 0.88,
+            generalize_min_n: 4,
+            scan_limit: 2_000,
+            synthesis: EvolutionSynthesisMode::Off,
+        }
+    }
+
+    pub fn from_env_vars(get: impl Fn(&str) -> Option<String>) -> Result<Self, ConfigError> {
+        fn invalid(var: &'static str, value: &str) -> ConfigError {
+            ConfigError::InvalidEvolutionSetting {
+                var,
+                value: value.to_string(),
+            }
+        }
+        let mut s = Self::development_defaults();
+        if let Some(raw) = get("MEM_EVOLUTION_ENABLED") {
+            s.enabled = matches!(raw.to_ascii_lowercase().as_str(), "1" | "true" | "yes");
+        }
+        if let Some(raw) = get("MEM_EVOLUTION_INTERVAL_SECS") {
+            const VAR: &str = "MEM_EVOLUTION_INTERVAL_SECS";
+            let n: u64 = raw.parse().map_err(|_| invalid(VAR, &raw))?;
+            if n == 0 {
+                return Err(invalid(VAR, &raw));
+            }
+            s.interval_secs = n;
+        }
+        if let Some(raw) = get("MEM_EVOLUTION_K_CYCLES") {
+            const VAR: &str = "MEM_EVOLUTION_K_CYCLES";
+            let n: u32 = raw.parse().map_err(|_| invalid(VAR, &raw))?;
+            if n == 0 {
+                return Err(invalid(VAR, &raw));
+            }
+            s.k_cycles = n;
+        }
+        if let Some(raw) = get("MEM_EVOLUTION_EVIDENCE_DECAY") {
+            const VAR: &str = "MEM_EVOLUTION_EVIDENCE_DECAY";
+            let n: f32 = raw.parse().map_err(|_| invalid(VAR, &raw))?;
+            if !(0.0..1.0).contains(&n) {
+                return Err(invalid(VAR, &raw));
+            }
+            s.evidence_decay = n;
+        }
+        if let Some(raw) = get("MEM_EVOLUTION_HYSTERESIS") {
+            const VAR: &str = "MEM_EVOLUTION_HYSTERESIS";
+            let n: f32 = raw.parse().map_err(|_| invalid(VAR, &raw))?;
+            if !(0.0 < n && n <= 1.0) {
+                return Err(invalid(VAR, &raw));
+            }
+            s.hysteresis = n;
+        }
+        if let Some(raw) = get("MEM_EVOLUTION_CLUSTER_THRESHOLD") {
+            const VAR: &str = "MEM_EVOLUTION_CLUSTER_THRESHOLD";
+            let n: f32 = raw.parse().map_err(|_| invalid(VAR, &raw))?;
+            if !(0.0 < n && n <= 1.0) {
+                return Err(invalid(VAR, &raw));
+            }
+            s.cluster_threshold = n;
+        }
+        if let Some(raw) = get("MEM_EVOLUTION_MERGE_THRESHOLD") {
+            const VAR: &str = "MEM_EVOLUTION_MERGE_THRESHOLD";
+            let n: f32 = raw.parse().map_err(|_| invalid(VAR, &raw))?;
+            if !(0.0 < n && n <= 1.0) {
+                return Err(invalid(VAR, &raw));
+            }
+            s.merge_threshold = n;
+        }
+        if let Some(raw) = get("MEM_EVOLUTION_GENERALIZE_MIN_N") {
+            const VAR: &str = "MEM_EVOLUTION_GENERALIZE_MIN_N";
+            let n: usize = raw.parse().map_err(|_| invalid(VAR, &raw))?;
+            if n < 2 {
+                return Err(invalid(VAR, &raw));
+            }
+            s.generalize_min_n = n;
+        }
+        if let Some(raw) = get("MEM_EVOLUTION_SCAN_LIMIT") {
+            const VAR: &str = "MEM_EVOLUTION_SCAN_LIMIT";
+            let n: usize = raw.parse().map_err(|_| invalid(VAR, &raw))?;
+            if n == 0 {
+                return Err(invalid(VAR, &raw));
+            }
+            s.scan_limit = n;
+        }
+        if let Some(raw) = get("MEM_EVOLUTION_SYNTHESIS") {
+            const VAR: &str = "MEM_EVOLUTION_SYNTHESIS";
+            s.synthesis = match raw.to_ascii_lowercase().as_str() {
+                "off" => EvolutionSynthesisMode::Off,
+                "review" => EvolutionSynthesisMode::Review,
+                // `local` / `api` are designed (doc §6.2) but not
+                // implemented — fail loudly instead of silently off.
+                _ => return Err(invalid(VAR, &raw)),
+            };
+        }
+        Ok(s)
+    }
+}
+
 impl IngestSettings {
     pub fn development_defaults() -> Self {
         Self {
@@ -1044,6 +1216,7 @@ impl Config {
             ingest: IngestSettings::development_defaults(),
             edge_dynamics: EdgeDynamicsSettings::development_defaults(),
             cooccurrence: CooccurrenceSettings::development_defaults(),
+            evolution: EvolutionSettings::development_defaults(),
         }
     }
 
@@ -1061,6 +1234,7 @@ impl Config {
             ingest: IngestSettings::from_env_vars(|k| std::env::var(k).ok())?,
             edge_dynamics: EdgeDynamicsSettings::from_env_vars(|k| std::env::var(k).ok())?,
             cooccurrence: CooccurrenceSettings::from_env_vars(|k| std::env::var(k).ok())?,
+            evolution: EvolutionSettings::from_env_vars(|k| std::env::var(k).ok())?,
         })
     }
 }
@@ -1392,5 +1566,72 @@ mod tests {
         let err = VacuumSettings::from_env_vars(env(&[("MEM_VACUUM_OLDER_THAN_DAYS", "soon")]))
             .unwrap_err();
         assert!(matches!(err, ConfigError::InvalidVacuumOlderThanDays(ref s) if s == "soon"));
+    }
+
+    #[test]
+    fn evolution_defaults_when_empty() {
+        // Mirrors `EvolutionSettings::development_defaults` — worker OFF,
+        // daily cadence, K=3 anti-jitter gate, doc evolution-worker §9.
+        let s = EvolutionSettings::from_env_vars(|_| None).unwrap();
+        assert!(!s.enabled, "evolution must be opt-in (default OFF)");
+        assert_eq!(s.interval_secs, 86_400);
+        assert_eq!(s.k_cycles, 3);
+        assert!((s.evidence_decay - 0.7).abs() < 1e-6);
+        assert!((s.hysteresis - 0.5).abs() < 1e-6);
+        assert!((s.cluster_threshold - 0.80).abs() < 1e-6);
+        assert!((s.merge_threshold - 0.88).abs() < 1e-6);
+        assert_eq!(s.generalize_min_n, 4);
+        assert_eq!(s.scan_limit, 2_000);
+        assert_eq!(s.synthesis, EvolutionSynthesisMode::Off);
+    }
+
+    #[test]
+    fn evolution_env_overrides_apply() {
+        let s = EvolutionSettings::from_env_vars(env(&[
+            ("MEM_EVOLUTION_ENABLED", "1"),
+            ("MEM_EVOLUTION_INTERVAL_SECS", "3600"),
+            ("MEM_EVOLUTION_K_CYCLES", "5"),
+            ("MEM_EVOLUTION_EVIDENCE_DECAY", "0.9"),
+            ("MEM_EVOLUTION_HYSTERESIS", "0.4"),
+            ("MEM_EVOLUTION_CLUSTER_THRESHOLD", "0.75"),
+            ("MEM_EVOLUTION_MERGE_THRESHOLD", "0.9"),
+            ("MEM_EVOLUTION_GENERALIZE_MIN_N", "6"),
+            ("MEM_EVOLUTION_SCAN_LIMIT", "500"),
+            ("MEM_EVOLUTION_SYNTHESIS", "review"),
+        ]))
+        .unwrap();
+        assert!(s.enabled);
+        assert_eq!(s.interval_secs, 3_600);
+        assert_eq!(s.k_cycles, 5);
+        assert!((s.evidence_decay - 0.9).abs() < 1e-6);
+        assert!((s.hysteresis - 0.4).abs() < 1e-6);
+        assert!((s.cluster_threshold - 0.75).abs() < 1e-6);
+        assert!((s.merge_threshold - 0.9).abs() < 1e-6);
+        assert_eq!(s.generalize_min_n, 6);
+        assert_eq!(s.scan_limit, 500);
+        assert_eq!(s.synthesis, EvolutionSynthesisMode::Review);
+    }
+
+    #[test]
+    fn evolution_invalid_values_rejected() {
+        // Zero / out-of-range / non-numeric inputs must error loudly
+        // (dedup precedent), not silently fall back.
+        for (var, bad) in [
+            ("MEM_EVOLUTION_INTERVAL_SECS", "0"),
+            ("MEM_EVOLUTION_K_CYCLES", "0"),
+            ("MEM_EVOLUTION_EVIDENCE_DECAY", "1.5"),
+            ("MEM_EVOLUTION_HYSTERESIS", "0"),
+            ("MEM_EVOLUTION_CLUSTER_THRESHOLD", "1.2"),
+            ("MEM_EVOLUTION_MERGE_THRESHOLD", "nope"),
+            ("MEM_EVOLUTION_GENERALIZE_MIN_N", "1"),
+            ("MEM_EVOLUTION_SCAN_LIMIT", "0"),
+            // local / api synthesis backends are designed (doc §6.2) but
+            // not implemented in E1 — selecting one must fail loudly.
+            ("MEM_EVOLUTION_SYNTHESIS", "local"),
+            ("MEM_EVOLUTION_SYNTHESIS", "api"),
+        ] {
+            let err = EvolutionSettings::from_env_vars(env(&[(var, bad)]));
+            assert!(err.is_err(), "{var}={bad} must be rejected");
+        }
     }
 }
