@@ -1506,14 +1506,101 @@ pub(crate) async fn resolve_drafts_to_edges(
     Ok(out)
 }
 
+/// Derive an index-only `summary` from `content` when the caller supplies
+/// none. Deterministic, no LLM (mem offloads real summarization to the
+/// writing agent): lift the first line that carries real text — markdown
+/// decoration (`#` headers, list bullets, blockquotes, fenced code blocks)
+/// stripped/skipped — then cut at the first sentence boundary or
+/// `SUMMARY_LIMIT` chars, whichever comes first, on a char/whitespace
+/// boundary so it never splits a word or a multi-byte character. Falls back
+/// to `"memory"` when nothing usable remains. This is a *hint* for ranking /
+/// display, never a fact source — the verbatim rule lives on `content`.
 fn summarize(content: &str) -> String {
-    const SUMMARY_LIMIT: usize = 80;
-    let summary: String = content.chars().take(SUMMARY_LIMIT).collect();
-    if summary.is_empty() {
-        "memory".to_string()
-    } else {
-        summary
+    const SUMMARY_LIMIT: usize = 100;
+
+    let mut in_fence = false;
+    let line = content.lines().find_map(|raw| {
+        let t = raw.trim();
+        // Fenced code blocks: ``` toggles in/out; everything inside is skipped.
+        if t.starts_with("```") {
+            in_fence = !in_fence;
+            return None;
+        }
+        if in_fence {
+            return None;
+        }
+        let stripped = strip_markdown_noise(t);
+        (!stripped.is_empty()).then_some(stripped)
+    });
+
+    match line {
+        Some(l) => {
+            let s = first_sentence_or_cap(&l, SUMMARY_LIMIT);
+            if s.is_empty() {
+                "memory".to_string()
+            } else {
+                s
+            }
+        }
+        None => "memory".to_string(),
     }
+}
+
+/// Strip leading markdown decoration from a single (already-trimmed) line.
+/// A line that is *only* decoration (`###`, `---`, `***`, `> `) collapses to
+/// the empty string so the caller skips it.
+fn strip_markdown_noise(line: &str) -> String {
+    if line.is_empty()
+        || line
+            .chars()
+            .all(|c| matches!(c, '#' | '-' | '*' | '_' | '=' | '>' | ' '))
+    {
+        return String::new();
+    }
+    let s = line.trim_start_matches(['#', '>', '`']).trim_start();
+    let s = s
+        .strip_prefix("- ")
+        .or_else(|| s.strip_prefix("* "))
+        .or_else(|| s.strip_prefix("+ "))
+        .unwrap_or(s);
+    s.trim().to_string()
+}
+
+/// Cut `line` at the first sentence boundary within `cap` chars, else at the
+/// last whitespace before `cap` (so an ASCII word isn't split; CJK has no
+/// spaces, so it just hits the cap). An ASCII `.`/`!`/`?` only ends a
+/// sentence when followed by whitespace or end-of-line — that keeps version
+/// numbers (`v3.5.0.3`) and paths (`src/a.rs`) intact. CJK `。！？` always end.
+fn first_sentence_or_cap(line: &str, cap: usize) -> String {
+    const CJK_TERMS: [char; 3] = ['。', '！', '？'];
+    const ASCII_TERMS: [char; 3] = ['.', '!', '?'];
+
+    let chars: Vec<char> = line.chars().collect();
+    let scan = chars.len().min(cap);
+    let mut end = scan;
+    let mut at_boundary = false;
+    for i in 0..scan {
+        let c = chars[i];
+        let next_breaks = match chars.get(i + 1) {
+            Some(n) => n.is_whitespace(),
+            None => true,
+        };
+        if CJK_TERMS.contains(&c) || (ASCII_TERMS.contains(&c) && next_breaks) {
+            end = i + 1;
+            at_boundary = true;
+            break;
+        }
+    }
+    // No sentence end within the cap and the line overruns it: back off to the
+    // last whitespace (only when that keeps ≥60% of the budget, else just cap).
+    if !at_boundary && chars.len() > cap {
+        if let Some(ws) = (0..end).rev().find(|&i| chars[i].is_whitespace()) {
+            if ws >= cap * 6 / 10 {
+                end = ws;
+            }
+        }
+    }
+    chars[..end].iter().collect::<String>().trim().to_string()
 }
 
 fn default_confidence(status: &CapabilityCapsuleStatus) -> f32 {
@@ -1552,4 +1639,88 @@ enum PreparedIngest {
 
 fn next_episode_id() -> String {
     format!("ep_{}", uuid::Uuid::now_v7())
+}
+
+#[cfg(test)]
+mod summarize_tests {
+    use super::summarize;
+
+    #[test]
+    fn strips_markdown_header() {
+        // Old [:80] kept the leading `# ` and bled into later lines; the
+        // heuristic lifts the header text as the index hint.
+        assert_eq!(
+            summarize("# Auto-promote sweep\n\n## Symptom\nblah"),
+            "Auto-promote sweep"
+        );
+    }
+
+    #[test]
+    fn takes_first_real_line_skipping_blanks_and_bullets() {
+        assert_eq!(
+            summarize("\n\n- the fix is a new column\nmore detail"),
+            "the fix is a new column"
+        );
+    }
+
+    #[test]
+    fn cuts_at_sentence_boundary() {
+        assert_eq!(
+            summarize("This is the lesson. And more after."),
+            "This is the lesson."
+        );
+    }
+
+    #[test]
+    fn does_not_cut_on_version_or_path_dots() {
+        // '.' inside v3.5.0.3 / src/a.rs is followed by a non-space, so it is
+        // NOT a sentence end — the whole short line is kept.
+        let s = summarize("commit abc (zgy-v3.5.0.3) shipped src/a.rs behind a flag");
+        assert_eq!(
+            s,
+            "commit abc (zgy-v3.5.0.3) shipped src/a.rs behind a flag"
+        );
+    }
+
+    #[test]
+    fn caps_long_line_without_splitting_a_word() {
+        let long = "alpha beta gamma delta epsilon zeta eta theta iota kappa \
+                    lambda mu nu xi omicron pi rho sigma tau upsilon phi chi psi omega";
+        let s = summarize(long);
+        assert!(s.chars().count() <= 100, "too long: {}", s.chars().count());
+        assert!(long.starts_with(&s), "summary must be a prefix");
+        // the byte right after the prefix is a space → clean word boundary
+        assert!(
+            long.len() == s.len() || long.as_bytes()[s.len()] == b' ',
+            "cut landed mid-word: {s:?}"
+        );
+    }
+
+    #[test]
+    fn cjk_sentence_boundary() {
+        assert_eq!(
+            summarize("这是一条中文教训。后面还有更多细节"),
+            "这是一条中文教训。"
+        );
+    }
+
+    #[test]
+    fn skips_fenced_code_block() {
+        let s = summarize("```rust\nlet x = 1;\n```\nThe real takeaway here.");
+        assert_eq!(s, "The real takeaway here.");
+    }
+
+    #[test]
+    fn decoration_only_lines_skipped() {
+        assert_eq!(
+            summarize("###\n---\nActual lesson text"),
+            "Actual lesson text"
+        );
+    }
+
+    #[test]
+    fn empty_or_whitespace_is_memory() {
+        assert_eq!(summarize(""), "memory");
+        assert_eq!(summarize("   \n\t \n"), "memory");
+    }
 }
