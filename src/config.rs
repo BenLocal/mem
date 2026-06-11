@@ -1014,7 +1014,8 @@ impl IngestSettings {
             s.max_per_session = if n == 0 { None } else { Some(n) };
         }
         if let Some(raw) = get("MEM_INGEST_QUALITY_GATE_ENABLED") {
-            s.quality_gate_enabled = matches!(raw.to_ascii_lowercase().as_str(), "1" | "true" | "yes");
+            s.quality_gate_enabled =
+                matches!(raw.to_ascii_lowercase().as_str(), "1" | "true" | "yes");
         }
         if let Some(raw) = get("MEM_INGEST_MIN_CONTENT_LEN") {
             let n: usize = raw
