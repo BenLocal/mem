@@ -29,9 +29,9 @@ const CAPABILITY_CAPSULE_COLS: &str =
     summary, content, evidence, code_refs, project, repo, module, task_type, \
     tags, topics, confidence, decay_score, content_hash, idempotency_key, \
     session_id, supersedes_capability_capsule_id, source_agent, created_at, updated_at, \
-    last_validated_at, last_used_at, last_recalled_at";
+    last_validated_at, last_used_at, last_recalled_at, expires_at";
 
-/// Parse one row of the 29-column SELECT above into a [`CapabilityCapsuleRecord`].
+/// Parse one row of the 30-column SELECT above into a [`CapabilityCapsuleRecord`].
 ///
 /// Type expectations (Lance Arrow → DuckDB SQL via the lance extension):
 ///   - `Utf8` → `VARCHAR` → `String` / `Option<String>`
@@ -77,6 +77,7 @@ fn row_to_capability_capsule_record(
         last_validated_at: row.get(26)?,
         last_used_at: row.get(27)?,
         last_recalled_at: row.get(28)?,
+        expires_at: row.get(29)?,
     })
 }
 
@@ -1248,6 +1249,7 @@ mod tests {
             last_validated_at: None,
             last_used_at: None,
             last_recalled_at: None,
+            expires_at: None,
         }
     }
 

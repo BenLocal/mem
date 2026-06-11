@@ -100,6 +100,7 @@ fn baseline_memory(id: &str) -> CapabilityCapsuleRecord {
         last_validated_at: None,
         last_used_at: None,
         last_recalled_at: None,
+        expires_at: None,
     }
 }
 

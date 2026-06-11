@@ -389,6 +389,7 @@ impl CapabilityCapsuleService {
             last_validated_at: None,
             last_used_at: None,
             last_recalled_at: None,
+            expires_at: request.expires_at.clone(),
         };
 
         let stored = self.store.insert_capability_capsule(memory).await?;
@@ -592,6 +593,7 @@ impl CapabilityCapsuleService {
             last_validated_at: None,
             last_used_at: None,
             last_recalled_at: None,
+            expires_at: request.expires_at.clone(),
         };
         Ok(PreparedIngest::New {
             record: Box::new(record),
@@ -1085,6 +1087,7 @@ impl CapabilityCapsuleService {
             idempotency_key: None,
             write_mode: crate::domain::capability_capsule::WriteMode::Auto,
             supersedes_capability_capsule_id: Some(original.capability_capsule_id.clone()),
+            expires_at: None,
         };
         let now = current_timestamp();
 
@@ -1118,6 +1121,8 @@ impl CapabilityCapsuleService {
             last_validated_at: None,
             last_used_at: None,
             last_recalled_at: None,
+            // A superseding successor gets a fresh lease — no inherited expiry.
+            expires_at: None,
         }
     }
 

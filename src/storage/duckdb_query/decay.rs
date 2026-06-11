@@ -40,6 +40,21 @@ impl DuckDbQuery {
         let now_ms_str = now_ms_str.to_string();
         spawn_blocking_storage(move || {
             let conn = conn.lock().expect("duckdb_query mutex poisoned");
+            // Hard expiry (Supermemory-style auto-forget): archive any active
+            // capsule whose `expires_at` deadline has passed. Deterministic —
+            // the caller declared the deadline — so unlike idle-archive this
+            // needs no gate / dry-run. Run it FIRST so expired rows leave the
+            // active set before the decay passes touch it. String comparison
+            // is valid because `expires_at` and `now_ms_str` share the
+            // 20-digit zero-padded ms format. `expires_at IS NULL` (the
+            // default) is never matched, so this is a no-op for almost every
+            // capsule.
+            conn.execute(
+                "UPDATE ns.main.capability_capsules SET status = 'archived' \
+                 WHERE status = 'active' AND expires_at IS NOT NULL AND expires_at <= ?1",
+                params![now_ms_str],
+            )
+            .map_err(StorageError::DuckDb)?;
             // Roadmap O1 — retrieval reinforcement. The decay clock is
             // anchored on the capsule's *last touch* = `last_used_at` if
             // it has ever been used (emitted into a retrieval response,

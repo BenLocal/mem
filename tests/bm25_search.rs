@@ -32,6 +32,7 @@ fn ingest_request(content: &str, summary: &str) -> IngestCapabilityCapsuleReques
         idempotency_key: None,
         write_mode: WriteMode::Auto,
         supersedes_capability_capsule_id: None,
+        expires_at: None,
     }
 }
 

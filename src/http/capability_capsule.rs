@@ -242,6 +242,11 @@ struct HttpIngestMemoryRequest {
     /// previous version.
     #[serde(default)]
     supersedes_capability_capsule_id: Option<String>,
+    /// Optional hard expiry — a 20-digit zero-padded ms-since-epoch string.
+    /// When set, the capsule is recalled until this time, then skipped by
+    /// retrieve and archived by the decay worker. Omit for no deadline.
+    #[serde(default)]
+    expires_at: Option<String>,
 }
 
 impl From<HttpIngestMemoryRequest> for IngestCapabilityCapsuleRequest {
@@ -265,6 +270,7 @@ impl From<HttpIngestMemoryRequest> for IngestCapabilityCapsuleRequest {
             idempotency_key: request.idempotency_key,
             write_mode: request.write_mode,
             supersedes_capability_capsule_id: request.supersedes_capability_capsule_id,
+            expires_at: request.expires_at,
         }
     }
 }

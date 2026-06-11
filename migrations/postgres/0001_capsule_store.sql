@@ -80,7 +80,11 @@ CREATE TABLE IF NOT EXISTS capability_capsules (
     -- Step-1 governance fix: durable, sweep-proof recall signal. Written
     -- ONLY by the real recall path (never by the decay sweep), so
     -- `last_recalled_at IS NULL` == "never recalled since creation".
-    last_recalled_at                 TEXT
+    last_recalled_at                 TEXT,
+    -- Optional hard expiry (Supermemory-style auto-forget). When set and
+    -- reached, retrieve skips the row and the decay worker archives it.
+    -- NULL = never expires.
+    expires_at                       TEXT
 );
 
 -- Common query patterns used by CapsuleStore reads.

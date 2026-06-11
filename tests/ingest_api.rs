@@ -136,6 +136,7 @@ fn sample_memory(
         last_validated_at: None,
         last_used_at: None,
         last_recalled_at: None,
+        expires_at: None,
     }
 }
 
@@ -228,6 +229,7 @@ fn content_hash_is_deterministic_for_same_request() {
         idempotency_key: Some("idem".into()),
         write_mode: WriteMode::Auto,
         supersedes_capability_capsule_id: None,
+        expires_at: None,
     };
 
     let hash = compute_content_hash(&request);
@@ -280,6 +282,7 @@ async fn repository_dedupe_lookup_prefers_same_tenant_memory() {
             last_validated_at: None,
             last_used_at: None,
             last_recalled_at: None,
+            expires_at: None,
         }
     };
 

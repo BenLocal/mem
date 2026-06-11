@@ -111,6 +111,7 @@ fn request(content: &str, idempotency_key: Option<&str>) -> IngestCapabilityCaps
         idempotency_key: idempotency_key.map(str::to_string),
         write_mode: WriteMode::Auto,
         supersedes_capability_capsule_id: None,
+        expires_at: None,
     }
 }
 

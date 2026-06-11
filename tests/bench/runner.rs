@@ -140,6 +140,7 @@ async fn ingest_fixture(f: &Fixture, chunking_on: bool) -> IngestedFixture {
                 idempotency_key: None,
                 write_mode: WriteMode::Auto,
                 supersedes_capability_capsule_id: None,
+                expires_at: None,
             })
             .await
             .expect("ingest");

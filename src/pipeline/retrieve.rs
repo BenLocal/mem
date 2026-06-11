@@ -67,6 +67,18 @@ pub fn matches_scope_filters(memory: &CapabilityCapsuleRecord, filters: &[String
     })
 }
 
+/// True when `m` carries a hard `expires_at` that `now` has reached. `None`
+/// (the default) never expires. Compared as fixed-width 20-digit ms strings
+/// (the `current_timestamp` format) — a malformed / wrong-width `expires_at`
+/// reads as not-expired, so a bad timestamp can never silently hide a
+/// capsule from recall.
+fn is_expired(m: &CapabilityCapsuleRecord, now: &str) -> bool {
+    match &m.expires_at {
+        Some(e) => e.len() == now.len() && e.as_str() <= now,
+        None => false,
+    }
+}
+
 /// Filters scored candidates by the relevance floor and strips scores.
 /// Used at every user-visible exit point so empty results bubble up to
 /// `compress`, which renders them as empty sections.
@@ -171,6 +183,17 @@ pub async fn rank_with_hybrid_and_graph(
         by_id.entry(m.capability_capsule_id.clone()).or_insert(m);
     }
     let candidates: Vec<CapabilityCapsuleRecord> = by_id.into_values().collect();
+
+    // Hard expiry (Supermemory-style auto-forget): never surface a capsule
+    // past its `expires_at`, even in the window before the decay worker
+    // archives it. `None` expiry (the default for almost every capsule) is
+    // never expired, so this is a no-op at scale. Direct get-by-id is
+    // unaffected — like `archived`, expiry only hides from *recall*.
+    let now = crate::storage::current_timestamp();
+    let candidates: Vec<CapabilityCapsuleRecord> = candidates
+        .into_iter()
+        .filter(|m| !is_expired(m, &now))
+        .collect();
 
     let floor = effective_floor(query);
     let empty_boosts: HashMap<String, i64> = HashMap::new();
@@ -703,6 +726,62 @@ mod tests {
     };
     use crate::domain::query::SearchCapabilityCapsuleRequest;
 
+    #[test]
+    fn is_expired_respects_hard_deadline() {
+        let now = "00000001781106546457".to_string(); // 20-digit ms
+        let mut m = CapabilityCapsuleRecord::default();
+        // No expiry → never expired (the default for almost every capsule).
+        assert!(!is_expired(&m, &now));
+        // 1 ms before now → expired.
+        m.expires_at = Some("00000001781106546456".to_string());
+        assert!(is_expired(&m, &now));
+        // Exactly now → expired (<=).
+        m.expires_at = Some(now.clone());
+        assert!(is_expired(&m, &now));
+        // Future → not expired.
+        m.expires_at = Some("00000001781106546458".to_string());
+        assert!(!is_expired(&m, &now));
+        // Malformed (wrong width) → not expired (never hide on a bad ts).
+        m.expires_at = Some("123".to_string());
+        assert!(!is_expired(&m, &now));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn rank_skips_expired_candidates() {
+        // End of the wiring: a capsule whose `expires_at` has passed is
+        // dropped from the ranked result, while a non-expiring sibling
+        // survives. Preference type so the relevance floor can't be the
+        // reason either one is dropped — isolating the expiry filter.
+        let dir = tempfile::tempdir().unwrap();
+        let store = crate::storage::Store::open(&dir.path().join("exp.lance"))
+            .await
+            .unwrap();
+
+        let mut live = fixture_memory("live");
+        live.capability_capsule_type = CapabilityCapsuleType::Preference;
+        let mut expired = fixture_memory("expired");
+        expired.capability_capsule_type = CapabilityCapsuleType::Preference;
+        expired.expires_at = Some("00000001000000000000".to_string()); // long past
+
+        let out =
+            rank_with_hybrid_and_graph(vec![live, expired], vec![], &fixture_query(), &store, None)
+                .await
+                .unwrap();
+
+        let ids: Vec<String> = out
+            .iter()
+            .map(|m| m.capability_capsule_id.clone())
+            .collect();
+        assert!(
+            ids.contains(&"live".to_string()),
+            "non-expired must survive: {ids:?}"
+        );
+        assert!(
+            !ids.contains(&"expired".to_string()),
+            "expired capsule must be skipped by recall: {ids:?}"
+        );
+    }
+
     fn fixture_memory(id: &str) -> CapabilityCapsuleRecord {
         CapabilityCapsuleRecord {
             capability_capsule_id: id.to_string(),
@@ -734,6 +813,7 @@ mod tests {
             last_validated_at: None,
             last_used_at: None,
             last_recalled_at: None,
+            expires_at: None,
         }
     }
 

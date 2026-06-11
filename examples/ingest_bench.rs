@@ -152,6 +152,7 @@ fn make_capsule_request(i: usize) -> IngestCapabilityCapsuleRequest {
         idempotency_key: Some(format!("bench-{i}")),
         write_mode: WriteMode::Auto,
         supersedes_capability_capsule_id: None,
+        expires_at: None,
     }
 }
 

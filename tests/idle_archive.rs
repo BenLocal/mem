@@ -70,6 +70,7 @@ fn capsule(id: &str, created_ms: u128, confidence: f32, decay: f32) -> Capabilit
         last_validated_at: None,
         last_used_at: None,
         last_recalled_at: None,
+        expires_at: None,
     }
 }
 

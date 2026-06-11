@@ -180,6 +180,12 @@ pub struct IngestCapabilityCapsuleRequest {
     /// not auto-close them.
     #[serde(default, skip_serializing_if = "skip_none")]
     pub supersedes_capability_capsule_id: Option<String>,
+    /// Optional hard expiry (20-digit zero-padded ms-since-epoch). When set,
+    /// the capsule is recalled until this time, then skipped by retrieve and
+    /// archived by the decay worker. Omit (the default) for facts with no
+    /// deadline. See [`CapabilityCapsuleRecord::expires_at`].
+    #[serde(default, skip_serializing_if = "skip_none")]
+    pub expires_at: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -244,6 +250,17 @@ pub struct CapabilityCapsuleRecord {
     /// `None` on legacy / never-recalled rows.
     #[serde(default, skip_serializing_if = "skip_none")]
     pub last_recalled_at: Option<String>,
+    /// Optional **hard expiry** (Supermemory-style auto-forget). A 20-digit
+    /// zero-padded ms-since-epoch string (same format as `created_at`). When
+    /// set and reached, the capsule is excluded from recall (the retrieve
+    /// pipeline skips it) and the always-on decay worker archives it on its
+    /// hourly tick. `None` — the default for every capsule unless a caller
+    /// opts in — means "never expires", so existing behaviour is unchanged.
+    /// For facts with a known deadline: temp credentials, "use staging until
+    /// the migration", sprint-scoped decisions. Complements (does not
+    /// replace) the gradual `decay_score`.
+    #[serde(default, skip_serializing_if = "skip_none")]
+    pub expires_at: Option<String>,
 }
 
 impl Default for CapabilityCapsuleRecord {
@@ -278,6 +295,7 @@ impl Default for CapabilityCapsuleRecord {
             last_validated_at: None,
             last_used_at: None,
             last_recalled_at: None,
+            expires_at: None,
         }
     }
 }

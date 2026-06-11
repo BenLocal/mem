@@ -371,6 +371,7 @@ fn capability_capsules_schema() -> Schema {
         Field::new("last_validated_at", DataType::Utf8, true),
         Field::new("last_used_at", DataType::Utf8, true),
         Field::new("last_recalled_at", DataType::Utf8, true),
+        Field::new("expires_at", DataType::Utf8, true),
     ])
 }
 
@@ -495,7 +496,7 @@ async fn migrate_capability_capsules_add_columns(conn: &Connection) -> Result<()
         .execute()
         .await
         .map_err(lancedb_err)?;
-    for col in ["last_used_at", "last_recalled_at"] {
+    for col in ["last_used_at", "last_recalled_at", "expires_at"] {
         let schema = table.schema().await.map_err(lancedb_err)?;
         if schema.field_with_name(col).is_ok() {
             continue;
@@ -1516,6 +1517,7 @@ pub(super) fn capability_capsules_to_record_batch(
     let mut last_validated_at = StringBuilder::new();
     let mut last_used_at = StringBuilder::new();
     let mut last_recalled_at = StringBuilder::new();
+    let mut expires_at = StringBuilder::new();
 
     for m in memories {
         capability_capsule_id.append_value(&m.capability_capsule_id);
@@ -1589,6 +1591,10 @@ pub(super) fn capability_capsules_to_record_batch(
             Some(s) => last_recalled_at.append_value(s),
             None => last_recalled_at.append_null(),
         }
+        match &m.expires_at {
+            Some(s) => expires_at.append_value(s),
+            None => expires_at.append_null(),
+        }
     }
 
     let schema = Arc::new(capability_capsules_schema());
@@ -1622,6 +1628,7 @@ pub(super) fn capability_capsules_to_record_batch(
         Arc::new(last_validated_at.finish()),
         Arc::new(last_used_at.finish()),
         Arc::new(last_recalled_at.finish()),
+        Arc::new(expires_at.finish()),
     ];
     RecordBatch::try_new(schema, columns)
         .map_err(|e| StorageError::InvalidInput(format!("memories record batch: {e}")))
@@ -1671,6 +1678,7 @@ pub(super) fn record_batch_to_capability_capsules(
     let last_validated_at = parse_col::<StringArray>(batch, TABLE, "last_validated_at")?;
     let last_used_at = parse_col::<StringArray>(batch, TABLE, "last_used_at")?;
     let last_recalled_at = parse_col::<StringArray>(batch, TABLE, "last_recalled_at")?;
+    let expires_at = parse_col::<StringArray>(batch, TABLE, "expires_at")?;
 
     fn list_at(arr: &ListArray, i: usize) -> Result<Vec<String>, StorageError> {
         let inner = arr.value(i);
@@ -1720,6 +1728,7 @@ pub(super) fn record_batch_to_capability_capsules(
             last_validated_at: opt(last_validated_at, i),
             last_used_at: opt(last_used_at, i),
             last_recalled_at: opt(last_recalled_at, i),
+            expires_at: opt(expires_at, i),
         });
     }
     Ok(out)

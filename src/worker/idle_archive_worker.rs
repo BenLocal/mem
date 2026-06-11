@@ -210,6 +210,7 @@ mod tests {
             content: "short".into(), // structurally low-value (< min_content_len)
             created_at: "00000000000000001000".into(), // small => old
             last_recalled_at: None,
+            expires_at: None,
             ..Default::default()
         }
     }

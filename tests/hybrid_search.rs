@@ -68,6 +68,7 @@ async fn hybrid_search_surfaces_semantic_match_without_lexical_overlap() {
         last_validated_at: None,
         last_used_at: None,
         last_recalled_at: None,
+        expires_at: None,
     };
 
     let mem_hit = CapabilityCapsuleRecord {
@@ -100,6 +101,7 @@ async fn hybrid_search_surfaces_semantic_match_without_lexical_overlap() {
         last_validated_at: None,
         last_used_at: None,
         last_recalled_at: None,
+        expires_at: None,
     };
 
     repo.insert_capability_capsule(mem_noise.clone())
@@ -212,6 +214,7 @@ async fn ingest_for_e2e(
         idempotency_key: None,
         write_mode: WriteMode::Auto,
         supersedes_capability_capsule_id: None,
+        expires_at: None,
     })
     .await
     .unwrap()
