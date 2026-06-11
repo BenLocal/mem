@@ -308,7 +308,8 @@ HTTP 手动一击：`POST /reviews/evolution {dry_run: bool, ops?: [...]}`（先
 
 | E# | 里程碑 | 内容 | 验收 |
 |---|---|---|---|
-| E1 ✅(2026-06-11 实现，含 ①② 执行路径，待人工验收) | 地图层+①②一条线 | 快照+聚类+跨期对齐+证据表落库；`POST /reviews/evolution {dry_run:true}` 输出簇报告与候选 | 集成测试：构造 3 期合成数据，簇对齐正确、K 闸生效（2 期信号不触发、3 期触发）、重启证据不丢 |
+| E1 ✅(2026-06-11 实现并验收，commit acf2ea2，含 ①② 执行路径) | 地图层+①②一条线 | 快照+聚类+跨期对齐+证据表落库；`POST /reviews/evolution {dry_run:true}` 输出簇报告与候选 | 集成测试：构造 3 期合成数据，簇对齐正确、K 闸生效（2 期信号不触发、3 期触发）、重启证据不丢 |
+| **E1.5** | **解锁②泛化：共享主题信号**（前置依赖，§12.6.5） | 线上 265 条胶囊 `topics` 全空 → ② 结构性沉默。两条路：(a) **推荐·短期**——`detect_generalize` 的共享信号改 `topics ∪ tags`（lowercased 并集；实测 2026-06-11：255/265 条有 ≥2 个 tags 且值有语义如 rust/tools4a/dlhs/performance，立刻可触发，改动面只在 worker 检测函数 + 单测）；(b) **中期**——ingest 侧补 topics 抽取（实体/关键词启发式，零 LLM），绑 ROADMAP #20「内容抽实体」一起做，tags 路线作为其落地前的过渡。两路不互斥，(a) 先行 | 验收：①线上副本 dry-run ② 产生 ≥1 条人工认可的合理提议、无跨主题误聚；②tags-only 语料的检测单测（含 tags 与 topics 混合、大小写归一）；③worker 保持零 LLM；④信号源变更对 ① merge 无行为影响（回归测试） |
 | E2 | ① merge live | keep-longest + supersede 链 + `merged_into` 边 + 滞回 | `tests/evolution_merge.rs`：合并后检索只回 canonical（复用 version_chain_dedup 断言形态）；dry-run 与 live 集合一致；回滚脚本可还原 |
 | E3 | ② generalize（review 形态） | 稳定簇检测 + 占位候选进 pending review + `generalizes` 边（accept 时写） | review 面全流程：list→edit_accept→新 semantic 胶囊 Active、源不动；reject→候选 cancelled 且 K 期内不复提 |
 | E4 | ⑤ reweight + ⑥ Hebbian | feedback_events 通道调权；`co_recalled_with` 建边+剪枝 | 调权可在 feedback_events 审计到；剪枝只动 `extractor="evolution"` 边 |

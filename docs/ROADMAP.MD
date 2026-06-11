@@ -6,6 +6,7 @@
 > - **② Backend 存储抽象** —— [`backend-coupling.md`](./backend-coupling.md) §6，Phase 0–5 已 shipped（DuckDbQuery / LanceStore 已收窄 `pub(crate)`）；引用 `closes backend-coupling §6 Phase N`
 > - **③ 长内容召回** —— [`long-content-recall.md`](./long-content-recall.md)，chunked embeddings 消除长内容尾部静默截断，4 phase 全 ✅；引用 `refs long-content-recall ③ pN`
 > - **④ OSS 记忆引擎对照** —— [`oss-memory-diff.md`](./oss-memory-diff.md)，参照 mem0 / agentmemory 沿 write→recall→feedback 主轴补审，产出 O1–O5（**O1 ✅ / O2 ✅ / O3 ✅ / O4 ✅**，O5 待办，见下「OSS 对照路线」表）；引用 `closes oss-memory-diff O#`
+> - **⑤ 胶囊自进化** —— [`evolution-worker.md`](./evolution-worker.md)，语义活地图 + 6 进化算子 + EvoMap 防抖 K 闸；**E1 ✅**（`acf2ea2`，地图层 + ①合并/②泛化一条线 + `evolution_candidates` 表 + `POST /reviews/evolution` dry-run 预览，全开关默认 OFF），**E1.5 待办**（共享信号 topics∪tags 解锁②——线上语料 topics 全空，见该文 §10/§12.6.5），E2–E6 见该文里程碑表；引用 `closes evolution-worker E#`
 >
 > **状态（2026-06-05）**：核心改造 #1–#19 全部 ✅，#20（内容抽实体）LATER；③ 长内容召回 4 phase 全 ✅；④ OSS 对照 **O1 ✅**（检索使用强化 + 衰减时钟重置，`808cb59`+`709c648`）/ **O2 ✅**（写时近邻去重 → PendingConfirmation + suspected_supersede 边，`b7b9528`+embedding worker）/ **O3 ✅**（capsule recall 多样化 / per-source 软配额，`pipeline/retrieve.rs`）/ **O4 ✅**（graph boost 按锚 fanout 反比衰减 `spread_decay`，`retrieve.rs`），O5 待办。Incident TODO 见文末（#2/#3/#4 已 ✅）。本文件「路线图」表的项用 `closes ROADMAP #N` 引用。
 
