@@ -69,9 +69,18 @@ pub async fn sweep_once(
     dry_run: bool,
 ) -> Result<Vec<String>, StorageError> {
     let cutoff = cutoff_timestamp(settings.age_days);
-    let candidates = store
+    let candidates: Vec<CapabilityCapsuleRecord> = store
         .auto_promote_candidates(tenant, &cutoff, &settings.types, settings.decay_threshold)
-        .await?;
+        .await?
+        .into_iter()
+        // Evolution-generated proposals are review-gated by design
+        // (doc evolution-worker §6.2: products are forced through
+        // PendingConfirmation, never directly Active) — promoting an
+        // un-reviewed raw-material placeholder would bypass that gate.
+        // Filtered here (not in SQL) so the dry-run preview and the
+        // real path can never disagree (E1.6).
+        .filter(|c| c.source_agent != crate::worker::evolution_worker::EVOLUTION_SOURCE_AGENT)
+        .collect();
 
     if dry_run {
         return Ok(candidates
@@ -248,6 +257,66 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(row.status, CapabilityCapsuleStatus::Active);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn sweep_never_promotes_evolution_proposals() {
+        // Evolution-generated proposal capsules (e.g. the ② generalize
+        // raw-material placeholder) are review-gated BY DESIGN — the
+        // worker writes them as PendingConfirmation precisely so a
+        // human/agent must accept them. Auto-promote silently promoting
+        // an un-reviewed raw-material placeholder into the active pool
+        // would bypass that gate (evolution-worker E1.6).
+        let dir = tempdir().unwrap();
+        let store = Store::open(&dir.path().join("p.lance")).await.unwrap();
+        let now_ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_millis();
+        let ten_days_ago = ms_string(now_ms - 10 * 86_400_000);
+
+        let mut proposal = fixture(
+            "evo-proposal",
+            CapabilityCapsuleType::Experience,
+            CapabilityCapsuleStatus::PendingConfirmation,
+            &ten_days_ago,
+            0.0,
+        );
+        proposal.source_agent = crate::worker::evolution_worker::EVOLUTION_SOURCE_AGENT.into();
+        store.insert_capability_capsule(proposal).await.unwrap();
+        // Control row: identical except source_agent — must promote.
+        store
+            .insert_capability_capsule(fixture(
+                "normal",
+                CapabilityCapsuleType::Experience,
+                CapabilityCapsuleStatus::PendingConfirmation,
+                &ten_days_ago,
+                0.0,
+            ))
+            .await
+            .unwrap();
+
+        // Dry-run preview must already exclude it (operators trust the
+        // preview to show exactly what the next tick would touch).
+        let preview = sweep_once(&store, &default_settings(), "t", true)
+            .await
+            .unwrap();
+        assert_eq!(preview, vec!["normal".to_string()]);
+
+        let promoted = sweep_once(&store, &default_settings(), "t", false)
+            .await
+            .unwrap();
+        assert_eq!(promoted, vec!["normal".to_string()]);
+        let row = store
+            .get_capability_capsule_for_tenant("t", "evo-proposal")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            row.status,
+            CapabilityCapsuleStatus::PendingConfirmation,
+            "evolution proposal must stay in the review queue"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread")]

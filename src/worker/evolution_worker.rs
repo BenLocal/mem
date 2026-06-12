@@ -66,6 +66,14 @@ use crate::pipeline::ingest::compute_content_hash_from_record;
 use crate::storage::types::StorageError;
 use crate::storage::{current_timestamp, Backend, EvolutionCandidate};
 
+/// `source_agent` stamped on every capsule the evolution worker
+/// creates. Load-bearing beyond provenance: `auto_promote_worker`
+/// excludes capsules carrying this agent from its sweep, because
+/// evolution proposals are review-gated BY DESIGN (doc §6.2 — products
+/// are forced through PendingConfirmation, never directly Active) and
+/// auto-promote would silently bypass that gate (E1.6).
+pub const EVOLUTION_SOURCE_AGENT: &str = "evolution_worker";
+
 /// Mean-confidence floor for ② generalize sources (doc §4② — fixed in
 /// E1, not env-tunable).
 const GENERALIZE_MIN_CONFIDENCE: f32 = 0.6;
@@ -608,7 +616,7 @@ async fn execute_generalize(
         idempotency_key: None,
         session_id: None,
         supersedes_capability_capsule_id: None,
-        source_agent: "evolution_worker".to_string(),
+        source_agent: EVOLUTION_SOURCE_AGENT.to_string(),
         created_at: now.to_string(),
         updated_at: now.to_string(),
         last_validated_at: None,
