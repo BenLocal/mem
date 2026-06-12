@@ -148,6 +148,7 @@ fn capsule_full(
     capsule_type: CapabilityCapsuleType,
     project: Option<&str>,
     topics: &[&str],
+    tags: &[&str],
     confidence: f32,
     created_at: &str,
 ) -> CapabilityCapsuleRecord {
@@ -167,7 +168,7 @@ fn capsule_full(
         repo: Some("mem".into()),
         module: None,
         task_type: None,
-        tags: vec![],
+        tags: tags.iter().map(|s| s.to_string()).collect(),
         topics: topics.iter().map(|s| s.to_string()).collect(),
         confidence,
         decay_score: 0.0,
@@ -240,6 +241,7 @@ async fn seed_merge_pair(store: &Store) {
             CapabilityCapsuleType::Experience,
             Some("mem"),
             &["rust", "lance"],
+            &[],
             0.7,
             "00000000000000000001",
         ),
@@ -254,6 +256,7 @@ async fn seed_merge_pair(store: &Store) {
             CapabilityCapsuleType::Experience,
             Some("mem"),
             &["rust", "lance"],
+            &[],
             0.7,
             "00000000000000000002",
         ),
@@ -387,6 +390,7 @@ async fn generalize_proposes_pending_capsule_sources_stay_active() {
                 CapabilityCapsuleType::Experience,
                 Some("mem"),
                 &["rust", "lance"],
+                &[],
                 0.7,
                 &format!("0000000000000000000{}", i + 1),
             ),
@@ -522,6 +526,7 @@ async fn merge_excludes_guidance_and_cross_project_pairs() {
             CapabilityCapsuleType::Preference,
             Some("mem"),
             &[],
+            &[],
             0.7,
             "00000000000000000001",
         ),
@@ -535,6 +540,7 @@ async fn merge_excludes_guidance_and_cross_project_pairs() {
             "run cargo fmt before commit",
             CapabilityCapsuleType::Preference,
             Some("mem"),
+            &[],
             &[],
             0.7,
             "00000000000000000002",
@@ -551,6 +557,7 @@ async fn merge_excludes_guidance_and_cross_project_pairs() {
             CapabilityCapsuleType::Experience,
             Some("alpha"),
             &[],
+            &[],
             0.7,
             "00000000000000000003",
         ),
@@ -564,6 +571,7 @@ async fn merge_excludes_guidance_and_cross_project_pairs() {
             "a lesson in project beta about caching too",
             CapabilityCapsuleType::Experience,
             Some("beta"),
+            &[],
             &[],
             0.7,
             "00000000000000000004",
@@ -652,4 +660,142 @@ async fn http_reviews_evolution_dry_run_previews() {
         .await
         .unwrap()
         .is_empty());
+}
+
+// ───────────────── E1.5: topics ∪ tags shared signal ─────────────────
+
+/// Four episodic capsules chained into one map cluster, `topics`
+/// EMPTY, shared themes carried entirely by `tags` — the live-corpus
+/// shape (E1 dry-run 2026-06-11: 265/265 capsules have empty topics,
+/// 255/265 have ≥2 tags). Generalize must fire on tags alone.
+#[tokio::test(flavor = "multi_thread")]
+async fn generalize_fires_on_pure_tags_corpus() {
+    let dir = tempdir().unwrap();
+    let store = Arc::new(Store::open(&dir.path().join("evo.lance")).await.unwrap());
+    let angles = [0.0_f32, 30.0, 60.0, 90.0];
+    for (i, deg) in angles.iter().enumerate() {
+        let rad = deg.to_radians();
+        seed(
+            &store,
+            &capsule_full(
+                &format!("tag-{i}"),
+                &format!("episodic lesson {i} about lance ann indexes"),
+                CapabilityCapsuleType::Experience,
+                Some("mem"),
+                &[], // topics empty — live-corpus shape
+                &["rust", "lance"],
+                0.7,
+                &format!("0000000000000000000{}", i + 1),
+            ),
+            (rad.cos(), rad.sin()),
+        )
+        .await;
+    }
+    let settings = evo_settings();
+    let report = evolution_worker::sweep_once(&*store, &settings, TENANT, true)
+        .await
+        .unwrap();
+    let gen: Vec<_> = report
+        .proposals
+        .iter()
+        .filter(|p| p.op_kind == "generalize")
+        .collect();
+    assert_eq!(
+        gen.len(),
+        1,
+        "tags-only corpus must yield a generalize proposal"
+    );
+    assert_eq!(gen[0].member_ids.len(), 4);
+}
+
+/// Shared themes only emerge after lowercasing and unioning across
+/// BOTH fields: half the members carry "RUST" as a topic and "Lance"
+/// as a tag, the other half the reverse in opposite cases. The
+/// proposal capsule's `topics` must come out lowercased + sorted.
+#[tokio::test(flavor = "multi_thread")]
+async fn generalize_normalizes_case_across_topics_and_tags() {
+    let dir = tempdir().unwrap();
+    let store = Arc::new(Store::open(&dir.path().join("evo.lance")).await.unwrap());
+    let angles = [0.0_f32, 30.0, 60.0, 90.0];
+    for (i, deg) in angles.iter().enumerate() {
+        let rad = deg.to_radians();
+        let (topics, tags): (&[&str], &[&str]) = if i % 2 == 0 {
+            (&["RUST"], &["Lance"])
+        } else {
+            (&["lance"], &["Rust"])
+        };
+        seed(
+            &store,
+            &capsule_full(
+                &format!("mix-{i}"),
+                &format!("episodic lesson {i} about lance ann indexes"),
+                CapabilityCapsuleType::Experience,
+                Some("mem"),
+                topics,
+                tags,
+                0.7,
+                &format!("0000000000000000000{}", i + 1),
+            ),
+            (rad.cos(), rad.sin()),
+        )
+        .await;
+    }
+    // k_cycles=1 → executes on first real sweep, so we can assert the
+    // proposal capsule's normalized topics end-to-end.
+    let mut settings = evo_settings();
+    settings.k_cycles = 1;
+    let report = evolution_worker::sweep_once(&*store, &settings, TENANT, false)
+        .await
+        .unwrap();
+    assert_eq!(report.executed.len(), 1);
+    let pending = store.list_pending_review(TENANT).await.unwrap();
+    assert_eq!(pending.len(), 1);
+    assert_eq!(
+        pending[0].topics,
+        vec!["lance".to_string(), "rust".to_string()],
+        "proposal topics must be the lowercased sorted union"
+    );
+}
+
+/// Same embedding cluster but pairwise-disjoint themes — generalize
+/// must NOT glue unrelated subjects together just because they sit
+/// close in embedding space.
+#[tokio::test(flavor = "multi_thread")]
+async fn generalize_rejects_disjoint_theme_cluster() {
+    let dir = tempdir().unwrap();
+    let store = Arc::new(Store::open(&dir.path().join("evo.lance")).await.unwrap());
+    let angles = [0.0_f32, 30.0, 60.0, 90.0];
+    let themes: [&[&str]; 4] = [
+        &["docker", "cifs"],
+        &["mysql", "deadlock"],
+        &["socks5", "tunnel"],
+        &["playwright", "elementui"],
+    ];
+    for (i, deg) in angles.iter().enumerate() {
+        let rad = deg.to_radians();
+        seed(
+            &store,
+            &capsule_full(
+                &format!("dis-{i}"),
+                &format!("episodic lesson {i} on an unrelated subject"),
+                CapabilityCapsuleType::Experience,
+                Some("mem"),
+                &[],
+                themes[i],
+                0.7,
+                &format!("0000000000000000000{}", i + 1),
+            ),
+            (rad.cos(), rad.sin()),
+        )
+        .await;
+    }
+    let settings = evo_settings();
+    let report = evolution_worker::sweep_once(&*store, &settings, TENANT, true)
+        .await
+        .unwrap();
+    assert!(
+        report.proposals.iter().all(|p| p.op_kind != "generalize"),
+        "disjoint themes must never generalize, got {:?}",
+        report.proposals,
+    );
 }

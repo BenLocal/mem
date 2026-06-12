@@ -432,10 +432,38 @@ fn detect_merge(
     out
 }
 
+/// One capsule's theme set for the ② generalize shared signal:
+/// lowercased `topics ∪ tags` (E1.5, refs evolution-worker E1.5).
+/// Rationale: the live corpus carries empty `topics` everywhere
+/// (mine/hook ingest never fills it) but ≥2 meaningful `tags` on
+/// 255/265 capsules — topics-only made ② structurally silent.
+/// Entity-registry resolution stays a doc §4② refinement.
+fn member_themes(c: &CapabilityCapsuleRecord) -> BTreeSet<String> {
+    c.topics
+        .iter()
+        .chain(c.tags.iter())
+        .map(|t| t.trim().to_lowercase())
+        .filter(|t| !t.is_empty())
+        .collect()
+}
+
+/// Shared themes across a member set — the intersection of each
+/// member's `topics ∪ tags` (lowercased). Empty input → empty set.
+fn shared_themes(members: &[&CapabilityCapsuleRecord]) -> Vec<String> {
+    let mut shared: Option<BTreeSet<String>> = None;
+    for c in members {
+        let themes = member_themes(c);
+        shared = Some(match shared {
+            None => themes,
+            Some(prev) => prev.intersection(&themes).cloned().collect(),
+        });
+    }
+    shared.unwrap_or_default().into_iter().collect()
+}
+
 /// ② generalize detection over one map cluster: ≥ `generalize_min_n`
-/// episodic members sharing ≥ 2 topics with mean confidence ≥ 0.6.
-/// (E1 uses raw lowercased `topics` intersection; entity-registry
-/// resolution is a doc §4② refinement deferred past the MVP.)
+/// episodic members sharing ≥ 2 themes (`topics ∪ tags`, lowercased)
+/// with mean confidence ≥ 0.6.
 fn detect_generalize(
     cluster: &[usize],
     active: &[CapabilityCapsuleRecord],
@@ -449,20 +477,8 @@ fn detect_generalize(
     if members.len() < settings.generalize_min_n {
         return None;
     }
-    let mut shared: Option<BTreeSet<String>> = None;
-    for &i in &members {
-        let topics: BTreeSet<String> = active[i]
-            .topics
-            .iter()
-            .map(|t| t.trim().to_lowercase())
-            .filter(|t| !t.is_empty())
-            .collect();
-        shared = Some(match shared {
-            None => topics,
-            Some(prev) => prev.intersection(&topics).cloned().collect(),
-        });
-    }
-    let shared: Vec<String> = shared.unwrap_or_default().into_iter().collect();
+    let member_refs: Vec<&CapabilityCapsuleRecord> = members.iter().map(|&i| &active[i]).collect();
+    let shared: Vec<String> = shared_themes(&member_refs);
     if shared.len() < GENERALIZE_MIN_SHARED_TOPICS {
         return None;
     }
@@ -556,20 +572,7 @@ async fn execute_generalize(
     if sources.is_empty() {
         return Ok(Vec::new());
     }
-    let mut shared: Option<BTreeSet<String>> = None;
-    for s in &sources {
-        let topics: BTreeSet<String> = s
-            .topics
-            .iter()
-            .map(|t| t.trim().to_lowercase())
-            .filter(|t| !t.is_empty())
-            .collect();
-        shared = Some(match shared {
-            None => topics,
-            Some(prev) => prev.intersection(&topics).cloned().collect(),
-        });
-    }
-    let shared_topics: Vec<String> = shared.unwrap_or_default().into_iter().collect();
+    let shared_topics: Vec<String> = shared_themes(&sources);
     let synthesized = ReviewSynthesisBackend.synthesize(&SynthesisTask::Generalize {
         sources: &sources,
         shared_topics: &shared_topics,
