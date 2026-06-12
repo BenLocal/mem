@@ -801,4 +801,107 @@ mod tests {
             "an un-reused recalled capsule must not be credited, got {unconsumed:?}"
         );
     }
+
+    // ---- round-trip with the REAL banner renderer (progressive disclosure) --
+    //
+    // These tests feed `format_prompt_recall_styled`'s verbatim output into
+    // `scan_transcript`, binding the renderer and the parser into one test
+    // suite. The renderer/parser format coupling has silently broken three
+    // times (see capsule mem_019e9214); after this, a format drift fails at
+    // test time instead of killing the feedback loop in production.
+
+    fn rendered_index_banner(id: &str) -> String {
+        let cap = serde_json::json!({
+            "relevant_facts": [{
+                "text": "完整正文：泛化算子的共享主题信号从共享 topics 改为 topics 与 tags 的并集，解锁结构性沉默。",
+                "source_summary": "泛化共享信号改 topics∪tags 摘要行",
+                "capability_capsule_id": id,
+            }]
+        });
+        let v = crate::cli::hook::format_prompt_recall_styled(
+            &cap,
+            &serde_json::json!({}),
+            crate::cli::hook::RecallStyle::Index,
+        );
+        v["hookSpecificOutput"]["additionalContext"]
+            .as_str()
+            .expect("renderer must emit additionalContext")
+            .to_string()
+    }
+
+    fn attachment_line(banner: &str) -> String {
+        serde_json::json!({
+            "type": "attachment",
+            "attachment": {"type": "hook_additional_context", "content": [banner]},
+        })
+        .to_string()
+    }
+
+    #[test]
+    fn roundtrip_index_banner_plus_get_is_consumed() {
+        use std::io::Write;
+        let id = "mem_01900000-0000-7000-8000-000000000abc";
+        let get_call = serde_json::json!({
+            "type": "assistant",
+            "message": {"role": "assistant", "content": [{
+                "type": "tool_use",
+                "id": "toolu_rt1",
+                "name": "mcp__plugin_mem_mem__capability_capsule_get",
+                "input": {"capability_capsule_id": id},
+            }]},
+        });
+        let mut f = tempfile::NamedTempFile::new().unwrap();
+        writeln!(f, "{}", attachment_line(&rendered_index_banner(id))).unwrap();
+        writeln!(f, "{get_call}").unwrap();
+        let consumed = scan_transcript(f.path(), false).unwrap();
+        assert!(
+            consumed.contains(id),
+            "index banner + deliberate get must credit, got {consumed:?}"
+        );
+    }
+
+    #[test]
+    fn roundtrip_index_banner_alone_is_not_consumed() {
+        use std::io::Write;
+        let id = "mem_01900000-0000-7000-8000-000000000abc";
+        let unrelated = serde_json::json!({
+            "type": "assistant",
+            "message": {"role": "assistant", "content": [{
+                "type": "text",
+                "text": "Completely unrelated reply about playwright selectors and npx caches.",
+            }]},
+        });
+        let mut f = tempfile::NamedTempFile::new().unwrap();
+        writeln!(f, "{}", attachment_line(&rendered_index_banner(id))).unwrap();
+        writeln!(f, "{unrelated}").unwrap();
+        let consumed = scan_transcript(f.path(), false).unwrap();
+        assert!(
+            !consumed.contains(id),
+            "skimmed-and-ignored index banner must stay silent, got {consumed:?}"
+        );
+    }
+
+    #[test]
+    fn roundtrip_assistant_id_citation_is_consumed() {
+        use std::io::Write;
+        // Citing the capsule id in assistant prose credits through the
+        // n-gram path: a UUIDv7 contributes 5 hex tokens >= 4 chars, well
+        // past HIT_THRESHOLD — no dedicated citation code needed.
+        let id = "mem_01900000-1111-7222-8333-000000000abc";
+        let citing = serde_json::json!({
+            "type": "assistant",
+            "message": {"role": "assistant", "content": [{
+                "type": "text",
+                "text": format!("依据 {id} 的结论继续处理。"),
+            }]},
+        });
+        let mut f = tempfile::NamedTempFile::new().unwrap();
+        writeln!(f, "{}", attachment_line(&rendered_index_banner(id))).unwrap();
+        writeln!(f, "{citing}").unwrap();
+        let consumed = scan_transcript(f.path(), false).unwrap();
+        assert!(
+            consumed.contains(id),
+            "assistant id citation must credit via fingerprint, got {consumed:?}"
+        );
+    }
 }

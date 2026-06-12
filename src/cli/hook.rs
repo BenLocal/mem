@@ -187,9 +187,30 @@ fn format_error_recall(resp: &Value) -> Value {
     let mut lines = vec![
         "⚠️ The last Bash command failed — mem found related incidents/fixes. Check these BEFORE re-deriving; if one matches, `capability_capsule_get` it for the verbatim fix and send `mcp__mem__memory_feedback` `useful` after. Ignore if unrelated.".to_string(),
     ];
-    push_section(&mut lines, "**Directives**", &dir, 2, false);
-    push_section(&mut lines, "**Related incidents**", &facts, 3, true);
-    push_section(&mut lines, "**Reusable fixes**", &pat, 2, false);
+    push_section(
+        &mut lines,
+        "**Directives**",
+        &dir,
+        2,
+        false,
+        RecallStyle::Snippet,
+    );
+    push_section(
+        &mut lines,
+        "**Related incidents**",
+        &facts,
+        3,
+        true,
+        RecallStyle::Snippet,
+    );
+    push_section(
+        &mut lines,
+        "**Reusable fixes**",
+        &pat,
+        2,
+        false,
+        RecallStyle::Snippet,
+    );
     hook_envelope("PostToolUseFailure", &lines.join("\n"))
 }
 
@@ -263,7 +284,42 @@ fn is_continuation(lc: &str) -> bool {
     )
 }
 
+/// Banner rendering style — progressive disclosure (refs the
+/// claude-mem comparison in `docs/oss-memory-diff.md` follow-ups).
+///
+/// `Index` (default): one headline line per hit (`source_summary`,
+/// else the content head) + the `[mem_…]` id; the agent fetches the
+/// verbatim body via `capability_capsule_get` only when it actually
+/// needs it. Cuts the per-prompt injection cost ~3-4× and makes the
+/// feedback "consumed" signal sharper (a deliberate get beats a fuzzy
+/// n-gram match). `Snippet` is the legacy 240-char-body shape, kept
+/// as a one-env rollback (`MEM_RECALL_STYLE=snippet`).
+///
+/// COUPLING NOTE: whatever this renders is parsed back by
+/// `cli::feedback::scan_transcript`. The round-trip tests in
+/// `cli/feedback.rs` feed this renderer's verbatim output into that
+/// parser — change the format only together with them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RecallStyle {
+    Index,
+    Snippet,
+}
+
+/// Parse `MEM_RECALL_STYLE`. Unknown values fall back to the default
+/// (`Index`) — a typo in an env var must never kill the hook.
+pub(crate) fn parse_recall_style(raw: Option<&str>) -> RecallStyle {
+    match raw.map(|s| s.trim().to_ascii_lowercase()).as_deref() {
+        Some("snippet") => RecallStyle::Snippet,
+        _ => RecallStyle::Index,
+    }
+}
+
 fn format_prompt_recall(cap: &Value, tr: &Value) -> Value {
+    let style = parse_recall_style(std::env::var("MEM_RECALL_STYLE").ok().as_deref());
+    format_prompt_recall_styled(cap, tr, style)
+}
+
+pub(crate) fn format_prompt_recall_styled(cap: &Value, tr: &Value, style: RecallStyle) -> Value {
     let dir = section(cap, "directives");
     let facts = section(cap, "relevant_facts");
     let pat = section(cap, "reusable_patterns");
@@ -271,24 +327,43 @@ fn format_prompt_recall(cap: &Value, tr: &Value) -> Value {
     if dir.is_empty() && facts.is_empty() && pat.is_empty() && windows.is_empty() {
         return skip();
     }
-    let mut lines = vec![
-        "🧠 mem auto-recall — memories & past conversations relevant to this prompt (auto-retrieved). Read before answering. If a hit is load-bearing, `capability_capsule_get` it for the verbatim content and then send `mcp__mem__memory_feedback` `useful` for that id — silence freezes ranking. Ignore if irrelevant.".to_string(),
-    ];
-    push_section(&mut lines, "**Directives**", &dir, 3, false);
-    push_section(&mut lines, "**Relevant facts**", &facts, 3, true);
-    push_section(&mut lines, "**Reusable patterns**", &pat, 2, false);
+    let preamble = match style {
+        RecallStyle::Index => {
+            "🧠 mem auto-recall (index) — hits relevant to this prompt, headlines only. To USE one, `capability_capsule_get` its id FIRST for the verbatim content, then send `mcp__mem__capability_capsule_feedback` for it — silence freezes ranking. Ignore if irrelevant."
+        }
+        RecallStyle::Snippet => {
+            "🧠 mem auto-recall — memories & past conversations relevant to this prompt (auto-retrieved). Read before answering. If a hit is load-bearing, `capability_capsule_get` it for the verbatim content and then send `mcp__mem__memory_feedback` `useful` for that id — silence freezes ranking. Ignore if irrelevant."
+        }
+    };
+    let mut lines = vec![preamble.to_string()];
+    // Directives are few, load-bearing instructions — full text in BOTH
+    // styles (hiding a directive behind a get defeats its purpose).
+    push_section(
+        &mut lines,
+        "**Directives**",
+        &dir,
+        3,
+        false,
+        RecallStyle::Snippet,
+    );
+    push_section(&mut lines, "**Relevant facts**", &facts, 3, true, style);
+    push_section(&mut lines, "**Reusable patterns**", &pat, 2, false, style);
     if !windows.is_empty() {
         lines.push(String::new());
         lines.push("**Past conversations** (`transcripts_search` for full threads)".to_string());
+        let window_cap = match style {
+            RecallStyle::Index => 120,
+            RecallStyle::Snippet => 240,
+        };
         for w in windows.iter().take(2) {
-            lines.push(format_window(w));
+            lines.push(format_window(w, window_cap));
         }
     }
     hook_envelope("UserPromptSubmit", &lines.join("\n"))
 }
 
 /// One transcript window → one bullet: `- [sid8] yyyy-mm-dd: <primary block text>`.
-fn format_window(w: &Value) -> String {
+fn format_window(w: &Value, content_cap: usize) -> String {
     let sid: String = w["session_id"]
         .as_str()
         .unwrap_or("?")
@@ -308,7 +383,7 @@ fn format_window(w: &Value) -> String {
         .chars()
         .take(10)
         .collect();
-    let content = clean(primary["content"].as_str().unwrap_or(""));
+    let content = clean_to(primary["content"].as_str().unwrap_or(""), content_cap);
     format!("- [{sid}] {date}: {content}")
 }
 
@@ -407,9 +482,16 @@ fn hook_envelope(event: &str, ctx: &str) -> Value {
 
 /// Whitespace-collapse + truncate to 240 chars with an ellipsis.
 fn clean(s: &str) -> String {
+    clean_to(s, 240)
+}
+
+/// Whitespace-collapse + char-cap with ellipsis. `max` is the style-
+/// dependent budget (240 snippet body / 80 index headline / 120 index
+/// transcript window).
+fn clean_to(s: &str, max: usize) -> String {
     let collapsed = s.split_whitespace().collect::<Vec<_>>().join(" ");
-    if collapsed.chars().count() > 240 {
-        let head: String = collapsed.chars().take(240).collect();
+    if collapsed.chars().count() > max {
+        let head: String = collapsed.chars().take(max).collect();
         format!("{head}…")
     } else {
         collapsed
@@ -420,14 +502,18 @@ fn section(v: &Value, key: &str) -> Vec<Value> {
     v[key].as_array().cloned().unwrap_or_default()
 }
 
-/// Append `**Header**` + up to `take` bullet items to `lines`. Each item
-/// renders as `- <text>[ (code_refs)]  \`[id]\``. No-op on an empty slice.
+/// Append `**Header**` + up to `take` bullet items to `lines`. Snippet
+/// style renders `- <text 240>[ (code_refs)]  \`[id]\``; index style
+/// renders `- <source_summary|text head 80>  \`[id]\`` (no refs — the
+/// get brings them). The trailing `` `[id]` `` token is the contract
+/// `cli::feedback::extract_injected_ids` parses; keep it in BOTH arms.
 fn push_section(
     lines: &mut Vec<String>,
     header: &str,
     items: &[Value],
     take: usize,
     with_refs: bool,
+    style: RecallStyle,
 ) {
     if items.is_empty() {
         return;
@@ -435,27 +521,39 @@ fn push_section(
     lines.push(String::new());
     lines.push(header.to_string());
     for it in items.iter().take(take) {
-        let text = clean(it["text"].as_str().unwrap_or(""));
         let id = it["capability_capsule_id"].as_str().unwrap_or("");
-        let refs = if with_refs {
-            let joined = it["code_refs"]
-                .as_array()
-                .map(|a| {
-                    a.iter()
-                        .filter_map(|x| x.as_str())
-                        .collect::<Vec<_>>()
-                        .join(", ")
-                })
-                .unwrap_or_default();
-            if joined.is_empty() {
-                String::new()
-            } else {
-                format!(" ({joined})")
+        match style {
+            RecallStyle::Index => {
+                let headline = it["source_summary"]
+                    .as_str()
+                    .filter(|s| !s.trim().is_empty())
+                    .unwrap_or_else(|| it["text"].as_str().unwrap_or(""));
+                let headline = clean_to(headline, 80);
+                lines.push(format!("- {headline}  `[{id}]`"));
             }
-        } else {
-            String::new()
-        };
-        lines.push(format!("- {text}{refs}  `[{id}]`"));
+            RecallStyle::Snippet => {
+                let text = clean(it["text"].as_str().unwrap_or(""));
+                let refs = if with_refs {
+                    let joined = it["code_refs"]
+                        .as_array()
+                        .map(|a| {
+                            a.iter()
+                                .filter_map(|x| x.as_str())
+                                .collect::<Vec<_>>()
+                                .join(", ")
+                        })
+                        .unwrap_or_default();
+                    if joined.is_empty() {
+                        String::new()
+                    } else {
+                        format!(" ({joined})")
+                    }
+                } else {
+                    String::new()
+                };
+                lines.push(format!("- {text}{refs}  `[{id}]`"));
+            }
+        }
     }
 }
 
@@ -726,5 +824,122 @@ mod tests {
         let c = clean(&long);
         assert_eq!(c.chars().count(), 241); // 240 + ellipsis
         assert!(c.ends_with('…'));
+    }
+
+    // ---- progressive disclosure (index style) -----------------------------
+
+    fn fact_with_long_body() -> Value {
+        json!({
+            "relevant_facts": [{
+                "text": format!("DEEPBODY{} tail-marker-deep-in-body", "正文很长".repeat(60)),
+                "source_summary": "E1.5 泛化共享信号改 topics∪tags 的一行摘要",
+                "capability_capsule_id": "mem_01900000-0000-7000-8000-000000000abc",
+                "code_refs": ["src/worker/evolution_worker.rs"]
+            }]
+        })
+    }
+
+    #[test]
+    fn index_style_renders_summary_headline_not_body() {
+        let v = format_prompt_recall_styled(&fact_with_long_body(), &json!({}), RecallStyle::Index);
+        let ctx = v["hookSpecificOutput"]["additionalContext"]
+            .as_str()
+            .unwrap();
+        assert!(
+            ctx.contains("E1.5 泛化共享信号改"),
+            "headline from source_summary"
+        );
+        assert!(ctx.contains("`[mem_01900000-0000-7000-8000-000000000abc]`"));
+        assert!(
+            !ctx.contains("tail-marker-deep-in-body"),
+            "index mode must not inject the capsule body"
+        );
+        assert!(
+            !ctx.contains("(src/worker/evolution_worker.rs)"),
+            "index mode drops code_refs — get brings them"
+        );
+        // The instruction line tells the agent to get-before-use.
+        assert!(ctx.contains("capability_capsule_get"));
+    }
+
+    #[test]
+    fn index_style_falls_back_to_text_head_when_no_summary() {
+        let cap = json!({
+            "relevant_facts": [{
+                "text": format!("HEADMARK 前八十字内的内容{} tail-marker-deep-in-body", "填充".repeat(80)),
+                "capability_capsule_id": "mem_01900000-0000-7000-8000-000000000abc"
+            }]
+        });
+        let v = format_prompt_recall_styled(&cap, &json!({}), RecallStyle::Index);
+        let ctx = v["hookSpecificOutput"]["additionalContext"]
+            .as_str()
+            .unwrap();
+        assert!(ctx.contains("HEADMARK"), "falls back to the text head");
+        assert!(!ctx.contains("tail-marker-deep-in-body"));
+    }
+
+    #[test]
+    fn index_style_keeps_directives_full() {
+        let directive_text = format!(
+            "MUST 指令全文必须完整保留{}END_OF_DIRECTIVE",
+            "规则".repeat(50)
+        );
+        let cap = json!({
+            "directives": [{"text": directive_text, "capability_capsule_id": "mem_01900000-0000-7000-8000-000000000abc"}]
+        });
+        let v = format_prompt_recall_styled(&cap, &json!({}), RecallStyle::Index);
+        let ctx = v["hookSpecificOutput"]["additionalContext"]
+            .as_str()
+            .unwrap();
+        assert!(
+            ctx.contains("END_OF_DIRECTIVE"),
+            "directives are few and load-bearing — never index-truncated"
+        );
+    }
+
+    #[test]
+    fn index_style_caps_transcript_windows() {
+        let tr = json!({
+            "windows": [{"session_id": "abcdef12-3456", "blocks": [
+                {"is_primary": true, "created_at": "2026-06-04T01:00:00Z",
+                 "content": format!("WINHEAD {} WINTAIL", "对话".repeat(120))}
+            ]}]
+        });
+        let v = format_prompt_recall_styled(&json!({}), &tr, RecallStyle::Index);
+        let ctx = v["hookSpecificOutput"]["additionalContext"]
+            .as_str()
+            .unwrap();
+        assert!(ctx.contains("WINHEAD"));
+        assert!(
+            !ctx.contains("WINTAIL"),
+            "window content capped in index mode"
+        );
+    }
+
+    #[test]
+    fn snippet_style_preserves_legacy_shape() {
+        let v =
+            format_prompt_recall_styled(&fact_with_long_body(), &json!({}), RecallStyle::Snippet);
+        let ctx = v["hookSpecificOutput"]["additionalContext"]
+            .as_str()
+            .unwrap();
+        assert!(
+            ctx.contains("DEEPBODY"),
+            "snippet mode keeps the 240-char body"
+        );
+        assert!(
+            ctx.contains("(src/worker/evolution_worker.rs)"),
+            "snippet mode keeps code_refs"
+        );
+    }
+
+    #[test]
+    fn recall_style_parses_with_index_default() {
+        assert_eq!(parse_recall_style(None), RecallStyle::Index);
+        assert_eq!(parse_recall_style(Some("index")), RecallStyle::Index);
+        assert_eq!(parse_recall_style(Some("snippet")), RecallStyle::Snippet);
+        assert_eq!(parse_recall_style(Some("SNIPPET")), RecallStyle::Snippet);
+        // Unknown values fall back to the default, never crash the hook.
+        assert_eq!(parse_recall_style(Some("garbage")), RecallStyle::Index);
     }
 }
