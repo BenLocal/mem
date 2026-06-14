@@ -1,6 +1,6 @@
 # mem
 
-Local-first Rust `axum` memory service for multi-agent engineering workflows. The MVP supports memory ingest, pending review, detail lookup, graph diagnostics, compressed search, feedback updates, and episode-driven workflow extraction backed by DuckDB.
+Local-first Rust `axum` memory service for multi-agent engineering workflows. The MVP supports memory ingest, pending review, detail lookup, graph diagnostics, compressed search, feedback updates, and episode-driven workflow extraction backed by DuckDB. Beyond CRUD, memories have a **lifecycle**: retrieval reinforcement, time decay, hard expiry, opt-in governance sweeps (idle-archive, ingest quality gate), and an opt-in **self-evolution** worker that merges and generalizes related capsules — every governance / evolution path defaults **OFF**, previews via dry-run, and is verbatim-safe (never rewrites or physically deletes a fact).
 
 ## Run Locally
 
@@ -234,6 +234,64 @@ cargo clippy --all-targets -- -D warnings
 - **Verbatim discipline**: `memories.content` is the **fact source** — never rewritten or truncated at storage. `memories.summary` is **index/hint only** — never used as the basis for answers or quotes. When a caller provides an explicit `summary` field, the ingest pipeline rejects requests where `summary` equals `content` — preventing agents from copying refined text into the content field. When no caller summary is supplied, the server derives one from `content[:80]` for indexing only.
 - **Lifecycle-aware**: memories have status (`Provisional`, `Active`, `PendingConfirmation`), confidence scores, decay, and feedback loops — not just CRUD operations.
 - **Graph-temporal**: edges carry `valid_from`/`valid_to` timestamps for point-in-time queries and supersede chains.
+- **Safe by default**: every destructive or generative background sweep (idle-archive, ingest quality gate, near-dup flagging, self-evolution) ships **default OFF**, exposes a `dry_run` HTTP preview that works regardless of the switch and writes nothing, and is **verbatim-safe** — a memory only ever leaves the active pool via a reversible status flip (`Archived`) or a supersede chain (`version_chain` keeps the old row), never a physical delete or a content rewrite.
+
+## Lifecycle, Governance & Self-Evolution
+
+On top of the per-memory lifecycle, `mem` runs a set of background workers that keep the pool healthy as it grows. Each is independently switchable; the destructive / generative ones are **opt-in** and have an HTTP dry-run preview so you can inspect candidates before flipping the switch.
+
+### Retrieval reinforcement & decay
+
+Every memory written into a search response is stamped `last_used_at` (off the read path, batched by the always-on `last_used_worker`). The decay clock runs from `last_used_at` when a memory has ever been used, else `updated_at`, so retrieved memories decay slower than untouched ones. A separate sweep-proof `last_recalled_at` column records the first real recall — it is what the idle-archive sweep below trusts (the decay sweep cannot forge it).
+
+### Hard expiry (auto-forget)
+
+A memory may carry an optional `expires_at` (20-digit ms timestamp). Once past, it is treated as expired: filtered out of search candidates (`is_expired` in the retrieve pipeline) and excluded from the evolution map. Set it at ingest time for facts with a known shelf life (a temporary credential, a sprint-scoped decision). Always on, no env needed — a memory with no `expires_at` never expires.
+
+### Governance sweeps (opt-in, default OFF)
+
+- **Idle-archive** (`idle_archive_worker`) — archives `Active` memories that are dead weight on *every* axis at once: never recalled (`last_recalled_at IS NULL`), aged past `age_days`, never positively reinforced, decayed past a floor, **and** structurally low-value. The structural clause keeps substantive lessons safe however idle they look. Archival reuses the feedback path, so the row is kept verbatim — only search drops it. Preview: `POST /reviews/idle_archive {"tenant":"local","dry_run":true}`.
+- **Ingest quality gate** — rejects structurally low-value `experience` capsules at write time (too short, or a bare commit subject with no evidence / code_refs) instead of letting them accumulate as noise. Only `experience` is gated; every other type passes untouched.
+- **Auto-promote** (`auto_promote_worker`, **default ON**) — promotes long-idle `PendingConfirmation` capsules to `Active`. Excludes `Preference` / `Workflow` and, since the self-evolution work, anything stamped `source_agent=evolution_worker` (evolution proposals must stay review-gated). Preview: `POST /reviews/auto_promote {"dry_run":true}`.
+
+### Self-evolution (`evolution_worker`, opt-in, default OFF)
+
+A daily sweep that treats the active pool as points on a semantic "living map" and structurally consolidates it — **LLM-free**, anti-jitter, verbatim-safe:
+
+1. **Map** — clusters active memories over their *existing* embeddings (union-find on cosine; never calls embed itself).
+2. **Anti-jitter gate** — each candidate operation accumulates evidence in a durable `evolution_candidates` table and only executes after its signal held for `K` **consecutive** sweeps (EvoMap-inspired temporal smoothing); evidence survives restarts.
+3. **Operators**:
+   - **① merge** — a cluster of near-identical memories collapses to the longest-content canonical; the rest flip to `Archived` (reversible) with `merged_into` lineage edges.
+   - **② generalize** — a stable cluster of ≥4 episodic memories sharing ≥2 themes (`topics ∪ tags`) produces **one** `PendingConfirmation` proposal capsule built by the `review` `SynthesisBackend` (structured raw material, *no generated prose* — a human or the interactive agent writes the actual principle via review-edit-accept); the source memories stay `Active`.
+4. **Preview** — `POST /reviews/evolution {"tenant":"local","dry_run":true}` returns the proposals + per-candidate evidence/cycle counts and writes **nothing** (not even candidate rows), regardless of the switch.
+
+```bash
+# Preview what the evolution worker would merge / generalize — zero writes.
+curl -X POST localhost:3000/reviews/evolution \
+  -H 'content-type: application/json' \
+  -d '{"tenant":"local","dry_run":true}' | jq
+```
+
+### Governance & evolution env vars
+
+All default to the safe value; the worker for any opt-in feature is simply not spawned when its `*_ENABLED` is unset.
+
+| Variable | Default | Meaning |
+|----------|---------|---------|
+| `MEM_IDLE_ARCHIVE_ENABLED` | unset (OFF) | Spawn the idle-archive worker. Real sweeps are a no-op while off; the dry-run preview works regardless. |
+| `MEM_INGEST_QUALITY_GATE_ENABLED` | unset (OFF) | Reject structurally low-value `experience` capsules at ingest. |
+| `MEM_INGEST_MIN_CONTENT_LEN` | 40 | Minimum trimmed content length for a gated `experience` capsule. |
+| `MEM_AUTO_PROMOTE_DISABLED` | unset (worker ON) | Opt **out** of the `PendingConfirmation → Active` sweep (this one is default ON). |
+| `MEM_EVOLUTION_ENABLED` | unset (OFF) | Master switch for the self-evolution worker. |
+| `MEM_EVOLUTION_K_CYCLES` | 3 | Consecutive sweeps a candidate must hold before it executes (anti-jitter gate). |
+| `MEM_EVOLUTION_INTERVAL_SECS` | 86400 | Sweep cadence — one sweep is one cycle. Earliest real execution ≈ `K × interval` after start. |
+| `MEM_EVOLUTION_SYNTHESIS` | `off` | `off` \| `review`. `review` defers generalize content to the pending-review queue (worker stays LLM-free); `local` / `api` are designed but unimplemented and rejected at parse. |
+| `MEM_EVOLUTION_CLUSTER_THRESHOLD` / `MEM_EVOLUTION_MERGE_THRESHOLD` | 0.80 / 0.88 | Map-cluster vs ① merge cosine thresholds. |
+| `MEM_EVOLUTION_GENERALIZE_MIN_N` | 4 | Minimum episodic members for a ② generalize proposal. |
+| `MEM_EVOLUTION_EVIDENCE_DECAY` / `MEM_EVOLUTION_HYSTERESIS` | 0.7 / 0.5 | Evidence retention `β` and the cancel-below floor. |
+| `MEM_EVOLUTION_SCAN_LIMIT` | 2000 | Per-sweep cap on candidate memories pulled. |
+
+`POST /reviews/idle_archive`, `POST /reviews/auto_promote`, and `POST /reviews/evolution` all accept `{"tenant": "...", "dry_run": bool}` and default `dry_run` to `true` — the canonical flow is preview → review → enable the worker.
 
 ## Claude Code Integration
 
