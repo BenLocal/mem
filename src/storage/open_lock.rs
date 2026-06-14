@@ -185,15 +185,49 @@ fn read_held_pid(sentinel: &Path) -> Option<u32> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Mutex;
     use tempfile::tempdir;
+
+    /// `MEM_OPEN_LOCK_DISABLED` is process-global, but `cargo test` runs
+    /// every unit test in ONE multi-threaded process. The tests below
+    /// either SET that var or call `acquire()` (which READS it via
+    /// `lock_disabled()`), so without serialization a setter's window
+    /// races a reader's check — e.g. a concurrent `set_var("…","1")`
+    /// makes a reader's `acquire()` return `None` ("disabled") when it
+    /// expected a real guard, and a concurrent `remove_var` makes a
+    /// setter's `assert!(lock_disabled())` see an unset var. This was a
+    /// ~60% CI flake (lower locally only because more cores finish the
+    /// tiny tests before they overlap). The earlier "can't collide with
+    /// other modules' env-var tests" comment mis-scoped the hazard: the
+    /// collision is INTRA-module, between this module's own setters and
+    /// readers. Serialize them all behind one mutex.
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    /// Hold the env mutex for a test's lifetime AND guarantee
+    /// `MEM_OPEN_LOCK_DISABLED` is cleared on entry and on drop — so a
+    /// setter that panics mid-assertion can't leak state into the next
+    /// serialized test. Tolerates a poisoned mutex (a prior panic) by
+    /// recovering the guard rather than cascading the failure.
+    struct EnvGuard(#[allow(dead_code)] std::sync::MutexGuard<'static, ()>);
+
+    impl EnvGuard {
+        fn acquire() -> Self {
+            let guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+            std::env::remove_var("MEM_OPEN_LOCK_DISABLED");
+            EnvGuard(guard)
+        }
+    }
+
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            std::env::remove_var("MEM_OPEN_LOCK_DISABLED");
+        }
+    }
 
     #[test]
     fn lock_disabled_recognizes_truthy_values() {
+        let _env = EnvGuard::acquire();
         for v in ["1", "true", "TRUE", "yes", "YES"] {
-            // SAFETY: env-var manipulation in tests must not race with
-            // other parallel tests; this test reads + sets a unique-ish
-            // var (the disable knob) so it can't collide with the
-            // other modules' env-var tests.
             std::env::set_var("MEM_OPEN_LOCK_DISABLED", v);
             assert!(lock_disabled(), "value {v} should disable lock");
         }
@@ -203,6 +237,7 @@ mod tests {
 
     #[test]
     fn acquire_then_release_then_reacquire() {
+        let _env = EnvGuard::acquire();
         let dir = tempdir().unwrap();
         let db = dir.path().join("mem.lance");
         let g1 = acquire(&db).expect("first acquire").expect("not disabled");
@@ -215,6 +250,7 @@ mod tests {
 
     #[test]
     fn second_acquire_while_held_returns_error() {
+        let _env = EnvGuard::acquire();
         let dir = tempdir().unwrap();
         let db = dir.path().join("mem.lance");
         let _g = acquire(&db).expect("first acquire").expect("not disabled");
@@ -236,6 +272,7 @@ mod tests {
 
     #[test]
     fn sentinel_body_carries_pid_for_diagnostics() {
+        let _env = EnvGuard::acquire();
         let dir = tempdir().unwrap();
         let db = dir.path().join("mem.lance");
         let g = acquire(&db).expect("acquire").expect("not disabled");
@@ -247,6 +284,7 @@ mod tests {
 
     #[test]
     fn disabled_env_returns_none() {
+        let _env = EnvGuard::acquire();
         let dir = tempdir().unwrap();
         let db = dir.path().join("mem.lance");
         std::env::set_var("MEM_OPEN_LOCK_DISABLED", "1");
