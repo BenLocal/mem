@@ -9,6 +9,17 @@ on:
 jobs:
   rust:
     runs-on: ubuntu-latest
+    # Drop debuginfo from the test profile. Linking the `cargo test`
+    # binaries against the full lance + duckdb dependency tree is
+    # memory-heavy, and debuginfo is the bulk of that — it OOM-killed
+    # `cc`/`ld` on the 7 GB ubuntu-latest runner ("error: linking with
+    # `cc` failed"), intermittently and only in CI (local boxes have
+    # more RAM). `debug = 0` for the test profile cuts link-time memory
+    # sharply with no effect on test results. (fmt/clippy don't link, so
+    # job-level scope is harmless to them; the release-profile cross job
+    # already builds without debuginfo.)
+    env:
+      CARGO_PROFILE_TEST_DEBUG: "0"
     steps:
       - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@stable
