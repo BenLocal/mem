@@ -36,6 +36,8 @@ pub mod maintenance_store;
 pub mod mine_cursor_store;
 pub mod open_lock;
 #[cfg(feature = "postgres")]
+pub mod postgres_backend;
+#[cfg(feature = "postgres")]
 pub mod postgres_capsule_store;
 pub mod session_store;
 pub mod store;

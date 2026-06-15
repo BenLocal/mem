@@ -180,3 +180,30 @@ pg_test!(apply_feedback_moves_confidence, backend, {
         "useful feedback raises confidence ({before} -> {after})"
     );
 });
+
+/// P2 smoke test: `mem serve` boots on the Postgres backend. Builds a
+/// `Config` with `backend = Postgres` + a Fake embedding provider (so no
+/// model download) and asserts `AppState::from_config` assembles cleanly
+/// — i.e. the Postgres arm of `app.rs` connects, migrates, wires up the
+/// services/workers, and never hits an `unimplemented!()` stub on the
+/// startup path. Skips when `MEM_TEST_POSTGRES_URL` is unset.
+#[tokio::test(flavor = "multi_thread")]
+async fn serve_boots_on_postgres() {
+    let Some(url) = std::env::var("MEM_TEST_POSTGRES_URL").ok() else {
+        eprintln!("skip serve_boots_on_postgres: MEM_TEST_POSTGRES_URL unset");
+        return;
+    };
+    let mut config = mem::config::Config::local();
+    config.backend = mem::config::BackendKind::Postgres;
+    config.postgres_url = Some(url);
+    config.embedding.provider = mem::config::EmbeddingProviderKind::Fake;
+    config.embedding.model = "fake".to_string();
+    config.embedding.dim = 64;
+
+    let state = mem::app::AppState::from_config(config).await;
+    assert!(
+        state.is_ok(),
+        "AppState::from_config should assemble on the Postgres backend: {:?}",
+        state.err()
+    );
+}

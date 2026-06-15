@@ -50,6 +50,30 @@ impl PostgresCapsuleStore {
         &self.pool
     }
 
+    /// Production connect: open an 8-connection pool against `url` and
+    /// **idempotently** apply the `0001_capsule_store` migration into the
+    /// connection's default schema (no per-call schema, no drop — unlike
+    /// [`Self::connect_fresh`], which is test-only). The migration's
+    /// `CREATE TABLE IF NOT EXISTS` / `CREATE INDEX IF NOT EXISTS`
+    /// statements make re-running it on an already-migrated database a
+    /// no-op, so this is safe to call on every `mem serve` boot.
+    pub async fn connect(url: &str) -> Result<Self, StorageError> {
+        use sqlx::postgres::PgPoolOptions;
+
+        let pool = PgPoolOptions::new()
+            .max_connections(8)
+            .connect(url)
+            .await
+            .map_err(sqlx_err)?;
+        sqlx::raw_sql(include_str!(
+            "../../migrations/postgres/0001_capsule_store.sql"
+        ))
+        .execute(&pool)
+        .await
+        .map_err(sqlx_err)?;
+        Ok(Self { pool })
+    }
+
     /// Connect to `url` on a **fresh, isolated Postgres schema** and
     /// apply the `0001_capsule_store` migration into it. Each call
     /// creates a unique `mem_test_<uuid>` schema and pins every pooled

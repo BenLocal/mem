@@ -51,70 +51,120 @@ impl AppState {
             );
         }
 
-        // Open the unified storage handle. LanceStore creates the
-        // schema + FTS indexes; DuckDbQuery ATTACHes the lance dir.
-        // We hold a concrete `Arc<Store>` here so we can call
-        // `set_transcript_job_provider` (Lance-only configuration —
-        // not on any sub-trait); services / workers get the
-        // upcast `Arc<dyn Backend>` so the concrete type never
-        // appears below this line.
-        let store_concrete = Arc::new(
-            Store::open_with_provider(&config.db_path, provider.clone())
-                .await
-                .map_err(|e| anyhow::anyhow!("storage open: {e}"))?,
-        );
-        info!(path = %config.db_path.display(), "storage initialized");
+        // Open the unified storage handle, dispatching on the configured
+        // backend. Each arm produces the same three bindings the rest of
+        // `from_config` consumes:
+        //   * `store: Arc<dyn Backend>`        — the erased storage handle
+        //   * `edge_access_tx: Option<…>`      — K9 potentiation sender
+        //   * `capsule_used_tx: UnboundedSender<…>` — O1 last-used sender
+        // so everything below this `match` is backend-agnostic and stays
+        // byte-for-byte identical to the pre-Postgres single-backend path.
+        let (store, edge_access_tx, capsule_used_tx): (
+            Arc<dyn Backend>,
+            Option<
+                tokio::sync::mpsc::UnboundedSender<crate::worker::potentiation_worker::EdgeAccess>,
+            >,
+            tokio::sync::mpsc::UnboundedSender<crate::worker::last_used_worker::CapsuleUsed>,
+        ) = match config.backend {
+            crate::config::BackendKind::Lance => {
+                // LanceStore creates the schema + FTS indexes; DuckDbQuery
+                // ATTACHes the lance dir. We hold a concrete `Arc<Store>`
+                // here so we can call `set_transcript_job_provider`
+                // (Lance-only configuration — not on any sub-trait) and
+                // spawn the two Store-glue workers, then upcast to
+                // `Arc<dyn Backend>` so the concrete type never appears
+                // below this `match`.
+                let store_concrete = Arc::new(
+                    Store::open_with_provider(&config.db_path, provider.clone())
+                        .await
+                        .map_err(|e| anyhow::anyhow!("storage open: {e}"))?,
+                );
+                info!(path = %config.db_path.display(), "storage initialized");
 
-        // Configure the transcript embedding worker's job-provider id
-        // before any transcript writes happen (writes that are
-        // embed_eligible enqueue a transcript_embedding_jobs row, and
-        // the row's provider column comes from this setter).
-        store_concrete.set_transcript_job_provider(config.embedding.job_provider_id());
+                // Configure the transcript embedding worker's job-provider
+                // id before any transcript writes happen (writes that are
+                // embed_eligible enqueue a transcript_embedding_jobs row,
+                // and the row's provider column comes from this setter).
+                store_concrete.set_transcript_job_provider(config.embedding.job_provider_id());
 
-        // ── K9 potentiation worker (strategy B, in-memory channel) ──
-        // Spawned BEFORE the upcast so the worker keeps a concrete
-        // `Arc<Store>` (it calls `Store::potentiate_edge`, a Store-level
-        // composition). The sender goes to the capsule service, which
-        // enqueues graph-edge co-access events during search. Default OFF
-        // (`MEM_EDGE_DYNAMICS_ENABLED`).
-        let edge_access_tx = if config.edge_dynamics.enabled {
-            let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
-            let store_pot = store_concrete.clone();
-            let ed_settings = config.edge_dynamics.clone();
-            tokio::spawn(async move {
-                crate::worker::potentiation_worker::run(store_pot, rx, ed_settings).await;
-            });
-            Some(tx)
-        } else {
-            None
+                // ── K9 potentiation worker (strategy B, in-mem channel) ──
+                // Spawned BEFORE the upcast so the worker keeps a concrete
+                // `Arc<Store>` (it calls `Store::potentiate_edge`, a
+                // Store-level composition). The sender goes to the capsule
+                // service, which enqueues graph-edge co-access events
+                // during search. Default OFF (`MEM_EDGE_DYNAMICS_ENABLED`).
+                let edge_access_tx = if config.edge_dynamics.enabled {
+                    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+                    let store_pot = store_concrete.clone();
+                    let ed_settings = config.edge_dynamics.clone();
+                    tokio::spawn(async move {
+                        crate::worker::potentiation_worker::run(store_pot, rx, ed_settings).await;
+                    });
+                    Some(tx)
+                } else {
+                    None
+                };
+
+                // ── O1 last-used worker (retrieval reinforcement, on) ──
+                // Spawned BEFORE the upcast so the worker keeps a concrete
+                // `Arc<Store>` (it calls `Store::bump_last_used_at`). The
+                // sender goes to the capsule service, which enqueues a
+                // capsule-used event for every capsule emitted into a
+                // search response; the worker coalesces them off the read
+                // path and stamps `last_used_at`, anchoring the decay clock.
+                let (capsule_used_tx, capsule_used_rx) = tokio::sync::mpsc::unbounded_channel();
+                {
+                    let store_lu = store_concrete.clone();
+                    // Drain cadence; coalescing within a window bounds
+                    // write pressure to one batched UPDATE per tenant per
+                    // tick.
+                    let flush_secs = std::env::var("MEM_LAST_USED_FLUSH_SECS")
+                        .ok()
+                        .and_then(|v| v.parse::<u64>().ok())
+                        .filter(|&v| v > 0)
+                        .unwrap_or(5);
+                    tokio::spawn(async move {
+                        crate::worker::last_used_worker::run(store_lu, capsule_used_rx, flush_secs)
+                            .await;
+                    });
+                }
+
+                let store: Arc<dyn Backend> = store_concrete;
+                (store, edge_access_tx, capsule_used_tx)
+            }
+            crate::config::BackendKind::Postgres => {
+                #[cfg(feature = "postgres")]
+                {
+                    // Connect + idempotently migrate. The Store-glue
+                    // workers (last_used / potentiation) and the
+                    // Lance-only `set_transcript_job_provider` are skipped:
+                    // they are optimizations, not correctness — their real
+                    // Postgres implementations land in P5. The capsule
+                    // service still gets a live `capsule_used_tx`; its
+                    // receiver is dropped, so the events it emits are
+                    // silently discarded (acceptable for P2).
+                    let url = config
+                        .postgres_url
+                        .as_deref()
+                        .expect("postgres_url present when backend=Postgres");
+                    let pg = Arc::new(
+                        crate::storage::PostgresCapsuleStore::connect(url)
+                            .await
+                            .map_err(|e| anyhow::anyhow!("postgres connect: {e}"))?,
+                    );
+                    info!(backend = "postgres", "storage initialized");
+                    let store: Arc<dyn Backend> = pg;
+                    let (capsule_used_tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+                    (store, None, capsule_used_tx)
+                }
+                #[cfg(not(feature = "postgres"))]
+                {
+                    return Err(anyhow::anyhow!(
+                        "MEM_BACKEND=postgres requires building mem with --features postgres"
+                    ));
+                }
+            }
         };
-
-        // ── O1 last-used worker (retrieval reinforcement, always on) ──
-        // Spawned BEFORE the upcast so the worker keeps a concrete
-        // `Arc<Store>` (it calls `Store::bump_last_used_at`). The sender
-        // goes to the capsule service, which enqueues a capsule-used
-        // event for every capsule emitted into a search response; the
-        // worker coalesces them off the read path and stamps
-        // `last_used_at`, which anchors the decay clock.
-        let (capsule_used_tx, capsule_used_rx) = tokio::sync::mpsc::unbounded_channel();
-        {
-            let store_lu = store_concrete.clone();
-            // Drain cadence; coalescing within a window bounds write
-            // pressure to one batched UPDATE per tenant per tick.
-            let flush_secs = std::env::var("MEM_LAST_USED_FLUSH_SECS")
-                .ok()
-                .and_then(|v| v.parse::<u64>().ok())
-                .filter(|&v| v > 0)
-                .unwrap_or(5);
-            tokio::spawn(async move {
-                crate::worker::last_used_worker::run(store_lu, capsule_used_rx, flush_secs).await;
-            });
-        }
-
-        // Erase to the umbrella trait. Every service / worker below
-        // works through `Arc<dyn Backend>` — swap in a different
-        // backend by changing this one binding.
-        let store: Arc<dyn Backend> = store_concrete;
 
         // ── Workers ─────────────────────────────────────────────
         let provider_worker = provider.clone();

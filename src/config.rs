@@ -378,12 +378,56 @@ pub struct Config {
     pub edge_dynamics: EdgeDynamicsSettings,
     pub cooccurrence: CooccurrenceSettings,
     pub evolution: EvolutionSettings,
+    /// Which storage backend `mem serve` runs on. Default `Lance`
+    /// (Lance datasets + in-process DuckDB). `Postgres` requires the
+    /// `postgres` cargo feature and `postgres_url`.
+    pub backend: BackendKind,
+    /// Connection string for the Postgres backend (`MEM_POSTGRES_URL`).
+    /// `None` for the Lance backend.
+    pub postgres_url: Option<String>,
+}
+
+/// Storage backend selector (`MEM_BACKEND`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum BackendKind {
+    /// Lance datasets + in-process DuckDB (the default; always built).
+    #[default]
+    Lance,
+    /// Postgres (+ pgvector). Requires the `postgres` cargo feature.
+    Postgres,
+}
+
+/// Parse `MEM_BACKEND` (`lance` default | `postgres`) + `MEM_POSTGRES_URL`.
+/// `postgres` without a URL is a loud error, not a silent fallback to
+/// Lance — selecting a backend you can't reach should fail at startup.
+pub fn parse_backend(
+    get: impl Fn(&str) -> Option<String>,
+) -> Result<(BackendKind, Option<String>), ConfigError> {
+    let kind = match get("MEM_BACKEND").map(|s| s.trim().to_ascii_lowercase()) {
+        None => BackendKind::Lance,
+        Some(s) if s == "lance" || s.is_empty() => BackendKind::Lance,
+        Some(s) if s == "postgres" || s == "postgresql" || s == "pg" => BackendKind::Postgres,
+        Some(other) => {
+            return Err(ConfigError::InvalidBackend(format!(
+                "{other} (expected lance or postgres)"
+            )))
+        }
+    };
+    let url = get("MEM_POSTGRES_URL").filter(|s| !s.trim().is_empty());
+    if kind == BackendKind::Postgres && url.is_none() {
+        return Err(ConfigError::InvalidBackend(
+            "MEM_BACKEND=postgres requires MEM_POSTGRES_URL".to_string(),
+        ));
+    }
+    Ok((kind, url))
 }
 
 #[derive(Debug, Error)]
 pub enum ConfigError {
     #[error("invalid EMBEDDING_PROVIDER: {0} (expected fake, openai, or embedanything)")]
     InvalidEmbeddingProvider(String),
+    #[error("invalid MEM_BACKEND: {0}")]
+    InvalidBackend(String),
     #[error("OPENAI_API_KEY is required when EMBEDDING_PROVIDER=openai (or real alias)")]
     MissingOpenAiApiKey,
     #[error("invalid EMBEDDING_DIM: {0}")]
@@ -1217,11 +1261,14 @@ impl Config {
             edge_dynamics: EdgeDynamicsSettings::development_defaults(),
             cooccurrence: CooccurrenceSettings::development_defaults(),
             evolution: EvolutionSettings::development_defaults(),
+            backend: BackendKind::Lance,
+            postgres_url: None,
         }
     }
 
     pub fn from_env() -> Result<Self, ConfigError> {
         let bind_addr = std::env::var("BIND_ADDR").unwrap_or_else(|_| "127.0.0.1:3000".to_string());
+        let (backend, postgres_url) = parse_backend(|k| std::env::var(k).ok())?;
         Ok(Self {
             bind_addr,
             db_path: default_db_path(),
@@ -1235,6 +1282,8 @@ impl Config {
             edge_dynamics: EdgeDynamicsSettings::from_env_vars(|k| std::env::var(k).ok())?,
             cooccurrence: CooccurrenceSettings::from_env_vars(|k| std::env::var(k).ok())?,
             evolution: EvolutionSettings::from_env_vars(|k| std::env::var(k).ok())?,
+            backend,
+            postgres_url,
         })
     }
 }
@@ -1566,6 +1615,39 @@ mod tests {
         let err = VacuumSettings::from_env_vars(env(&[("MEM_VACUUM_OLDER_THAN_DAYS", "soon")]))
             .unwrap_err();
         assert!(matches!(err, ConfigError::InvalidVacuumOlderThanDays(ref s) if s == "soon"));
+    }
+
+    #[test]
+    fn backend_defaults_to_lance() {
+        let (kind, url) = parse_backend(|_| None).unwrap();
+        assert_eq!(kind, BackendKind::Lance);
+        assert_eq!(url, None);
+    }
+
+    #[test]
+    fn backend_postgres_requires_url() {
+        // postgres selected but no URL → loud error, not a silent fallback.
+        let err = parse_backend(env(&[("MEM_BACKEND", "postgres")])).unwrap_err();
+        assert!(
+            matches!(err, ConfigError::InvalidBackend(ref s) if s.contains("MEM_POSTGRES_URL"))
+        );
+    }
+
+    #[test]
+    fn backend_postgres_with_url_ok() {
+        let (kind, url) = parse_backend(env(&[
+            ("MEM_BACKEND", "postgres"),
+            ("MEM_POSTGRES_URL", "postgres://localhost/mem"),
+        ]))
+        .unwrap();
+        assert_eq!(kind, BackendKind::Postgres);
+        assert_eq!(url.as_deref(), Some("postgres://localhost/mem"));
+    }
+
+    #[test]
+    fn backend_unknown_value_rejected() {
+        let err = parse_backend(env(&[("MEM_BACKEND", "mysql")])).unwrap_err();
+        assert!(matches!(err, ConfigError::InvalidBackend(_)));
     }
 
     #[test]
