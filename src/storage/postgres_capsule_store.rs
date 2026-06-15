@@ -154,6 +154,10 @@ impl PostgresCapsuleStore {
             .execute(&pool)
             .await
             .map_err(sqlx_err)?;
+        sqlx::raw_sql(include_str!("../../migrations/postgres/0004_p5_tables.sql"))
+            .execute(&pool)
+            .await
+            .map_err(sqlx_err)?;
         Ok(Self { pool })
     }
 
@@ -214,6 +218,10 @@ impl PostgresCapsuleStore {
             .execute(&pool)
             .await
             .map_err(sqlx_err)?;
+        sqlx::raw_sql(include_str!("../../migrations/postgres/0004_p5_tables.sql"))
+            .execute(&pool)
+            .await
+            .map_err(sqlx_err)?;
         Ok(Self { pool })
     }
 }
@@ -260,7 +268,7 @@ fn parse_visibility(s: &str) -> Result<Visibility, StorageError> {
         .map_err(|_| StorageError::InvalidData("unknown capsule visibility"))
 }
 
-fn enum_to_str<T: serde::Serialize>(v: &T) -> Result<String, StorageError> {
+pub(crate) fn enum_to_str<T: serde::Serialize>(v: &T) -> Result<String, StorageError> {
     serde_json::to_value(v)
         .ok()
         .and_then(|v| v.as_str().map(str::to_owned))

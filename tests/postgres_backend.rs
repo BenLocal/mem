@@ -23,9 +23,13 @@ use std::sync::Arc;
 use mem::domain::capability_capsule::{
     CapabilityCapsuleRecord, CapabilityCapsuleStatus, CapabilityCapsuleType, Scope, Visibility,
 };
+use mem::domain::entity::EntityKind;
+use mem::domain::episode::EpisodeRecord;
+use mem::domain::AddAliasOutcome;
 use mem::storage::{
-    current_timestamp, CapsuleSearchStore, CapsuleStore, EmbeddingVectorStore, FeedbackEvent,
-    PostgresCapsuleStore,
+    current_timestamp, CapsuleSearchStore, CapsuleStore, EmbeddingVectorStore, EntityRegistry,
+    EvolutionCandidate, EvolutionCandidateStore, FeedbackEvent, MaintenanceStore, MineCursorStore,
+    PostgresCapsuleStore, SessionStore,
 };
 
 /// `Some(store)` on a fresh schema when `MEM_TEST_POSTGRES_URL` is set,
@@ -771,4 +775,543 @@ emb_test!(hybrid_excludes_archived_vec_only_hit, store, {
         !ids.contains(&"arch_vec"),
         "archived vec-only hit dropped post-fusion: {ids:?}"
     );
+});
+
+// ═══════════════════════ P5 batch-1 sub-trait tests ═════════════════════
+//
+// MineCursorStore / EvolutionCandidateStore / SessionStore /
+// EntityRegistry / MaintenanceStore — round-trip + behaviour parity
+// against a real Postgres on a fresh per-test schema.
+
+// ───────────────────────────── MineCursorStore ──────────────────────────
+
+emb_test!(mine_cursor_upsert_get_and_monotonic, store, {
+    // No row yet → None.
+    assert!(store.get_mine_cursor("/t/a.jsonl").await.unwrap().is_none());
+
+    // First upsert creates the row.
+    store
+        .upsert_mine_cursor("/t/a.jsonl", 10, "00000000000000000001")
+        .await
+        .unwrap();
+    let c = store
+        .get_mine_cursor("/t/a.jsonl")
+        .await
+        .unwrap()
+        .expect("cursor exists after upsert");
+    assert_eq!(c.transcript_path, "/t/a.jsonl");
+    assert_eq!(c.last_line_number, 10);
+    assert_eq!(c.updated_at, "00000000000000000001");
+
+    // Second upsert on the same path replaces in place (ON CONFLICT) —
+    // advancing the high-water mark, not inserting a duplicate.
+    store
+        .upsert_mine_cursor("/t/a.jsonl", 42, "00000000000000000002")
+        .await
+        .unwrap();
+    let c2 = store.get_mine_cursor("/t/a.jsonl").await.unwrap().unwrap();
+    assert_eq!(c2.last_line_number, 42);
+    assert_eq!(c2.updated_at, "00000000000000000002");
+
+    // A different path is an independent row.
+    store
+        .upsert_mine_cursor("/t/b.jsonl", 5, "00000000000000000003")
+        .await
+        .unwrap();
+    assert_eq!(
+        store
+            .get_mine_cursor("/t/b.jsonl")
+            .await
+            .unwrap()
+            .unwrap()
+            .last_line_number,
+        5
+    );
+    // /t/a.jsonl unaffected.
+    assert_eq!(
+        store
+            .get_mine_cursor("/t/a.jsonl")
+            .await
+            .unwrap()
+            .unwrap()
+            .last_line_number,
+        42
+    );
+});
+
+// ─────────────────────── EvolutionCandidateStore ────────────────────────
+
+fn evo_candidate(id: &str, tenant: &str, status: &str) -> EvolutionCandidate {
+    EvolutionCandidate {
+        candidate_id: id.into(),
+        tenant: tenant.into(),
+        op_kind: "merge".into(),
+        member_ids: vec!["m1".into(), "m2".into()],
+        params: r#"{"threshold":0.9}"#.into(),
+        evidence: 1.5,
+        consecutive_cycles: 2,
+        status: status.into(),
+        first_proposed_at: "00000000000000000001".into(),
+        last_signal_at: "00000000000000000002".into(),
+        executed_at: None,
+        result_capsule_ids: vec![],
+    }
+}
+
+emb_test!(evolution_candidate_upsert_and_list, store, {
+    store
+        .upsert_evolution_candidate(evo_candidate("c1", "t", "pending"))
+        .await
+        .unwrap();
+    store
+        .upsert_evolution_candidate(evo_candidate("c2", "t", "executed"))
+        .await
+        .unwrap();
+    // Different tenant — must not leak into t's listing.
+    store
+        .upsert_evolution_candidate(evo_candidate("c3", "other", "pending"))
+        .await
+        .unwrap();
+
+    // List all for t (status=None) → c1 + c2, not c3.
+    let all = store.list_evolution_candidates("t", None).await.unwrap();
+    let mut ids: Vec<&str> = all.iter().map(|c| c.candidate_id.as_str()).collect();
+    ids.sort();
+    assert_eq!(ids, vec!["c1", "c2"]);
+
+    // Status filter.
+    let pending = store
+        .list_evolution_candidates("t", Some("pending"))
+        .await
+        .unwrap();
+    assert_eq!(pending.len(), 1);
+    let got = &pending[0];
+    assert_eq!(got.candidate_id, "c1");
+    // JSON id-list + params round-trip verbatim.
+    assert_eq!(got.member_ids, vec!["m1".to_string(), "m2".to_string()]);
+    assert_eq!(got.params, r#"{"threshold":0.9}"#);
+    assert_eq!(got.op_kind, "merge");
+    assert!((got.evidence - 1.5).abs() < 1e-6);
+    assert_eq!(got.consecutive_cycles, 2);
+    assert!(got.executed_at.is_none());
+    assert!(got.result_capsule_ids.is_empty());
+});
+
+emb_test!(evolution_candidate_upsert_replaces_in_place, store, {
+    store
+        .upsert_evolution_candidate(evo_candidate("c1", "t", "pending"))
+        .await
+        .unwrap();
+    // Re-upsert same id with mutated fields (executed).
+    let mut updated = evo_candidate("c1", "t", "executed");
+    updated.consecutive_cycles = 9;
+    updated.executed_at = Some("00000000000000000099".into());
+    updated.result_capsule_ids = vec!["r1".into()];
+    store.upsert_evolution_candidate(updated).await.unwrap();
+
+    let all = store.list_evolution_candidates("t", None).await.unwrap();
+    assert_eq!(all.len(), 1, "ON CONFLICT replaced, did not duplicate");
+    let c = &all[0];
+    assert_eq!(c.status, "executed");
+    assert_eq!(c.consecutive_cycles, 9);
+    assert_eq!(c.executed_at.as_deref(), Some("00000000000000000099"));
+    assert_eq!(c.result_capsule_ids, vec!["r1".to_string()]);
+});
+
+// ──────────────────────────────── SessionStore ──────────────────────────
+
+emb_test!(session_open_touch_close_latest, store, {
+    // No active session yet.
+    assert!(store
+        .latest_active_session("t", "claude")
+        .await
+        .unwrap()
+        .is_none());
+
+    let s = store
+        .open_session("s1", "t", "claude", "00000000000000000010")
+        .await
+        .unwrap();
+    assert_eq!(s.session_id, "s1");
+    assert_eq!(s.memory_count, 0);
+    assert!(s.ended_at.is_none());
+
+    // latest_active_session finds it.
+    let latest = store
+        .latest_active_session("t", "claude")
+        .await
+        .unwrap()
+        .expect("active session");
+    assert_eq!(latest.session_id, "s1");
+
+    // touch bumps memory_count + last_seen_at.
+    store
+        .touch_session("s1", "00000000000000000020")
+        .await
+        .unwrap();
+    let touched = store
+        .latest_active_session("t", "claude")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(touched.memory_count, 1);
+    assert_eq!(touched.last_seen_at, "00000000000000000020");
+
+    // A second, newer active session wins latest (ORDER BY last_seen_at DESC).
+    store
+        .open_session("s2", "t", "claude", "00000000000000000030")
+        .await
+        .unwrap();
+    assert_eq!(
+        store
+            .latest_active_session("t", "claude")
+            .await
+            .unwrap()
+            .unwrap()
+            .session_id,
+        "s2"
+    );
+
+    // Close s2 → latest falls back to s1.
+    store
+        .close_session("s2", "00000000000000000040")
+        .await
+        .unwrap();
+    assert_eq!(
+        store
+            .latest_active_session("t", "claude")
+            .await
+            .unwrap()
+            .unwrap()
+            .session_id,
+        "s1"
+    );
+
+    // Different caller_agent is isolated.
+    assert!(store
+        .latest_active_session("t", "other-agent")
+        .await
+        .unwrap()
+        .is_none());
+});
+
+fn episode(id: &str, tenant: &str, outcome: &str) -> EpisodeRecord {
+    EpisodeRecord {
+        episode_id: id.into(),
+        tenant: tenant.into(),
+        goal: format!("goal-{id}"),
+        steps: vec!["step1".into(), "step2".into()],
+        outcome: outcome.into(),
+        evidence: vec!["ev1".into()],
+        scope: Scope::Repo,
+        visibility: Visibility::Private,
+        project: Some("proj".into()),
+        repo: None,
+        module: None,
+        tags: vec!["t1".into()],
+        source_agent: "test".into(),
+        idempotency_key: None,
+        created_at: format!("0000000000000000{id:0>4}"),
+        updated_at: format!("0000000000000000{id:0>4}"),
+        workflow_candidate: None,
+    }
+}
+
+emb_test!(insert_and_list_successful_episodes, store, {
+    store
+        .insert_episode(episode("1", "t", "success"))
+        .await
+        .unwrap();
+    store
+        .insert_episode(episode("2", "t", "failure"))
+        .await
+        .unwrap();
+    store
+        .insert_episode(episode("3", "t", "success"))
+        .await
+        .unwrap();
+    // Other tenant — excluded.
+    store
+        .insert_episode(episode("4", "other", "success"))
+        .await
+        .unwrap();
+
+    let ok = store
+        .list_successful_episodes_for_tenant("t")
+        .await
+        .unwrap();
+    let ids: Vec<&str> = ok.iter().map(|e| e.episode_id.as_str()).collect();
+    // Only outcome='success' rows for t; ordered created_at DESC (id 3, 1).
+    assert_eq!(ids, vec!["3", "1"]);
+    // Round-trip a list-column + scope/visibility field.
+    let e3 = &ok[0];
+    assert_eq!(e3.steps, vec!["step1".to_string(), "step2".to_string()]);
+    assert_eq!(e3.scope, Scope::Repo);
+    assert_eq!(e3.visibility, Visibility::Private);
+    assert_eq!(e3.project.as_deref(), Some("proj"));
+    assert_eq!(e3.tags, vec!["t1".to_string()]);
+});
+
+// ─────────────────────────────── EntityRegistry ─────────────────────────
+
+emb_test!(entity_resolve_or_create_and_alias, store, {
+    // Same normalized alias → same id (casing/whitespace collapse).
+    let id1 = store
+        .resolve_or_create(
+            "ta",
+            "Rust Async",
+            EntityKind::Topic,
+            "00000000000000000001",
+        )
+        .await
+        .unwrap();
+    let id1b = store
+        .resolve_or_create(
+            "ta",
+            "  rust   ASYNC  ",
+            EntityKind::Topic,
+            "00000000000000000002",
+        )
+        .await
+        .unwrap();
+    assert_eq!(id1, id1b, "normalized alias round-trips to same entity");
+
+    // Distinct alias → distinct entity.
+    let id2 = store
+        .resolve_or_create("ta", "DuckDB", EntityKind::Project, "00000000000000000003")
+        .await
+        .unwrap();
+    assert_ne!(id1, id2);
+
+    // Cross-tenant same alias → distinct entity (composite PK).
+    let id3 = store
+        .resolve_or_create(
+            "tb",
+            "Rust Async",
+            EntityKind::Topic,
+            "00000000000000000004",
+        )
+        .await
+        .unwrap();
+    assert_ne!(id1, id3);
+
+    // add_alias: new alias on same entity → Inserted.
+    assert_eq!(
+        store
+            .add_alias("ta", &id1, "Tokio", "00000000000000000010")
+            .await
+            .unwrap(),
+        AddAliasOutcome::Inserted
+    );
+    // Re-add (idempotent) → AlreadyOnSameEntity.
+    assert_eq!(
+        store
+            .add_alias("ta", &id1, "tokio", "00000000000000000011")
+            .await
+            .unwrap(),
+        AddAliasOutcome::AlreadyOnSameEntity
+    );
+    // Different entity claiming an owned alias → Conflict(owner).
+    assert_eq!(
+        store
+            .add_alias("ta", &id2, "Tokio", "00000000000000000012")
+            .await
+            .unwrap(),
+        AddAliasOutcome::ConflictWithDifferentEntity(id1.clone())
+    );
+
+    // lookup_alias normalizes the probe.
+    assert_eq!(
+        store
+            .lookup_alias("ta", "  RUST  async ")
+            .await
+            .unwrap()
+            .as_deref(),
+        Some(id1.as_str())
+    );
+    assert!(store.lookup_alias("ta", "nope").await.unwrap().is_none());
+});
+
+emb_test!(entity_get_and_list, store, {
+    let id_rust = store
+        .resolve_or_create(
+            "ta",
+            "Rust Async",
+            EntityKind::Topic,
+            "00000000000000000001",
+        )
+        .await
+        .unwrap();
+    let id_duck = store
+        .resolve_or_create("ta", "DuckDB", EntityKind::Project, "00000000000000000010")
+        .await
+        .unwrap();
+    store
+        .add_alias("ta", &id_rust, "Tokio", "00000000000000000020")
+        .await
+        .unwrap();
+
+    // get_entity → canonical_name verbatim, kind, aliases ordered
+    // created_at ASC ('rust async' then 'tokio').
+    let with = store
+        .get_entity("ta", &id_rust)
+        .await
+        .unwrap()
+        .expect("entity exists");
+    assert_eq!(with.entity.canonical_name, "Rust Async");
+    assert_eq!(with.entity.kind, EntityKind::Topic);
+    assert_eq!(
+        with.aliases,
+        vec!["rust async".to_string(), "tokio".to_string()]
+    );
+    assert!(store.get_entity("ta", "missing").await.unwrap().is_none());
+
+    // list_entities ordered created_at DESC: duck (later) then rust.
+    let all = store.list_entities("ta", None, None, 10).await.unwrap();
+    let ids: Vec<&str> = all.iter().map(|e| e.entity_id.as_str()).collect();
+    assert_eq!(ids, vec![id_duck.as_str(), id_rust.as_str()]);
+
+    // kind filter.
+    let topics = store
+        .list_entities("ta", Some(EntityKind::Topic), None, 10)
+        .await
+        .unwrap();
+    assert_eq!(topics.len(), 1);
+    assert_eq!(topics[0].entity_id, id_rust);
+
+    // LIKE substring on canonical_name (case-sensitive).
+    let like = store
+        .list_entities("ta", None, Some("Rust"), 10)
+        .await
+        .unwrap();
+    assert_eq!(like.len(), 1);
+    assert_eq!(like[0].canonical_name, "Rust Async");
+});
+
+// ────────────────────────────── MaintenanceStore ────────────────────────
+
+emb_test!(apply_time_decay_bumps_active_only, store, {
+    // Active row with last_used_at one day before now → decays.
+    let mut active = fixture("dk_active", CapabilityCapsuleStatus::Active);
+    active.decay_score = 0.0;
+    active.updated_at = "00000000000086400000".into(); // 1 day in ms
+    active.last_used_at = Some("00000000000086400000".into());
+    store.insert_capability_capsule(active).await.unwrap();
+
+    // Archived row → must NOT be touched by the sweep.
+    let mut archived = fixture("dk_archived", CapabilityCapsuleStatus::Archived);
+    archived.decay_score = 0.0;
+    store.insert_capability_capsule(archived).await.unwrap();
+
+    // now = 2 days in ms; rate 0.1/day; ms_per_day = 86_400_000.
+    let now_ms = 172_800_000.0_f64;
+    store
+        .apply_time_decay(0.1, now_ms, 86_400_000.0, "00000000000172800000")
+        .await
+        .unwrap();
+
+    let a = store
+        .get_capability_capsule_for_tenant("t", "dk_active")
+        .await
+        .unwrap()
+        .unwrap();
+    // 1 day elapsed * 0.1/day = +0.1.
+    assert!(
+        (a.decay_score - 0.1).abs() < 1e-5,
+        "decay bumped: {}",
+        a.decay_score
+    );
+    // last_used_at advanced to now (decay clock reset).
+    assert_eq!(a.last_used_at.as_deref(), Some("00000000000172800000"));
+
+    let arch = store
+        .get_capability_capsule_for_tenant("t", "dk_archived")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(arch.decay_score, 0.0, "archived row untouched");
+});
+
+emb_test!(apply_time_decay_archives_expired, store, {
+    let mut exp = fixture("dk_exp", CapabilityCapsuleStatus::Active);
+    exp.expires_at = Some("00000000000000000100".into());
+    store.insert_capability_capsule(exp).await.unwrap();
+
+    // now past the deadline → archived.
+    store
+        .apply_time_decay(0.1, 200.0, 86_400_000.0, "00000000000000000200")
+        .await
+        .unwrap();
+    let got = store
+        .get_capability_capsule_for_tenant("t", "dk_exp")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(got.status, CapabilityCapsuleStatus::Archived);
+});
+
+emb_test!(auto_promote_candidates_filters, store, {
+    // Eligible: pending, updated_at < cutoff, low decay, type in list.
+    let mut ok = fixture("ap_ok", CapabilityCapsuleStatus::PendingConfirmation);
+    ok.capability_capsule_type = CapabilityCapsuleType::Experience;
+    ok.updated_at = "00000000000000000100".into();
+    ok.created_at = "00000000000000000100".into();
+    ok.decay_score = 0.1;
+    store.insert_capability_capsule(ok).await.unwrap();
+
+    // Too fresh (updated_at >= cutoff) → excluded.
+    let mut fresh = fixture("ap_fresh", CapabilityCapsuleStatus::PendingConfirmation);
+    fresh.capability_capsule_type = CapabilityCapsuleType::Experience;
+    fresh.updated_at = "00000000000000000900".into();
+    store.insert_capability_capsule(fresh).await.unwrap();
+
+    // High decay → excluded.
+    let mut decayed = fixture("ap_decayed", CapabilityCapsuleStatus::PendingConfirmation);
+    decayed.capability_capsule_type = CapabilityCapsuleType::Experience;
+    decayed.updated_at = "00000000000000000100".into();
+    decayed.decay_score = 0.9;
+    store.insert_capability_capsule(decayed).await.unwrap();
+
+    // Wrong type → excluded.
+    let mut wrong = fixture("ap_wrong", CapabilityCapsuleStatus::PendingConfirmation);
+    wrong.capability_capsule_type = CapabilityCapsuleType::Preference;
+    wrong.updated_at = "00000000000000000100".into();
+    store.insert_capability_capsule(wrong).await.unwrap();
+
+    // Active (not pending) → excluded.
+    let mut act = fixture("ap_active", CapabilityCapsuleStatus::Active);
+    act.capability_capsule_type = CapabilityCapsuleType::Experience;
+    act.updated_at = "00000000000000000100".into();
+    store.insert_capability_capsule(act).await.unwrap();
+
+    let got = store
+        .auto_promote_candidates(
+            "t",
+            "00000000000000000500",
+            &[CapabilityCapsuleType::Experience],
+            0.5,
+        )
+        .await
+        .unwrap();
+    let ids: Vec<&str> = got
+        .iter()
+        .map(|c| c.capability_capsule_id.as_str())
+        .collect();
+    assert_eq!(ids, vec!["ap_ok"], "only the fully-eligible row: {ids:?}");
+
+    // Empty types short-circuits.
+    let none = store
+        .auto_promote_candidates("t", "00000000000000000500", &[], 0.5)
+        .await
+        .unwrap();
+    assert!(none.is_empty());
+});
+
+emb_test!(vacuum_old_versions_is_noop, store, {
+    // Postgres has no Lance manifests — zero-stats no-op, both flags.
+    let s = store.vacuum_old_versions_with(7, false).await.unwrap();
+    assert_eq!(s.old_versions_removed, 0);
+    assert_eq!(s.tables_pruned, 0);
+    let s2 = store.vacuum_old_versions_with(0, true).await.unwrap();
+    assert_eq!(s2.bytes_removed, 0);
 });

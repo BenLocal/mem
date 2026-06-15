@@ -645,7 +645,8 @@ impl EmbeddingJobStore for PostgresCapsuleStore {
 use sqlx::Row as _;
 
 use super::postgres_capsule_store::{
-    parse_status as parse_status_pub, row_to_record as pg_row_to_record, sqlx_err, SELECT_COLUMNS,
+    enum_to_str as enum_to_str_pub, parse_status as parse_status_pub,
+    row_to_record as pg_row_to_record, sqlx_err, SELECT_COLUMNS,
 };
 use crate::embedding::wire::decode_f32_blob;
 
@@ -1248,59 +1249,191 @@ impl TranscriptStore for PostgresCapsuleStore {
 impl EntityRegistry for PostgresCapsuleStore {
     async fn resolve_or_create(
         &self,
-        _tenant: &str,
-        _alias: &str,
-        _kind: EntityKind,
-        _now: &str,
+        tenant: &str,
+        alias: &str,
+        kind: EntityKind,
+        now: &str,
     ) -> Result<String, StorageError> {
-        unimplemented!(
-            "postgres backend: EntityRegistry::resolve_or_create not yet implemented (postgres-backend P3-P5)"
+        use crate::pipeline::entity_normalize::normalize_alias;
+        let normalized = normalize_alias(alias);
+
+        // Lookup first — same precondition the Lance writer uses.
+        if let Some(id) = self.lookup_alias(tenant, alias).await? {
+            return Ok(id);
+        }
+
+        // Auto-promote: insert entity + first alias in one transaction.
+        // entity_id is UUIDv7 (matches the Lance backend's id source).
+        // canonical_name preserves the caller-verbatim alias; the alias
+        // row stores the normalized form (the entity_aliases PK).
+        let entity_id = uuid::Uuid::now_v7().to_string();
+        let mut tx = self.pool().begin().await.map_err(sqlx_err)?;
+        sqlx::query(
+            "INSERT INTO entities (entity_id, tenant, canonical_name, kind, created_at) \
+             VALUES ($1, $2, $3, $4, $5)",
         )
+        .bind(&entity_id)
+        .bind(tenant)
+        .bind(alias)
+        .bind(kind.as_db_str())
+        .bind(now)
+        .execute(&mut *tx)
+        .await
+        .map_err(sqlx_err)?;
+        sqlx::query(
+            "INSERT INTO entity_aliases (tenant, alias_text, entity_id, created_at) \
+             VALUES ($1, $2, $3, $4)",
+        )
+        .bind(tenant)
+        .bind(&normalized)
+        .bind(&entity_id)
+        .bind(now)
+        .execute(&mut *tx)
+        .await
+        .map_err(sqlx_err)?;
+        tx.commit().await.map_err(sqlx_err)?;
+        Ok(entity_id)
     }
 
     async fn add_alias(
         &self,
-        _tenant: &str,
-        _entity_id: &str,
-        _alias: &str,
-        _now: &str,
+        tenant: &str,
+        entity_id: &str,
+        alias: &str,
+        now: &str,
     ) -> Result<AddAliasOutcome, StorageError> {
-        unimplemented!(
-            "postgres backend: EntityRegistry::add_alias not yet implemented (postgres-backend P3-P5)"
-        )
+        use crate::pipeline::entity_normalize::normalize_alias;
+        let normalized = normalize_alias(alias);
+
+        // Existing-owner check: who currently owns the normalized form?
+        // Mirrors the Lance backend's three-way outcome.
+        match self.lookup_alias(tenant, alias).await? {
+            None => {
+                sqlx::query(
+                    "INSERT INTO entity_aliases (tenant, alias_text, entity_id, created_at) \
+                     VALUES ($1, $2, $3, $4)",
+                )
+                .bind(tenant)
+                .bind(&normalized)
+                .bind(entity_id)
+                .bind(now)
+                .execute(self.pool())
+                .await
+                .map_err(sqlx_err)?;
+                Ok(AddAliasOutcome::Inserted)
+            }
+            Some(owner) if owner == entity_id => Ok(AddAliasOutcome::AlreadyOnSameEntity),
+            Some(other) => Ok(AddAliasOutcome::ConflictWithDifferentEntity(other)),
+        }
     }
 
     async fn get_entity(
         &self,
-        _tenant: &str,
-        _entity_id: &str,
+        tenant: &str,
+        entity_id: &str,
     ) -> Result<Option<EntityWithAliases>, StorageError> {
-        unimplemented!(
-            "postgres backend: EntityRegistry::get_entity not yet implemented (postgres-backend P3-P5)"
+        // Two SELECTs — entity row, then its aliases ordered
+        // `created_at ASC, alias_text ASC` (matches DuckDB read).
+        let row = sqlx::query(
+            "SELECT entity_id, tenant, canonical_name, kind, created_at \
+             FROM entities WHERE tenant = $1 AND entity_id = $2",
         )
+        .bind(tenant)
+        .bind(entity_id)
+        .fetch_optional(self.pool())
+        .await
+        .map_err(sqlx_err)?;
+        let Some(row) = row else {
+            return Ok(None);
+        };
+        let entity = pg_row_to_entity(&row)?;
+
+        let alias_rows = sqlx::query(
+            "SELECT alias_text FROM entity_aliases \
+             WHERE tenant = $1 AND entity_id = $2 \
+             ORDER BY created_at ASC, alias_text ASC",
+        )
+        .bind(tenant)
+        .bind(entity_id)
+        .fetch_all(self.pool())
+        .await
+        .map_err(sqlx_err)?;
+        let aliases = alias_rows
+            .iter()
+            .map(|r| r.try_get::<String, _>("alias_text").map_err(sqlx_err))
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(Some(EntityWithAliases { entity, aliases }))
     }
 
     async fn lookup_alias(
         &self,
-        _tenant: &str,
-        _alias: &str,
+        tenant: &str,
+        alias: &str,
     ) -> Result<Option<String>, StorageError> {
-        unimplemented!(
-            "postgres backend: EntityRegistry::lookup_alias not yet implemented (postgres-backend P3-P5)"
+        use crate::pipeline::entity_normalize::normalize_alias;
+        let normalized = normalize_alias(alias);
+        let row = sqlx::query(
+            "SELECT entity_id FROM entity_aliases \
+             WHERE tenant = $1 AND alias_text = $2 LIMIT 1",
         )
+        .bind(tenant)
+        .bind(&normalized)
+        .fetch_optional(self.pool())
+        .await
+        .map_err(sqlx_err)?;
+        match row {
+            None => Ok(None),
+            Some(r) => Ok(Some(r.try_get::<String, _>("entity_id").map_err(sqlx_err)?)),
+        }
     }
 
     async fn list_entities(
         &self,
-        _tenant: &str,
-        _kind_filter: Option<EntityKind>,
-        _query: Option<&str>,
-        _limit: usize,
+        tenant: &str,
+        kind_filter: Option<EntityKind>,
+        query: Option<&str>,
+        limit: usize,
     ) -> Result<Vec<Entity>, StorageError> {
-        unimplemented!(
-            "postgres backend: EntityRegistry::list_entities not yet implemented (postgres-backend P3-P5)"
+        // Static SQL with optional filters via `($N IS NULL OR ...)`,
+        // mirroring the DuckDB read: tenant + optional kind + optional
+        // LIKE substring on canonical_name, ordered created_at DESC,
+        // limit clamped to [1, 1024]. `query` is wrapped in `%...%` so
+        // the caller doesn't deal with wildcards (LIKE, case-sensitive).
+        let lim = i64::try_from(limit).unwrap_or(64).clamp(1, 1024);
+        let kind = kind_filter.map(|k| k.as_db_str().to_string());
+        let like = query.map(|q| format!("%{q}%"));
+        let rows = sqlx::query(
+            "SELECT entity_id, tenant, canonical_name, kind, created_at \
+             FROM entities \
+             WHERE tenant = $1 \
+               AND ($2::TEXT IS NULL OR kind = $2) \
+               AND ($3::TEXT IS NULL OR canonical_name LIKE $3) \
+             ORDER BY created_at DESC \
+             LIMIT $4",
         )
+        .bind(tenant)
+        .bind(kind)
+        .bind(like)
+        .bind(lim)
+        .fetch_all(self.pool())
+        .await
+        .map_err(sqlx_err)?;
+        rows.iter().map(pg_row_to_entity).collect()
     }
+}
+
+/// Project an `entities` row into an [`Entity`]. `kind` round-trips
+/// through `EntityKind::from_db_str` (lowercase db form).
+fn pg_row_to_entity(row: &sqlx::postgres::PgRow) -> Result<Entity, StorageError> {
+    let kind_str: String = row.try_get("kind").map_err(sqlx_err)?;
+    Ok(Entity {
+        entity_id: row.try_get("entity_id").map_err(sqlx_err)?,
+        tenant: row.try_get("tenant").map_err(sqlx_err)?,
+        canonical_name: row.try_get("canonical_name").map_err(sqlx_err)?,
+        kind: EntityKind::from_db_str(&kind_str)
+            .ok_or(StorageError::InvalidData("unknown entity kind"))?,
+        created_at: row.try_get("created_at").map_err(sqlx_err)?,
+    })
 }
 
 // ──────────────────────────────── SessionStore ────────────────────────────
@@ -1309,56 +1442,212 @@ impl EntityRegistry for PostgresCapsuleStore {
 impl SessionStore for PostgresCapsuleStore {
     async fn touch_session(
         &self,
-        _session_id: &str,
-        _last_active_at: &str,
+        session_id: &str,
+        last_active_at: &str,
     ) -> Result<(), StorageError> {
-        unimplemented!(
-            "postgres backend: SessionStore::touch_session not yet implemented (postgres-backend P3-P5)"
+        // Bump memory_count + stamp last_seen_at on the active row
+        // (Lance only_if `session_id =`). Silent no-op if the row is
+        // missing — `rows_affected == 0` is not an error.
+        sqlx::query(
+            "UPDATE sessions SET last_seen_at = $1, memory_count = memory_count + 1 \
+             WHERE session_id = $2",
         )
+        .bind(last_active_at)
+        .bind(session_id)
+        .execute(self.pool())
+        .await
+        .map_err(sqlx_err)?;
+        Ok(())
     }
 
     async fn open_session(
         &self,
-        _session_id: &str,
-        _tenant: &str,
-        _caller_agent: &str,
-        _now: &str,
+        session_id: &str,
+        tenant: &str,
+        caller_agent: &str,
+        now: &str,
     ) -> Result<Session, StorageError> {
-        unimplemented!(
-            "postgres backend: SessionStore::open_session not yet implemented (postgres-backend P3-P5)"
+        let session = Session {
+            session_id: session_id.to_string(),
+            tenant: tenant.to_string(),
+            caller_agent: caller_agent.to_string(),
+            started_at: now.to_string(),
+            last_seen_at: now.to_string(),
+            ended_at: None,
+            goal: None,
+            memory_count: 0,
+        };
+        sqlx::query(
+            "INSERT INTO sessions (session_id, tenant, caller_agent, started_at, \
+                last_seen_at, ended_at, goal, memory_count) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8)",
         )
+        .bind(&session.session_id)
+        .bind(&session.tenant)
+        .bind(&session.caller_agent)
+        .bind(&session.started_at)
+        .bind(&session.last_seen_at)
+        .bind(&session.ended_at)
+        .bind(&session.goal)
+        .bind(i64::from(session.memory_count))
+        .execute(self.pool())
+        .await
+        .map_err(sqlx_err)?;
+        Ok(session)
     }
 
-    async fn close_session(&self, _session_id: &str, _ended_at: &str) -> Result<(), StorageError> {
-        unimplemented!(
-            "postgres backend: SessionStore::close_session not yet implemented (postgres-backend P3-P5)"
-        )
+    async fn close_session(&self, session_id: &str, ended_at: &str) -> Result<(), StorageError> {
+        sqlx::query("UPDATE sessions SET ended_at = $1 WHERE session_id = $2")
+            .bind(ended_at)
+            .bind(session_id)
+            .execute(self.pool())
+            .await
+            .map_err(sqlx_err)?;
+        Ok(())
     }
 
     async fn latest_active_session(
         &self,
-        _tenant: &str,
-        _caller_agent: &str,
+        tenant: &str,
+        caller_agent: &str,
     ) -> Result<Option<Session>, StorageError> {
-        unimplemented!(
-            "postgres backend: SessionStore::latest_active_session not yet implemented (postgres-backend P3-P5)"
+        // Most-recent non-closed session for the identity. The Lance
+        // backend sorts collected rows by `last_seen_at DESC`; the
+        // trait doc says "most-recent". Postgres pushes the ORDER down.
+        let row = sqlx::query(
+            "SELECT session_id, tenant, caller_agent, started_at, last_seen_at, \
+                    ended_at, goal, memory_count \
+             FROM sessions \
+             WHERE tenant = $1 AND caller_agent = $2 AND ended_at IS NULL \
+             ORDER BY last_seen_at DESC \
+             LIMIT 1",
         )
+        .bind(tenant)
+        .bind(caller_agent)
+        .fetch_optional(self.pool())
+        .await
+        .map_err(sqlx_err)?;
+        row.as_ref().map(pg_row_to_session).transpose()
     }
 
-    async fn insert_episode(&self, _episode: EpisodeRecord) -> Result<EpisodeRecord, StorageError> {
-        unimplemented!(
-            "postgres backend: SessionStore::insert_episode not yet implemented (postgres-backend P3-P5)"
+    async fn insert_episode(&self, episode: EpisodeRecord) -> Result<EpisodeRecord, StorageError> {
+        // `workflow_candidate` is JSON-encoded into the nullable text
+        // column (same as the Lance backend). scope / visibility serialize
+        // to their snake_case wire form.
+        let workflow_json: Option<String> = match &episode.workflow_candidate {
+            Some(c) => Some(
+                serde_json::to_string(c)
+                    .map_err(|e| StorageError::InvalidInput(format!("workflow_candidate: {e}")))?,
+            ),
+            None => None,
+        };
+        sqlx::query(
+            "INSERT INTO episodes (episode_id, tenant, goal, steps, outcome, evidence, \
+                scope, visibility, project, repo, module, tags, source_agent, \
+                idempotency_key, created_at, updated_at, workflow_candidate) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17)",
         )
+        .bind(&episode.episode_id)
+        .bind(&episode.tenant)
+        .bind(&episode.goal)
+        .bind(&episode.steps)
+        .bind(&episode.outcome)
+        .bind(&episode.evidence)
+        .bind(enum_to_str_pub(&episode.scope)?)
+        .bind(enum_to_str_pub(&episode.visibility)?)
+        .bind(&episode.project)
+        .bind(&episode.repo)
+        .bind(&episode.module)
+        .bind(&episode.tags)
+        .bind(&episode.source_agent)
+        .bind(&episode.idempotency_key)
+        .bind(&episode.created_at)
+        .bind(&episode.updated_at)
+        .bind(&workflow_json)
+        .execute(self.pool())
+        .await
+        .map_err(sqlx_err)?;
+        Ok(episode)
     }
 
     async fn list_successful_episodes_for_tenant(
         &self,
-        _tenant: &str,
+        tenant: &str,
     ) -> Result<Vec<EpisodeRecord>, StorageError> {
-        unimplemented!(
-            "postgres backend: SessionStore::list_successful_episodes_for_tenant not yet implemented (postgres-backend P3-P5)"
+        // Trait contract: episodes whose `outcome = 'success'`. Ordered
+        // created_at DESC (the Lance backend's in-memory sort).
+        let rows = sqlx::query(
+            "SELECT episode_id, tenant, goal, steps, outcome, evidence, scope, \
+                    visibility, project, repo, module, tags, source_agent, \
+                    idempotency_key, created_at, updated_at, workflow_candidate \
+             FROM episodes \
+             WHERE tenant = $1 AND outcome = 'success' \
+             ORDER BY created_at DESC",
         )
+        .bind(tenant)
+        .fetch_all(self.pool())
+        .await
+        .map_err(sqlx_err)?;
+        rows.iter().map(pg_row_to_episode).collect()
     }
+}
+
+/// Project a `sessions` row into a [`Session`]. `memory_count` is
+/// BIGINT on disk (no unsigned PG type) → clamp back into `u32`.
+fn pg_row_to_session(row: &sqlx::postgres::PgRow) -> Result<Session, StorageError> {
+    let memory_count: i64 = row.try_get("memory_count").map_err(sqlx_err)?;
+    Ok(Session {
+        session_id: row.try_get("session_id").map_err(sqlx_err)?,
+        tenant: row.try_get("tenant").map_err(sqlx_err)?,
+        caller_agent: row.try_get("caller_agent").map_err(sqlx_err)?,
+        started_at: row.try_get("started_at").map_err(sqlx_err)?,
+        last_seen_at: row.try_get("last_seen_at").map_err(sqlx_err)?,
+        ended_at: row.try_get("ended_at").map_err(sqlx_err)?,
+        goal: row.try_get("goal").map_err(sqlx_err)?,
+        memory_count: u32::try_from(memory_count).unwrap_or(u32::MAX),
+    })
+}
+
+/// Project an `episodes` row into an [`EpisodeRecord`]. scope /
+/// visibility parse from their snake_case text; workflow_candidate
+/// JSON-decodes when present.
+fn pg_row_to_episode(row: &sqlx::postgres::PgRow) -> Result<EpisodeRecord, StorageError> {
+    use crate::domain::capability_capsule::{Scope, Visibility};
+    use crate::domain::workflow::WorkflowCandidate;
+
+    let scope_s: String = row.try_get("scope").map_err(sqlx_err)?;
+    let visibility_s: String = row.try_get("visibility").map_err(sqlx_err)?;
+    let scope: Scope = serde_json::from_value(serde_json::Value::String(scope_s))
+        .map_err(|_| StorageError::InvalidData("unknown episode scope"))?;
+    let visibility: Visibility = serde_json::from_value(serde_json::Value::String(visibility_s))
+        .map_err(|_| StorageError::InvalidData("unknown episode visibility"))?;
+    let workflow_raw: Option<String> = row.try_get("workflow_candidate").map_err(sqlx_err)?;
+    let workflow_candidate = match workflow_raw {
+        None => None,
+        Some(raw) => Some(
+            serde_json::from_str::<WorkflowCandidate>(&raw)
+                .map_err(|e| StorageError::InvalidInput(format!("workflow_candidate: {e}")))?,
+        ),
+    };
+    Ok(EpisodeRecord {
+        episode_id: row.try_get("episode_id").map_err(sqlx_err)?,
+        tenant: row.try_get("tenant").map_err(sqlx_err)?,
+        goal: row.try_get("goal").map_err(sqlx_err)?,
+        steps: row.try_get("steps").map_err(sqlx_err)?,
+        outcome: row.try_get("outcome").map_err(sqlx_err)?,
+        evidence: row.try_get("evidence").map_err(sqlx_err)?,
+        scope,
+        visibility,
+        project: row.try_get("project").map_err(sqlx_err)?,
+        repo: row.try_get("repo").map_err(sqlx_err)?,
+        module: row.try_get("module").map_err(sqlx_err)?,
+        tags: row.try_get("tags").map_err(sqlx_err)?,
+        source_agent: row.try_get("source_agent").map_err(sqlx_err)?,
+        idempotency_key: row.try_get("idempotency_key").map_err(sqlx_err)?,
+        created_at: row.try_get("created_at").map_err(sqlx_err)?,
+        updated_at: row.try_get("updated_at").map_err(sqlx_err)?,
+        workflow_candidate,
+    })
 }
 
 // ────────────────────────────── MaintenanceStore ──────────────────────────
@@ -1372,14 +1661,48 @@ impl SessionStore for PostgresCapsuleStore {
 impl MaintenanceStore for PostgresCapsuleStore {
     async fn apply_time_decay(
         &self,
-        _decay_rate_per_day: f64,
-        _now_ms: f64,
-        _ms_per_day: f64,
-        _now_ms_str: &str,
+        decay_rate_per_day: f64,
+        now_ms: f64,
+        ms_per_day: f64,
+        now_ms_str: &str,
     ) -> Result<(), StorageError> {
-        unimplemented!(
-            "postgres backend: MaintenanceStore::apply_time_decay not yet implemented (postgres-backend P3-P5)"
+        // Mirror the DuckDB decay sweep (duckdb_query/decay.rs) in PG
+        // dialect, in one transaction:
+        //   1. hard-expiry archive (expires_at deadline passed),
+        //   2. decay the active set, anchoring the clock on
+        //      COALESCE(last_used_at, updated_at) and advancing
+        //      last_used_at to now. Postgres supports COALESCE inside the
+        //      SET expression (the lance extension didn't, which is why
+        //      the DuckDB impl split into two NULL-disjoint passes); a
+        //      single statement is equivalent. Timestamps are 20-digit
+        //      zero-padded ms strings → cast to double precision for the
+        //      arithmetic. decay_score stays an additive accumulator,
+        //      capped at 1.0 via LEAST.
+        let mut tx = self.pool().begin().await.map_err(sqlx_err)?;
+        sqlx::query(
+            "UPDATE capability_capsules SET status = 'archived' \
+             WHERE status = 'active' AND expires_at IS NOT NULL AND expires_at <= $1",
         )
+        .bind(now_ms_str)
+        .execute(&mut *tx)
+        .await
+        .map_err(sqlx_err)?;
+        sqlx::query(
+            "UPDATE capability_capsules \
+             SET decay_score = LEAST(1.0, decay_score + $1 * \
+                     (($2 - COALESCE(last_used_at, updated_at)::double precision) / $3)), \
+                 last_used_at = $4 \
+             WHERE status = 'active' AND decay_score < 1.0",
+        )
+        .bind(decay_rate_per_day)
+        .bind(now_ms)
+        .bind(ms_per_day)
+        .bind(now_ms_str)
+        .execute(&mut *tx)
+        .await
+        .map_err(sqlx_err)?;
+        tx.commit().await.map_err(sqlx_err)?;
+        Ok(())
     }
 
     async fn vacuum_old_versions_with(
@@ -1387,21 +1710,48 @@ impl MaintenanceStore for PostgresCapsuleStore {
         _older_than_days: i64,
         _aggressive: bool,
     ) -> Result<VacuumStats, StorageError> {
-        unimplemented!(
-            "postgres backend: MaintenanceStore::vacuum_old_versions_with not yet implemented (postgres-backend P3-P5)"
-        )
+        // Lance manifest pruning has no Postgres analog (autovacuum
+        // handles dead tuples). No-op zero-stats, per the trait doc for
+        // non-Lance backends.
+        Ok(VacuumStats::default())
     }
 
     async fn auto_promote_candidates(
         &self,
-        _tenant: &str,
-        _cutoff_updated_at: &str,
-        _types: &[CapabilityCapsuleType],
-        _max_decay_score: f32,
+        tenant: &str,
+        cutoff_updated_at: &str,
+        types: &[CapabilityCapsuleType],
+        max_decay_score: f32,
     ) -> Result<Vec<CapabilityCapsuleRecord>, StorageError> {
-        unimplemented!(
-            "postgres backend: MaintenanceStore::auto_promote_candidates not yet implemented (postgres-backend P3-P5)"
-        )
+        // Empty `types` short-circuits (trait contract). Otherwise: the
+        // pending-confirmation rows past the cutoff with low decay and a
+        // type in the allow-list, ordered created_at ASC (matches the
+        // DuckDB read). `decay_score < $4` uses f64 like the DuckDB side.
+        if types.is_empty() {
+            return Ok(Vec::new());
+        }
+        let type_strs: Vec<String> = types
+            .iter()
+            .map(enum_to_str_pub)
+            .collect::<Result<Vec<_>, _>>()?;
+        let max_decay = max_decay_score as f64;
+        let sql = format!(
+            "SELECT {SELECT_COLUMNS} FROM capability_capsules \
+             WHERE tenant = $1 AND status = 'pending_confirmation' \
+               AND updated_at < $2 \
+               AND decay_score < $3 \
+               AND capability_capsule_type = ANY($4) \
+             ORDER BY created_at ASC"
+        );
+        let rows = sqlx::query(&sql)
+            .bind(tenant)
+            .bind(cutoff_updated_at)
+            .bind(max_decay)
+            .bind(&type_strs)
+            .fetch_all(self.pool())
+            .await
+            .map_err(sqlx_err)?;
+        rows.iter().map(pg_row_to_record).collect()
     }
 }
 
@@ -1411,22 +1761,50 @@ impl MaintenanceStore for PostgresCapsuleStore {
 impl MineCursorStore for PostgresCapsuleStore {
     async fn get_mine_cursor(
         &self,
-        _transcript_path: &str,
+        transcript_path: &str,
     ) -> Result<Option<MineCursor>, StorageError> {
-        unimplemented!(
-            "postgres backend: MineCursorStore::get_mine_cursor not yet implemented (postgres-backend P3-P5)"
+        let row = sqlx::query(
+            "SELECT transcript_path, last_line_number, updated_at \
+             FROM mine_cursors WHERE transcript_path = $1 LIMIT 1",
         )
+        .bind(transcript_path)
+        .fetch_optional(self.pool())
+        .await
+        .map_err(sqlx_err)?;
+        match row {
+            None => Ok(None),
+            Some(r) => Ok(Some(MineCursor {
+                transcript_path: r.try_get("transcript_path").map_err(sqlx_err)?,
+                last_line_number: r.try_get("last_line_number").map_err(sqlx_err)?,
+                updated_at: r.try_get("updated_at").map_err(sqlx_err)?,
+            })),
+        }
     }
 
     async fn upsert_mine_cursor(
         &self,
-        _transcript_path: &str,
-        _last_line_number: i64,
-        _updated_at: &str,
+        transcript_path: &str,
+        last_line_number: i64,
+        updated_at: &str,
     ) -> Result<(), StorageError> {
-        unimplemented!(
-            "postgres backend: MineCursorStore::upsert_mine_cursor not yet implemented (postgres-backend P3-P5)"
+        // INSERT ON CONFLICT(transcript_path) DO UPDATE — the real-PK
+        // analog of the Lance delete-then-add upsert. Monotonicity of
+        // last_line_number is a caller invariant, not enforced here
+        // (same as Lance).
+        sqlx::query(
+            "INSERT INTO mine_cursors (transcript_path, last_line_number, updated_at) \
+             VALUES ($1, $2, $3) \
+             ON CONFLICT (transcript_path) DO UPDATE \
+             SET last_line_number = EXCLUDED.last_line_number, \
+                 updated_at = EXCLUDED.updated_at",
         )
+        .bind(transcript_path)
+        .bind(last_line_number)
+        .bind(updated_at)
+        .execute(self.pool())
+        .await
+        .map_err(sqlx_err)?;
+        Ok(())
     }
 }
 
@@ -1436,20 +1814,105 @@ impl MineCursorStore for PostgresCapsuleStore {
 impl EvolutionCandidateStore for PostgresCapsuleStore {
     async fn upsert_evolution_candidate(
         &self,
-        _candidate: EvolutionCandidate,
+        candidate: EvolutionCandidate,
     ) -> Result<(), StorageError> {
-        unimplemented!(
-            "postgres backend: EvolutionCandidateStore::upsert_evolution_candidate not yet implemented (postgres-backend P3-P5)"
+        // Full-row upsert keyed on candidate_id. `member_ids` /
+        // `result_capsule_ids` (Vec<String>) JSON-encode into text
+        // columns — same on-disk shape as the Lance backend (which also
+        // stored them as JSON strings, not Arrow lists). `params` is
+        // already a JSON string; stored verbatim.
+        let member_ids = encode_id_list(&candidate.member_ids);
+        let result_ids = encode_id_list(&candidate.result_capsule_ids);
+        sqlx::query(
+            "INSERT INTO evolution_candidates (candidate_id, tenant, op_kind, member_ids, \
+                params, evidence, consecutive_cycles, status, first_proposed_at, \
+                last_signal_at, executed_at, result_capsule_ids) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12) \
+             ON CONFLICT (candidate_id) DO UPDATE SET \
+                tenant = EXCLUDED.tenant, \
+                op_kind = EXCLUDED.op_kind, \
+                member_ids = EXCLUDED.member_ids, \
+                params = EXCLUDED.params, \
+                evidence = EXCLUDED.evidence, \
+                consecutive_cycles = EXCLUDED.consecutive_cycles, \
+                status = EXCLUDED.status, \
+                first_proposed_at = EXCLUDED.first_proposed_at, \
+                last_signal_at = EXCLUDED.last_signal_at, \
+                executed_at = EXCLUDED.executed_at, \
+                result_capsule_ids = EXCLUDED.result_capsule_ids",
         )
+        .bind(&candidate.candidate_id)
+        .bind(&candidate.tenant)
+        .bind(&candidate.op_kind)
+        .bind(&member_ids)
+        .bind(&candidate.params)
+        .bind(candidate.evidence)
+        .bind(candidate.consecutive_cycles)
+        .bind(&candidate.status)
+        .bind(&candidate.first_proposed_at)
+        .bind(&candidate.last_signal_at)
+        .bind(&candidate.executed_at)
+        .bind(&result_ids)
+        .execute(self.pool())
+        .await
+        .map_err(sqlx_err)?;
+        Ok(())
     }
 
     async fn list_evolution_candidates(
         &self,
-        _tenant: &str,
-        _status: Option<&str>,
+        tenant: &str,
+        status: Option<&str>,
     ) -> Result<Vec<EvolutionCandidate>, StorageError> {
-        unimplemented!(
-            "postgres backend: EvolutionCandidateStore::list_evolution_candidates not yet implemented (postgres-backend P3-P5)"
+        // tenant + optional status, no pagination (sweep-time read of a
+        // small table). Optional status via `($2 IS NULL OR status = $2)`.
+        let rows = sqlx::query(
+            "SELECT candidate_id, tenant, op_kind, member_ids, params, evidence, \
+                    consecutive_cycles, status, first_proposed_at, last_signal_at, \
+                    executed_at, result_capsule_ids \
+             FROM evolution_candidates \
+             WHERE tenant = $1 AND ($2::TEXT IS NULL OR status = $2)",
         )
+        .bind(tenant)
+        .bind(status)
+        .fetch_all(self.pool())
+        .await
+        .map_err(sqlx_err)?;
+        rows.iter().map(pg_row_to_evolution_candidate).collect()
     }
+}
+
+/// Encode a `Vec<String>` id list as a JSON text array (the Lance
+/// backend's `encode_ids`). Lossless round-trip with
+/// [`decode_id_list`].
+fn encode_id_list(ids: &[String]) -> String {
+    serde_json::to_string(ids).unwrap_or_else(|_| "[]".to_string())
+}
+
+/// Decode a JSON text array back into a `Vec<String>` (Lance's
+/// `decode_ids`). Malformed / NULL-equivalent text → empty vec.
+fn decode_id_list(raw: &str) -> Vec<String> {
+    serde_json::from_str(raw).unwrap_or_default()
+}
+
+/// Project an `evolution_candidates` row into an [`EvolutionCandidate`].
+fn pg_row_to_evolution_candidate(
+    row: &sqlx::postgres::PgRow,
+) -> Result<EvolutionCandidate, StorageError> {
+    let member_ids: String = row.try_get("member_ids").map_err(sqlx_err)?;
+    let result_ids: String = row.try_get("result_capsule_ids").map_err(sqlx_err)?;
+    Ok(EvolutionCandidate {
+        candidate_id: row.try_get("candidate_id").map_err(sqlx_err)?,
+        tenant: row.try_get("tenant").map_err(sqlx_err)?,
+        op_kind: row.try_get("op_kind").map_err(sqlx_err)?,
+        member_ids: decode_id_list(&member_ids),
+        params: row.try_get("params").map_err(sqlx_err)?,
+        evidence: row.try_get("evidence").map_err(sqlx_err)?,
+        consecutive_cycles: row.try_get("consecutive_cycles").map_err(sqlx_err)?,
+        status: row.try_get("status").map_err(sqlx_err)?,
+        first_proposed_at: row.try_get("first_proposed_at").map_err(sqlx_err)?,
+        last_signal_at: row.try_get("last_signal_at").map_err(sqlx_err)?,
+        executed_at: row.try_get("executed_at").map_err(sqlx_err)?,
+        result_capsule_ids: decode_id_list(&result_ids),
+    })
 }
