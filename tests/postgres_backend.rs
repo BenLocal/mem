@@ -24,7 +24,8 @@ use mem::domain::capability_capsule::{
     CapabilityCapsuleRecord, CapabilityCapsuleStatus, CapabilityCapsuleType, Scope, Visibility,
 };
 use mem::storage::{
-    current_timestamp, CapsuleStore, EmbeddingVectorStore, FeedbackEvent, PostgresCapsuleStore,
+    current_timestamp, CapsuleSearchStore, CapsuleStore, EmbeddingVectorStore, FeedbackEvent,
+    PostgresCapsuleStore,
 };
 
 /// `Some(store)` on a fresh schema when `MEM_TEST_POSTGRES_URL` is set,
@@ -426,4 +427,348 @@ emb_test!(conversation_embedding_roundtrip, store, {
         .unwrap();
     let cnt = store.count_message_embedding_rows("msg1").await.unwrap();
     assert_eq!(cnt, 0, "conversation embedding gone after delete");
+});
+
+// ───────────────────── CapsuleSearchStore — hybrid (P4) ───────────────────
+//
+// Verifies the Postgres lexical (tsvector) / semantic (pgvector) / RRF
+// channels behave-align with the Lance backend. These assert PG's own
+// behaviour (cross-backend parity is hard to scaffold; the contract is
+// "same top hit set"). One case directly checks the RRF ordering against
+// `1/(60+rank)` summed — the exact formula in `pipeline::retrieve::sql_rrf`.
+//
+// CHINESE-TOKENIZATION NOTE: the 'simple' tsvector config splits on
+// whitespace/punctuation and has NO CJK segmenter, so a run of Han
+// characters is one token — sub-phrase lexical recall over Chinese is weak.
+// That is an accepted, documented limitation (see 0003_search.sql); pgvector
+// semantic recall + RRF cover Chinese. These tests therefore exercise
+// lexical recall with ASCII tokens only.
+
+/// Capsule fixture with explicit content + type, tenant "t".
+fn capsule_with(id: &str, content: &str, ty: CapabilityCapsuleType) -> CapabilityCapsuleRecord {
+    let mut c = fixture(id, CapabilityCapsuleStatus::Active);
+    c.capability_capsule_type = ty;
+    c.content = content.into();
+    c.content_hash = format!("{id:0>64}");
+    c
+}
+
+/// Insert a capsule + its (single-vector) embedding so the hybrid path has
+/// both channels to draw on.
+async fn seed(
+    store: &PostgresCapsuleStore,
+    id: &str,
+    content: &str,
+    ty: CapabilityCapsuleType,
+    vec: &[f32],
+) {
+    store
+        .insert_capability_capsule(capsule_with(id, content, ty))
+        .await
+        .unwrap();
+    store
+        .upsert_capability_capsule_embedding(
+            id,
+            "t",
+            "fake",
+            DIM as i64,
+            &blob_of(&vec_of(DIM, vec)),
+            "h",
+            "s",
+            "n",
+        )
+        .await
+        .unwrap();
+}
+
+emb_test!(bm25_finds_lexical_match, store, {
+    store
+        .insert_capability_capsule(capsule_with(
+            "lex_hit",
+            "configure the embedding batch size knob",
+            CapabilityCapsuleType::Experience,
+        ))
+        .await
+        .unwrap();
+    store
+        .insert_capability_capsule(capsule_with(
+            "lex_miss",
+            "completely unrelated transcript archive note",
+            CapabilityCapsuleType::Experience,
+        ))
+        .await
+        .unwrap();
+    let hits = store
+        .bm25_candidate_ids("t", "embedding batch", 10)
+        .await
+        .unwrap();
+    let ids: Vec<&str> = hits.iter().map(|(id, _)| id.as_str()).collect();
+    assert!(
+        ids.contains(&"lex_hit"),
+        "keyword capsule is recalled: {ids:?}"
+    );
+    assert!(
+        !ids.contains(&"lex_miss"),
+        "unrelated capsule not recalled: {ids:?}"
+    );
+    // ranks are 1-based and contiguous.
+    assert_eq!(hits[0].1, 1, "top hit has rank 1");
+});
+
+emb_test!(bm25_empty_query_is_empty, store, {
+    store
+        .insert_capability_capsule(capsule_with(
+            "x",
+            "anything",
+            CapabilityCapsuleType::Experience,
+        ))
+        .await
+        .unwrap();
+    assert!(store
+        .bm25_candidate_ids("t", "   ", 10)
+        .await
+        .unwrap()
+        .is_empty());
+});
+
+emb_test!(ann_finds_semantic_neighbor, store, {
+    // [1,0,..] nearest to query [1,0,..]; [0.9,0.1,..] second; [0,1,..] last.
+    seed(
+        &store,
+        "near",
+        "alpha",
+        CapabilityCapsuleType::Experience,
+        &[1.0, 0.0],
+    )
+    .await;
+    seed(
+        &store,
+        "mid",
+        "beta",
+        CapabilityCapsuleType::Experience,
+        &[0.9, 0.1],
+    )
+    .await;
+    seed(
+        &store,
+        "far",
+        "gamma",
+        CapabilityCapsuleType::Experience,
+        &[0.0, 1.0],
+    )
+    .await;
+    let hits = store
+        .ann_candidate_ids("t", &vec_of(DIM, &[1.0, 0.0]), 3)
+        .await
+        .unwrap();
+    let ids: Vec<&str> = hits.iter().map(|(id, _)| id.as_str()).collect();
+    assert_eq!(
+        ids,
+        vec!["near", "mid", "far"],
+        "ANN orders by cosine distance"
+    );
+    assert_eq!(hits[0].1, 1, "1-based rank");
+    assert_eq!(hits[1].1, 2);
+});
+
+emb_test!(ann_missing_embeddings_table_is_empty, store, {
+    // No embedding ever upserted → table not lazy-created → empty, no error.
+    let hits = store
+        .ann_candidate_ids("t", &vec_of(DIM, &[1.0, 0.0]), 5)
+        .await
+        .unwrap();
+    assert!(
+        hits.is_empty(),
+        "missing embeddings table short-circuits to empty"
+    );
+});
+
+emb_test!(hybrid_fuses_both, store, {
+    // lex_only: matches the text query, far embedding.
+    // sem_only: no keyword, embedding identical to query.
+    // both:     matches text AND near embedding → must rank first by RRF.
+    seed(
+        &store,
+        "lex_only",
+        "rust async runtime tokio scheduler",
+        CapabilityCapsuleType::Experience,
+        &[0.0, 1.0],
+    )
+    .await;
+    seed(
+        &store,
+        "sem_only",
+        "an entirely different unrelated topic",
+        CapabilityCapsuleType::Experience,
+        &[1.0, 0.0],
+    )
+    .await;
+    seed(
+        &store,
+        "both",
+        "rust async runtime done right",
+        CapabilityCapsuleType::Experience,
+        &[1.0, 0.0],
+    )
+    .await;
+
+    let fused = store
+        .hybrid_candidates("t", "rust async runtime", &vec_of(DIM, &[1.0, 0.0]), 10)
+        .await
+        .unwrap();
+    let ids: Vec<&str> = fused
+        .iter()
+        .map(|(c, _)| c.capability_capsule_id.as_str())
+        .collect();
+    assert_eq!(
+        ids.first(),
+        Some(&"both"),
+        "dual-channel hit ranks first: {ids:?}"
+    );
+    assert!(
+        ids.contains(&"lex_only") && ids.contains(&"sem_only"),
+        "single-channel hits still surface: {ids:?}"
+    );
+});
+
+emb_test!(hybrid_rrf_score_matches_formula, store, {
+    // Two capsules, distinct embeddings, no shared lexical token, query that
+    // matches NEITHER lexically → the fused score is purely the ANN channel:
+    // each capsule's rrf == 1/(60+rank_sem). Assert that exact value.
+    seed(
+        &store,
+        "v1",
+        "qqqqq",
+        CapabilityCapsuleType::Experience,
+        &[1.0, 0.0],
+    )
+    .await;
+    seed(
+        &store,
+        "v2",
+        "wwwww",
+        CapabilityCapsuleType::Experience,
+        &[0.0, 1.0],
+    )
+    .await;
+    let fused = store
+        .hybrid_candidates("t", "zzzzz", &vec_of(DIM, &[1.0, 0.0]), 10)
+        .await
+        .unwrap();
+    let by_id: std::collections::HashMap<&str, f32> = fused
+        .iter()
+        .map(|(c, s)| (c.capability_capsule_id.as_str(), *s))
+        .collect();
+    // v1 is the nearest neighbor (rank_sem 1), v2 is rank_sem 2.
+    let expect_rank1 = 1.0_f32 / (60.0 + 1.0);
+    let expect_rank2 = 1.0_f32 / (60.0 + 2.0);
+    assert!(
+        (by_id["v1"] - expect_rank1).abs() < 1e-6,
+        "v1 rrf == 1/(60+1): {}",
+        by_id["v1"]
+    );
+    assert!(
+        (by_id["v2"] - expect_rank2).abs() < 1e-6,
+        "v2 rrf == 1/(60+2): {}",
+        by_id["v2"]
+    );
+    // and the order respects the score.
+    assert_eq!(fused[0].0.capability_capsule_id, "v1");
+});
+
+emb_test!(search_candidates_respects_status_and_diary, store, {
+    store
+        .insert_capability_capsule(capsule_with(
+            "active1",
+            "live capsule",
+            CapabilityCapsuleType::Experience,
+        ))
+        .await
+        .unwrap();
+    store
+        .insert_capability_capsule(fixture("arch1", CapabilityCapsuleStatus::Archived))
+        .await
+        .unwrap();
+    store
+        .insert_capability_capsule(fixture("rej1", CapabilityCapsuleStatus::Rejected))
+        .await
+        .unwrap();
+    store
+        .insert_capability_capsule(capsule_with(
+            "diary1",
+            "diary entry",
+            CapabilityCapsuleType::Diary,
+        ))
+        .await
+        .unwrap();
+
+    let pool = store.search_candidates("t").await.unwrap();
+    let ids: Vec<&str> = pool
+        .iter()
+        .map(|c| c.capability_capsule_id.as_str())
+        .collect();
+    assert!(ids.contains(&"active1"), "active capsule in pool: {ids:?}");
+    assert!(!ids.contains(&"arch1"), "archived excluded: {ids:?}");
+    assert!(!ids.contains(&"rej1"), "rejected excluded: {ids:?}");
+    assert!(!ids.contains(&"diary1"), "diary excluded: {ids:?}");
+});
+
+emb_test!(search_candidates_dedups_superseded, store, {
+    // old <- new(supersedes old, active). search_candidates must drop `old`.
+    store
+        .insert_capability_capsule(capsule_with(
+            "old",
+            "version one",
+            CapabilityCapsuleType::Experience,
+        ))
+        .await
+        .unwrap();
+    let mut new = capsule_with("new", "version two", CapabilityCapsuleType::Experience);
+    new.supersedes_capability_capsule_id = Some("old".into());
+    store.insert_capability_capsule(new).await.unwrap();
+
+    let pool = store.search_candidates("t").await.unwrap();
+    let ids: Vec<&str> = pool
+        .iter()
+        .map(|c| c.capability_capsule_id.as_str())
+        .collect();
+    assert!(ids.contains(&"new"), "superseder present: {ids:?}");
+    assert!(
+        !ids.contains(&"old"),
+        "superseded-by-active row dropped: {ids:?}"
+    );
+});
+
+emb_test!(hybrid_excludes_archived_vec_only_hit, store, {
+    // Archived capsule with an embedding that matches the query: the ANN
+    // channel finds it, but the outer hydration filter must drop it (same as
+    // the Lance hybrid outer WHERE).
+    let mut arch = capsule_with("arch_vec", "qqq", CapabilityCapsuleType::Experience);
+    arch.status = CapabilityCapsuleStatus::Archived;
+    store.insert_capability_capsule(arch).await.unwrap();
+    store
+        .upsert_capability_capsule_embedding(
+            "arch_vec",
+            "t",
+            "fake",
+            DIM as i64,
+            &blob_of(&vec_of(DIM, &[1.0, 0.0])),
+            "h",
+            "s",
+            "n",
+        )
+        .await
+        .unwrap();
+    let fused = store
+        .hybrid_candidates("t", "", &vec_of(DIM, &[1.0, 0.0]), 10)
+        .await
+        .unwrap();
+    let ids: Vec<&str> = fused
+        .iter()
+        .map(|(c, _)| c.capability_capsule_id.as_str())
+        .collect();
+    assert!(
+        !ids.contains(&"arch_vec"),
+        "archived vec-only hit dropped post-fusion: {ids:?}"
+    );
 });

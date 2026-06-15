@@ -150,6 +150,10 @@ impl PostgresCapsuleStore {
         .execute(&pool)
         .await
         .map_err(sqlx_err)?;
+        sqlx::raw_sql(include_str!("../../migrations/postgres/0003_search.sql"))
+            .execute(&pool)
+            .await
+            .map_err(sqlx_err)?;
         Ok(Self { pool })
     }
 
@@ -206,6 +210,10 @@ impl PostgresCapsuleStore {
         .execute(&pool)
         .await
         .map_err(sqlx_err)?;
+        sqlx::raw_sql(include_str!("../../migrations/postgres/0003_search.sql"))
+            .execute(&pool)
+            .await
+            .map_err(sqlx_err)?;
         Ok(Self { pool })
     }
 }
@@ -232,7 +240,7 @@ fn try_get_string_list(
 /// backend's `enum_from_str` helper but uses the domain enums'
 /// `from_db_str` methods (added in the Phase 2 side-findings
 /// cleanup) where available, and serde for the rest.
-fn parse_status(s: &str) -> Result<CapabilityCapsuleStatus, StorageError> {
+pub(crate) fn parse_status(s: &str) -> Result<CapabilityCapsuleStatus, StorageError> {
     serde_json::from_value(serde_json::Value::String(s.to_string()))
         .map_err(|_| StorageError::InvalidData("unknown capsule status"))
 }
@@ -263,7 +271,9 @@ fn enum_to_str<T: serde::Serialize>(v: &T) -> Result<String, StorageError> {
 
 /// Project the 27-column row into a `CapabilityCapsuleRecord`.
 /// Column order matches `select_columns()` below.
-fn row_to_record(row: &sqlx::postgres::PgRow) -> Result<CapabilityCapsuleRecord, StorageError> {
+pub(crate) fn row_to_record(
+    row: &sqlx::postgres::PgRow,
+) -> Result<CapabilityCapsuleRecord, StorageError> {
     Ok(CapabilityCapsuleRecord {
         capability_capsule_id: row.try_get("capability_capsule_id").map_err(sqlx_err)?,
         tenant: row.try_get("tenant").map_err(sqlx_err)?,
@@ -303,7 +313,8 @@ fn row_to_record(row: &sqlx::postgres::PgRow) -> Result<CapabilityCapsuleRecord,
     })
 }
 
-const SELECT_COLUMNS: &str = "capability_capsule_id, tenant, capability_capsule_type, status, \
+pub(crate) const SELECT_COLUMNS: &str =
+    "capability_capsule_id, tenant, capability_capsule_type, status, \
     scope, visibility, version, summary, content, evidence, code_refs, project, repo, module, \
     task_type, tags, topics, confidence, decay_score, content_hash, idempotency_key, session_id, \
     supersedes_capability_capsule_id, source_agent, created_at, updated_at, last_validated_at, \

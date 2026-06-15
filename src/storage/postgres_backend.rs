@@ -36,101 +36,396 @@ use crate::storage::types::{
 };
 
 // ─────────────────────────── CapsuleSearchStore ───────────────────────────
+//
+// postgres-backend P4 — hybrid retrieval (pgvector ANN + tsvector BM25 +
+// RRF fusion), behaviour-aligned with the Lance/DuckDB backend in
+// `duckdb_query/capability_capsules.rs` and `pipeline/retrieve.rs`.
+//
+// Lance-semantic parity preserved:
+//   - `search_candidates`: live status (NOT rejected/archived), exclude
+//     `diary` type, exclude rows superseded by another *active* row
+//     (version-chain dedup), ordered `updated_at DESC, version DESC, id ASC`;
+//     optional `MEM_RECALL_POOL_LIMIT` lifecycle-pool cap with
+//     `preference`/`workflow` guidance floor-exempt.
+//   - `bm25_candidate_ids`: tsvector @@ plainto_tsquery('simple', q), live
+//     status + non-diary filter, 1-based rank by ts_rank DESC then id ASC.
+//   - `ann_candidate_ids`: pgvector `<=>` cosine distance, DISTINCT-ON dedup
+//     over chunk rows (min distance per capsule), 1-based rank; missing
+//     embeddings table short-circuits to empty (lazy-create parity).
+//   - `hybrid_candidates`: RRF over the two channels with the EXACT formula
+//     from `retrieve::sql_rrf` — `1/(60+rank)` per source, summed.
+//
+// per-source cap is a `pipeline::retrieve::finalize` concern (downstream of
+// this layer), not applied in the candidate SQL — same as Lance, whose
+// `hybrid_candidates` likewise does not apply the per-source cap.
+
+use super::CapsuleStore;
+
+/// RRF reciprocal-rank constant — mirrors `retrieve::sql_rrf` / the Lance
+/// `hybrid_candidates` SQL (`1.0 / (60.0 + rank)`). Kept as a named const so
+/// the two backends can't silently drift.
+const RRF_K: f32 = 60.0;
+
+/// Read the optional `MEM_RECALL_POOL_LIMIT` lifecycle-pool cap. Unset / 0 /
+/// invalid → `None` (unbounded full pool — default). Mirrors the Lance
+/// `search_candidates` env read.
+fn recall_pool_limit() -> Option<usize> {
+    std::env::var("MEM_RECALL_POOL_LIMIT")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .filter(|&n| n > 0)
+}
 
 #[async_trait]
 impl CapsuleSearchStore for PostgresCapsuleStore {
     async fn search_candidates(
         &self,
-        _tenant: &str,
+        tenant: &str,
     ) -> Result<Vec<CapabilityCapsuleRecord>, StorageError> {
-        unimplemented!(
-            "postgres backend: CapsuleSearchStore::search_candidates not yet implemented (postgres-backend P3-P5)"
-        )
+        // Live (non-rejected, non-archived), non-diary, version-chain
+        // deduped pool. Optional MEM_RECALL_POOL_LIMIT cap keeps all
+        // preference/workflow guidance plus the N most-recently-written
+        // other rows. `n` is a parsed usize, safe to interpolate; tenant
+        // is a bound param.
+        let pool_limit = recall_pool_limit();
+        let bound_clause = match pool_limit {
+            Some(n) => format!(
+                "AND (c.capability_capsule_type IN ('preference', 'workflow') \
+                      OR c.capability_capsule_id IN ( \
+                          SELECT capability_capsule_id FROM capability_capsules \
+                          WHERE tenant = $1 AND status NOT IN ('rejected', 'archived') \
+                            AND capability_capsule_type != 'diary' \
+                          ORDER BY updated_at DESC LIMIT {n} \
+                      )) "
+            ),
+            None => String::new(),
+        };
+        let cols = SELECT_COLUMNS
+            .split(',')
+            .map(|c| format!("c.{}", c.trim()))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let sql = format!(
+            "SELECT {cols} FROM capability_capsules c \
+             WHERE c.tenant = $1 AND c.status NOT IN ('rejected', 'archived') \
+               AND c.capability_capsule_type != 'diary' \
+               AND NOT EXISTS ( \
+                   SELECT 1 FROM capability_capsules s \
+                   WHERE s.supersedes_capability_capsule_id = c.capability_capsule_id \
+                     AND s.tenant = c.tenant AND s.status = 'active' \
+               ) \
+               {bound_clause}\
+             ORDER BY c.updated_at DESC, c.version DESC, c.capability_capsule_id ASC"
+        );
+        let rows = sqlx::query(&sql)
+            .bind(tenant)
+            .fetch_all(self.pool())
+            .await
+            .map_err(sqlx_err)?;
+        rows.iter().map(pg_row_to_record).collect()
     }
 
     async fn recent_active_capability_capsules(
         &self,
-        _tenant: &str,
-        _limit: usize,
+        tenant: &str,
+        limit: usize,
     ) -> Result<Vec<CapabilityCapsuleRecord>, StorageError> {
-        unimplemented!(
-            "postgres backend: CapsuleSearchStore::recent_active_capability_capsules not yet implemented (postgres-backend P3-P5)"
-        )
+        // Same live filter as the Lance fast path: non-rejected,
+        // non-archived, non-diary, ordered updated_at/version/id, bounded
+        // limit clamped to [1, 1024].
+        let lim = i64::try_from(limit).unwrap_or(64).clamp(1, 1024);
+        let sql = format!(
+            "SELECT {SELECT_COLUMNS} FROM capability_capsules \
+             WHERE tenant = $1 AND status NOT IN ('rejected', 'archived') \
+               AND capability_capsule_type != 'diary' \
+             ORDER BY updated_at DESC, version DESC, capability_capsule_id ASC \
+             LIMIT $2"
+        );
+        let rows = sqlx::query(&sql)
+            .bind(tenant)
+            .bind(lim)
+            .fetch_all(self.pool())
+            .await
+            .map_err(sqlx_err)?;
+        rows.iter().map(pg_row_to_record).collect()
     }
 
     async fn fetch_capability_capsules_by_ids(
         &self,
-        _tenant: &str,
-        _ids: &[&str],
+        tenant: &str,
+        ids: &[&str],
     ) -> Result<Vec<CapabilityCapsuleRecord>, StorageError> {
-        unimplemented!(
-            "postgres backend: CapsuleSearchStore::fetch_capability_capsules_by_ids not yet implemented (postgres-backend P3-P5)"
-        )
+        // Identical contract to CapsuleStore::fetch_capability_capsules_by_ids
+        // (same columns, same `tenant + id = ANY($2)` shape, empty
+        // short-circuit, no order guarantee) — reuse it directly.
+        CapsuleStore::fetch_capability_capsules_by_ids(self, tenant, ids).await
     }
 
     async fn list_capability_capsule_ids_for_tenant(
         &self,
-        _tenant: &str,
+        tenant: &str,
     ) -> Result<Vec<String>, StorageError> {
-        unimplemented!(
-            "postgres backend: CapsuleSearchStore::list_capability_capsule_ids_for_tenant not yet implemented (postgres-backend P3-P5)"
+        // Project just the id column, ordered updated_at DESC. Admin reads
+        // are NOT status/diary/supersede filtered (Lance does the same).
+        let rows = sqlx::query(
+            "SELECT capability_capsule_id FROM capability_capsules \
+             WHERE tenant = $1 ORDER BY updated_at DESC",
         )
+        .bind(tenant)
+        .fetch_all(self.pool())
+        .await
+        .map_err(sqlx_err)?;
+        rows.iter()
+            .map(|r| {
+                r.try_get::<String, _>("capability_capsule_id")
+                    .map_err(sqlx_err)
+            })
+            .collect()
     }
 
     async fn list_capability_capsule_versions_for_tenant(
         &self,
-        _tenant: &str,
-        _capability_capsule_id: &str,
+        tenant: &str,
+        capability_capsule_id: &str,
     ) -> Result<Vec<CapabilityCapsuleVersionLink>, StorageError> {
-        unimplemented!(
-            "postgres backend: CapsuleSearchStore::list_capability_capsule_versions_for_tenant not yet implemented (postgres-backend P3-P5)"
+        // Recursive walk of the supersedes link, both directions
+        // (predecessors + successors), tenant-filtered at every step,
+        // ordered version DESC, updated_at DESC — mirrors the Lance
+        // recursive CTE.
+        let rows = sqlx::query(
+            "WITH RECURSIVE chain AS ( \
+                SELECT capability_capsule_id, version, status, updated_at, \
+                       supersedes_capability_capsule_id \
+                FROM capability_capsules \
+                WHERE tenant = $1 AND capability_capsule_id = $2 \
+              UNION \
+                SELECT c.capability_capsule_id, c.version, c.status, c.updated_at, \
+                       c.supersedes_capability_capsule_id \
+                FROM capability_capsules c \
+                JOIN chain ch \
+                  ON c.capability_capsule_id = ch.supersedes_capability_capsule_id \
+                  OR c.supersedes_capability_capsule_id = ch.capability_capsule_id \
+                WHERE c.tenant = $1 \
+            ) \
+            SELECT capability_capsule_id, version, status, updated_at, \
+                   supersedes_capability_capsule_id \
+            FROM chain \
+            ORDER BY version DESC, updated_at DESC",
         )
+        .bind(tenant)
+        .bind(capability_capsule_id)
+        .fetch_all(self.pool())
+        .await
+        .map_err(sqlx_err)?;
+        rows.iter()
+            .map(|r| {
+                Ok(CapabilityCapsuleVersionLink {
+                    capability_capsule_id: r.try_get("capability_capsule_id").map_err(sqlx_err)?,
+                    version: r.try_get("version").map_err(sqlx_err)?,
+                    status: parse_status_pub(&r.try_get::<String, _>("status").map_err(sqlx_err)?)?,
+                    updated_at: r.try_get("updated_at").map_err(sqlx_err)?,
+                    supersedes_capability_capsule_id: r
+                        .try_get("supersedes_capability_capsule_id")
+                        .map_err(sqlx_err)?,
+                })
+            })
+            .collect()
     }
 
     async fn hybrid_candidates(
         &self,
-        _tenant: &str,
-        _query_text: &str,
-        _query_embedding: &[f32],
-        _k: usize,
+        tenant: &str,
+        query_text: &str,
+        query_embedding: &[f32],
+        k: usize,
     ) -> Result<Vec<(CapabilityCapsuleRecord, f32)>, StorageError> {
-        unimplemented!(
-            "postgres backend: CapsuleSearchStore::hybrid_candidates not yet implemented (postgres-backend P3-P5)"
-        )
+        // Postgres routes the fused path through the portable compose form
+        // (the Lance fused-SQL fast path is lance-extension specific). Same
+        // outputs within f32 rounding per the trait doc.
+        self.hybrid_candidates_compose(tenant, query_text, query_embedding, k)
+            .await
     }
 
     async fn hybrid_candidates_compose(
         &self,
-        _tenant: &str,
-        _query_text: &str,
-        _query_embedding: &[f32],
-        _k: usize,
+        tenant: &str,
+        query_text: &str,
+        query_embedding: &[f32],
+        k: usize,
     ) -> Result<Vec<(CapabilityCapsuleRecord, f32)>, StorageError> {
-        unimplemented!(
-            "postgres backend: CapsuleSearchStore::hybrid_candidates_compose not yet implemented (postgres-backend P3-P5)"
-        )
+        let has_text = !query_text.trim().is_empty();
+        let has_vec = !query_embedding.is_empty();
+        if (!has_text && !has_vec) || k == 0 {
+            return Ok(Vec::new());
+        }
+        // Oversample mirrors the Lance fused query: FTS over the one-row-per-
+        // capsule table gets k*2; the ANN channel gets k*4 because its
+        // embeddings table holds N chunk-rows per capsule that collapse to
+        // fewer distinct capsules after the per-capsule dedup.
+        let lex = self
+            .bm25_candidate_ids(tenant, query_text, k.saturating_mul(2))
+            .await?;
+        let sem = self
+            .ann_candidate_ids(tenant, query_embedding, k.saturating_mul(4))
+            .await?;
+
+        // Rust-side RRF, byte-identical to retrieve::sql_rrf: per id, sum
+        // 1/(RRF_K + rank) over whichever channels it appears in. `rank`
+        // is the 1-based rank from each channel.
+        use std::collections::HashMap;
+        let mut rrf: HashMap<String, f32> = HashMap::new();
+        for (id, rank) in &lex {
+            *rrf.entry(id.clone()).or_insert(0.0) += 1.0 / (RRF_K + *rank as f32);
+        }
+        for (id, rank) in &sem {
+            *rrf.entry(id.clone()).or_insert(0.0) += 1.0 / (RRF_K + *rank as f32);
+        }
+        if rrf.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        // Hydrate the fused ids, then apply the SAME outer filter the Lance
+        // hybrid query applies post-fusion: live status, non-diary, and
+        // version-chain dedup (drop rows superseded by an active row). The
+        // ANN channel carries no status/type columns, so vec-only hits that
+        // point at archived/rejected/diary/superseded rows are dropped here.
+        let owned_ids: Vec<String> = rrf.keys().cloned().collect();
+        let hydrate_sql = format!(
+            "SELECT {SELECT_COLUMNS} FROM capability_capsules m \
+             WHERE m.tenant = $1 AND m.capability_capsule_id = ANY($2) \
+               AND m.status NOT IN ('rejected', 'archived') \
+               AND m.capability_capsule_type != 'diary' \
+               AND NOT EXISTS ( \
+                   SELECT 1 FROM capability_capsules s \
+                   WHERE s.supersedes_capability_capsule_id = m.capability_capsule_id \
+                     AND s.tenant = m.tenant AND s.status = 'active' \
+               )"
+        );
+        let hydrated_rows = sqlx::query(&hydrate_sql)
+            .bind(tenant)
+            .bind(&owned_ids)
+            .fetch_all(self.pool())
+            .await
+            .map_err(sqlx_err)?;
+        let hydrated: Vec<CapabilityCapsuleRecord> = hydrated_rows
+            .iter()
+            .map(pg_row_to_record)
+            .collect::<Result<_, _>>()?;
+
+        let mut scored: Vec<(CapabilityCapsuleRecord, f32)> = hydrated
+            .into_iter()
+            .filter_map(|rec| rrf.get(&rec.capability_capsule_id).map(|s| (rec, *s)))
+            .collect();
+        // Order: rrf_score DESC, updated_at DESC, id ASC — matches the Lance
+        // ORDER BY. f32 total order via partial_cmp (scores are finite).
+        scored.sort_by(|a, b| {
+            b.1.partial_cmp(&a.1)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| b.0.updated_at.cmp(&a.0.updated_at))
+                .then_with(|| a.0.capability_capsule_id.cmp(&b.0.capability_capsule_id))
+        });
+        scored.truncate(k);
+        Ok(scored)
     }
 
     async fn bm25_candidate_ids(
         &self,
-        _tenant: &str,
-        _query_text: &str,
-        _k: usize,
+        tenant: &str,
+        query_text: &str,
+        k: usize,
     ) -> Result<Vec<(String, i64)>, StorageError> {
-        unimplemented!(
-            "postgres backend: CapsuleSearchStore::bm25_candidate_ids not yet implemented (postgres-backend P3-P5)"
+        if query_text.trim().is_empty() || k == 0 {
+            return Ok(Vec::new());
+        }
+        let k_i = i64::try_from(k).unwrap_or(64).clamp(1, 1024);
+        // tsvector @@ plainto_tsquery('simple', q) — same 'simple' config as
+        // the generated column. Live status + non-diary filter mirrors the
+        // Lance bm25 CTE. 1-based rank by ts_rank DESC, id ASC (the Lance
+        // `_score DESC, id ASC` tiebreak). NULL plainto_tsquery (all-stopword
+        // / empty after tokenize) yields no matches — fine, returns empty.
+        let rows = sqlx::query(
+            "SELECT capability_capsule_id, \
+                    ROW_NUMBER() OVER ( \
+                        ORDER BY ts_rank(content_tsv, plainto_tsquery('simple', $2)) DESC, \
+                                 capability_capsule_id ASC \
+                    ) AS rank_lex \
+             FROM capability_capsules \
+             WHERE tenant = $1 \
+               AND status NOT IN ('rejected', 'archived') \
+               AND capability_capsule_type != 'diary' \
+               AND content_tsv @@ plainto_tsquery('simple', $2) \
+             ORDER BY rank_lex \
+             LIMIT $3",
         )
+        .bind(tenant)
+        .bind(query_text)
+        .bind(k_i)
+        .fetch_all(self.pool())
+        .await
+        .map_err(sqlx_err)?;
+        rows.iter()
+            .map(|r| {
+                Ok((
+                    r.try_get::<String, _>("capability_capsule_id")
+                        .map_err(sqlx_err)?,
+                    r.try_get::<i64, _>("rank_lex").map_err(sqlx_err)?,
+                ))
+            })
+            .collect()
     }
 
     async fn ann_candidate_ids(
         &self,
-        _tenant: &str,
-        _query_embedding: &[f32],
-        _k: usize,
+        tenant: &str,
+        query_embedding: &[f32],
+        k: usize,
     ) -> Result<Vec<(String, i64)>, StorageError> {
-        unimplemented!(
-            "postgres backend: CapsuleSearchStore::ann_candidate_ids not yet implemented (postgres-backend P3-P5)"
+        if query_embedding.is_empty() || k == 0 {
+            return Ok(Vec::new());
+        }
+        // Lazy-create parity: if no upsert has created the embeddings table
+        // yet, there are no candidates — return empty rather than error
+        // (mirrors the Lance "embeddings dataset missing" short-circuit).
+        if !embeddings_table_exists(self, "capability_capsule_embeddings").await? {
+            return Ok(Vec::new());
+        }
+        let k_i = i64::try_from(k).unwrap_or(64).clamp(1, 1024);
+        // pgvector cosine distance `<=>`. The embeddings table holds N chunk
+        // rows per capsule; dedup to one row per capsule taking the nearest
+        // (min distance) chunk — the analog of the Lance `GROUP BY
+        // capability_capsule_id, MIN(_distance)` collapse. DISTINCT ON keeps
+        // the closest chunk per id (ORDER BY id, distance), then the outer
+        // query ranks those by distance ASC, id ASC (1-based).
+        let qv = pgvector::Vector::from(query_embedding.to_vec());
+        let rows = sqlx::query(
+            "SELECT capability_capsule_id, \
+                    ROW_NUMBER() OVER (ORDER BY best_distance ASC, capability_capsule_id ASC) \
+                        AS rank_sem \
+             FROM ( \
+                 SELECT DISTINCT ON (capability_capsule_id) \
+                        capability_capsule_id, (embedding <=> $1) AS best_distance \
+                 FROM capability_capsule_embeddings \
+                 WHERE tenant = $2 \
+                 ORDER BY capability_capsule_id, embedding <=> $1 \
+             ) d \
+             ORDER BY rank_sem \
+             LIMIT $3",
         )
+        .bind(qv)
+        .bind(tenant)
+        .bind(k_i)
+        .fetch_all(self.pool())
+        .await
+        .map_err(sqlx_err)?;
+        rows.iter()
+            .map(|r| {
+                Ok((
+                    r.try_get::<String, _>("capability_capsule_id")
+                        .map_err(sqlx_err)?,
+                    r.try_get::<i64, _>("rank_sem").map_err(sqlx_err)?,
+                ))
+            })
+            .collect()
     }
 }
 
@@ -349,7 +644,9 @@ impl EmbeddingJobStore for PostgresCapsuleStore {
 
 use sqlx::Row as _;
 
-use super::postgres_capsule_store::sqlx_err;
+use super::postgres_capsule_store::{
+    parse_status as parse_status_pub, row_to_record as pg_row_to_record, sqlx_err, SELECT_COLUMNS,
+};
 use crate::embedding::wire::decode_f32_blob;
 
 /// Lazy-create the `capability_capsule_embeddings` table at the given
