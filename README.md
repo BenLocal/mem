@@ -30,6 +30,29 @@ The MCP server forwards 20 tools to the HTTP service over `MEM_BASE_URL` (defaul
 | `MEM_TENANT` | `local` | Default tenant when a tool omits it |
 | `MEM_MCP_EXPOSE_EMBEDDINGS` | unset | Set to `1` to enable admin `embeddings_*` tools |
 
+## Storage backends
+
+`mem` has two interchangeable storage backends behind one `Backend` trait. The default needs no setup; Postgres is opt-in for teams that already run Postgres and want a single shared store.
+
+| Backend | Select with | Storage | Notes |
+|---------|-------------|---------|-------|
+| **Lance + DuckDB** (default) | `MEM_BACKEND=lance` (or unset) | On-disk Lance datasets at `MEM_DB_PATH`, queried via an in-process DuckDB with the `lance` extension | Zero external services. The standard single-node deployment. |
+| **Postgres** | `MEM_BACKEND=postgres` + `MEM_POSTGRES_URL=…` | A Postgres database with the [`pgvector`](https://github.com/pgvector/pgvector) extension | ANN via pgvector, BM25 via `tsvector`/GIN, hybrid recall fused with RRF. Build with `--features postgres`. |
+
+The Postgres backend is gated behind the `postgres` cargo feature, so the default build does not pull `sqlx`/`pgvector` into the dependency graph:
+
+```bash
+# Build + run with the Postgres backend.
+cargo build --features postgres
+MEM_BACKEND=postgres \
+MEM_POSTGRES_URL='postgres://user:pass@localhost:5432/mem' \
+  ./target/debug/mem serve     # or target/release/mem after a release build
+```
+
+- The database must have `pgvector` available (`CREATE EXTENSION vector;` — the image [`pgvector/pgvector:pg16`](https://hub.docker.com/r/pgvector/pgvector) ships it). Schema migrations (`migrations/postgres/0001`–`0004`) are applied idempotently on connect; no manual setup needed.
+- Embedding dimension is provider-dependent (default 1024). The pgvector embedding tables are lazy-created on first upsert with the running provider's dim — changing the embedding provider/dim means recreating those tables.
+- Selecting `MEM_BACKEND=postgres` without `--features postgres` is a startup error; with the default build, `MEM_BACKEND` is ignored and Lance is always used.
+
 ## Cross-compile server (Linux binary)
 
 The config file is **`Cross.toml`** at the repo root (the `cross` CLI always reads that exact filename; set the `CROSS_CONFIG` environment variable to use a different path).

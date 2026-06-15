@@ -46,6 +46,48 @@ jobs:
       - run: cargo clippy --all-targets -- -D warnings
       - run: cargo test
 
+  # Opt-in Postgres backend (the `postgres` cargo feature). Spins up a
+  # pgvector-enabled Postgres service container and runs the
+  # feature-gated parity suite (tests/postgres_backend.rs) + clippy over
+  # the feature-gated code. The default `rust` job above covers
+  # everything else; this only gates the Postgres backend.
+  postgres:
+    runs-on: ubuntu-latest
+    env:
+      CARGO_PROFILE_TEST_DEBUG: "0"
+    services:
+      postgres:
+        image: pgvector/pgvector:pg16
+        env:
+          POSTGRES_PASSWORD: mem
+          POSTGRES_DB: mem
+        ports:
+          - 5432:5432
+        # Wait for the DB to accept connections before the job's steps run.
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: rust-postgres
+      # `--features postgres` is additive — it still compiles lance, whose
+      # build script needs a recent protoc (see the `rust` job).
+      - uses: arduino/setup-protoc@v3
+        with:
+          version: "27.x"
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+      - run: cargo clippy --features postgres --all-targets -- -D warnings
+      - run: cargo test --features postgres --test postgres_backend
+        env:
+          MEM_TEST_POSTGRES_URL: postgres://postgres:mem@localhost:5432/mem
+
   rust-cross:
     runs-on: ubuntu-latest
     steps:
