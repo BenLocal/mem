@@ -43,6 +43,56 @@ impl PostgresCapsuleStore {
     pub fn new(pool: PgPool) -> Self {
         Self { pool }
     }
+
+    /// Borrow the underlying pool (later phases build a full
+    /// `PostgresBackend` from the same pool).
+    pub fn pool(&self) -> &PgPool {
+        &self.pool
+    }
+
+    /// Connect to `url` on a **fresh, isolated Postgres schema** and
+    /// apply the `0001_capsule_store` migration into it. Each call
+    /// creates a unique `mem_test_<uuid>` schema and pins every pooled
+    /// connection's `search_path` to it, so integration tests run fully
+    /// parallel on one shared database without colliding (the obvious
+    /// "drop + recreate shared tables" approach races under cargo's
+    /// default multi-thread test runner). Keeps all `sqlx` usage inside
+    /// the crate so tests need no direct `sqlx` dependency. Test/CI only.
+    pub async fn connect_fresh(url: &str) -> Result<Self, StorageError> {
+        use sqlx::postgres::{PgConnectOptions, PgPoolOptions};
+        use std::str::FromStr;
+
+        let schema = format!("mem_test_{}", uuid::Uuid::new_v4().simple());
+        let base = PgConnectOptions::from_str(url).map_err(sqlx_err)?;
+
+        // Bootstrap connection just to create the per-test schema.
+        let bootstrap = PgPoolOptions::new()
+            .max_connections(1)
+            .connect_with(base.clone())
+            .await
+            .map_err(sqlx_err)?;
+        sqlx::raw_sql(&format!("CREATE SCHEMA \"{schema}\";"))
+            .execute(&bootstrap)
+            .await
+            .map_err(sqlx_err)?;
+        bootstrap.close().await;
+
+        // Real pool: every connection resolves unqualified table names
+        // in the isolated schema via search_path.
+        let opts = base.options([("search_path", schema.as_str())]);
+        let pool = PgPoolOptions::new()
+            .max_connections(8)
+            .connect_with(opts)
+            .await
+            .map_err(sqlx_err)?;
+        sqlx::raw_sql(include_str!(
+            "../../migrations/postgres/0001_capsule_store.sql"
+        ))
+        .execute(&pool)
+        .await
+        .map_err(sqlx_err)?;
+        Ok(Self { pool })
+    }
 }
 
 /// Map sqlx errors to `StorageError`. sqlx has rich error variants
