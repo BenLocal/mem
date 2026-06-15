@@ -76,6 +76,55 @@ pub struct DuckDbQuery {
     pub(super) dirty: Arc<std::sync::atomic::AtomicBool>,
 }
 
+/// Env var capping DuckDB's intra-query thread pool (`SET threads`).
+const DUCKDB_THREADS_ENV: &str = "MEM_DUCKDB_THREADS";
+
+/// Default DuckDB intra-query thread cap. DuckDB otherwise defaults to
+/// one thread per core; on a many-core box a single read fanned out
+/// across all cores and drove the CPU spikes seen in the thread-leak
+/// incident (see `docs/duckdb-read-path-strategy.md`). 6 is ample for
+/// mem's read sizes. Overridable via `MEM_DUCKDB_THREADS` (invalid /
+/// non-positive values silently fall back to this default).
+const DEFAULT_DUCKDB_THREADS: u32 = 6;
+
+/// Parse the `MEM_DUCKDB_THREADS` value. `None` / non-numeric / `0`
+/// (DuckDB treats 0 as "auto = one thread per core", which re-opens the
+/// CPU spike) all fall back to [`DEFAULT_DUCKDB_THREADS`].
+fn parse_duckdb_threads(raw: Option<String>) -> u32 {
+    raw.and_then(|v| v.parse::<u32>().ok())
+        .filter(|&n| n > 0)
+        .unwrap_or(DEFAULT_DUCKDB_THREADS)
+}
+
+/// Live read of the configured DuckDB thread cap.
+fn duckdb_threads() -> u32 {
+    parse_duckdb_threads(std::env::var(DUCKDB_THREADS_ENV).ok())
+}
+
+/// Build a fresh read connection: in-memory DuckDB + `lance` extension +
+/// `ATTACH` of the dataset directory + a capped intra-query thread
+/// pool. Shared by [`DuckDbQuery::open`] and [`DuckDbQuery::refresh`] so
+/// the connection setup cannot drift between the two paths.
+///
+/// Why a brand-new connection every refresh (not a cheap re-attach):
+/// the lance extension pins the dataset version per connection, and
+/// `tests/lance_snapshot_visibility.rs` proves NO same-connection
+/// re-attach primitive (`DETACH`+`ATTACH`, `ATTACH OR REPLACE`) clears
+/// that cache — only a fresh `Connection` sees post-attach Rust-API
+/// writes. The ~100ms rebuild is therefore intrinsic to this attach
+/// route; see `docs/duckdb-read-path-strategy.md`.
+fn build_lance_connection(lance_path: &Path) -> Result<Connection, StorageError> {
+    let path_str = lance_path
+        .to_str()
+        .ok_or(StorageError::InvalidData("lance path must be UTF-8"))?;
+    let escaped = path_str.replace('\'', "''");
+    let c = Connection::open_in_memory()?;
+    c.execute_batch("INSTALL lance; LOAD lance;")?;
+    c.execute_batch(&format!("ATTACH '{escaped}' AS ns (TYPE LANCE);"))?;
+    c.execute_batch(&format!("SET threads = {};", duckdb_threads()))?;
+    Ok(c)
+}
+
 impl DuckDbQuery {
     /// Open an in-memory DuckDB, install + load the `lance` core
     /// extension, and ATTACH `lance_path` as namespace `ns`. The
@@ -101,18 +150,9 @@ impl DuckDbQuery {
     pub async fn open(lance_path: impl AsRef<Path>) -> Result<Self, StorageError> {
         let path = lance_path.as_ref().to_path_buf();
         let path_for_thread = path.clone();
-        let conn = tokio::task::spawn_blocking(move || -> Result<Connection, StorageError> {
-            let path_str = path_for_thread
-                .to_str()
-                .ok_or(StorageError::InvalidData("lance path must be UTF-8"))?;
-            let escaped = path_str.replace('\'', "''");
-            let c = Connection::open_in_memory()?;
-            c.execute_batch("INSTALL lance; LOAD lance;")?;
-            c.execute_batch(&format!("ATTACH '{escaped}' AS ns (TYPE LANCE);"))?;
-            Ok(c)
-        })
-        .await
-        .map_err(|e| StorageError::InvalidInput(format!("spawn_blocking join: {e}")))??;
+        let conn = tokio::task::spawn_blocking(move || build_lance_connection(&path_for_thread))
+            .await
+            .map_err(|e| StorageError::InvalidInput(format!("spawn_blocking join: {e}")))??;
         Ok(Self {
             conn: Arc::new(Mutex::new(conn)),
             lance_path: path,
@@ -190,13 +230,7 @@ impl DuckDbQuery {
         let conn_arc = self.conn.clone();
         let path = self.lance_path.clone();
         tokio::task::spawn_blocking(move || -> Result<(), StorageError> {
-            let path_str = path
-                .to_str()
-                .ok_or(StorageError::InvalidData("lance path must be UTF-8"))?;
-            let escaped = path_str.replace('\'', "''");
-            let new_conn = Connection::open_in_memory()?;
-            new_conn.execute_batch("INSTALL lance; LOAD lance;")?;
-            new_conn.execute_batch(&format!("ATTACH '{escaped}' AS ns (TYPE LANCE);"))?;
+            let new_conn = build_lance_connection(&path)?;
             // Swap the inner connection. Previous prepared
             // statements are dropped along with the old conn — that
             // matters if a caller cached a `Statement` outside the
@@ -325,4 +359,51 @@ pub(super) fn get_string_list(row: &duckdb::Row<'_>, idx: usize) -> duckdb::Resu
             )),
         })
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::storage::lance_store::LanceStore;
+    use tempfile::tempdir;
+
+    #[test]
+    fn parse_duckdb_threads_defaults_and_validates() {
+        // Unset → default.
+        assert_eq!(parse_duckdb_threads(None), DEFAULT_DUCKDB_THREADS);
+        // Non-numeric / empty → default (invalid silently falls back).
+        assert_eq!(
+            parse_duckdb_threads(Some("abc".into())),
+            DEFAULT_DUCKDB_THREADS
+        );
+        assert_eq!(
+            parse_duckdb_threads(Some("".into())),
+            DEFAULT_DUCKDB_THREADS
+        );
+        // 0 is the footgun (DuckDB treats 0 as "auto = one per core",
+        // re-opening the CPU spike). Reject it → default.
+        assert_eq!(
+            parse_duckdb_threads(Some("0".into())),
+            DEFAULT_DUCKDB_THREADS
+        );
+        // Valid positive int passes through.
+        assert_eq!(parse_duckdb_threads(Some("4".into())), 4);
+        assert_eq!(parse_duckdb_threads(Some("1".into())), 1);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn build_lance_connection_applies_thread_cap() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("store");
+        // LanceStore::open creates the dir + datasets so ATTACH succeeds.
+        let _lance = LanceStore::open(&path).await.unwrap();
+        let conn = build_lance_connection(&path).unwrap();
+        // DuckDB's `current_setting('threads')` reflects the SET we ran.
+        let threads: String = conn
+            .query_row("SELECT current_setting('threads')::VARCHAR", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(threads, DEFAULT_DUCKDB_THREADS.to_string());
+    }
 }

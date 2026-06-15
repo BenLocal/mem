@@ -40,8 +40,25 @@ enum Command {
     FeedbackFromTranscript(mem::cli::feedback::FeedbackFromTranscriptArgs),
 }
 
-#[tokio::main]
-async fn main() -> error::Result<()> {
+fn main() -> error::Result<()> {
+    // Build the runtime explicitly instead of `#[tokio::main]` so we can
+    // cap `max_blocking_threads`. tokio's default is 512; on a many-core
+    // box mem's heavy `spawn_blocking` load (every DuckDB read serializes
+    // through `spawn_blocking_storage`; local embedding inference is
+    // blocking) balloons the blocking pool toward that ceiling. A long-
+    // lived `mem serve` was holding 500-800 `tokio-rt-worker` threads
+    // (~11 GB RSS) with periodic CPU spikes — confirmed via `kernel_clone`
+    // tracing. The DuckDB reads serialize on a single mutex anyway, so a
+    // large blocking pool buys no throughput; it just piles up idle
+    // thread stacks. 32 is plenty for the embedding + mutex-bound reads.
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .max_blocking_threads(32)
+        .build()?;
+    runtime.block_on(async_main())
+}
+
+async fn async_main() -> error::Result<()> {
     let cli = Cli::parse();
     let command = cli.command.unwrap_or(Command::Serve);
 
