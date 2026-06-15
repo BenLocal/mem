@@ -32,24 +32,24 @@ The MCP server forwards 20 tools to the HTTP service over `MEM_BASE_URL` (defaul
 
 ## Cross-compile server (Linux binary)
 
-配置文件为仓库根目录的 **`Cross.toml`**（`cross` CLI 固定读取该文件名；若要用别的路径可设环境变量 `CROSS_CONFIG`）。
+The config file is **`Cross.toml`** at the repo root (the `cross` CLI always reads that exact filename; set the `CROSS_CONFIG` environment variable to use a different path).
 
 ```bash
 cargo install cross --locked
 cross build --release
 ```
 
-二进制：`target/x86_64-unknown-linux-gnu/release/mem`。静态 **musl** 构建：
+Binary: `target/x86_64-unknown-linux-gnu/release/mem`. Static **musl** build:
 
 ```bash
 cross build --release --target x86_64-unknown-linux-musl
 ```
 
-产物：`target/x86_64-unknown-linux-musl/release/mem`（适合 Alpine 等无 glibc 环境）。
+Output: `target/x86_64-unknown-linux-musl/release/mem` (suitable for glibc-free environments such as Alpine).
 
-需要本机已安装并运行 Docker（`cross` 通过容器提供链接环境）。`duckdb` 使用 `bundled` 时若某目标编译失败，可先升级 `cross` 或在 `Cross.toml` 里为该 `target` 换用较新的 `image` 标签。
+Docker must be installed and running locally (`cross` provides the linking environment through a container). When `duckdb` is built with `bundled` and a target fails to compile, upgrade `cross` first, or switch that `target` to a newer `image` tag in `Cross.toml`.
 
-CI（`.github/workflows/ci.yml`）在 PR / push 上会跑 **`cross build --release`**，目标为 **`x86_64-unknown-linux-gnu`** 与 **`x86_64-unknown-linux-musl`**（与 `Cross.toml` / Docker builder 一致）。打 `v*.*.*` tag 时 Release 工作流会把 **`mem-<tag>-x86_64-unknown-linux-gnu`** 与 **`mem-<tag>-x86_64-unknown-linux-musl`** 一并上传到 GitHub Release。
+CI (`.github/workflows/ci.yml`) runs **`cross build --release`** on PRs / pushes, targeting **`x86_64-unknown-linux-gnu`** and **`x86_64-unknown-linux-musl`** (matching `Cross.toml` / the Docker builder). On a `v*.*.*` tag, the Release workflow uploads both **`mem-<tag>-x86_64-unknown-linux-gnu`** and **`mem-<tag>-x86_64-unknown-linux-musl`** to the GitHub Release.
 
 ## Service install (systemd / supervisor)
 
@@ -150,7 +150,7 @@ Verify either with `curl http://127.0.0.1:3000/health`.
 
 ## Docker (mem HTTP only)
 
-Build and run locally（构建阶段使用与 `Cross.toml` 一致的 **cross-rs** `x86_64-unknown-linux-gnu` 镜像）：
+Build and run locally (the build stage uses the same **cross-rs** `x86_64-unknown-linux-gnu` image as `Cross.toml`):
 
 ```bash
 docker build -t mem:local .
@@ -163,8 +163,8 @@ Default in the image: `BIND_ADDR=0.0.0.0:3000`, `MEM_DB_PATH=/data/mem.duckdb`. 
 
 ## Release (GHCR + binaries)
 
-1. Push a semver tag: `git tag v0.1.0 && git push origin v0.1.0`（同时触发 **CI** 与 **Release**；Docker 镜像构建使用 GitHub Actions 缓存加速重复构建）。
-2. Workflow [`.github/workflows/release.yml`](.github/workflows/release.yml) 推送 **`ghcr.io/<lowercase-owner>/mem:<tag>`** 与 **`:latest`**，并在 GitHub Release 上附带 **`mem-<tag>-x86_64-unknown-linux-gnu`**、**`mem-<tag>-x86_64-unknown-linux-musl`** 以及 **`mem-<tag>-SHA256SUMS`**（`sha256sum` 校验文件）。MCP server 已合入二进制，无需单独发布。
+1. Push a semver tag: `git tag v0.1.0 && git push origin v0.1.0` (triggers both **CI** and **Release**; the Docker image build uses the GitHub Actions cache to speed up repeated builds).
+2. Workflow [`.github/workflows/release.yml`](.github/workflows/release.yml) pushes **`ghcr.io/<lowercase-owner>/mem:<tag>`** and **`:latest`**, and attaches **`mem-<tag>-x86_64-unknown-linux-gnu`**, **`mem-<tag>-x86_64-unknown-linux-musl`**, and **`mem-<tag>-SHA256SUMS`** (a `sha256sum` checksum file) to the GitHub Release. The MCP server is built into the binary, so no separate release is needed.
 
 Point every client at the same `MEM_BASE_URL` and `tenant` so multiple Codex or Cursor processes share one store.
 
