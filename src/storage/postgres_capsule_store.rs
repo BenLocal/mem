@@ -50,6 +50,79 @@ impl PostgresCapsuleStore {
         &self.pool
     }
 
+    /// Test helper: count embedding rows for one capsule id. Keeps the
+    /// raw `sqlx` call inside the crate so the integration test crate
+    /// needs no direct `sqlx`/`pgvector` dependency (mirrors the
+    /// `connect_fresh` rationale). Not used in production code paths.
+    #[doc(hidden)]
+    pub async fn count_capsule_embedding_rows(&self, id: &str) -> Result<i64, StorageError> {
+        sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM capability_capsule_embeddings WHERE capability_capsule_id = $1",
+        )
+        .bind(id)
+        .fetch_one(&self.pool)
+        .await
+        .map_err(sqlx_err)
+    }
+
+    /// Test helper: count embedding rows for one transcript block id.
+    #[doc(hidden)]
+    pub async fn count_message_embedding_rows(&self, id: &str) -> Result<i64, StorageError> {
+        sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM conversation_message_embeddings WHERE message_block_id = $1",
+        )
+        .bind(id)
+        .fetch_one(&self.pool)
+        .await
+        .map_err(sqlx_err)
+    }
+
+    /// Test helper: read back the chunk_index=0 vector for a transcript
+    /// block id (there is no trait getter for conversation vectors).
+    #[doc(hidden)]
+    pub async fn get_message_embedding_vector(
+        &self,
+        id: &str,
+    ) -> Result<Option<Vec<f32>>, StorageError> {
+        let row = sqlx::query(
+            "SELECT embedding FROM conversation_message_embeddings \
+             WHERE message_block_id = $1 AND chunk_index = 0 LIMIT 1",
+        )
+        .bind(id)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(sqlx_err)?;
+        match row {
+            None => Ok(None),
+            Some(r) => Ok(Some(
+                r.try_get::<pgvector::Vector, _>("embedding")
+                    .map_err(sqlx_err)?
+                    .to_vec(),
+            )),
+        }
+    }
+
+    /// Test helper: pgvector cosine-distance ANN over
+    /// `capability_capsule_embeddings`, returning the `top_k` nearest
+    /// capsule ids to `query`. Proves the pgvector extension / `vector`
+    /// column / `<=>` operator work end-to-end (P3 → P4 hybrid retrieval).
+    #[doc(hidden)]
+    pub async fn ann_nearest_capsule_ids(
+        &self,
+        query: &[f32],
+        top_k: i64,
+    ) -> Result<Vec<String>, StorageError> {
+        sqlx::query_scalar::<_, String>(
+            "SELECT capability_capsule_id FROM capability_capsule_embeddings \
+             ORDER BY embedding <=> $1 LIMIT $2",
+        )
+        .bind(pgvector::Vector::from(query.to_vec()))
+        .bind(top_k)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(sqlx_err)
+    }
+
     /// Production connect: open an 8-connection pool against `url` and
     /// **idempotently** apply the `0001_capsule_store` migration into the
     /// connection's default schema (no per-call schema, no drop — unlike
@@ -67,6 +140,12 @@ impl PostgresCapsuleStore {
             .map_err(sqlx_err)?;
         sqlx::raw_sql(include_str!(
             "../../migrations/postgres/0001_capsule_store.sql"
+        ))
+        .execute(&pool)
+        .await
+        .map_err(sqlx_err)?;
+        sqlx::raw_sql(include_str!(
+            "../../migrations/postgres/0002_embeddings.sql"
         ))
         .execute(&pool)
         .await
@@ -102,8 +181,14 @@ impl PostgresCapsuleStore {
         bootstrap.close().await;
 
         // Real pool: every connection resolves unqualified table names
-        // in the isolated schema via search_path.
-        let opts = base.options([("search_path", schema.as_str())]);
+        // in the isolated schema via search_path. `public` is appended
+        // so the pgvector `vector` type (installed once into `public` by
+        // the P1 docker setup, not re-creatable per-schema because
+        // `CREATE EXTENSION IF NOT EXISTS` is a no-op when it already
+        // exists anywhere) still resolves — the test schema stays first
+        // so unqualified CREATE/INSERT land there.
+        let search_path = format!("{schema},public");
+        let opts = base.options([("search_path", search_path.as_str())]);
         let pool = PgPoolOptions::new()
             .max_connections(8)
             .connect_with(opts)
@@ -111,6 +196,12 @@ impl PostgresCapsuleStore {
             .map_err(sqlx_err)?;
         sqlx::raw_sql(include_str!(
             "../../migrations/postgres/0001_capsule_store.sql"
+        ))
+        .execute(&pool)
+        .await
+        .map_err(sqlx_err)?;
+        sqlx::raw_sql(include_str!(
+            "../../migrations/postgres/0002_embeddings.sql"
         ))
         .execute(&pool)
         .await
@@ -124,7 +215,7 @@ impl PostgresCapsuleStore {
 /// flattens to `InvalidInput` with a string. Future cleanup can
 /// add a `StorageError::Backend(Box<dyn Error>)` variant per doc
 /// §3.3 if richer surfacing is needed.
-fn sqlx_err(e: sqlx::Error) -> StorageError {
+pub(crate) fn sqlx_err(e: sqlx::Error) -> StorageError {
     StorageError::InvalidInput(format!("postgres: {e}"))
 }
 

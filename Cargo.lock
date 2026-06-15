@@ -5046,6 +5046,7 @@ dependencies = [
  "http-body-util",
  "lancedb",
  "once_cell",
+ "pgvector",
  "rand 0.8.5",
  "regex",
  "reqwest",
@@ -5682,6 +5683,15 @@ dependencies = [
  "hashbrown 0.15.5",
  "indexmap 2.13.0",
  "serde",
+]
+
+[[package]]
+name = "pgvector"
+version = "0.4.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3673cba5b9a124916096a423b806a9f29620972c6c97b08db5f2053e9428b481"
+dependencies = [
+ "sqlx",
 ]
 
 [[package]]

@@ -13,12 +13,16 @@ default = []
 # + PostgresCapsuleStore behind `cargo build --features postgres`.
 # Default build is unaffected; no sqlx pulled into the dep graph
 # unless the feature is on. See `docs/backend-coupling.md` §6.5.
-postgres = ["dep:sqlx"]
+postgres = ["dep:sqlx", "dep:pgvector"]
 
 [dependencies]
 # Optional: Phase 4 Postgres spike. Gated behind the `postgres`
 # feature so the default build doesn't pull sqlx + libpq machinery.
 sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "tls-rustls", "postgres", "uuid"], optional = true }
+# Optional: pgvector binding for the Postgres EmbeddingVectorStore (P3).
+# `pgvector::Vector` implements sqlx Encode/Decode for the PG `vector`
+# type. Only pulled in under the `postgres` feature.
+pgvector = { version = "0.4", default-features = false, features = ["sqlx"], optional = true }
 # LanceDB is the storage backend (on-disk Lance datasets) and DuckDB
 # is the SQL query engine on top via the `lance` core extension. Both
 # are unconditional dependencies — there's only one storage path now.

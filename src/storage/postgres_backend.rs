@@ -328,111 +328,357 @@ impl EmbeddingJobStore for PostgresCapsuleStore {
 }
 
 // ────────────────────────── EmbeddingVectorStore ──────────────────────────
+//
+// pgvector-backed implementation (postgres-backend P3). Two tables —
+// `capability_capsule_embeddings` (keyed `capability_capsule_id`) and
+// `conversation_message_embeddings` (keyed `message_block_id`) — are
+// **lazy-created on first upsert** with a `vector(<dim>)` column, the
+// dim spliced in from the upsert call (the dim is provider-dependent
+// and unknown at migrate time, exactly like the Lance backend). The
+// migration `0002_embeddings.sql` only installs the `vector` extension.
+//
+// Chunked semantics mirror Lance: one DELETE of the id's rows, then one
+// INSERT per chunk vector, all sharing the id (chunk_index 0..N) — search
+// dedups via GROUP BY. The single-vector upsert is the chunk_index=0 case.
+// `get_capability_capsule_embedding_vector` / `_row` read the chunk_index
+// = 0 row, matching Lance's "first row" read.
+//
+// Dim drift (re-upserting at a different dim into an existing table) is
+// NOT handled — `CREATE TABLE IF NOT EXISTS` won't alter the column.
+// Same limitation as Lance; P3 tests use one fixed dim.
+
+use sqlx::Row as _;
+
+use super::postgres_capsule_store::sqlx_err;
+use crate::embedding::wire::decode_f32_blob;
+
+/// Lazy-create the `capability_capsule_embeddings` table at the given
+/// vector dim. `dim` is a trusted i64 (the embedding provider's
+/// dimension), never user input, so splicing it into the DDL is safe.
+async fn ensure_capability_capsule_embeddings_table(
+    store: &PostgresCapsuleStore,
+    dim: i64,
+) -> Result<(), StorageError> {
+    let ddl = format!(
+        "CREATE TABLE IF NOT EXISTS capability_capsule_embeddings (\
+            capability_capsule_id TEXT NOT NULL, \
+            tenant TEXT NOT NULL, \
+            chunk_index INT NOT NULL DEFAULT 0, \
+            embedding vector({dim}) NOT NULL, \
+            embedding_model TEXT, \
+            embedding_dim BIGINT, \
+            content_hash TEXT, \
+            source_updated_at TEXT, \
+            created_at TEXT, \
+            PRIMARY KEY (capability_capsule_id, chunk_index))"
+    );
+    sqlx::raw_sql(&ddl)
+        .execute(store.pool())
+        .await
+        .map_err(sqlx_err)?;
+    sqlx::raw_sql(
+        "CREATE INDEX IF NOT EXISTS idx_capability_capsule_embeddings_hnsw \
+         ON capability_capsule_embeddings USING hnsw (embedding vector_cosine_ops)",
+    )
+    .execute(store.pool())
+    .await
+    .map_err(sqlx_err)?;
+    Ok(())
+}
+
+/// Lazy-create the `conversation_message_embeddings` table at the given
+/// vector dim. Transcript analog of the capsule table.
+async fn ensure_conversation_message_embeddings_table(
+    store: &PostgresCapsuleStore,
+    dim: i64,
+) -> Result<(), StorageError> {
+    let ddl = format!(
+        "CREATE TABLE IF NOT EXISTS conversation_message_embeddings (\
+            message_block_id TEXT NOT NULL, \
+            tenant TEXT NOT NULL, \
+            chunk_index INT NOT NULL DEFAULT 0, \
+            embedding vector({dim}) NOT NULL, \
+            embedding_model TEXT, \
+            embedding_dim BIGINT, \
+            content_hash TEXT, \
+            source_updated_at TEXT, \
+            created_at TEXT, \
+            PRIMARY KEY (message_block_id, chunk_index))"
+    );
+    sqlx::raw_sql(&ddl)
+        .execute(store.pool())
+        .await
+        .map_err(sqlx_err)?;
+    sqlx::raw_sql(
+        "CREATE INDEX IF NOT EXISTS idx_conversation_message_embeddings_hnsw \
+         ON conversation_message_embeddings USING hnsw (embedding vector_cosine_ops)",
+    )
+    .execute(store.pool())
+    .await
+    .map_err(sqlx_err)?;
+    Ok(())
+}
+
+/// Does table `name` exist in the current search_path? Used so the
+/// `get_*` / `delete_*` methods stay no-op when no upsert has lazily
+/// created the table yet (Lance returns `None` / does nothing there).
+async fn embeddings_table_exists(
+    store: &PostgresCapsuleStore,
+    name: &str,
+) -> Result<bool, StorageError> {
+    let row = sqlx::query("SELECT to_regclass($1) IS NOT NULL AS present")
+        .bind(name)
+        .fetch_one(store.pool())
+        .await
+        .map_err(sqlx_err)?;
+    row.try_get::<bool, _>("present").map_err(sqlx_err)
+}
 
 #[async_trait]
 impl EmbeddingVectorStore for PostgresCapsuleStore {
     #[allow(clippy::too_many_arguments)]
     async fn upsert_capability_capsule_embedding(
         &self,
-        _capability_capsule_id: &str,
-        _tenant: &str,
-        _embedding_model: &str,
-        _embedding_dim: i64,
-        _embedding_blob: &[u8],
-        _content_hash: &str,
-        _source_updated_at: &str,
-        _now: &str,
+        capability_capsule_id: &str,
+        tenant: &str,
+        embedding_model: &str,
+        embedding_dim: i64,
+        embedding_blob: &[u8],
+        content_hash: &str,
+        source_updated_at: &str,
+        now: &str,
     ) -> Result<(), StorageError> {
-        unimplemented!(
-            "postgres backend: EmbeddingVectorStore::upsert_capability_capsule_embedding not yet implemented (postgres-backend P3-P5)"
+        let dim = usize::try_from(embedding_dim)
+            .map_err(|_| StorageError::InvalidData("embedding_dim negative"))?;
+        let vector = decode_f32_blob(embedding_blob, dim).map_err(StorageError::InvalidData)?;
+        // Single-vector upsert == the one-chunk case.
+        self.upsert_capability_capsule_embedding_chunks(
+            capability_capsule_id,
+            tenant,
+            embedding_model,
+            embedding_dim,
+            std::slice::from_ref(&vector),
+            content_hash,
+            source_updated_at,
+            now,
         )
+        .await
     }
 
     #[allow(clippy::too_many_arguments)]
     async fn upsert_capability_capsule_embedding_chunks(
         &self,
-        _capability_capsule_id: &str,
-        _tenant: &str,
-        _embedding_model: &str,
-        _embedding_dim: i64,
-        _vectors: &[Vec<f32>],
-        _content_hash: &str,
-        _source_updated_at: &str,
-        _now: &str,
+        capability_capsule_id: &str,
+        tenant: &str,
+        embedding_model: &str,
+        embedding_dim: i64,
+        vectors: &[Vec<f32>],
+        content_hash: &str,
+        source_updated_at: &str,
+        now: &str,
     ) -> Result<(), StorageError> {
-        unimplemented!(
-            "postgres backend: EmbeddingVectorStore::upsert_capability_capsule_embedding_chunks not yet implemented (postgres-backend P3-P5)"
-        )
+        // Empty vectors == no-op: leave the capsule with no embedding
+        // rows (Lance contract). Don't even create the table.
+        if vectors.is_empty() {
+            return Ok(());
+        }
+        ensure_capability_capsule_embeddings_table(self, embedding_dim).await?;
+        let mut tx = self.pool().begin().await.map_err(sqlx_err)?;
+        // Delete the id's existing rows ONCE, then insert one row per
+        // chunk vector (chunk_index 0..N).
+        sqlx::query("DELETE FROM capability_capsule_embeddings WHERE capability_capsule_id = $1")
+            .bind(capability_capsule_id)
+            .execute(&mut *tx)
+            .await
+            .map_err(sqlx_err)?;
+        for (idx, v) in vectors.iter().enumerate() {
+            let chunk_index = i32::try_from(idx)
+                .map_err(|_| StorageError::InvalidData("chunk_index does not fit in i32"))?;
+            sqlx::query(
+                "INSERT INTO capability_capsule_embeddings (\
+                    capability_capsule_id, tenant, chunk_index, embedding, embedding_model, \
+                    embedding_dim, content_hash, source_updated_at, created_at) \
+                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)",
+            )
+            .bind(capability_capsule_id)
+            .bind(tenant)
+            .bind(chunk_index)
+            .bind(pgvector::Vector::from(v.clone()))
+            .bind(embedding_model)
+            .bind(embedding_dim)
+            .bind(content_hash)
+            .bind(source_updated_at)
+            .bind(now)
+            .execute(&mut *tx)
+            .await
+            .map_err(sqlx_err)?;
+        }
+        tx.commit().await.map_err(sqlx_err)?;
+        Ok(())
     }
 
     async fn delete_capability_capsule_embedding(
         &self,
-        _capability_capsule_id: &str,
+        capability_capsule_id: &str,
     ) -> Result<(), StorageError> {
-        unimplemented!(
-            "postgres backend: EmbeddingVectorStore::delete_capability_capsule_embedding not yet implemented (postgres-backend P3-P5)"
-        )
+        // Idempotent; no-op if the table was never lazy-created.
+        if !embeddings_table_exists(self, "capability_capsule_embeddings").await? {
+            return Ok(());
+        }
+        sqlx::query("DELETE FROM capability_capsule_embeddings WHERE capability_capsule_id = $1")
+            .bind(capability_capsule_id)
+            .execute(self.pool())
+            .await
+            .map_err(sqlx_err)?;
+        Ok(())
     }
 
     async fn get_capability_capsule_embedding_row(
         &self,
-        _capability_capsule_id: &str,
+        capability_capsule_id: &str,
     ) -> Result<Option<(String, String, String)>, StorageError> {
-        unimplemented!(
-            "postgres backend: EmbeddingVectorStore::get_capability_capsule_embedding_row not yet implemented (postgres-backend P3-P5)"
+        // Returns `(model, content_hash, created_at)` for the chunk_index
+        // = 0 row. Mirrors Lance's metadata triple (Lance's `updated_at`
+        // == `now` at upsert, which is `created_at` here).
+        if !embeddings_table_exists(self, "capability_capsule_embeddings").await? {
+            return Ok(None);
+        }
+        let row = sqlx::query(
+            "SELECT embedding_model, content_hash, created_at \
+             FROM capability_capsule_embeddings \
+             WHERE capability_capsule_id = $1 AND chunk_index = 0 LIMIT 1",
         )
+        .bind(capability_capsule_id)
+        .fetch_optional(self.pool())
+        .await
+        .map_err(sqlx_err)?;
+        match row {
+            None => Ok(None),
+            Some(r) => Ok(Some((
+                r.try_get::<String, _>("embedding_model")
+                    .map_err(sqlx_err)?,
+                r.try_get::<String, _>("content_hash").map_err(sqlx_err)?,
+                r.try_get::<String, _>("created_at").map_err(sqlx_err)?,
+            ))),
+        }
     }
 
     async fn get_capability_capsule_embedding_vector(
         &self,
-        _capability_capsule_id: &str,
+        capability_capsule_id: &str,
     ) -> Result<Option<Vec<f32>>, StorageError> {
-        unimplemented!(
-            "postgres backend: EmbeddingVectorStore::get_capability_capsule_embedding_vector not yet implemented (postgres-backend P3-P5)"
+        // Chunk_index = 0 row's vector (Lance reads the first row).
+        if !embeddings_table_exists(self, "capability_capsule_embeddings").await? {
+            return Ok(None);
+        }
+        let row = sqlx::query(
+            "SELECT embedding FROM capability_capsule_embeddings \
+             WHERE capability_capsule_id = $1 AND chunk_index = 0 LIMIT 1",
         )
+        .bind(capability_capsule_id)
+        .fetch_optional(self.pool())
+        .await
+        .map_err(sqlx_err)?;
+        match row {
+            None => Ok(None),
+            Some(r) => {
+                let v = r
+                    .try_get::<pgvector::Vector, _>("embedding")
+                    .map_err(sqlx_err)?;
+                Ok(Some(v.to_vec()))
+            }
+        }
     }
 
     #[allow(clippy::too_many_arguments)]
     async fn upsert_conversation_message_embedding(
         &self,
-        _message_block_id: &str,
-        _tenant: &str,
-        _embedding_model: &str,
-        _embedding_dim: i64,
-        _embedding_blob: &[u8],
-        _content_hash: &str,
-        _source_updated_at: &str,
-        _now: &str,
+        message_block_id: &str,
+        tenant: &str,
+        embedding_model: &str,
+        embedding_dim: i64,
+        embedding_blob: &[u8],
+        content_hash: &str,
+        source_updated_at: &str,
+        now: &str,
     ) -> Result<(), StorageError> {
-        unimplemented!(
-            "postgres backend: EmbeddingVectorStore::upsert_conversation_message_embedding not yet implemented (postgres-backend P3-P5)"
+        let dim = usize::try_from(embedding_dim)
+            .map_err(|_| StorageError::InvalidData("embedding_dim negative"))?;
+        let vector = decode_f32_blob(embedding_blob, dim).map_err(StorageError::InvalidData)?;
+        self.upsert_conversation_message_embedding_chunks(
+            message_block_id,
+            tenant,
+            embedding_model,
+            embedding_dim,
+            std::slice::from_ref(&vector),
+            content_hash,
+            source_updated_at,
+            now,
         )
+        .await
     }
 
     #[allow(clippy::too_many_arguments)]
     async fn upsert_conversation_message_embedding_chunks(
         &self,
-        _message_block_id: &str,
-        _tenant: &str,
-        _embedding_model: &str,
-        _embedding_dim: i64,
-        _vectors: &[Vec<f32>],
-        _content_hash: &str,
-        _source_updated_at: &str,
-        _now: &str,
+        message_block_id: &str,
+        tenant: &str,
+        embedding_model: &str,
+        embedding_dim: i64,
+        vectors: &[Vec<f32>],
+        content_hash: &str,
+        source_updated_at: &str,
+        now: &str,
     ) -> Result<(), StorageError> {
-        unimplemented!(
-            "postgres backend: EmbeddingVectorStore::upsert_conversation_message_embedding_chunks not yet implemented (postgres-backend P3-P5)"
-        )
+        if vectors.is_empty() {
+            return Ok(());
+        }
+        ensure_conversation_message_embeddings_table(self, embedding_dim).await?;
+        let mut tx = self.pool().begin().await.map_err(sqlx_err)?;
+        sqlx::query("DELETE FROM conversation_message_embeddings WHERE message_block_id = $1")
+            .bind(message_block_id)
+            .execute(&mut *tx)
+            .await
+            .map_err(sqlx_err)?;
+        for (idx, v) in vectors.iter().enumerate() {
+            let chunk_index = i32::try_from(idx)
+                .map_err(|_| StorageError::InvalidData("chunk_index does not fit in i32"))?;
+            sqlx::query(
+                "INSERT INTO conversation_message_embeddings (\
+                    message_block_id, tenant, chunk_index, embedding, embedding_model, \
+                    embedding_dim, content_hash, source_updated_at, created_at) \
+                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)",
+            )
+            .bind(message_block_id)
+            .bind(tenant)
+            .bind(chunk_index)
+            .bind(pgvector::Vector::from(v.clone()))
+            .bind(embedding_model)
+            .bind(embedding_dim)
+            .bind(content_hash)
+            .bind(source_updated_at)
+            .bind(now)
+            .execute(&mut *tx)
+            .await
+            .map_err(sqlx_err)?;
+        }
+        tx.commit().await.map_err(sqlx_err)?;
+        Ok(())
     }
 
     async fn delete_conversation_message_embedding(
         &self,
-        _message_block_id: &str,
+        message_block_id: &str,
     ) -> Result<(), StorageError> {
-        unimplemented!(
-            "postgres backend: EmbeddingVectorStore::delete_conversation_message_embedding not yet implemented (postgres-backend P3-P5)"
-        )
+        if !embeddings_table_exists(self, "conversation_message_embeddings").await? {
+            return Ok(());
+        }
+        sqlx::query("DELETE FROM conversation_message_embeddings WHERE message_block_id = $1")
+            .bind(message_block_id)
+            .execute(self.pool())
+            .await
+            .map_err(sqlx_err)?;
+        Ok(())
     }
 }
 

@@ -23,7 +23,9 @@ use std::sync::Arc;
 use mem::domain::capability_capsule::{
     CapabilityCapsuleRecord, CapabilityCapsuleStatus, CapabilityCapsuleType, Scope, Visibility,
 };
-use mem::storage::{current_timestamp, CapsuleStore, FeedbackEvent, PostgresCapsuleStore};
+use mem::storage::{
+    current_timestamp, CapsuleStore, EmbeddingVectorStore, FeedbackEvent, PostgresCapsuleStore,
+};
 
 /// `Some(store)` on a fresh schema when `MEM_TEST_POSTGRES_URL` is set,
 /// else `None` (caller skips). Each call drops + re-applies the schema
@@ -34,6 +36,36 @@ async fn backend() -> Option<Arc<dyn CapsuleStore>> {
         .await
         .expect("connect + migrate test postgres");
     Some(Arc::new(store))
+}
+
+/// Like [`backend`] but returns the concrete store so we can both call
+/// `EmbeddingVectorStore` methods AND reach `pool()` for raw pgvector
+/// ANN queries. `None` (skip) when `MEM_TEST_POSTGRES_URL` is unset.
+async fn embedding_backend() -> Option<PostgresCapsuleStore> {
+    let url = std::env::var("MEM_TEST_POSTGRES_URL").ok()?;
+    Some(
+        PostgresCapsuleStore::connect_fresh(&url)
+            .await
+            .expect("connect + migrate test postgres"),
+    )
+}
+
+/// f32 vector of length `dim` with `v[i] = vals[i]` and zeros after.
+fn vec_of(dim: usize, vals: &[f32]) -> Vec<f32> {
+    let mut v = vec![0.0_f32; dim];
+    for (i, x) in vals.iter().enumerate() {
+        v[i] = *x;
+    }
+    v
+}
+
+/// Native-endian f32 blob (matches `crate::embedding::wire::encode_f32_blob`).
+fn blob_of(v: &[f32]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(v.len() * 4);
+    for f in v {
+        out.extend_from_slice(&f.to_ne_bytes());
+    }
+    out
 }
 
 macro_rules! pg_test {
@@ -207,3 +239,191 @@ async fn serve_boots_on_postgres() {
         state.err()
     );
 }
+
+// ───────────────────────── EmbeddingVectorStore (P3) ──────────────────────
+
+const DIM: usize = 8;
+
+macro_rules! emb_test {
+    ($name:ident, $store:ident, $body:block) => {
+        #[tokio::test(flavor = "multi_thread")]
+        async fn $name() {
+            let Some($store) = embedding_backend().await else {
+                eprintln!("skip {}: MEM_TEST_POSTGRES_URL unset", stringify!($name));
+                return;
+            };
+            $body
+        }
+    };
+}
+
+emb_test!(embedding_upsert_get_roundtrip, store, {
+    let v = vec_of(DIM, &[0.1, -0.2, 0.3, 0.4, -0.5, 0.6, 0.7, -0.8]);
+    store
+        .upsert_capability_capsule_embedding(
+            "cap1",
+            "t",
+            "fake",
+            DIM as i64,
+            &blob_of(&v),
+            "hash1",
+            "src-ts",
+            "now-ts",
+        )
+        .await
+        .unwrap();
+    let got = store
+        .get_capability_capsule_embedding_vector("cap1")
+        .await
+        .unwrap()
+        .expect("vector should exist after upsert");
+    assert_eq!(got.len(), DIM);
+    for (a, b) in got.iter().zip(v.iter()) {
+        assert!((a - b).abs() < 1e-6, "elementwise: {a} vs {b}");
+    }
+    // metadata triple = (model, content_hash, created_at==now)
+    let row = store
+        .get_capability_capsule_embedding_row("cap1")
+        .await
+        .unwrap()
+        .expect("row should exist");
+    assert_eq!(row, ("fake".into(), "hash1".into(), "now-ts".into()));
+});
+
+emb_test!(embedding_chunks_replace, store, {
+    let three = vec![
+        vec_of(DIM, &[1.0]),
+        vec_of(DIM, &[0.0, 1.0]),
+        vec_of(DIM, &[0.0, 0.0, 1.0]),
+    ];
+    store
+        .upsert_capability_capsule_embedding_chunks(
+            "capc", "t", "fake", DIM as i64, &three, "h", "s", "n",
+        )
+        .await
+        .unwrap();
+    let cnt = store.count_capsule_embedding_rows("capc").await.unwrap();
+    assert_eq!(cnt, 3, "first upsert writes 3 chunk rows");
+
+    let two = vec![vec_of(DIM, &[1.0]), vec_of(DIM, &[0.0, 1.0])];
+    store
+        .upsert_capability_capsule_embedding_chunks(
+            "capc", "t", "fake", DIM as i64, &two, "h2", "s", "n",
+        )
+        .await
+        .unwrap();
+    let cnt2 = store.count_capsule_embedding_rows("capc").await.unwrap();
+    assert_eq!(cnt2, 2, "second upsert fully replaces — only 2 rows remain");
+});
+
+emb_test!(embedding_delete, store, {
+    let v = vec_of(DIM, &[0.5, 0.5]);
+    store
+        .upsert_capability_capsule_embedding(
+            "capd",
+            "t",
+            "fake",
+            DIM as i64,
+            &blob_of(&v),
+            "h",
+            "s",
+            "n",
+        )
+        .await
+        .unwrap();
+    store
+        .delete_capability_capsule_embedding("capd")
+        .await
+        .unwrap();
+    let got = store
+        .get_capability_capsule_embedding_vector("capd")
+        .await
+        .unwrap();
+    assert!(got.is_none(), "vector gone after delete");
+});
+
+emb_test!(embedding_ann_cosine_orders_by_distance, store, {
+    // [1,0,..], [0.9,0.1,..], [0,1,..]; query [1,0,..]. Nearest two by
+    // cosine distance are cap_a (identical dir) then cap_b (0.9,0.1).
+    store
+        .upsert_capability_capsule_embedding(
+            "cap_a",
+            "t",
+            "fake",
+            DIM as i64,
+            &blob_of(&vec_of(DIM, &[1.0, 0.0])),
+            "h",
+            "s",
+            "n",
+        )
+        .await
+        .unwrap();
+    store
+        .upsert_capability_capsule_embedding(
+            "cap_b",
+            "t",
+            "fake",
+            DIM as i64,
+            &blob_of(&vec_of(DIM, &[0.9, 0.1])),
+            "h",
+            "s",
+            "n",
+        )
+        .await
+        .unwrap();
+    store
+        .upsert_capability_capsule_embedding(
+            "cap_c",
+            "t",
+            "fake",
+            DIM as i64,
+            &blob_of(&vec_of(DIM, &[0.0, 1.0])),
+            "h",
+            "s",
+            "n",
+        )
+        .await
+        .unwrap();
+
+    let rows = store
+        .ann_nearest_capsule_ids(&vec_of(DIM, &[1.0, 0.0]), 2)
+        .await
+        .unwrap();
+    assert_eq!(
+        rows,
+        vec!["cap_a".to_string(), "cap_b".to_string()],
+        "pgvector cosine orders cap_a (identical) then cap_b (0.9,0.1)"
+    );
+});
+
+emb_test!(conversation_embedding_roundtrip, store, {
+    let v = vec_of(DIM, &[0.2, 0.4, 0.6, 0.8, -0.1, -0.3, -0.5, -0.7]);
+    store
+        .upsert_conversation_message_embedding(
+            "msg1",
+            "t",
+            "fake",
+            DIM as i64,
+            &blob_of(&v),
+            "mh",
+            "s",
+            "n",
+        )
+        .await
+        .unwrap();
+    let got = store
+        .get_message_embedding_vector("msg1")
+        .await
+        .unwrap()
+        .expect("message vector should exist after upsert");
+    assert_eq!(got.len(), DIM);
+    for (a, b) in got.iter().zip(v.iter()) {
+        assert!((a - b).abs() < 1e-6, "elementwise: {a} vs {b}");
+    }
+    store
+        .delete_conversation_message_embedding("msg1")
+        .await
+        .unwrap();
+    let cnt = store.count_message_embedding_rows("msg1").await.unwrap();
+    assert_eq!(cnt, 0, "conversation embedding gone after delete");
+});
