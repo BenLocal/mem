@@ -36,9 +36,7 @@ pub mod maintenance_store;
 pub mod mine_cursor_store;
 pub mod open_lock;
 #[cfg(feature = "postgres")]
-pub mod postgres_backend;
-#[cfg(feature = "postgres")]
-pub mod postgres_capsule_store;
+pub mod postgres_store;
 pub mod session_store;
 pub mod store;
 pub mod time;
@@ -57,7 +55,7 @@ pub use lance_store::{IndexMaintenanceStats, VacuumStats};
 pub use maintenance_store::MaintenanceStore;
 pub use mine_cursor_store::{MineCursor, MineCursorStore};
 #[cfg(feature = "postgres")]
-pub use postgres_capsule_store::PostgresCapsuleStore;
+pub use postgres_store::PostgresCapsuleStore;
 pub use session_store::SessionStore;
 pub use store::Store;
 pub use time::{current_timestamp, timestamp_add_ms};

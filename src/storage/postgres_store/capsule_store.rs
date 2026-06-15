@@ -1,6 +1,6 @@
 //! Phase 4 Postgres spike (backend-coupling.md §6.5):
 //! `PostgresCapsuleStore` — a sqlx-backed implementation of the
-//! [`super::CapsuleStore`] trait. Behind the `postgres` cargo
+//! [`super::super::CapsuleStore`] trait. Behind the `postgres` cargo
 //! feature so the default build doesn't pull sqlx.
 //!
 //! **Status: scaffold, untested**. This module compiles but has
@@ -25,7 +25,7 @@
 use async_trait::async_trait;
 use sqlx::{PgPool, Row};
 
-use super::CapsuleStore;
+use super::super::CapsuleStore;
 use crate::domain::capability_capsule::{
     CapabilityCapsuleRecord, CapabilityCapsuleStatus, CapabilityCapsuleType, CapsuleStats,
     FeedbackKind, FeedbackSummary, Scope, Visibility,
@@ -167,25 +167,27 @@ impl PostgresCapsuleStore {
             .await
             .map_err(sqlx_err)?;
         sqlx::raw_sql(include_str!(
-            "../../migrations/postgres/0001_capsule_store.sql"
+            "../../../migrations/postgres/0001_capsule_store.sql"
         ))
         .execute(&pool)
         .await
         .map_err(sqlx_err)?;
         sqlx::raw_sql(include_str!(
-            "../../migrations/postgres/0002_embeddings.sql"
+            "../../../migrations/postgres/0002_embeddings.sql"
         ))
         .execute(&pool)
         .await
         .map_err(sqlx_err)?;
-        sqlx::raw_sql(include_str!("../../migrations/postgres/0003_search.sql"))
+        sqlx::raw_sql(include_str!("../../../migrations/postgres/0003_search.sql"))
             .execute(&pool)
             .await
             .map_err(sqlx_err)?;
-        sqlx::raw_sql(include_str!("../../migrations/postgres/0004_p5_tables.sql"))
-            .execute(&pool)
-            .await
-            .map_err(sqlx_err)?;
+        sqlx::raw_sql(include_str!(
+            "../../../migrations/postgres/0004_p5_tables.sql"
+        ))
+        .execute(&pool)
+        .await
+        .map_err(sqlx_err)?;
         Ok(Self {
             pool,
             transcript_job_provider: std::sync::Arc::new(std::sync::RwLock::new(None)),
@@ -234,25 +236,27 @@ impl PostgresCapsuleStore {
             .await
             .map_err(sqlx_err)?;
         sqlx::raw_sql(include_str!(
-            "../../migrations/postgres/0001_capsule_store.sql"
+            "../../../migrations/postgres/0001_capsule_store.sql"
         ))
         .execute(&pool)
         .await
         .map_err(sqlx_err)?;
         sqlx::raw_sql(include_str!(
-            "../../migrations/postgres/0002_embeddings.sql"
+            "../../../migrations/postgres/0002_embeddings.sql"
         ))
         .execute(&pool)
         .await
         .map_err(sqlx_err)?;
-        sqlx::raw_sql(include_str!("../../migrations/postgres/0003_search.sql"))
+        sqlx::raw_sql(include_str!("../../../migrations/postgres/0003_search.sql"))
             .execute(&pool)
             .await
             .map_err(sqlx_err)?;
-        sqlx::raw_sql(include_str!("../../migrations/postgres/0004_p5_tables.sql"))
-            .execute(&pool)
-            .await
-            .map_err(sqlx_err)?;
+        sqlx::raw_sql(include_str!(
+            "../../../migrations/postgres/0004_p5_tables.sql"
+        ))
+        .execute(&pool)
+        .await
+        .map_err(sqlx_err)?;
         Ok(Self {
             pool,
             transcript_job_provider: std::sync::Arc::new(std::sync::RwLock::new(None)),

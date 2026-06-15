@@ -1,8 +1,8 @@
 //! Phase 5 — `Backend` umbrella sub-trait impls for
 //! [`PostgresCapsuleStore`].
 //!
-//! [`super::Backend`] requires 11 storage sub-traits. The Phase 4
-//! spike (`postgres_capsule_store.rs`) implements [`super::CapsuleStore`];
+//! [`super::super::Backend`] requires 11 storage sub-traits. The Phase 4
+//! spike (`postgres_capsule_store.rs`) implements [`super::super::CapsuleStore`];
 //! this module supplies the other 10 (CapsuleSearchStore,
 //! EmbeddingVectorStore, EmbeddingJobStore, GraphStore, TranscriptStore,
 //! EntityRegistry, SessionStore, MaintenanceStore, MineCursorStore,
@@ -19,12 +19,12 @@
 
 use async_trait::async_trait;
 
-use super::postgres_capsule_store::PostgresCapsuleStore;
-use super::{
+use super::super::{
     CapsuleSearchStore, EmbeddingJobStore, EmbeddingVectorStore, EntityRegistry,
     EvolutionCandidate, EvolutionCandidateStore, GraphStore, MaintenanceStore, MineCursor,
     MineCursorStore, SessionStore, TranscriptStore,
 };
+use super::capsule_store::PostgresCapsuleStore;
 use crate::domain::capability_capsule::{
     CapabilityCapsuleRecord, CapabilityCapsuleType, CapabilityCapsuleVersionLink, GraphEdge,
     GraphStats,
@@ -63,7 +63,7 @@ use crate::storage::types::{
 // this layer), not applied in the candidate SQL — same as Lance, whose
 // `hybrid_candidates` likewise does not apply the per-source cap.
 
-use super::CapsuleStore;
+use super::super::CapsuleStore;
 
 /// RRF reciprocal-rank constant — mirrors `retrieve::sql_rrf` / the Lance
 /// `hybrid_candidates` SQL (`1.0 / (60.0 + rank)`). Kept as a named const so
@@ -928,7 +928,7 @@ impl EmbeddingJobStore for PostgresCapsuleStore {
 
 use sqlx::Row as _;
 
-use super::postgres_capsule_store::{
+use super::capsule_store::{
     enum_to_str as enum_to_str_pub, parse_status as parse_status_pub,
     row_to_record as pg_row_to_record, sqlx_err, SELECT_COLUMNS,
 };
