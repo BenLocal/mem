@@ -136,22 +136,28 @@ impl AppState {
                 #[cfg(feature = "postgres")]
                 {
                     // Connect + idempotently migrate. The Store-glue
-                    // workers (last_used / potentiation) and the
-                    // Lance-only `set_transcript_job_provider` are skipped:
-                    // they are optimizations, not correctness — their real
-                    // Postgres implementations land in P5. The capsule
-                    // service still gets a live `capsule_used_tx`; its
-                    // receiver is dropped, so the events it emits are
-                    // silently discarded (acceptable for P2).
+                    // workers (last_used / potentiation) are skipped: they
+                    // are optimizations, not correctness, and call
+                    // Store-level compositions absent on the Postgres
+                    // backend. The transcript embedding-job provider IS
+                    // configured (P5 wired the transcript fan-out). The
+                    // capsule service still gets a live `capsule_used_tx`;
+                    // its receiver is dropped, so the events it emits are
+                    // silently discarded (acceptable until the PG last-used
+                    // worker lands).
                     let url = config
                         .postgres_url
                         .as_deref()
                         .expect("postgres_url present when backend=Postgres");
-                    let pg = Arc::new(
-                        crate::storage::PostgresCapsuleStore::connect(url)
-                            .await
-                            .map_err(|e| anyhow::anyhow!("postgres connect: {e}"))?,
-                    );
+                    let pg_concrete = crate::storage::PostgresCapsuleStore::connect(url)
+                        .await
+                        .map_err(|e| anyhow::anyhow!("postgres connect: {e}"))?;
+                    // Stamp the transcript embedding-job provider so
+                    // embed-eligible transcript inserts can enqueue jobs
+                    // (P5: TranscriptStore::create_conversation_message
+                    // fans out into transcript_embedding_jobs).
+                    pg_concrete.set_transcript_job_provider(config.embedding.job_provider_id());
+                    let pg = Arc::new(pg_concrete);
                     info!(backend = "postgres", "storage initialized");
                     let store: Arc<dyn Backend> = pg;
                     let (capsule_used_tx, _rx) = tokio::sync::mpsc::unbounded_channel();

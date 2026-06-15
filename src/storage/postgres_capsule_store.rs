@@ -37,17 +37,45 @@ use crate::storage::types::{FeedbackEvent, StorageError};
 #[derive(Clone)]
 pub struct PostgresCapsuleStore {
     pool: PgPool,
+    /// Transcript-embedding-job provider id, stamped onto
+    /// `transcript_embedding_jobs.provider` rows enqueued by
+    /// `create_conversation_message`. Mirrors the Lance store's field —
+    /// configured once at startup via `set_transcript_job_provider`;
+    /// `None` until then (an embed-eligible insert without a provider
+    /// configured errors, same posture as the Lance backend).
+    transcript_job_provider: std::sync::Arc<std::sync::RwLock<Option<String>>>,
 }
 
 impl PostgresCapsuleStore {
     pub fn new(pool: PgPool) -> Self {
-        Self { pool }
+        Self {
+            pool,
+            transcript_job_provider: std::sync::Arc::new(std::sync::RwLock::new(None)),
+        }
     }
 
     /// Borrow the underlying pool (later phases build a full
     /// `PostgresBackend` from the same pool).
     pub fn pool(&self) -> &PgPool {
         &self.pool
+    }
+
+    /// Configure the transcript embedding-job provider id (call once at
+    /// startup, before any transcript writes). Mirrors
+    /// `LanceStore::set_transcript_job_provider`.
+    pub fn set_transcript_job_provider(&self, provider: impl Into<String>) {
+        *self
+            .transcript_job_provider
+            .write()
+            .expect("transcript_job_provider lock poisoned") = Some(provider.into());
+    }
+
+    /// Read the configured transcript embedding-job provider id, if any.
+    pub(crate) fn transcript_job_provider(&self) -> Option<String> {
+        self.transcript_job_provider
+            .read()
+            .expect("transcript_job_provider lock poisoned")
+            .clone()
     }
 
     /// Test helper: count embedding rows for one capsule id. Keeps the
@@ -158,7 +186,10 @@ impl PostgresCapsuleStore {
             .execute(&pool)
             .await
             .map_err(sqlx_err)?;
-        Ok(Self { pool })
+        Ok(Self {
+            pool,
+            transcript_job_provider: std::sync::Arc::new(std::sync::RwLock::new(None)),
+        })
     }
 
     /// Connect to `url` on a **fresh, isolated Postgres schema** and
@@ -222,7 +253,10 @@ impl PostgresCapsuleStore {
             .execute(&pool)
             .await
             .map_err(sqlx_err)?;
-        Ok(Self { pool })
+        Ok(Self {
+            pool,
+            transcript_job_provider: std::sync::Arc::new(std::sync::RwLock::new(None)),
+        })
     }
 }
 

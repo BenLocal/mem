@@ -21,15 +21,17 @@
 use std::sync::Arc;
 
 use mem::domain::capability_capsule::{
-    CapabilityCapsuleRecord, CapabilityCapsuleStatus, CapabilityCapsuleType, Scope, Visibility,
+    CapabilityCapsuleRecord, CapabilityCapsuleStatus, CapabilityCapsuleType, GraphEdge, Scope,
+    Visibility,
 };
 use mem::domain::entity::EntityKind;
 use mem::domain::episode::EpisodeRecord;
-use mem::domain::AddAliasOutcome;
+use mem::domain::{AddAliasOutcome, BlockType, ConversationMessage, MessageRole};
 use mem::storage::{
-    current_timestamp, CapsuleSearchStore, CapsuleStore, EmbeddingVectorStore, EntityRegistry,
-    EvolutionCandidate, EvolutionCandidateStore, FeedbackEvent, MaintenanceStore, MineCursorStore,
-    PostgresCapsuleStore, SessionStore,
+    current_timestamp, CapsuleSearchStore, CapsuleStore, EmbeddingJobInsert, EmbeddingJobStore,
+    EmbeddingVectorStore, EntityRegistry, EvolutionCandidate, EvolutionCandidateStore,
+    FeedbackEvent, GraphStore, MaintenanceStore, MineCursorStore, PostgresCapsuleStore,
+    SessionStore, TranscriptStore,
 };
 
 /// `Some(store)` on a fresh schema when `MEM_TEST_POSTGRES_URL` is set,
@@ -1314,4 +1316,943 @@ emb_test!(vacuum_old_versions_is_noop, store, {
     assert_eq!(s.tables_pruned, 0);
     let s2 = store.vacuum_old_versions_with(0, true).await.unwrap();
     assert_eq!(s2.bytes_removed, 0);
+});
+
+// ═══════════════════════ P5 batch-2 sub-trait tests ═════════════════════
+//
+// EmbeddingJobStore / GraphStore / TranscriptStore — round-trip +
+// behaviour parity against a real Postgres on a fresh per-test schema.
+
+// ──────────────────────────── EmbeddingJobStore ─────────────────────────
+
+fn job_insert(job_id: &str, capsule: &str, hash: &str) -> EmbeddingJobInsert {
+    EmbeddingJobInsert {
+        job_id: job_id.into(),
+        tenant: "t".into(),
+        capability_capsule_id: capsule.into(),
+        target_content_hash: hash.into(),
+        provider: "fake".into(),
+        available_at: "00000000000000000000".into(),
+        created_at: "00000000000000000001".into(),
+        updated_at: "00000000000000000001".into(),
+    }
+}
+
+emb_test!(embedding_job_enqueue_idempotent, store, {
+    // First try_enqueue inserts → true; a second over the same
+    // (tenant, capsule, hash, provider) live tuple → false.
+    assert!(store
+        .try_enqueue_embedding_job(job_insert("j1", "cap1", "h1"))
+        .await
+        .unwrap());
+    assert!(
+        !store
+            .try_enqueue_embedding_job(job_insert("j1b", "cap1", "h1"))
+            .await
+            .unwrap(),
+        "live duplicate declined"
+    );
+    // Different hash → distinct, inserts.
+    assert!(store
+        .try_enqueue_embedding_job(job_insert("j2", "cap1", "h2"))
+        .await
+        .unwrap());
+    assert_eq!(
+        store
+            .get_embedding_job_status("j1")
+            .await
+            .unwrap()
+            .as_deref(),
+        Some("pending")
+    );
+    assert!(store
+        .get_embedding_job_status("nope")
+        .await
+        .unwrap()
+        .is_none());
+});
+
+emb_test!(embedding_job_claim_skip_locked_and_complete, store, {
+    store
+        .enqueue_embedding_jobs(&[
+            job_insert("c1", "capA", "ha"),
+            job_insert("c2", "capB", "hb"),
+        ])
+        .await
+        .unwrap();
+    // Empty batch is a no-op.
+    store.enqueue_embedding_jobs(&[]).await.unwrap();
+
+    let claimed = store
+        .claim_next_n_embedding_jobs("00000000000000000010", 3, 5)
+        .await
+        .unwrap();
+    let mut ids: Vec<&str> = claimed.iter().map(|c| c.job_id.as_str()).collect();
+    ids.sort();
+    assert_eq!(ids, vec!["c1", "c2"], "both pending jobs claimed");
+    // claimed → status processing.
+    assert_eq!(
+        store
+            .get_embedding_job_status("c1")
+            .await
+            .unwrap()
+            .as_deref(),
+        Some("processing")
+    );
+    // A re-claim now finds nothing (both processing, not pending/failed).
+    let again = store
+        .claim_next_n_embedding_jobs("00000000000000000011", 3, 5)
+        .await
+        .unwrap();
+    assert!(again.is_empty(), "processing rows are not re-claimed");
+
+    // complete moves processing → completed.
+    store
+        .complete_embedding_job("c1", "00000000000000000020")
+        .await
+        .unwrap();
+    assert_eq!(
+        store
+            .get_embedding_job_status("c1")
+            .await
+            .unwrap()
+            .as_deref(),
+        Some("completed")
+    );
+});
+
+emb_test!(embedding_job_reschedule_then_reclaim, store, {
+    store
+        .enqueue_embedding_jobs(&[job_insert("r1", "capR", "hr")])
+        .await
+        .unwrap();
+    let claimed = store
+        .claim_next_n_embedding_jobs("00000000000000000010", 3, 5)
+        .await
+        .unwrap();
+    assert_eq!(claimed.len(), 1);
+    assert_eq!(claimed[0].attempt_count, 0);
+
+    // Reschedule with backoff: available_at in the future.
+    store
+        .reschedule_embedding_job_failure(
+            "r1",
+            1,
+            "boom",
+            "00000000000000000100",
+            "00000000000000000050",
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        store
+            .get_embedding_job_status("r1")
+            .await
+            .unwrap()
+            .as_deref(),
+        Some("failed")
+    );
+    // Not yet available (now < available_at) → not reclaimed.
+    let too_early = store
+        .claim_next_n_embedding_jobs("00000000000000000060", 3, 5)
+        .await
+        .unwrap();
+    assert!(too_early.is_empty(), "failed job not yet available");
+    // Past available_at and under retry budget → reclaimed with new count.
+    let ready = store
+        .claim_next_n_embedding_jobs("00000000000000000200", 3, 5)
+        .await
+        .unwrap();
+    assert_eq!(ready.len(), 1);
+    assert_eq!(ready[0].attempt_count, 1);
+
+    // permanently_fail exhausts retries — claim with max_retries=2 skips it
+    // (attempt_count 2 is not < 2).
+    store
+        .permanently_fail_embedding_job("r1", 2, "dead", "00000000000000000300")
+        .await
+        .unwrap();
+    let exhausted = store
+        .claim_next_n_embedding_jobs("00000000000000000400", 2, 5)
+        .await
+        .unwrap();
+    assert!(exhausted.is_empty(), "exhausted-retry job not reclaimed");
+});
+
+emb_test!(embedding_job_stale_delete_and_latest_status, store, {
+    store
+        .enqueue_embedding_jobs(&[job_insert("s1", "capS", "hs")])
+        .await
+        .unwrap();
+    // mark_stale on a job id.
+    store
+        .mark_embedding_job_stale("s1", "00000000000000000020")
+        .await
+        .unwrap();
+    assert_eq!(
+        store
+            .get_embedding_job_status("s1")
+            .await
+            .unwrap()
+            .as_deref(),
+        Some("stale")
+    );
+
+    // stale_live_* only touches live rows; s1 already stale → 0.
+    let n = store
+        .stale_live_embedding_jobs_for_capability_capsule(
+            "t",
+            "capS",
+            "fake",
+            "00000000000000000030",
+        )
+        .await
+        .unwrap();
+    assert_eq!(n, 0, "no live rows for capS to stale");
+
+    // Enqueue a fresh live one, then stale_live should flip it.
+    store
+        .try_enqueue_embedding_job(job_insert("s2", "capS", "hs2"))
+        .await
+        .unwrap();
+    let n2 = store
+        .stale_live_embedding_jobs_for_capability_capsule(
+            "t",
+            "capS",
+            "fake",
+            "00000000000000000040",
+        )
+        .await
+        .unwrap();
+    assert_eq!(n2, 1);
+
+    // latest_embedding_job_status_for_hash: most-recent updated_at wins.
+    let latest = store
+        .latest_embedding_job_status_for_hash("t", "capS", "hs2")
+        .await
+        .unwrap();
+    assert_eq!(latest.as_deref(), Some("stale"));
+
+    // list_embedding_jobs: tenant + status filter.
+    let stale_list = store
+        .list_embedding_jobs("t", Some("stale"), None, 100)
+        .await
+        .unwrap();
+    assert!(stale_list.iter().all(|j| j.status == "stale"));
+    assert!(stale_list.len() >= 2);
+
+    // delete_by_capsule cascades.
+    let deleted = store
+        .delete_embedding_jobs_by_capability_capsule_id("capS")
+        .await
+        .unwrap();
+    assert_eq!(deleted, 2, "both capS jobs removed");
+    assert!(store
+        .get_embedding_job_status("s1")
+        .await
+        .unwrap()
+        .is_none());
+});
+
+emb_test!(transcript_embedding_job_claim_complete_fail, store, {
+    // Transcript jobs have no try_enqueue at the trait level — they are
+    // enqueued by create_conversation_message. Seed two via transcript
+    // writes (text blocks are embed-eligible).
+    store.set_transcript_job_provider("fake-test");
+    store
+        .create_conversation_message(&conv_msg(
+            "tjob_a",
+            "ts1",
+            1,
+            0,
+            BlockType::Text,
+            "alpha block",
+        ))
+        .await
+        .unwrap();
+    store
+        .create_conversation_message(&conv_msg(
+            "tjob_b",
+            "ts1",
+            2,
+            0,
+            BlockType::Text,
+            "beta block",
+        ))
+        .await
+        .unwrap();
+
+    let claimed = store
+        .claim_next_n_transcript_embedding_jobs("00000000000000000010", 3, 5)
+        .await
+        .unwrap();
+    assert_eq!(claimed.len(), 2, "both eligible transcript jobs claimed");
+    let block_ids: std::collections::HashSet<&str> = claimed
+        .iter()
+        .map(|c| c.message_block_id.as_str())
+        .collect();
+    assert!(block_ids.contains("tjob_a") && block_ids.contains("tjob_b"));
+
+    let jid_a = claimed
+        .iter()
+        .find(|c| c.message_block_id == "tjob_a")
+        .unwrap()
+        .job_id
+        .clone();
+    // complete one.
+    store
+        .complete_transcript_embedding_job(&jid_a, "00000000000000000020")
+        .await
+        .unwrap();
+    assert_eq!(
+        store
+            .get_transcript_embedding_job_status(&jid_a)
+            .await
+            .unwrap()
+            .as_deref(),
+        Some("completed")
+    );
+
+    // reschedule the other, then mark stale.
+    let jid_b = claimed
+        .iter()
+        .find(|c| c.message_block_id == "tjob_b")
+        .unwrap()
+        .job_id
+        .clone();
+    store
+        .reschedule_transcript_embedding_job_failure(
+            &jid_b,
+            1,
+            "err",
+            "00000000000000000100",
+            "00000000000000000050",
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        store
+            .get_transcript_embedding_job_status(&jid_b)
+            .await
+            .unwrap()
+            .as_deref(),
+        Some("failed")
+    );
+    store
+        .permanently_fail_transcript_embedding_job(&jid_b, 9, "dead", "00000000000000000200")
+        .await
+        .unwrap();
+    store
+        .mark_transcript_embedding_job_stale(&jid_b, "00000000000000000300")
+        .await
+        .unwrap();
+    assert_eq!(
+        store
+            .get_transcript_embedding_job_status(&jid_b)
+            .await
+            .unwrap()
+            .as_deref(),
+        Some("stale")
+    );
+});
+
+// ─────────────────────────────────── GraphStore ─────────────────────────
+
+fn edge(from: &str, to: &str, rel: &str, valid_from: &str, valid_to: Option<&str>) -> GraphEdge {
+    GraphEdge {
+        from_node_id: from.into(),
+        to_node_id: to.into(),
+        relation: rel.into(),
+        valid_from: valid_from.into(),
+        valid_to: valid_to.map(String::from),
+        confidence: None,
+        extractor: None,
+        strength: None,
+        stability: None,
+        last_activated: None,
+        access_count: None,
+    }
+}
+
+emb_test!(graph_add_edge_direct_and_neighbors, store, {
+    // add_edge_direct preserves valid_from verbatim, dedups active dups.
+    assert!(store
+        .add_edge_direct(&edge(
+            "capability_capsule:c1",
+            "entity:e1",
+            "mentions",
+            "00000001778000010000",
+            None,
+        ))
+        .await
+        .unwrap());
+    // Duplicate active (from, to, relation) → false.
+    assert!(
+        !store
+            .add_edge_direct(&edge(
+                "capability_capsule:c1",
+                "entity:e1",
+                "mentions",
+                "00000001778000019999",
+                None,
+            ))
+            .await
+            .unwrap(),
+        "active duplicate skipped"
+    );
+    // K12: inverted interval rejected.
+    let bad = store
+        .add_edge_direct(&edge(
+            "entity:a",
+            "entity:b",
+            "rel",
+            "00000001778000020000",
+            Some("00000001778000010000"),
+        ))
+        .await;
+    assert!(matches!(
+        bad,
+        Err(mem::storage::types::GraphError::InvalidInput(_))
+    ));
+
+    // neighbors: 1-hop active edges of e1.
+    let n = store.neighbors("entity:e1").await.unwrap();
+    assert_eq!(n.len(), 1);
+    assert_eq!(n[0].from_node_id, "capability_capsule:c1");
+    // confidence round-trips with a real value too.
+    store
+        .add_edge_direct(&GraphEdge {
+            confidence: Some(0.6),
+            extractor: Some("caller".into()),
+            ..edge(
+                "entity:e1",
+                "topic:t1",
+                "tagged",
+                "00000001778000010001",
+                None,
+            )
+        })
+        .await
+        .unwrap();
+    let n2 = store.neighbors("entity:e1").await.unwrap();
+    assert_eq!(n2.len(), 2);
+    let tagged = n2.iter().find(|e| e.relation == "tagged").unwrap();
+    assert_eq!(tagged.confidence, Some(0.6));
+    assert_eq!(tagged.extractor.as_deref(), Some("caller"));
+});
+
+emb_test!(graph_sync_neighbors_within_bfs_and_stats, store, {
+    // Seed via sync_memory_edges (forces valid_from = now, idempotent).
+    store
+        .sync_memory_edges(
+            &[
+                edge(
+                    "capability_capsule:c1",
+                    "entity:e_alpha",
+                    "mentions",
+                    "x",
+                    None,
+                ),
+                edge(
+                    "capability_capsule:c2",
+                    "entity:e_alpha",
+                    "mentions",
+                    "x",
+                    None,
+                ),
+                edge("entity:e_alpha", "topic:t1", "tagged", "x", None),
+            ],
+            "00000001778000010000",
+        )
+        .await
+        .unwrap();
+    // Re-sync identical edges → no duplicates (idempotent).
+    store
+        .sync_memory_edges(
+            &[edge(
+                "capability_capsule:c1",
+                "entity:e_alpha",
+                "mentions",
+                "x",
+                None,
+            )],
+            "00000001778000010001",
+        )
+        .await
+        .unwrap();
+    // Empty no-op.
+    store.sync_memory_edges(&[], "x").await.unwrap();
+    // Add a pre-closed historical edge for the stats split.
+    store
+        .add_edge_direct(&edge(
+            "capability_capsule:c3",
+            "capability_capsule:c1",
+            "supersedes",
+            "00000001778000010003",
+            Some("00000001778000020000"),
+        ))
+        .await
+        .unwrap();
+
+    // 1-hop from e_alpha → 3 active incident edges.
+    let one = store
+        .neighbors_within("entity:e_alpha", 1, None)
+        .await
+        .unwrap();
+    assert_eq!(one.len(), 3, "1-hop incident edges: {one:?}");
+    // 2-hop still only the 3 active edges (the c3→c1 edge is closed).
+    let two = store
+        .neighbors_within("entity:e_alpha", 2, None)
+        .await
+        .unwrap();
+    assert_eq!(two.len(), 3, "2-hop with closed-edge excluded: {two:?}");
+    // max_hops 0 clamps to 1.
+    let zero = store
+        .neighbors_within("entity:e_alpha", 0, None)
+        .await
+        .unwrap();
+    assert_eq!(zero.len(), 3);
+
+    // related_capability_capsule_ids: opposite endpoints, capsule prefix.
+    let related = store
+        .related_capability_capsule_ids(&["entity:e_alpha".into()])
+        .await
+        .unwrap();
+    assert_eq!(related, vec!["c1".to_string(), "c2".to_string()]);
+
+    // incident_edges_for_nodes returns raw active (from, to) pairs.
+    let pairs = store
+        .incident_edges_for_nodes(&["entity:e_alpha".into()])
+        .await
+        .unwrap();
+    assert_eq!(pairs.len(), 3);
+
+    // graph_stats split.
+    let s = store.graph_stats().await.unwrap();
+    assert_eq!(s.total_edges, 4);
+    assert_eq!(s.active_edges, 3);
+    assert_eq!(s.closed_edges, 1);
+    assert_eq!(s.node_count, 5); // c1, c2, c3, e_alpha, t1
+    assert_eq!(s.top_relations[0], ("mentions".to_string(), 2));
+});
+
+emb_test!(graph_invalidate_close_timeline_predicate_tunnels, store, {
+    store
+        .add_edge_direct(&edge(
+            "capability_capsule:c1",
+            "entity:e1",
+            "located_in",
+            "00000001778000010000",
+            None,
+        ))
+        .await
+        .unwrap();
+    // invalidate_edge stamps valid_to on the active triple.
+    let closed = store
+        .invalidate_edge(
+            "capability_capsule:c1",
+            "located_in",
+            "entity:e1",
+            "00000001778000020000",
+        )
+        .await
+        .unwrap();
+    assert_eq!(closed, 1);
+    // Idempotent: nothing active now → 0.
+    let again = store
+        .invalidate_edge(
+            "capability_capsule:c1",
+            "located_in",
+            "entity:e1",
+            "00000001778000020001",
+        )
+        .await
+        .unwrap();
+    assert_eq!(again, 0);
+
+    // kg_timeline shows the now-closed edge (history).
+    let tl = store.kg_timeline("capability_capsule:c1").await.unwrap();
+    assert_eq!(tl.len(), 1);
+    assert!(tl[0].valid_to.is_some());
+
+    // query_predicate: active+closed when as_of None.
+    let pred = store.query_predicate("located_in", None).await.unwrap();
+    assert_eq!(pred.len(), 1);
+    // as_of before the close → edge was active then.
+    let at = store
+        .query_predicate("located_in", Some("00000001778000015000"))
+        .await
+        .unwrap();
+    assert_eq!(at.len(), 1, "edge active at as_of");
+    // as_of after the close → excluded.
+    let after = store
+        .query_predicate("located_in", Some("00000001778000025000"))
+        .await
+        .unwrap();
+    assert!(after.is_empty());
+
+    // close_edges_for_capability_capsule closes all active edges FROM the
+    // capsule node.
+    store
+        .add_edge_direct(&edge(
+            "capability_capsule:c9",
+            "entity:e9",
+            "mentions",
+            "00000001778000010000",
+            None,
+        ))
+        .await
+        .unwrap();
+    let n = store
+        .close_edges_for_capability_capsule("c9")
+        .await
+        .unwrap();
+    assert_eq!(n, 1);
+    assert!(store.neighbors("entity:e9").await.unwrap().is_empty());
+
+    // user-tunnel discovery: list / find / follow.
+    store
+        .add_edge_direct(&edge(
+            "repo:mem",
+            "repo:other",
+            "user_tunnel:cross_project",
+            "00000001778000030000",
+            None,
+        ))
+        .await
+        .unwrap();
+    let tunnels = store.list_user_tunnels(100).await.unwrap();
+    assert_eq!(tunnels.len(), 1);
+    assert_eq!(tunnels[0].relation, "user_tunnel:cross_project");
+    let found = store
+        .find_tunnels("repo:mem", "repo:other", 100)
+        .await
+        .unwrap();
+    assert_eq!(found.len(), 1, "bidirectional prefix match");
+    let followed = store.follow_tunnels("repo:mem", 2).await.unwrap();
+    assert_eq!(followed.len(), 1);
+});
+
+// ─────────────────────────────────── TranscriptStore ────────────────────
+
+#[allow(clippy::too_many_arguments)]
+fn conv_msg(
+    id: &str,
+    session: &str,
+    line: u64,
+    block: u32,
+    block_type: BlockType,
+    content: &str,
+) -> ConversationMessage {
+    ConversationMessage {
+        message_block_id: id.into(),
+        session_id: Some(session.into()),
+        tenant: "t".into(),
+        caller_agent: "claude-code".into(),
+        transcript_path: format!("/tmp/{session}.jsonl"),
+        line_number: line,
+        block_index: block,
+        message_uuid: None,
+        role: MessageRole::Assistant,
+        block_type,
+        content: content.into(),
+        tool_name: None,
+        tool_use_id: None,
+        embed_eligible: matches!(block_type, BlockType::Text | BlockType::Thinking),
+        created_at: format!("000000017780000{line:05}0"),
+        meta_json: None,
+    }
+}
+
+emb_test!(transcript_create_dedup_and_by_session, store, {
+    store.set_transcript_job_provider("fake-test");
+    let m1 = conv_msg(
+        "blk_1",
+        "sess_a",
+        10,
+        0,
+        BlockType::Text,
+        "DuckDB serializes writes",
+    );
+    store.create_conversation_message(&m1).await.unwrap();
+    // Idempotent re-insert (same path/line/block) is a no-op, no error.
+    store.create_conversation_message(&m1).await.unwrap();
+
+    let by_session = store
+        .get_conversation_messages_by_session("t", "sess_a")
+        .await
+        .unwrap();
+    assert_eq!(by_session.len(), 1, "dedup on (path, line, block)");
+    assert_eq!(by_session[0].message_block_id, "blk_1");
+    assert_eq!(by_session[0].content, "DuckDB serializes writes");
+    assert_eq!(by_session[0].role, MessageRole::Assistant);
+    assert_eq!(by_session[0].block_type, BlockType::Text);
+});
+
+emb_test!(transcript_batch_dedup_count, store, {
+    store.set_transcript_job_provider("fake-test");
+    let mut dup = conv_msg("d1", "sess_b", 10, 0, BlockType::Text, "x");
+    // Pre-seed one row, then the batch carries a dup of it + two new +
+    // an intra-batch dup.
+    store.create_conversation_message(&dup).await.unwrap();
+    dup.message_block_id = "d1_dup".into(); // same (path, line, block) key
+    let new_a = conv_msg("n_a", "sess_b", 12, 0, BlockType::Text, "a");
+    let mut new_a_dup = conv_msg("n_a_dup", "sess_b", 12, 0, BlockType::Text, "a2");
+    new_a_dup.transcript_path = new_a.transcript_path.clone();
+    let new_b = conv_msg("n_b", "sess_b", 14, 0, BlockType::ToolUse, "{}");
+
+    let landed = store
+        .create_conversation_messages(&[dup.clone(), new_a, new_a_dup, new_b])
+        .await
+        .unwrap();
+    assert_eq!(landed, 2, "only n_a + n_b land");
+    // Empty no-op.
+    assert_eq!(store.create_conversation_messages(&[]).await.unwrap(), 0);
+
+    let all = store
+        .get_conversation_messages_by_session("t", "sess_b")
+        .await
+        .unwrap();
+    assert_eq!(all.len(), 3, "d1 + n_a + n_b");
+});
+
+emb_test!(transcript_paged_range_and_by_ids, store, {
+    store.set_transcript_job_provider("fake-test");
+    let m1 = conv_msg("p1", "sp", 10, 0, BlockType::Text, "alpha");
+    let m2 = conv_msg("p2", "sp", 12, 0, BlockType::ToolUse, "{}");
+    let m3 = conv_msg("p3", "sp", 14, 0, BlockType::Thinking, "gamma");
+    for m in [&m1, &m2, &m3] {
+        store.create_conversation_message(m).await.unwrap();
+    }
+
+    // Paged: page 1 of size 2 + cursor → page 2.
+    let (page1, more1) = store
+        .get_conversation_messages_by_session_paged("t", "sp", None, None, None, None, None, 2)
+        .await
+        .unwrap();
+    assert_eq!(page1.len(), 2);
+    assert!(more1);
+    let last = page1.last().unwrap();
+    let (page2, more2) = store
+        .get_conversation_messages_by_session_paged(
+            "t",
+            "sp",
+            None,
+            None,
+            None,
+            None,
+            Some((
+                last.created_at.as_str(),
+                last.line_number as i64,
+                last.block_index as i64,
+            )),
+            10,
+        )
+        .await
+        .unwrap();
+    assert_eq!(page2.len(), 1);
+    assert!(!more2);
+    assert_eq!(page2[0].message_block_id, "p3");
+
+    // block_type filter narrows to one row.
+    let (text_only, _) = store
+        .get_conversation_messages_by_session_paged(
+            "t",
+            "sp",
+            None,
+            None,
+            None,
+            Some("text"),
+            None,
+            10,
+        )
+        .await
+        .unwrap();
+    let text_ids: Vec<&str> = text_only
+        .iter()
+        .map(|m| m.message_block_id.as_str())
+        .collect();
+    assert_eq!(text_ids, vec!["p1"]);
+
+    // Cross-session range: session-bound rows only, ordered chronologically.
+    let (ranged, _) = store
+        .list_conversation_messages_in_range("t", None, None, None, None, None, 100)
+        .await
+        .unwrap();
+    let ranged_ids: Vec<&str> = ranged.iter().map(|m| m.message_block_id.as_str()).collect();
+    assert_eq!(ranged_ids, vec!["p1", "p2", "p3"]);
+
+    // by_ids preserves input order, drops missing.
+    let by_ids = store
+        .fetch_conversation_messages_by_ids("t", &["p3".into(), "p1".into(), "gone".into()])
+        .await
+        .unwrap();
+    let ids: Vec<&str> = by_ids.iter().map(|m| m.message_block_id.as_str()).collect();
+    assert_eq!(ids, vec!["p3", "p1"]);
+    // Empty short-circuits.
+    assert!(store
+        .fetch_conversation_messages_by_ids("t", &[])
+        .await
+        .unwrap()
+        .is_empty());
+
+    // list_transcript_sessions aggregate.
+    let sessions = store.list_transcript_sessions("t").await.unwrap();
+    assert_eq!(sessions.len(), 1);
+    assert_eq!(sessions[0].session_id, "sp");
+    assert_eq!(sessions[0].block_count, 3);
+    assert_eq!(sessions[0].caller_agent.as_deref(), Some("claude-code"));
+});
+
+emb_test!(transcript_context_window_and_anchors, store, {
+    store.set_transcript_job_provider("fake-test");
+    let m1 = conv_msg("w1", "sw", 10, 0, BlockType::Text, "before");
+    let m2 = conv_msg("w2", "sw", 12, 0, BlockType::ToolUse, "{}");
+    let m3 = conv_msg("w3", "sw", 14, 0, BlockType::Thinking, "after");
+    for m in [&m1, &m2, &m3] {
+        store.create_conversation_message(m).await.unwrap();
+    }
+
+    // context window around the tool_use middle block, tool blocks included.
+    let win = store
+        .context_window_for_block("t", "w2", 5, 5, true)
+        .await
+        .unwrap();
+    assert_eq!(win.primary.message_block_id, "w2");
+    assert_eq!(win.before.len(), 1);
+    assert_eq!(win.before[0].message_block_id, "w1");
+    assert_eq!(win.after.len(), 1);
+    assert_eq!(win.after[0].message_block_id, "w3");
+
+    // k=0 → empty neighbors.
+    let win0 = store
+        .context_window_for_block("t", "w2", 0, 0, true)
+        .await
+        .unwrap();
+    assert!(win0.before.is_empty() && win0.after.is_empty());
+
+    // Missing primary → NotFound.
+    let nf = store
+        .context_window_for_block("t", "nope", 5, 5, true)
+        .await
+        .unwrap_err();
+    assert!(matches!(
+        nf,
+        mem::storage::types::StorageError::NotFound("transcript primary block")
+    ));
+
+    // anchor_session_candidates: embed_eligible only, recent first
+    // (w3 thinking, w1 text; w2 tool_use excluded).
+    let anchors = store.anchor_session_candidates("t", "sw", 5).await.unwrap();
+    assert_eq!(anchors, vec!["w3".to_string(), "w1".to_string()]);
+
+    // recent_conversation_messages: embed_eligible, newest first.
+    let recent = store.recent_conversation_messages("t", 10).await.unwrap();
+    let recent_ids: Vec<&str> = recent.iter().map(|m| m.message_block_id.as_str()).collect();
+    assert_eq!(recent_ids, vec!["w3", "w1"]);
+});
+
+emb_test!(transcript_bm25_finds_lexical_match, store, {
+    store.set_transcript_job_provider("fake-test");
+    store
+        .create_conversation_message(&conv_msg(
+            "lex_hit",
+            "sl",
+            10,
+            0,
+            BlockType::Text,
+            "configure the embedding batch size knob",
+        ))
+        .await
+        .unwrap();
+    store
+        .create_conversation_message(&conv_msg(
+            "lex_miss",
+            "sl",
+            12,
+            0,
+            BlockType::Text,
+            "completely unrelated archive note",
+        ))
+        .await
+        .unwrap();
+    let hits = store
+        .bm25_transcript_candidates("t", "embedding batch", 10)
+        .await
+        .unwrap();
+    let ids: Vec<&str> = hits.iter().map(|m| m.message_block_id.as_str()).collect();
+    assert!(ids.contains(&"lex_hit"), "keyword block recalled: {ids:?}");
+    assert!(
+        !ids.contains(&"lex_miss"),
+        "unrelated block not recalled: {ids:?}"
+    );
+    // Empty query → empty.
+    assert!(store
+        .bm25_transcript_candidates("t", "   ", 10)
+        .await
+        .unwrap()
+        .is_empty());
+});
+
+emb_test!(transcript_semantic_search_pgvector, store, {
+    store.set_transcript_job_provider("fake-test");
+    let near = conv_msg("sem_near", "ss", 10, 0, BlockType::Text, "alpha");
+    let far = conv_msg("sem_far", "ss", 12, 0, BlockType::Text, "beta");
+    store.create_conversation_message(&near).await.unwrap();
+    store.create_conversation_message(&far).await.unwrap();
+    // Seed embeddings: near ≈ query [1,0,..], far = [0,1,..].
+    store
+        .upsert_conversation_message_embedding(
+            "sem_near",
+            "t",
+            "fake",
+            DIM as i64,
+            &blob_of(&vec_of(DIM, &[1.0, 0.0])),
+            "h",
+            "s",
+            "n",
+        )
+        .await
+        .unwrap();
+    store
+        .upsert_conversation_message_embedding(
+            "sem_far",
+            "t",
+            "fake",
+            DIM as i64,
+            &blob_of(&vec_of(DIM, &[0.0, 1.0])),
+            "h",
+            "s",
+            "n",
+        )
+        .await
+        .unwrap();
+
+    let hits = store
+        .semantic_search_transcripts("t", &vec_of(DIM, &[1.0, 0.0]), 5)
+        .await
+        .unwrap();
+    let ids: Vec<&str> = hits
+        .iter()
+        .map(|(m, _)| m.message_block_id.as_str())
+        .collect();
+    assert_eq!(
+        ids,
+        vec!["sem_near", "sem_far"],
+        "ordered by cosine distance"
+    );
+    // similarity of the identical-direction vector ≈ 1.0.
+    assert!(
+        (hits[0].1 - 1.0).abs() < 1e-4,
+        "near similarity ≈ 1.0: {}",
+        hits[0].1
+    );
+
+    // Empty embeddings table on a different tenant → empty (no error),
+    // but here the table exists; empty query short-circuits regardless.
+    assert!(store
+        .semantic_search_transcripts("t", &[], 5)
+        .await
+        .unwrap()
+        .is_empty());
 });

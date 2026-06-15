@@ -1,17 +1,21 @@
-//! Phase 5 — `Backend` umbrella placeholder impls for
+//! Phase 5 — `Backend` umbrella sub-trait impls for
 //! [`PostgresCapsuleStore`].
 //!
 //! [`super::Backend`] requires 11 storage sub-traits. The Phase 4
-//! spike (`postgres_capsule_store.rs`) only implements
-//! [`super::CapsuleStore`] for real. This module supplies P2-skeleton
-//! `unimplemented!()` placeholders for the other 10 so the concrete
-//! type satisfies `Backend` and the blanket impl in `backend.rs`
-//! applies. Every method body here is a deliberate stub — the real
-//! Postgres implementations land in postgres-backend phases P3-P5.
+//! spike (`postgres_capsule_store.rs`) implements [`super::CapsuleStore`];
+//! this module supplies the other 10 (CapsuleSearchStore,
+//! EmbeddingVectorStore, EmbeddingJobStore, GraphStore, TranscriptStore,
+//! EntityRegistry, SessionStore, MaintenanceStore, MineCursorStore,
+//! EvolutionCandidateStore) so the concrete type satisfies `Backend` and
+//! the blanket impl in `backend.rs` applies. Every method here is a real
+//! Postgres implementation behaviour-aligned with the Lance/DuckDB
+//! backend; the `MaintenanceStore::vacuum_old_versions_with` /
+//! `ensure_query_indexes` no-ops are deliberate (no Lance-manifest analog
+//! on Postgres).
 //!
 //! Behind the `postgres` cargo feature (this whole module is only
 //! `mod`'d under `#[cfg(feature = "postgres")]`), so the default build
-//! never sees these stubs.
+//! never pulls it in.
 
 use async_trait::async_trait;
 
@@ -435,190 +439,470 @@ impl CapsuleSearchStore for PostgresCapsuleStore {
 impl EmbeddingJobStore for PostgresCapsuleStore {
     async fn try_enqueue_embedding_job(
         &self,
-        _insert: EmbeddingJobInsert,
+        insert: EmbeddingJobInsert,
     ) -> Result<bool, StorageError> {
-        unimplemented!(
-            "postgres backend: EmbeddingJobStore::try_enqueue_embedding_job not yet implemented (postgres-backend P3-P5)"
+        // Idempotency probe: decline if any live (pending/processing)
+        // row already covers the (tenant, capsule, hash, provider) tuple.
+        // Mirrors the Lance count→insert window; PG gives us a real
+        // transaction so the probe + insert are atomic.
+        let mut tx = self.pool().begin().await.map_err(sqlx_err)?;
+        let live: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM embedding_jobs \
+             WHERE tenant = $1 AND capability_capsule_id = $2 \
+               AND target_content_hash = $3 AND provider = $4 \
+               AND status IN ('pending', 'processing')",
         )
+        .bind(&insert.tenant)
+        .bind(&insert.capability_capsule_id)
+        .bind(&insert.target_content_hash)
+        .bind(&insert.provider)
+        .fetch_one(&mut *tx)
+        .await
+        .map_err(sqlx_err)?;
+        if live > 0 {
+            tx.rollback().await.map_err(sqlx_err)?;
+            return Ok(false);
+        }
+        sqlx::query(
+            "INSERT INTO embedding_jobs (job_id, tenant, capability_capsule_id, \
+                target_content_hash, provider, status, attempt_count, last_error, \
+                available_at, created_at, updated_at) \
+             VALUES ($1, $2, $3, $4, $5, 'pending', 0, NULL, $6, $7, $8)",
+        )
+        .bind(&insert.job_id)
+        .bind(&insert.tenant)
+        .bind(&insert.capability_capsule_id)
+        .bind(&insert.target_content_hash)
+        .bind(&insert.provider)
+        .bind(&insert.available_at)
+        .bind(&insert.created_at)
+        .bind(&insert.updated_at)
+        .execute(&mut *tx)
+        .await
+        .map_err(sqlx_err)?;
+        tx.commit().await.map_err(sqlx_err)?;
+        Ok(true)
     }
 
     async fn enqueue_embedding_jobs(
         &self,
-        _inserts: &[EmbeddingJobInsert],
+        inserts: &[EmbeddingJobInsert],
     ) -> Result<(), StorageError> {
-        unimplemented!(
-            "postgres backend: EmbeddingJobStore::enqueue_embedding_jobs not yet implemented (postgres-backend P3-P5)"
-        )
+        if inserts.is_empty() {
+            return Ok(());
+        }
+        // Batch insert (caller guarantees no live duplicate, per the
+        // Lance contract — no per-row probe). One transaction.
+        let mut tx = self.pool().begin().await.map_err(sqlx_err)?;
+        for insert in inserts {
+            sqlx::query(
+                "INSERT INTO embedding_jobs (job_id, tenant, capability_capsule_id, \
+                    target_content_hash, provider, status, attempt_count, last_error, \
+                    available_at, created_at, updated_at) \
+                 VALUES ($1, $2, $3, $4, $5, 'pending', 0, NULL, $6, $7, $8)",
+            )
+            .bind(&insert.job_id)
+            .bind(&insert.tenant)
+            .bind(&insert.capability_capsule_id)
+            .bind(&insert.target_content_hash)
+            .bind(&insert.provider)
+            .bind(&insert.available_at)
+            .bind(&insert.created_at)
+            .bind(&insert.updated_at)
+            .execute(&mut *tx)
+            .await
+            .map_err(sqlx_err)?;
+        }
+        tx.commit().await.map_err(sqlx_err)?;
+        Ok(())
     }
 
     async fn claim_next_n_embedding_jobs(
         &self,
-        _now: &str,
-        _max_retries: u32,
-        _n: usize,
+        now: &str,
+        max_retries: u32,
+        n: usize,
     ) -> Result<Vec<ClaimedEmbeddingJob>, StorageError> {
-        unimplemented!(
-            "postgres backend: EmbeddingJobStore::claim_next_n_embedding_jobs not yet implemented (postgres-backend P3-P5)"
+        if n == 0 {
+            return Ok(Vec::new());
+        }
+        // SELECT ... FOR UPDATE SKIP LOCKED then flip to 'processing' in
+        // one transaction. Eligible = pending OR (failed with retry
+        // budget AND available_at <= now). Ordered created_at ASC.
+        let max_r = i64::from(max_retries);
+        let lim = i64::try_from(n).unwrap_or(i64::MAX);
+        let mut tx = self.pool().begin().await.map_err(sqlx_err)?;
+        let rows = sqlx::query(
+            "SELECT job_id, tenant, capability_capsule_id, target_content_hash, \
+                    provider, attempt_count \
+             FROM embedding_jobs \
+             WHERE status = 'pending' \
+                OR (status = 'failed' AND attempt_count < $1 AND available_at <= $2) \
+             ORDER BY created_at ASC \
+             LIMIT $3 \
+             FOR UPDATE SKIP LOCKED",
         )
+        .bind(max_r)
+        .bind(now)
+        .bind(lim)
+        .fetch_all(&mut *tx)
+        .await
+        .map_err(sqlx_err)?;
+
+        let mut claimed = Vec::with_capacity(rows.len());
+        for r in &rows {
+            let job_id: String = r.try_get("job_id").map_err(sqlx_err)?;
+            sqlx::query(
+                "UPDATE embedding_jobs SET status = 'processing', updated_at = $2 \
+                 WHERE job_id = $1",
+            )
+            .bind(&job_id)
+            .bind(now)
+            .execute(&mut *tx)
+            .await
+            .map_err(sqlx_err)?;
+            claimed.push(ClaimedEmbeddingJob {
+                job_id,
+                tenant: r.try_get("tenant").map_err(sqlx_err)?,
+                capability_capsule_id: r.try_get("capability_capsule_id").map_err(sqlx_err)?,
+                target_content_hash: r.try_get("target_content_hash").map_err(sqlx_err)?,
+                provider: r.try_get("provider").map_err(sqlx_err)?,
+                attempt_count: r.try_get("attempt_count").map_err(sqlx_err)?,
+            });
+        }
+        tx.commit().await.map_err(sqlx_err)?;
+        Ok(claimed)
     }
 
-    async fn complete_embedding_job(&self, _job_id: &str, _now: &str) -> Result<(), StorageError> {
-        unimplemented!(
-            "postgres backend: EmbeddingJobStore::complete_embedding_job not yet implemented (postgres-backend P3-P5)"
+    async fn complete_embedding_job(&self, job_id: &str, now: &str) -> Result<(), StorageError> {
+        // Only complete a row still 'processing' (mirror Lance / DuckDB).
+        sqlx::query(
+            "UPDATE embedding_jobs \
+             SET status = 'completed', last_error = NULL, updated_at = $2 \
+             WHERE job_id = $1 AND status = 'processing'",
         )
+        .bind(job_id)
+        .bind(now)
+        .execute(self.pool())
+        .await
+        .map_err(sqlx_err)?;
+        Ok(())
     }
 
-    async fn mark_embedding_job_stale(
-        &self,
-        _job_id: &str,
-        _now: &str,
-    ) -> Result<(), StorageError> {
-        unimplemented!(
-            "postgres backend: EmbeddingJobStore::mark_embedding_job_stale not yet implemented (postgres-backend P3-P5)"
+    async fn mark_embedding_job_stale(&self, job_id: &str, now: &str) -> Result<(), StorageError> {
+        sqlx::query(
+            "UPDATE embedding_jobs SET status = 'stale', updated_at = $2 WHERE job_id = $1",
         )
+        .bind(job_id)
+        .bind(now)
+        .execute(self.pool())
+        .await
+        .map_err(sqlx_err)?;
+        Ok(())
     }
 
     async fn reschedule_embedding_job_failure(
         &self,
-        _job_id: &str,
-        _new_attempt_count: i64,
-        _last_error: &str,
-        _available_at: &str,
-        _now: &str,
+        job_id: &str,
+        new_attempt_count: i64,
+        last_error: &str,
+        available_at: &str,
+        now: &str,
     ) -> Result<(), StorageError> {
-        unimplemented!(
-            "postgres backend: EmbeddingJobStore::reschedule_embedding_job_failure not yet implemented (postgres-backend P3-P5)"
+        sqlx::query(
+            "UPDATE embedding_jobs \
+             SET status = 'failed', attempt_count = $2, last_error = $3, \
+                 available_at = $4, updated_at = $5 \
+             WHERE job_id = $1",
         )
+        .bind(job_id)
+        .bind(new_attempt_count)
+        .bind(last_error)
+        .bind(available_at)
+        .bind(now)
+        .execute(self.pool())
+        .await
+        .map_err(sqlx_err)?;
+        Ok(())
     }
 
     async fn permanently_fail_embedding_job(
         &self,
-        _job_id: &str,
-        _new_attempt_count: i64,
-        _last_error: &str,
-        _now: &str,
+        job_id: &str,
+        new_attempt_count: i64,
+        last_error: &str,
+        now: &str,
     ) -> Result<(), StorageError> {
-        unimplemented!(
-            "postgres backend: EmbeddingJobStore::permanently_fail_embedding_job not yet implemented (postgres-backend P3-P5)"
+        sqlx::query(
+            "UPDATE embedding_jobs \
+             SET status = 'failed', attempt_count = $2, last_error = $3, updated_at = $4 \
+             WHERE job_id = $1",
         )
+        .bind(job_id)
+        .bind(new_attempt_count)
+        .bind(last_error)
+        .bind(now)
+        .execute(self.pool())
+        .await
+        .map_err(sqlx_err)?;
+        Ok(())
     }
 
     async fn delete_embedding_jobs_by_capability_capsule_id(
         &self,
-        _capability_capsule_id: &str,
+        capability_capsule_id: &str,
     ) -> Result<usize, StorageError> {
-        unimplemented!(
-            "postgres backend: EmbeddingJobStore::delete_embedding_jobs_by_capability_capsule_id not yet implemented (postgres-backend P3-P5)"
-        )
+        let res = sqlx::query("DELETE FROM embedding_jobs WHERE capability_capsule_id = $1")
+            .bind(capability_capsule_id)
+            .execute(self.pool())
+            .await
+            .map_err(sqlx_err)?;
+        Ok(res.rows_affected() as usize)
     }
 
     async fn stale_live_embedding_jobs_for_capability_capsule(
         &self,
-        _tenant: &str,
-        _capability_capsule_id: &str,
-        _provider: &str,
-        _now: &str,
+        tenant: &str,
+        capability_capsule_id: &str,
+        provider: &str,
+        now: &str,
     ) -> Result<usize, StorageError> {
-        unimplemented!(
-            "postgres backend: EmbeddingJobStore::stale_live_embedding_jobs_for_capability_capsule not yet implemented (postgres-backend P3-P5)"
+        // Mark every live (pending|processing) job for the triple stale.
+        let res = sqlx::query(
+            "UPDATE embedding_jobs SET status = 'stale', updated_at = $4 \
+             WHERE tenant = $1 AND capability_capsule_id = $2 AND provider = $3 \
+               AND status IN ('pending', 'processing')",
         )
+        .bind(tenant)
+        .bind(capability_capsule_id)
+        .bind(provider)
+        .bind(now)
+        .execute(self.pool())
+        .await
+        .map_err(sqlx_err)?;
+        Ok(res.rows_affected() as usize)
     }
 
-    async fn get_embedding_job_status(
-        &self,
-        _job_id: &str,
-    ) -> Result<Option<String>, StorageError> {
-        unimplemented!(
-            "postgres backend: EmbeddingJobStore::get_embedding_job_status not yet implemented (postgres-backend P3-P5)"
-        )
+    async fn get_embedding_job_status(&self, job_id: &str) -> Result<Option<String>, StorageError> {
+        sqlx::query_scalar::<_, String>("SELECT status FROM embedding_jobs WHERE job_id = $1")
+            .bind(job_id)
+            .fetch_optional(self.pool())
+            .await
+            .map_err(sqlx_err)
     }
 
     async fn latest_embedding_job_status_for_hash(
         &self,
-        _tenant: &str,
-        _capability_capsule_id: &str,
-        _target_content_hash: &str,
+        tenant: &str,
+        capability_capsule_id: &str,
+        target_content_hash: &str,
     ) -> Result<Option<String>, StorageError> {
-        unimplemented!(
-            "postgres backend: EmbeddingJobStore::latest_embedding_job_status_for_hash not yet implemented (postgres-backend P3-P5)"
+        // Most-recent row's status — Lance sorts by updated_at DESC.
+        sqlx::query_scalar::<_, String>(
+            "SELECT status FROM embedding_jobs \
+             WHERE tenant = $1 AND capability_capsule_id = $2 AND target_content_hash = $3 \
+             ORDER BY updated_at DESC LIMIT 1",
         )
+        .bind(tenant)
+        .bind(capability_capsule_id)
+        .bind(target_content_hash)
+        .fetch_optional(self.pool())
+        .await
+        .map_err(sqlx_err)
     }
 
     async fn list_embedding_jobs(
         &self,
-        _tenant: &str,
-        _status_filter: Option<&str>,
-        _memory_id_filter: Option<&str>,
-        _limit: usize,
+        tenant: &str,
+        status_filter: Option<&str>,
+        memory_id_filter: Option<&str>,
+        limit: usize,
     ) -> Result<Vec<EmbeddingJobInfo>, StorageError> {
-        unimplemented!(
-            "postgres backend: EmbeddingJobStore::list_embedding_jobs not yet implemented (postgres-backend P3-P5)"
+        // tenant + optional status + optional capsule id, ordered
+        // updated_at DESC, bounded (Lance clamps at 10_000).
+        let lim = i64::try_from(limit.min(10_000)).unwrap_or(10_000);
+        let rows = sqlx::query(
+            "SELECT job_id, tenant, capability_capsule_id, target_content_hash, provider, \
+                    status, attempt_count, last_error, available_at, created_at, updated_at \
+             FROM embedding_jobs \
+             WHERE tenant = $1 \
+               AND ($2::TEXT IS NULL OR status = $2) \
+               AND ($3::TEXT IS NULL OR capability_capsule_id = $3) \
+             ORDER BY updated_at DESC \
+             LIMIT $4",
         )
+        .bind(tenant)
+        .bind(status_filter)
+        .bind(memory_id_filter)
+        .bind(lim)
+        .fetch_all(self.pool())
+        .await
+        .map_err(sqlx_err)?;
+        rows.iter()
+            .map(|r| {
+                let attempt_count: i64 = r.try_get("attempt_count").map_err(sqlx_err)?;
+                Ok(EmbeddingJobInfo {
+                    job_id: r.try_get("job_id").map_err(sqlx_err)?,
+                    tenant: r.try_get("tenant").map_err(sqlx_err)?,
+                    capability_capsule_id: r.try_get("capability_capsule_id").map_err(sqlx_err)?,
+                    target_content_hash: r.try_get("target_content_hash").map_err(sqlx_err)?,
+                    provider: r.try_get("provider").map_err(sqlx_err)?,
+                    status: r.try_get("status").map_err(sqlx_err)?,
+                    attempt_count: u32::try_from(attempt_count).unwrap_or(u32::MAX),
+                    last_error: r.try_get("last_error").map_err(sqlx_err)?,
+                    available_at: r.try_get("available_at").map_err(sqlx_err)?,
+                    created_at: r.try_get("created_at").map_err(sqlx_err)?,
+                    updated_at: r.try_get("updated_at").map_err(sqlx_err)?,
+                })
+            })
+            .collect()
     }
 
     async fn claim_next_n_transcript_embedding_jobs(
         &self,
-        _now: &str,
-        _max_retries: u32,
-        _n: usize,
+        now: &str,
+        max_retries: u32,
+        n: usize,
     ) -> Result<Vec<ClaimedTranscriptEmbeddingJob>, StorageError> {
-        unimplemented!(
-            "postgres backend: EmbeddingJobStore::claim_next_n_transcript_embedding_jobs not yet implemented (postgres-backend P3-P5)"
+        if n == 0 {
+            return Ok(Vec::new());
+        }
+        let max_r = i64::from(max_retries);
+        let lim = i64::try_from(n).unwrap_or(i64::MAX);
+        let mut tx = self.pool().begin().await.map_err(sqlx_err)?;
+        let rows = sqlx::query(
+            "SELECT job_id, tenant, message_block_id, provider, attempt_count \
+             FROM transcript_embedding_jobs \
+             WHERE status = 'pending' \
+                OR (status = 'failed' AND attempt_count < $1 AND available_at <= $2) \
+             ORDER BY created_at ASC \
+             LIMIT $3 \
+             FOR UPDATE SKIP LOCKED",
         )
+        .bind(max_r)
+        .bind(now)
+        .bind(lim)
+        .fetch_all(&mut *tx)
+        .await
+        .map_err(sqlx_err)?;
+
+        let mut claimed = Vec::with_capacity(rows.len());
+        for r in &rows {
+            let job_id: String = r.try_get("job_id").map_err(sqlx_err)?;
+            sqlx::query(
+                "UPDATE transcript_embedding_jobs SET status = 'processing', updated_at = $2 \
+                 WHERE job_id = $1",
+            )
+            .bind(&job_id)
+            .bind(now)
+            .execute(&mut *tx)
+            .await
+            .map_err(sqlx_err)?;
+            claimed.push(ClaimedTranscriptEmbeddingJob {
+                job_id,
+                tenant: r.try_get("tenant").map_err(sqlx_err)?,
+                message_block_id: r.try_get("message_block_id").map_err(sqlx_err)?,
+                provider: r.try_get("provider").map_err(sqlx_err)?,
+                attempt_count: r.try_get("attempt_count").map_err(sqlx_err)?,
+            });
+        }
+        tx.commit().await.map_err(sqlx_err)?;
+        Ok(claimed)
     }
 
     async fn complete_transcript_embedding_job(
         &self,
-        _job_id: &str,
-        _now: &str,
+        job_id: &str,
+        now: &str,
     ) -> Result<(), StorageError> {
-        unimplemented!(
-            "postgres backend: EmbeddingJobStore::complete_transcript_embedding_job not yet implemented (postgres-backend P3-P5)"
+        sqlx::query(
+            "UPDATE transcript_embedding_jobs \
+             SET status = 'completed', last_error = NULL, updated_at = $2 \
+             WHERE job_id = $1 AND status = 'processing'",
         )
+        .bind(job_id)
+        .bind(now)
+        .execute(self.pool())
+        .await
+        .map_err(sqlx_err)?;
+        Ok(())
     }
 
     async fn mark_transcript_embedding_job_stale(
         &self,
-        _job_id: &str,
-        _now: &str,
+        job_id: &str,
+        now: &str,
     ) -> Result<(), StorageError> {
-        unimplemented!(
-            "postgres backend: EmbeddingJobStore::mark_transcript_embedding_job_stale not yet implemented (postgres-backend P3-P5)"
+        sqlx::query(
+            "UPDATE transcript_embedding_jobs SET status = 'stale', updated_at = $2 \
+             WHERE job_id = $1",
         )
+        .bind(job_id)
+        .bind(now)
+        .execute(self.pool())
+        .await
+        .map_err(sqlx_err)?;
+        Ok(())
     }
 
     async fn reschedule_transcript_embedding_job_failure(
         &self,
-        _job_id: &str,
-        _new_attempt_count: i64,
-        _last_error: &str,
-        _available_at: &str,
-        _now: &str,
+        job_id: &str,
+        new_attempt_count: i64,
+        last_error: &str,
+        available_at: &str,
+        now: &str,
     ) -> Result<(), StorageError> {
-        unimplemented!(
-            "postgres backend: EmbeddingJobStore::reschedule_transcript_embedding_job_failure not yet implemented (postgres-backend P3-P5)"
+        sqlx::query(
+            "UPDATE transcript_embedding_jobs \
+             SET status = 'failed', attempt_count = $2, last_error = $3, \
+                 available_at = $4, updated_at = $5 \
+             WHERE job_id = $1",
         )
+        .bind(job_id)
+        .bind(new_attempt_count)
+        .bind(last_error)
+        .bind(available_at)
+        .bind(now)
+        .execute(self.pool())
+        .await
+        .map_err(sqlx_err)?;
+        Ok(())
     }
 
     async fn permanently_fail_transcript_embedding_job(
         &self,
-        _job_id: &str,
-        _new_attempt_count: i64,
-        _last_error: &str,
-        _now: &str,
+        job_id: &str,
+        new_attempt_count: i64,
+        last_error: &str,
+        now: &str,
     ) -> Result<(), StorageError> {
-        unimplemented!(
-            "postgres backend: EmbeddingJobStore::permanently_fail_transcript_embedding_job not yet implemented (postgres-backend P3-P5)"
+        sqlx::query(
+            "UPDATE transcript_embedding_jobs \
+             SET status = 'failed', attempt_count = $2, last_error = $3, updated_at = $4 \
+             WHERE job_id = $1",
         )
+        .bind(job_id)
+        .bind(new_attempt_count)
+        .bind(last_error)
+        .bind(now)
+        .execute(self.pool())
+        .await
+        .map_err(sqlx_err)?;
+        Ok(())
     }
 
     async fn get_transcript_embedding_job_status(
         &self,
-        _job_id: &str,
+        job_id: &str,
     ) -> Result<Option<String>, StorageError> {
-        unimplemented!(
-            "postgres backend: EmbeddingJobStore::get_transcript_embedding_job_status not yet implemented (postgres-backend P3-P5)"
+        sqlx::query_scalar::<_, String>(
+            "SELECT status FROM transcript_embedding_jobs WHERE job_id = $1",
         )
+        .bind(job_id)
+        .fetch_optional(self.pool())
+        .await
+        .map_err(sqlx_err)
     }
 }
 
@@ -982,264 +1266,1210 @@ impl EmbeddingVectorStore for PostgresCapsuleStore {
 
 // ───────────────────────────────── GraphStore ─────────────────────────────
 
+/// Map a sqlx error into a `GraphError::Backend` (the graph trait's
+/// error type — distinct from `StorageError`, see `types.rs`).
+fn graph_err(e: sqlx::Error) -> GraphError {
+    GraphError::Backend(format!("postgres: {e}"))
+}
+
+/// `graph_edges` SELECT column order shared by every graph read. Keep
+/// in sync with [`pg_row_to_graph_edge`].
+const GRAPH_EDGE_COLS: &str = "from_node_id, to_node_id, relation, valid_from, valid_to, \
+    confidence, extractor, strength, stability, last_activated, access_count";
+
+/// Upper cap on `neighbors_within` / `follow_tunnels` hops (mirrors the
+/// DuckDB `MAX_HOPS_CAP`).
+const PG_MAX_HOPS_CAP: u32 = 3;
+
+/// Project a `graph_edges` row into a [`GraphEdge`].
+fn pg_row_to_graph_edge(row: &sqlx::postgres::PgRow) -> Result<GraphEdge, GraphError> {
+    Ok(GraphEdge {
+        from_node_id: row.try_get("from_node_id").map_err(graph_err)?,
+        to_node_id: row.try_get("to_node_id").map_err(graph_err)?,
+        relation: row.try_get("relation").map_err(graph_err)?,
+        valid_from: row.try_get("valid_from").map_err(graph_err)?,
+        valid_to: row.try_get("valid_to").map_err(graph_err)?,
+        confidence: row.try_get("confidence").map_err(graph_err)?,
+        extractor: row.try_get("extractor").map_err(graph_err)?,
+        strength: row.try_get("strength").map_err(graph_err)?,
+        stability: row.try_get("stability").map_err(graph_err)?,
+        last_activated: row.try_get("last_activated").map_err(graph_err)?,
+        access_count: row.try_get("access_count").map_err(graph_err)?,
+    })
+}
+
 #[async_trait]
 impl GraphStore for PostgresCapsuleStore {
-    async fn neighbors(&self, _node_id: &str) -> Result<Vec<GraphEdge>, GraphError> {
-        unimplemented!(
-            "postgres backend: GraphStore::neighbors not yet implemented (postgres-backend P3-P5)"
-        )
+    async fn neighbors(&self, node_id: &str) -> Result<Vec<GraphEdge>, GraphError> {
+        // 1-hop active edges incident on node_id, ordered
+        // (relation, from, to) — matches the DuckDB `neighbors`.
+        let sql = format!(
+            "SELECT {GRAPH_EDGE_COLS} FROM graph_edges \
+             WHERE (from_node_id = $1 OR to_node_id = $1) AND valid_to IS NULL \
+             ORDER BY relation, from_node_id, to_node_id"
+        );
+        let rows = sqlx::query(&sql)
+            .bind(node_id)
+            .fetch_all(self.pool())
+            .await
+            .map_err(graph_err)?;
+        rows.iter().map(pg_row_to_graph_edge).collect()
     }
 
     async fn neighbors_within(
         &self,
-        _node_id: &str,
-        _max_hops: u32,
-        _as_of: Option<&str>,
+        node_id: &str,
+        max_hops: u32,
+        as_of: Option<&str>,
     ) -> Result<Vec<GraphEdge>, GraphError> {
-        unimplemented!(
-            "postgres backend: GraphStore::neighbors_within not yet implemented (postgres-backend P3-P5)"
-        )
+        // Recursive CTE BFS. `valid_to IS NULL` (active now) when as_of
+        // is None; bitemporal window when supplied. The CTE walks node
+        // ids up to `hops` levels; the final SELECT projects the
+        // DISTINCT incident edge set, ordered (relation, from, to,
+        // valid_from) for determinism (matches the DuckDB read).
+        let hops = i32::try_from(max_hops.clamp(1, PG_MAX_HOPS_CAP)).unwrap_or(1);
+        let validity = if as_of.is_some() {
+            "valid_from <= $3 AND (valid_to IS NULL OR valid_to > $3)"
+        } else {
+            "valid_to IS NULL"
+        };
+        // `walk` accumulates the reachable node set with its depth;
+        // `edges` is the DISTINCT incident-edge projection over those
+        // nodes. Depth bound `< $2` (root is depth 0; a `hops`-level
+        // walk visits depths 0..hops, expanding while depth < hops).
+        let sql = format!(
+            "WITH RECURSIVE walk(node, depth) AS ( \
+                 SELECT $1::TEXT, 0 \
+               UNION \
+                 SELECT CASE WHEN e.from_node_id = w.node THEN e.to_node_id \
+                             ELSE e.from_node_id END, \
+                        w.depth + 1 \
+                 FROM walk w \
+                 JOIN graph_edges e \
+                   ON (e.from_node_id = w.node OR e.to_node_id = w.node) \
+                  AND {validity} \
+                 WHERE w.depth < $2 \
+             ) \
+             SELECT DISTINCT {GRAPH_EDGE_COLS} \
+             FROM graph_edges e \
+             WHERE (e.from_node_id IN (SELECT node FROM walk) \
+                 OR e.to_node_id IN (SELECT node FROM walk)) \
+               AND {validity} \
+             ORDER BY relation, from_node_id, to_node_id, valid_from"
+        );
+        let mut q = sqlx::query(&sql).bind(node_id).bind(hops);
+        if let Some(ts) = as_of {
+            q = q.bind(ts);
+        }
+        let rows = q.fetch_all(self.pool()).await.map_err(graph_err)?;
+        // The final projection keys edges by their incidence on ANY
+        // visited node — but a `hops`-deep walk's frontier nodes pull in
+        // edges that are one hop beyond the bound. Trim to the edges
+        // whose endpoints are both within the visited set so the result
+        // matches the DuckDB BFS edge set exactly.
+        let visited = self
+            .neighbors_within_visited(node_id, max_hops, as_of, validity)
+            .await?;
+        let out: Vec<GraphEdge> = rows
+            .iter()
+            .map(pg_row_to_graph_edge)
+            .collect::<Result<Vec<_>, _>>()?
+            .into_iter()
+            .filter(|e| {
+                visited.contains(e.from_node_id.as_str()) && visited.contains(e.to_node_id.as_str())
+            })
+            .collect();
+        Ok(out)
     }
 
-    async fn kg_timeline(&self, _node_id: &str) -> Result<Vec<GraphEdge>, GraphError> {
-        unimplemented!(
-            "postgres backend: GraphStore::kg_timeline not yet implemented (postgres-backend P3-P5)"
-        )
+    async fn kg_timeline(&self, node_id: &str) -> Result<Vec<GraphEdge>, GraphError> {
+        // All edges (active + closed) incident on node_id, chronological.
+        let sql = format!(
+            "SELECT {GRAPH_EDGE_COLS} FROM graph_edges \
+             WHERE from_node_id = $1 OR to_node_id = $1 \
+             ORDER BY valid_from ASC, relation ASC, from_node_id ASC, to_node_id ASC"
+        );
+        let rows = sqlx::query(&sql)
+            .bind(node_id)
+            .fetch_all(self.pool())
+            .await
+            .map_err(graph_err)?;
+        rows.iter().map(pg_row_to_graph_edge).collect()
     }
 
     async fn query_predicate(
         &self,
-        _predicate: &str,
-        _as_of: Option<&str>,
+        predicate: &str,
+        as_of: Option<&str>,
     ) -> Result<Vec<GraphEdge>, GraphError> {
-        unimplemented!(
-            "postgres backend: GraphStore::query_predicate not yet implemented (postgres-backend P3-P5)"
-        )
+        // relation = predicate, time-scoped when as_of supplied (else
+        // active + closed). Ordered (valid_from, from, to).
+        let sql = format!(
+            "SELECT {GRAPH_EDGE_COLS} FROM graph_edges \
+             WHERE relation = $1 \
+               AND ($2::TEXT IS NULL \
+                    OR (valid_from <= $2 AND (valid_to IS NULL OR valid_to > $2))) \
+             ORDER BY valid_from ASC, from_node_id ASC, to_node_id ASC"
+        );
+        let rows = sqlx::query(&sql)
+            .bind(predicate)
+            .bind(as_of)
+            .fetch_all(self.pool())
+            .await
+            .map_err(graph_err)?;
+        rows.iter().map(pg_row_to_graph_edge).collect()
     }
 
-    async fn list_user_tunnels(&self, _limit: usize) -> Result<Vec<GraphEdge>, GraphError> {
-        unimplemented!(
-            "postgres backend: GraphStore::list_user_tunnels not yet implemented (postgres-backend P3-P5)"
-        )
+    async fn list_user_tunnels(&self, limit: usize) -> Result<Vec<GraphEdge>, GraphError> {
+        let lim = i64::try_from(limit.clamp(1, 200)).unwrap_or(50);
+        let sql = format!(
+            "SELECT {GRAPH_EDGE_COLS} FROM graph_edges \
+             WHERE relation LIKE 'user_tunnel:%' AND valid_to IS NULL \
+             ORDER BY relation, from_node_id, to_node_id \
+             LIMIT $1"
+        );
+        let rows = sqlx::query(&sql)
+            .bind(lim)
+            .fetch_all(self.pool())
+            .await
+            .map_err(graph_err)?;
+        rows.iter().map(pg_row_to_graph_edge).collect()
     }
 
     async fn find_tunnels(
         &self,
-        _prefix_a: &str,
-        _prefix_b: &str,
-        _limit: usize,
+        prefix_a: &str,
+        prefix_b: &str,
+        limit: usize,
     ) -> Result<Vec<GraphEdge>, GraphError> {
-        unimplemented!(
-            "postgres backend: GraphStore::find_tunnels not yet implemented (postgres-backend P3-P5)"
-        )
+        // Active user-tunnel edges bridging the two prefixes, both
+        // directions. LIKE escaping is not applied (prefixes are
+        // caller-trusted node-id stems, same as the DuckDB read).
+        let like_a = format!("{prefix_a}%");
+        let like_b = format!("{prefix_b}%");
+        let lim = i64::try_from(limit.clamp(1, 200)).unwrap_or(50);
+        let sql = format!(
+            "SELECT {GRAPH_EDGE_COLS} FROM graph_edges \
+             WHERE relation LIKE 'user_tunnel:%' AND valid_to IS NULL \
+               AND ((from_node_id LIKE $1 AND to_node_id LIKE $2) \
+                 OR (from_node_id LIKE $2 AND to_node_id LIKE $1)) \
+             ORDER BY relation, from_node_id, to_node_id \
+             LIMIT $3"
+        );
+        let rows = sqlx::query(&sql)
+            .bind(&like_a)
+            .bind(&like_b)
+            .bind(lim)
+            .fetch_all(self.pool())
+            .await
+            .map_err(graph_err)?;
+        rows.iter().map(pg_row_to_graph_edge).collect()
     }
 
     async fn follow_tunnels(
         &self,
-        _node_id: &str,
-        _max_hops: u32,
+        node_id: &str,
+        max_hops: u32,
     ) -> Result<Vec<GraphEdge>, GraphError> {
-        unimplemented!(
-            "postgres backend: GraphStore::follow_tunnels not yet implemented (postgres-backend P3-P5)"
-        )
+        // BFS over active user-tunnel edges only, up to max_hops.
+        let hops = i32::try_from(max_hops.clamp(1, PG_MAX_HOPS_CAP)).unwrap_or(1);
+        let sql = format!(
+            "WITH RECURSIVE walk(node, depth) AS ( \
+                 SELECT $1::TEXT, 0 \
+               UNION \
+                 SELECT CASE WHEN e.from_node_id = w.node THEN e.to_node_id \
+                             ELSE e.from_node_id END, \
+                        w.depth + 1 \
+                 FROM walk w \
+                 JOIN graph_edges e \
+                   ON (e.from_node_id = w.node OR e.to_node_id = w.node) \
+                  AND e.relation LIKE 'user_tunnel:%' AND e.valid_to IS NULL \
+                 WHERE w.depth < $2 \
+             ) \
+             SELECT DISTINCT {GRAPH_EDGE_COLS} \
+             FROM graph_edges e \
+             WHERE (e.from_node_id IN (SELECT node FROM walk) \
+                 OR e.to_node_id IN (SELECT node FROM walk)) \
+               AND e.relation LIKE 'user_tunnel:%' AND e.valid_to IS NULL \
+             ORDER BY relation, from_node_id, to_node_id"
+        );
+        let rows = sqlx::query(&sql)
+            .bind(node_id)
+            .bind(hops)
+            .fetch_all(self.pool())
+            .await
+            .map_err(graph_err)?;
+        let visited = self.follow_tunnels_visited(node_id, max_hops).await?;
+        let out: Vec<GraphEdge> = rows
+            .iter()
+            .map(pg_row_to_graph_edge)
+            .collect::<Result<Vec<_>, _>>()?
+            .into_iter()
+            .filter(|e| {
+                visited.contains(e.from_node_id.as_str()) && visited.contains(e.to_node_id.as_str())
+            })
+            .collect();
+        Ok(out)
     }
 
     async fn graph_stats(&self) -> Result<GraphStats, GraphError> {
-        unimplemented!(
-            "postgres backend: GraphStore::graph_stats not yet implemented (postgres-backend P3-P5)"
+        let total_edges: i64 = sqlx::query_scalar("SELECT count(*) FROM graph_edges")
+            .fetch_one(self.pool())
+            .await
+            .map_err(graph_err)?;
+        let active_edges: i64 =
+            sqlx::query_scalar("SELECT count(*) FROM graph_edges WHERE valid_to IS NULL")
+                .fetch_one(self.pool())
+                .await
+                .map_err(graph_err)?;
+        let node_count: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM ( \
+                 SELECT from_node_id AS n FROM graph_edges \
+                 UNION SELECT to_node_id FROM graph_edges \
+             ) u",
         )
+        .fetch_one(self.pool())
+        .await
+        .map_err(graph_err)?;
+        let rel_rows = sqlx::query(
+            "SELECT relation, count(*) AS c FROM graph_edges \
+             GROUP BY relation ORDER BY c DESC, relation ASC LIMIT 16",
+        )
+        .fetch_all(self.pool())
+        .await
+        .map_err(graph_err)?;
+        let mut top_relations = Vec::with_capacity(rel_rows.len());
+        for r in &rel_rows {
+            top_relations.push((
+                r.try_get::<String, _>("relation").map_err(graph_err)?,
+                r.try_get::<i64, _>("c").map_err(graph_err)?,
+            ));
+        }
+        Ok(GraphStats {
+            node_count,
+            total_edges,
+            active_edges,
+            closed_edges: total_edges - active_edges,
+            top_relations,
+        })
     }
 
     async fn related_capability_capsule_ids(
         &self,
-        _node_ids: &[String],
+        node_ids: &[String],
     ) -> Result<Vec<String>, GraphError> {
-        unimplemented!(
-            "postgres backend: GraphStore::related_capability_capsule_ids not yet implemented (postgres-backend P3-P5)"
+        if node_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        // Pull active edges incident on the input set, keep the opposite
+        // endpoint, strip the `capability_capsule:` prefix, dedup + sort.
+        let owned: Vec<String> = node_ids.to_vec();
+        let rows = sqlx::query(
+            "SELECT from_node_id, to_node_id FROM graph_edges \
+             WHERE (from_node_id = ANY($1) OR to_node_id = ANY($1)) AND valid_to IS NULL",
         )
+        .bind(&owned)
+        .fetch_all(self.pool())
+        .await
+        .map_err(graph_err)?;
+        let node_set: std::collections::HashSet<&str> =
+            node_ids.iter().map(|s| s.as_str()).collect();
+        let mut ids = std::collections::HashSet::new();
+        for r in &rows {
+            let from: String = r.try_get("from_node_id").map_err(graph_err)?;
+            let to: String = r.try_get("to_node_id").map_err(graph_err)?;
+            for endpoint in [&from, &to] {
+                if !node_set.contains(endpoint.as_str()) {
+                    if let Some(mid) = endpoint.strip_prefix("capability_capsule:") {
+                        ids.insert(mid.to_string());
+                    }
+                }
+            }
+        }
+        let mut out: Vec<String> = ids.into_iter().collect();
+        out.sort();
+        Ok(out)
     }
 
     async fn incident_edges_for_nodes(
         &self,
-        _node_ids: &[String],
+        node_ids: &[String],
     ) -> Result<Vec<(String, String)>, GraphError> {
-        unimplemented!(
-            "postgres backend: GraphStore::incident_edges_for_nodes not yet implemented (postgres-backend P3-P5)"
+        if node_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let owned: Vec<String> = node_ids.to_vec();
+        let rows = sqlx::query(
+            "SELECT from_node_id, to_node_id FROM graph_edges \
+             WHERE (from_node_id = ANY($1) OR to_node_id = ANY($1)) AND valid_to IS NULL",
         )
+        .bind(&owned)
+        .fetch_all(self.pool())
+        .await
+        .map_err(graph_err)?;
+        rows.iter()
+            .map(|r| {
+                Ok((
+                    r.try_get::<String, _>("from_node_id").map_err(graph_err)?,
+                    r.try_get::<String, _>("to_node_id").map_err(graph_err)?,
+                ))
+            })
+            .collect()
     }
 
-    async fn sync_memory_edges(&self, _edges: &[GraphEdge], _now: &str) -> Result<(), GraphError> {
-        unimplemented!(
-            "postgres backend: GraphStore::sync_memory_edges not yet implemented (postgres-backend P3-P5)"
-        )
+    async fn sync_memory_edges(&self, edges: &[GraphEdge], now: &str) -> Result<(), GraphError> {
+        if edges.is_empty() {
+            return Ok(());
+        }
+        // Idempotent: skip rows whose active (from, to, relation) exists.
+        // Server forces valid_from = now, valid_to = NULL (active);
+        // confidence/extractor/K9 dynamics preserved. One transaction.
+        let mut tx = self.pool().begin().await.map_err(graph_err)?;
+        for edge in edges {
+            let exists: i64 = sqlx::query_scalar(
+                "SELECT count(*) FROM graph_edges \
+                 WHERE from_node_id = $1 AND to_node_id = $2 AND relation = $3 \
+                   AND valid_to IS NULL",
+            )
+            .bind(&edge.from_node_id)
+            .bind(&edge.to_node_id)
+            .bind(&edge.relation)
+            .fetch_one(&mut *tx)
+            .await
+            .map_err(graph_err)?;
+            if exists > 0 {
+                continue;
+            }
+            sqlx::query(
+                "INSERT INTO graph_edges (from_node_id, to_node_id, relation, valid_from, \
+                    valid_to, confidence, extractor, strength, stability, last_activated, \
+                    access_count) \
+                 VALUES ($1, $2, $3, $4, NULL, $5, $6, $7, $8, $9, $10)",
+            )
+            .bind(&edge.from_node_id)
+            .bind(&edge.to_node_id)
+            .bind(&edge.relation)
+            .bind(now)
+            .bind(edge.confidence)
+            .bind(&edge.extractor)
+            .bind(edge.strength)
+            .bind(edge.stability)
+            .bind(&edge.last_activated)
+            .bind(edge.access_count)
+            .execute(&mut *tx)
+            .await
+            .map_err(graph_err)?;
+        }
+        tx.commit().await.map_err(graph_err)?;
+        Ok(())
     }
 
-    async fn add_edge_direct(&self, _edge: &GraphEdge) -> Result<bool, GraphError> {
-        unimplemented!(
-            "postgres backend: GraphStore::add_edge_direct not yet implemented (postgres-backend P3-P5)"
+    async fn add_edge_direct(&self, edge: &GraphEdge) -> Result<bool, GraphError> {
+        // K12: reject an inverted bitemporal interval (valid_to <
+        // valid_from) — it would be stored-but-permanently-invisible.
+        if let Some(valid_to) = &edge.valid_to {
+            if valid_to.as_str() < edge.valid_from.as_str() {
+                return Err(GraphError::InvalidInput(format!(
+                    "edge valid_to ({}) precedes valid_from ({}); a recall query would never match it",
+                    valid_to, edge.valid_from
+                )));
+            }
+        }
+        // Idempotent: skip when an active (from, to, relation) exists.
+        // valid_from / valid_to preserved verbatim (caller can backdate
+        // or insert a pre-closed edge).
+        let mut tx = self.pool().begin().await.map_err(graph_err)?;
+        let exists: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM graph_edges \
+             WHERE from_node_id = $1 AND to_node_id = $2 AND relation = $3 \
+               AND valid_to IS NULL",
         )
+        .bind(&edge.from_node_id)
+        .bind(&edge.to_node_id)
+        .bind(&edge.relation)
+        .fetch_one(&mut *tx)
+        .await
+        .map_err(graph_err)?;
+        if exists > 0 {
+            tx.rollback().await.map_err(graph_err)?;
+            return Ok(false);
+        }
+        sqlx::query(
+            "INSERT INTO graph_edges (from_node_id, to_node_id, relation, valid_from, \
+                valid_to, confidence, extractor, strength, stability, last_activated, \
+                access_count) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)",
+        )
+        .bind(&edge.from_node_id)
+        .bind(&edge.to_node_id)
+        .bind(&edge.relation)
+        .bind(&edge.valid_from)
+        .bind(&edge.valid_to)
+        .bind(edge.confidence)
+        .bind(&edge.extractor)
+        .bind(edge.strength)
+        .bind(edge.stability)
+        .bind(&edge.last_activated)
+        .bind(edge.access_count)
+        .execute(&mut *tx)
+        .await
+        .map_err(graph_err)?;
+        tx.commit().await.map_err(graph_err)?;
+        Ok(true)
     }
 
     async fn invalidate_edge(
         &self,
-        _from_node_id: &str,
-        _predicate: &str,
-        _to_node_id: &str,
-        _ended_at: &str,
+        from_node_id: &str,
+        predicate: &str,
+        to_node_id: &str,
+        ended_at: &str,
     ) -> Result<usize, GraphError> {
-        unimplemented!(
-            "postgres backend: GraphStore::invalidate_edge not yet implemented (postgres-backend P3-P5)"
+        // Stamp valid_to on the active (from, predicate, to) edge.
+        // Idempotent — returns 0 when no active edge matches.
+        let res = sqlx::query(
+            "UPDATE graph_edges SET valid_to = $4 \
+             WHERE from_node_id = $1 AND to_node_id = $2 AND relation = $3 \
+               AND valid_to IS NULL",
         )
+        .bind(from_node_id)
+        .bind(to_node_id)
+        .bind(predicate)
+        .bind(ended_at)
+        .execute(self.pool())
+        .await
+        .map_err(graph_err)?;
+        Ok(res.rows_affected() as usize)
     }
 
     async fn close_edges_for_capability_capsule(
         &self,
-        _capability_capsule_id: &str,
+        capability_capsule_id: &str,
     ) -> Result<usize, GraphError> {
-        unimplemented!(
-            "postgres backend: GraphStore::close_edges_for_capability_capsule not yet implemented (postgres-backend P3-P5)"
+        // Close every active edge originating from `capability_capsule:<id>`
+        // (the node-id format the Lance writer uses).
+        let from = format!("capability_capsule:{capability_capsule_id}");
+        let now = crate::storage::current_timestamp();
+        let res = sqlx::query(
+            "UPDATE graph_edges SET valid_to = $2 \
+             WHERE from_node_id = $1 AND valid_to IS NULL",
         )
+        .bind(&from)
+        .bind(&now)
+        .execute(self.pool())
+        .await
+        .map_err(graph_err)?;
+        Ok(res.rows_affected() as usize)
+    }
+}
+
+impl PostgresCapsuleStore {
+    /// BFS-visited node set for `neighbors_within`, mirroring the DuckDB
+    /// walk's visited set so the edge projection can be trimmed to edges
+    /// whose *both* endpoints were reached. `validity` is the pre-built
+    /// active/as_of predicate fragment (referencing `$3` when as_of set).
+    async fn neighbors_within_visited(
+        &self,
+        node_id: &str,
+        max_hops: u32,
+        as_of: Option<&str>,
+        validity: &str,
+    ) -> Result<std::collections::HashSet<String>, GraphError> {
+        let hops = i32::try_from(max_hops.clamp(1, PG_MAX_HOPS_CAP)).unwrap_or(1);
+        let sql = format!(
+            "WITH RECURSIVE walk(node, depth) AS ( \
+                 SELECT $1::TEXT, 0 \
+               UNION \
+                 SELECT CASE WHEN e.from_node_id = w.node THEN e.to_node_id \
+                             ELSE e.from_node_id END, \
+                        w.depth + 1 \
+                 FROM walk w \
+                 JOIN graph_edges e \
+                   ON (e.from_node_id = w.node OR e.to_node_id = w.node) \
+                  AND {validity} \
+                 WHERE w.depth < $2 \
+             ) \
+             SELECT DISTINCT node FROM walk"
+        );
+        let mut q = sqlx::query_scalar::<_, String>(&sql)
+            .bind(node_id)
+            .bind(hops);
+        if let Some(ts) = as_of {
+            q = q.bind(ts);
+        }
+        let nodes = q.fetch_all(self.pool()).await.map_err(graph_err)?;
+        Ok(nodes.into_iter().collect())
+    }
+
+    /// BFS-visited node set for `follow_tunnels` (active user-tunnel
+    /// edges only).
+    async fn follow_tunnels_visited(
+        &self,
+        node_id: &str,
+        max_hops: u32,
+    ) -> Result<std::collections::HashSet<String>, GraphError> {
+        let hops = i32::try_from(max_hops.clamp(1, PG_MAX_HOPS_CAP)).unwrap_or(1);
+        let sql = "WITH RECURSIVE walk(node, depth) AS ( \
+                 SELECT $1::TEXT, 0 \
+               UNION \
+                 SELECT CASE WHEN e.from_node_id = w.node THEN e.to_node_id \
+                             ELSE e.from_node_id END, \
+                        w.depth + 1 \
+                 FROM walk w \
+                 JOIN graph_edges e \
+                   ON (e.from_node_id = w.node OR e.to_node_id = w.node) \
+                  AND e.relation LIKE 'user_tunnel:%' AND e.valid_to IS NULL \
+                 WHERE w.depth < $2 \
+             ) \
+             SELECT DISTINCT node FROM walk";
+        let nodes = sqlx::query_scalar::<_, String>(sql)
+            .bind(node_id)
+            .bind(hops)
+            .fetch_all(self.pool())
+            .await
+            .map_err(graph_err)?;
+        Ok(nodes.into_iter().collect())
     }
 }
 
 // ─────────────────────────────── TranscriptStore ──────────────────────────
 
+/// `conversation_messages` SELECT column order shared by every
+/// transcript read. Keep in sync with [`pg_row_to_conversation_message`].
+const CONVERSATION_COLS: &str = "message_block_id, session_id, tenant, caller_agent, \
+    transcript_path, line_number, block_index, message_uuid, role, block_type, content, \
+    tool_name, tool_use_id, embed_eligible, created_at, meta_json";
+
+/// Project a `conversation_messages` row into a [`ConversationMessage`].
+/// `line_number` / `block_index` are BIGINT on disk → narrow to u64/u32.
+fn pg_row_to_conversation_message(
+    row: &sqlx::postgres::PgRow,
+) -> Result<ConversationMessage, StorageError> {
+    use crate::domain::{BlockType, MessageRole};
+    let line_number: i64 = row.try_get("line_number").map_err(sqlx_err)?;
+    let block_index: i64 = row.try_get("block_index").map_err(sqlx_err)?;
+    let role: String = row.try_get("role").map_err(sqlx_err)?;
+    let block_type: String = row.try_get("block_type").map_err(sqlx_err)?;
+    Ok(ConversationMessage {
+        message_block_id: row.try_get("message_block_id").map_err(sqlx_err)?,
+        session_id: row.try_get("session_id").map_err(sqlx_err)?,
+        tenant: row.try_get("tenant").map_err(sqlx_err)?,
+        caller_agent: row.try_get("caller_agent").map_err(sqlx_err)?,
+        transcript_path: row.try_get("transcript_path").map_err(sqlx_err)?,
+        line_number: u64::try_from(line_number)
+            .map_err(|_| StorageError::InvalidData("negative line_number"))?,
+        block_index: u32::try_from(block_index)
+            .map_err(|_| StorageError::InvalidData("block_index out of range"))?,
+        message_uuid: row.try_get("message_uuid").map_err(sqlx_err)?,
+        role: MessageRole::from_db_str(&role)
+            .ok_or(StorageError::InvalidData("unknown message role"))?,
+        block_type: BlockType::from_db_str(&block_type)
+            .ok_or(StorageError::InvalidData("unknown block type"))?,
+        content: row.try_get("content").map_err(sqlx_err)?,
+        tool_name: row.try_get("tool_name").map_err(sqlx_err)?,
+        tool_use_id: row.try_get("tool_use_id").map_err(sqlx_err)?,
+        embed_eligible: row.try_get("embed_eligible").map_err(sqlx_err)?,
+        created_at: row.try_get("created_at").map_err(sqlx_err)?,
+        meta_json: row.try_get("meta_json").map_err(sqlx_err)?,
+    })
+}
+
 #[async_trait]
 impl TranscriptStore for PostgresCapsuleStore {
     async fn create_conversation_message(
         &self,
-        _msg: &ConversationMessage,
+        msg: &ConversationMessage,
     ) -> Result<(), StorageError> {
-        unimplemented!(
-            "postgres backend: TranscriptStore::create_conversation_message not yet implemented (postgres-backend P3-P5)"
+        // Idempotent on (transcript_path, line_number, block_index) via
+        // INSERT ... WHERE NOT EXISTS. On a fresh insert of an
+        // embed-eligible block, also enqueue a transcript_embedding_job
+        // (the fan-out the trait surface hides — mirrors Lance).
+        let mut tx = self.pool().begin().await.map_err(sqlx_err)?;
+        let res = sqlx::query(
+            "INSERT INTO conversation_messages (message_block_id, session_id, tenant, \
+                caller_agent, transcript_path, line_number, block_index, message_uuid, \
+                role, block_type, content, tool_name, tool_use_id, embed_eligible, \
+                created_at, meta_json) \
+             SELECT $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16 \
+             WHERE NOT EXISTS ( \
+                 SELECT 1 FROM conversation_messages \
+                 WHERE transcript_path = $5 AND line_number = $6 AND block_index = $7 \
+             )",
         )
+        .bind(&msg.message_block_id)
+        .bind(&msg.session_id)
+        .bind(&msg.tenant)
+        .bind(&msg.caller_agent)
+        .bind(&msg.transcript_path)
+        .bind(msg.line_number as i64)
+        .bind(i64::from(msg.block_index))
+        .bind(&msg.message_uuid)
+        .bind(msg.role.as_db_str())
+        .bind(msg.block_type.as_db_str())
+        .bind(&msg.content)
+        .bind(&msg.tool_name)
+        .bind(&msg.tool_use_id)
+        .bind(msg.embed_eligible)
+        .bind(&msg.created_at)
+        .bind(&msg.meta_json)
+        .execute(&mut *tx)
+        .await
+        .map_err(sqlx_err)?;
+
+        // Only enqueue when the row actually landed AND is embed-eligible.
+        if res.rows_affected() > 0 && msg.embed_eligible {
+            let provider = self
+                .transcript_job_provider()
+                .ok_or(StorageError::InvalidData(
+                    "transcript embedding job provider not configured; \
+                 call set_transcript_job_provider during startup",
+                ))?;
+            let job_id = uuid::Uuid::now_v7().to_string();
+            let now = crate::storage::current_timestamp();
+            sqlx::query(
+                "INSERT INTO transcript_embedding_jobs (job_id, tenant, message_block_id, \
+                    provider, status, attempt_count, last_error, available_at, created_at, \
+                    updated_at) \
+                 VALUES ($1, $2, $3, $4, 'pending', 0, NULL, $5, $5, $5)",
+            )
+            .bind(&job_id)
+            .bind(&msg.tenant)
+            .bind(&msg.message_block_id)
+            .bind(&provider)
+            .bind(&now)
+            .execute(&mut *tx)
+            .await
+            .map_err(sqlx_err)?;
+        }
+        tx.commit().await.map_err(sqlx_err)?;
+        Ok(())
     }
 
     async fn create_conversation_messages(
         &self,
-        _msgs: &[ConversationMessage],
+        msgs: &[ConversationMessage],
     ) -> Result<usize, StorageError> {
-        unimplemented!(
-            "postgres backend: TranscriptStore::create_conversation_messages not yet implemented (postgres-backend P3-P5)"
-        )
+        if msgs.is_empty() {
+            return Ok(0);
+        }
+        // Per-row dedup + enqueue inside one transaction. A HashSet
+        // tracks intra-batch dup keys so two rows with the same
+        // (path, line, block) in the input don't both land.
+        let mut seen: std::collections::HashSet<(String, u64, u32)> =
+            std::collections::HashSet::new();
+        let mut landed = 0usize;
+        let mut tx = self.pool().begin().await.map_err(sqlx_err)?;
+        for msg in msgs {
+            let key = (
+                msg.transcript_path.clone(),
+                msg.line_number,
+                msg.block_index,
+            );
+            if !seen.insert(key) {
+                continue;
+            }
+            let res = sqlx::query(
+                "INSERT INTO conversation_messages (message_block_id, session_id, tenant, \
+                    caller_agent, transcript_path, line_number, block_index, message_uuid, \
+                    role, block_type, content, tool_name, tool_use_id, embed_eligible, \
+                    created_at, meta_json) \
+                 SELECT $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16 \
+                 WHERE NOT EXISTS ( \
+                     SELECT 1 FROM conversation_messages \
+                     WHERE transcript_path = $5 AND line_number = $6 AND block_index = $7 \
+                 )",
+            )
+            .bind(&msg.message_block_id)
+            .bind(&msg.session_id)
+            .bind(&msg.tenant)
+            .bind(&msg.caller_agent)
+            .bind(&msg.transcript_path)
+            .bind(msg.line_number as i64)
+            .bind(i64::from(msg.block_index))
+            .bind(&msg.message_uuid)
+            .bind(msg.role.as_db_str())
+            .bind(msg.block_type.as_db_str())
+            .bind(&msg.content)
+            .bind(&msg.tool_name)
+            .bind(&msg.tool_use_id)
+            .bind(msg.embed_eligible)
+            .bind(&msg.created_at)
+            .bind(&msg.meta_json)
+            .execute(&mut *tx)
+            .await
+            .map_err(sqlx_err)?;
+            if res.rows_affected() == 0 {
+                continue;
+            }
+            landed += 1;
+            if msg.embed_eligible {
+                let provider = self
+                    .transcript_job_provider()
+                    .ok_or(StorageError::InvalidData(
+                        "transcript embedding job provider not configured; \
+                         call set_transcript_job_provider during startup",
+                    ))?;
+                let job_id = uuid::Uuid::now_v7().to_string();
+                let now = crate::storage::current_timestamp();
+                sqlx::query(
+                    "INSERT INTO transcript_embedding_jobs (job_id, tenant, message_block_id, \
+                        provider, status, attempt_count, last_error, available_at, created_at, \
+                        updated_at) \
+                     VALUES ($1, $2, $3, $4, 'pending', 0, NULL, $5, $5, $5)",
+                )
+                .bind(&job_id)
+                .bind(&msg.tenant)
+                .bind(&msg.message_block_id)
+                .bind(&provider)
+                .bind(&now)
+                .execute(&mut *tx)
+                .await
+                .map_err(sqlx_err)?;
+            }
+        }
+        tx.commit().await.map_err(sqlx_err)?;
+        Ok(landed)
     }
 
     async fn get_conversation_messages_by_session(
         &self,
-        _tenant: &str,
-        _session_id: &str,
+        tenant: &str,
+        session_id: &str,
     ) -> Result<Vec<ConversationMessage>, StorageError> {
-        unimplemented!(
-            "postgres backend: TranscriptStore::get_conversation_messages_by_session not yet implemented (postgres-backend P3-P5)"
-        )
+        let sql = format!(
+            "SELECT {CONVERSATION_COLS} FROM conversation_messages \
+             WHERE tenant = $1 AND session_id = $2 \
+             ORDER BY created_at ASC, line_number ASC, block_index ASC"
+        );
+        let rows = sqlx::query(&sql)
+            .bind(tenant)
+            .bind(session_id)
+            .fetch_all(self.pool())
+            .await
+            .map_err(sqlx_err)?;
+        rows.iter().map(pg_row_to_conversation_message).collect()
     }
 
     #[allow(clippy::too_many_arguments)]
     async fn get_conversation_messages_by_session_paged(
         &self,
-        _tenant: &str,
-        _session_id: &str,
-        _since: Option<&str>,
-        _until: Option<&str>,
-        _role: Option<&str>,
-        _block_type: Option<&str>,
-        _cursor: Option<(&str, i64, i64)>,
-        _limit: usize,
+        tenant: &str,
+        session_id: &str,
+        since: Option<&str>,
+        until: Option<&str>,
+        role: Option<&str>,
+        block_type: Option<&str>,
+        cursor: Option<(&str, i64, i64)>,
+        limit: usize,
     ) -> Result<(Vec<ConversationMessage>, bool), StorageError> {
-        unimplemented!(
-            "postgres backend: TranscriptStore::get_conversation_messages_by_session_paged not yet implemented (postgres-backend P3-P5)"
-        )
+        // Static SQL with optional filters via `($n IS NULL OR ...)` and
+        // an explicit composite-cursor tuple comparison. Fetch limit+1
+        // to detect has_more. Cursor bound as three separate params.
+        let lim = i64::try_from(limit).unwrap_or(64);
+        let fetch = lim.saturating_add(1);
+        let (cur_at, cur_line, cur_idx) = match cursor {
+            Some((s, l, b)) => (Some(s), Some(l), Some(b)),
+            None => (None, None, None),
+        };
+        let sql = format!(
+            "SELECT {CONVERSATION_COLS} FROM conversation_messages \
+             WHERE tenant = $1 AND session_id = $2 \
+               AND ($3::TEXT IS NULL OR created_at >= $3) \
+               AND ($4::TEXT IS NULL OR created_at < $4) \
+               AND ($5::TEXT IS NULL OR role = $5) \
+               AND ($6::TEXT IS NULL OR block_type = $6) \
+               AND ($7::TEXT IS NULL OR ( \
+                    created_at > $7 \
+                 OR (created_at = $7 AND line_number > $8) \
+                 OR (created_at = $7 AND line_number = $8 AND block_index > $9))) \
+             ORDER BY created_at ASC, line_number ASC, block_index ASC \
+             LIMIT $10"
+        );
+        let mut out = sqlx::query(&sql)
+            .bind(tenant)
+            .bind(session_id)
+            .bind(since)
+            .bind(until)
+            .bind(role)
+            .bind(block_type)
+            .bind(cur_at)
+            .bind(cur_line)
+            .bind(cur_idx)
+            .bind(fetch)
+            .fetch_all(self.pool())
+            .await
+            .map_err(sqlx_err)?
+            .iter()
+            .map(pg_row_to_conversation_message)
+            .collect::<Result<Vec<_>, _>>()?;
+        let has_more = out.len() as i64 == fetch;
+        if has_more {
+            out.pop();
+        }
+        Ok((out, has_more))
     }
 
     async fn list_transcript_sessions(
         &self,
-        _tenant: &str,
+        tenant: &str,
     ) -> Result<Vec<TranscriptSessionSummary>, StorageError> {
-        unimplemented!(
-            "postgres backend: TranscriptStore::list_transcript_sessions not yet implemented (postgres-backend P3-P5)"
+        let rows = sqlx::query(
+            "SELECT session_id, count(*) AS block_count, min(created_at) AS first_at, \
+                    max(created_at) AS last_at, max(caller_agent) AS caller_agent \
+             FROM conversation_messages \
+             WHERE tenant = $1 AND session_id IS NOT NULL \
+             GROUP BY session_id \
+             ORDER BY last_at DESC",
         )
+        .bind(tenant)
+        .fetch_all(self.pool())
+        .await
+        .map_err(sqlx_err)?;
+        rows.iter()
+            .map(|r| {
+                Ok(TranscriptSessionSummary {
+                    session_id: r.try_get("session_id").map_err(sqlx_err)?,
+                    block_count: r.try_get("block_count").map_err(sqlx_err)?,
+                    first_at: r.try_get("first_at").map_err(sqlx_err)?,
+                    last_at: r.try_get("last_at").map_err(sqlx_err)?,
+                    caller_agent: r.try_get("caller_agent").map_err(sqlx_err)?,
+                })
+            })
+            .collect()
     }
 
     #[allow(clippy::too_many_arguments)]
     async fn list_conversation_messages_in_range(
         &self,
-        _tenant: &str,
-        _time_from: Option<&str>,
-        _time_to: Option<&str>,
-        _role: Option<&str>,
-        _block_type: Option<&str>,
-        _cursor: Option<(&str, i64, i64)>,
-        _limit: usize,
+        tenant: &str,
+        time_from: Option<&str>,
+        time_to: Option<&str>,
+        role: Option<&str>,
+        block_type: Option<&str>,
+        cursor: Option<(&str, i64, i64)>,
+        limit: usize,
     ) -> Result<(Vec<ConversationMessage>, bool), StorageError> {
-        unimplemented!(
-            "postgres backend: TranscriptStore::list_conversation_messages_in_range not yet implemented (postgres-backend P3-P5)"
-        )
+        // Cross-session range scan: session_id IS NOT NULL, half-open
+        // [time_from, time_to), same composite cursor + filters as the
+        // per-session paged read.
+        let lim = i64::try_from(limit).unwrap_or(64);
+        let fetch = lim.saturating_add(1);
+        let (cur_at, cur_line, cur_idx) = match cursor {
+            Some((s, l, b)) => (Some(s), Some(l), Some(b)),
+            None => (None, None, None),
+        };
+        let sql = format!(
+            "SELECT {CONVERSATION_COLS} FROM conversation_messages \
+             WHERE tenant = $1 AND session_id IS NOT NULL \
+               AND ($2::TEXT IS NULL OR created_at >= $2) \
+               AND ($3::TEXT IS NULL OR created_at < $3) \
+               AND ($4::TEXT IS NULL OR role = $4) \
+               AND ($5::TEXT IS NULL OR block_type = $5) \
+               AND ($6::TEXT IS NULL OR ( \
+                    created_at > $6 \
+                 OR (created_at = $6 AND line_number > $7) \
+                 OR (created_at = $6 AND line_number = $7 AND block_index > $8))) \
+             ORDER BY created_at ASC, line_number ASC, block_index ASC \
+             LIMIT $9"
+        );
+        let mut out = sqlx::query(&sql)
+            .bind(tenant)
+            .bind(time_from)
+            .bind(time_to)
+            .bind(role)
+            .bind(block_type)
+            .bind(cur_at)
+            .bind(cur_line)
+            .bind(cur_idx)
+            .bind(fetch)
+            .fetch_all(self.pool())
+            .await
+            .map_err(sqlx_err)?
+            .iter()
+            .map(pg_row_to_conversation_message)
+            .collect::<Result<Vec<_>, _>>()?;
+        let has_more = out.len() as i64 == fetch;
+        if has_more {
+            out.pop();
+        }
+        Ok((out, has_more))
     }
 
     async fn fetch_conversation_messages_by_ids(
         &self,
-        _tenant: &str,
-        _ids: &[String],
+        tenant: &str,
+        ids: &[String],
     ) -> Result<Vec<ConversationMessage>, StorageError> {
-        unimplemented!(
-            "postgres backend: TranscriptStore::fetch_conversation_messages_by_ids not yet implemented (postgres-backend P3-P5)"
-        )
+        if ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        // WHERE message_block_id = ANY($2); preserve input-slice order
+        // with missing ids dropped (the DuckDB contract).
+        let owned: Vec<String> = ids.to_vec();
+        let sql = format!(
+            "SELECT {CONVERSATION_COLS} FROM conversation_messages \
+             WHERE tenant = $1 AND message_block_id = ANY($2)"
+        );
+        let fetched = sqlx::query(&sql)
+            .bind(tenant)
+            .bind(&owned)
+            .fetch_all(self.pool())
+            .await
+            .map_err(sqlx_err)?
+            .iter()
+            .map(pg_row_to_conversation_message)
+            .collect::<Result<Vec<_>, _>>()?;
+        let mut by_id: std::collections::HashMap<String, ConversationMessage> = fetched
+            .into_iter()
+            .map(|m| (m.message_block_id.clone(), m))
+            .collect();
+        let mut out = Vec::with_capacity(ids.len());
+        for id in ids {
+            if let Some(m) = by_id.remove(id) {
+                out.push(m);
+            }
+        }
+        Ok(out)
     }
 
     async fn context_window_for_block(
         &self,
-        _tenant: &str,
-        _primary_id: &str,
-        _k_before: usize,
-        _k_after: usize,
-        _include_tool_blocks: bool,
+        tenant: &str,
+        primary_id: &str,
+        k_before: usize,
+        k_after: usize,
+        include_tool_blocks: bool,
     ) -> Result<ContextWindow, StorageError> {
-        unimplemented!(
-            "postgres backend: TranscriptStore::context_window_for_block not yet implemented (postgres-backend P3-P5)"
-        )
+        // 1. Primary fetch (NotFound when absent).
+        let primary_sql = format!(
+            "SELECT {CONVERSATION_COLS} FROM conversation_messages \
+             WHERE tenant = $1 AND message_block_id = $2"
+        );
+        let primary_row = sqlx::query(&primary_sql)
+            .bind(tenant)
+            .bind(primary_id)
+            .fetch_optional(self.pool())
+            .await
+            .map_err(sqlx_err)?;
+        let primary = match primary_row {
+            Some(r) => pg_row_to_conversation_message(&r)?,
+            None => return Err(StorageError::NotFound("transcript primary block")),
+        };
+
+        // 2. No session → no neighbors.
+        let session_id = match primary.session_id.clone() {
+            Some(s) => s,
+            None => {
+                return Ok(ContextWindow {
+                    primary,
+                    before: Vec::new(),
+                    after: Vec::new(),
+                })
+            }
+        };
+
+        let type_filter = if include_tool_blocks {
+            ""
+        } else {
+            "AND block_type IN ('text', 'thinking') "
+        };
+        let k_before_i = i64::try_from(k_before).unwrap_or(0);
+        let k_after_i = i64::try_from(k_after).unwrap_or(0);
+        let p_line = primary.line_number as i64;
+        let p_idx = i64::from(primary.block_index);
+
+        // 3. Predecessors (strict tuple <), DESC then reversed to ASC.
+        let before_sql = format!(
+            "SELECT {CONVERSATION_COLS} FROM conversation_messages \
+             WHERE tenant = $1 AND session_id = $2 \
+               AND (created_at < $3 \
+                 OR (created_at = $3 AND line_number < $4) \
+                 OR (created_at = $3 AND line_number = $4 AND block_index < $5)) \
+               {type_filter} \
+             ORDER BY created_at DESC, line_number DESC, block_index DESC \
+             LIMIT $6"
+        );
+        let mut before = sqlx::query(&before_sql)
+            .bind(tenant)
+            .bind(&session_id)
+            .bind(&primary.created_at)
+            .bind(p_line)
+            .bind(p_idx)
+            .bind(k_before_i)
+            .fetch_all(self.pool())
+            .await
+            .map_err(sqlx_err)?
+            .iter()
+            .map(pg_row_to_conversation_message)
+            .collect::<Result<Vec<_>, _>>()?;
+        before.reverse();
+
+        // 4. Successors (strict tuple >), ASC.
+        let after_sql = format!(
+            "SELECT {CONVERSATION_COLS} FROM conversation_messages \
+             WHERE tenant = $1 AND session_id = $2 \
+               AND (created_at > $3 \
+                 OR (created_at = $3 AND line_number > $4) \
+                 OR (created_at = $3 AND line_number = $4 AND block_index > $5)) \
+               {type_filter} \
+             ORDER BY created_at ASC, line_number ASC, block_index ASC \
+             LIMIT $6"
+        );
+        let after = sqlx::query(&after_sql)
+            .bind(tenant)
+            .bind(&session_id)
+            .bind(&primary.created_at)
+            .bind(p_line)
+            .bind(p_idx)
+            .bind(k_after_i)
+            .fetch_all(self.pool())
+            .await
+            .map_err(sqlx_err)?
+            .iter()
+            .map(pg_row_to_conversation_message)
+            .collect::<Result<Vec<_>, _>>()?;
+
+        Ok(ContextWindow {
+            primary,
+            before,
+            after,
+        })
     }
 
     async fn anchor_session_candidates(
         &self,
-        _tenant: &str,
-        _session_id: &str,
-        _k: usize,
+        tenant: &str,
+        session_id: &str,
+        k: usize,
     ) -> Result<Vec<String>, StorageError> {
-        unimplemented!(
-            "postgres backend: TranscriptStore::anchor_session_candidates not yet implemented (postgres-backend P3-P5)"
+        if k == 0 {
+            return Ok(Vec::new());
+        }
+        let k_i = i64::try_from(k).unwrap_or(64);
+        sqlx::query_scalar::<_, String>(
+            "SELECT message_block_id FROM conversation_messages \
+             WHERE tenant = $1 AND session_id = $2 AND embed_eligible = true \
+             ORDER BY created_at DESC \
+             LIMIT $3",
         )
+        .bind(tenant)
+        .bind(session_id)
+        .bind(k_i)
+        .fetch_all(self.pool())
+        .await
+        .map_err(sqlx_err)
     }
 
     async fn recent_conversation_messages(
         &self,
-        _tenant: &str,
-        _limit: usize,
+        tenant: &str,
+        limit: usize,
     ) -> Result<Vec<ConversationMessage>, StorageError> {
-        unimplemented!(
-            "postgres backend: TranscriptStore::recent_conversation_messages not yet implemented (postgres-backend P3-P5)"
-        )
+        let lim = i64::try_from(limit).unwrap_or(64).clamp(1, 1024);
+        let sql = format!(
+            "SELECT {CONVERSATION_COLS} FROM conversation_messages \
+             WHERE tenant = $1 AND embed_eligible = true \
+             ORDER BY created_at DESC, line_number DESC, block_index DESC \
+             LIMIT $2"
+        );
+        let rows = sqlx::query(&sql)
+            .bind(tenant)
+            .bind(lim)
+            .fetch_all(self.pool())
+            .await
+            .map_err(sqlx_err)?;
+        rows.iter().map(pg_row_to_conversation_message).collect()
     }
 
     async fn bm25_transcript_candidates(
         &self,
-        _tenant: &str,
-        _query: &str,
-        _k: usize,
+        tenant: &str,
+        query: &str,
+        k: usize,
     ) -> Result<Vec<ConversationMessage>, StorageError> {
-        unimplemented!(
-            "postgres backend: TranscriptStore::bm25_transcript_candidates not yet implemented (postgres-backend P3-P5)"
-        )
+        if query.trim().is_empty() || k == 0 {
+            return Ok(Vec::new());
+        }
+        // tsvector @@ plainto_tsquery('simple', q) over content_tsv (the
+        // GIN-indexed generated column from 0004). embed_eligible scope,
+        // ranked ts_rank DESC then id ASC, LIMIT k. Parity with the
+        // capsule-side bm25 channel.
+        let k_i = i64::try_from(k).unwrap_or(64).clamp(1, 1024);
+        let cols = CONVERSATION_COLS
+            .split(',')
+            .map(|c| format!("m.{}", c.trim()))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let sql = format!(
+            "SELECT {cols} FROM conversation_messages m \
+             WHERE m.tenant = $1 AND m.embed_eligible = true \
+               AND m.content_tsv @@ plainto_tsquery('simple', $2) \
+             ORDER BY ts_rank(m.content_tsv, plainto_tsquery('simple', $2)) DESC, \
+                      m.message_block_id ASC \
+             LIMIT $3"
+        );
+        let rows = sqlx::query(&sql)
+            .bind(tenant)
+            .bind(query)
+            .bind(k_i)
+            .fetch_all(self.pool())
+            .await
+            .map_err(sqlx_err)?;
+        rows.iter().map(pg_row_to_conversation_message).collect()
     }
 
     async fn semantic_search_transcripts(
         &self,
-        _tenant: &str,
-        _query_embedding: &[f32],
-        _limit: usize,
+        tenant: &str,
+        query_embedding: &[f32],
+        limit: usize,
     ) -> Result<Vec<(ConversationMessage, f32)>, StorageError> {
-        unimplemented!(
-            "postgres backend: TranscriptStore::semantic_search_transcripts not yet implemented (postgres-backend P3-P5)"
-        )
+        if query_embedding.is_empty() || limit == 0 {
+            return Ok(Vec::new());
+        }
+        // Lazy-create parity: no embeddings table yet → empty.
+        if !embeddings_table_exists(self, "conversation_message_embeddings").await? {
+            return Ok(Vec::new());
+        }
+        // pgvector `<=>` cosine distance, DISTINCT-ON dedup to the nearest
+        // chunk per message, joined back to conversation_messages, scoped
+        // embed_eligible. Score = cosine similarity = 1 - distance (pgvector
+        // cosine distance is 1 - cosine_similarity). Ordered nearest first.
+        let lim = i64::try_from(limit).unwrap_or(64).clamp(1, 1024);
+        let qv = pgvector::Vector::from(query_embedding.to_vec());
+        let cols = CONVERSATION_COLS
+            .split(',')
+            .map(|c| format!("m.{}", c.trim()))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let sql = format!(
+            "SELECT {cols}, d.best_distance \
+             FROM ( \
+                 SELECT DISTINCT ON (message_block_id) \
+                        message_block_id, (embedding <=> $1) AS best_distance \
+                 FROM conversation_message_embeddings \
+                 WHERE tenant = $2 \
+                 ORDER BY message_block_id, embedding <=> $1 \
+             ) d \
+             JOIN conversation_messages m ON m.message_block_id = d.message_block_id \
+             WHERE m.tenant = $2 AND m.embed_eligible = true \
+             ORDER BY d.best_distance ASC \
+             LIMIT $3"
+        );
+        let rows = sqlx::query(&sql)
+            .bind(qv)
+            .bind(tenant)
+            .bind(lim)
+            .fetch_all(self.pool())
+            .await
+            .map_err(sqlx_err)?;
+        rows.iter()
+            .map(|r| {
+                let msg = pg_row_to_conversation_message(r)?;
+                let distance: f64 = r.try_get("best_distance").map_err(sqlx_err)?;
+                Ok((msg, 1.0_f32 - distance as f32))
+            })
+            .collect()
     }
 }
 
@@ -1653,8 +2883,8 @@ fn pg_row_to_episode(row: &sqlx::postgres::PgRow) -> Result<EpisodeRecord, Stora
 // ────────────────────────────── MaintenanceStore ──────────────────────────
 //
 // `vacuum_old_versions` + `ensure_query_indexes` have trait default
-// bodies (Lance-specific no-ops for non-Lance backends) — left
-// unimplemented here so the defaults apply. Only the three
+// bodies (Lance-specific no-ops for non-Lance backends) — left to the
+// defaults here so they apply unchanged. Only the three
 // no-default methods get stubs.
 
 #[async_trait]
