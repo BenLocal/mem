@@ -25,6 +25,14 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
+      # Cache the cargo registry + target dir. Without this the job
+      # cold-compiled the full lance + duckdb dependency tree (~20 min)
+      # on every push; an incremental restore cuts that to a few
+      # minutes. Distinct `shared-key` from the cross job so the two
+      # don't clobber each other's caches (different targets/profiles).
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: rust-test
       # `lance-encoding`'s build script invokes `prost-build` to compile
       # `.proto` files. The runner's apt protobuf-compiler ships an
       # ancient (~3.12) protoc that doesn't bundle

@@ -146,13 +146,36 @@ mod tests {
         assert_eq!(minutes_since(T_BASE, "also-not"), None);
     }
 
-    #[test]
-    fn idle_minutes_default_when_unset() {
-        // SAFETY: env var mutation; tests using env vars share process state.
-        // Same pattern used in retrieve.rs's MEM_RANKER kill switch test.
-        unsafe {
+    /// Serialize any test that reads or writes `MEM_SESSION_IDLE_MINUTES`.
+    /// `cargo test` runs every unit test in ONE multi-threaded process and
+    /// that var is process-global; today only this read-only test touches
+    /// it (no setter exists, so it can't race yet), but the moment someone
+    /// adds a `set_var` test the unguarded read here would flake — exactly
+    /// the open_lock CI flake (commit b4c2d1f). The guard is preventive:
+    /// it clears the var on entry and on drop (so a future setter that
+    /// panics can't leak) and tolerates a poisoned lock. Mirror this in
+    /// any new env-touching test in this module.
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    struct EnvGuard(#[allow(dead_code)] std::sync::MutexGuard<'static, ()>);
+
+    impl EnvGuard {
+        fn acquire() -> Self {
+            let guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+            std::env::remove_var("MEM_SESSION_IDLE_MINUTES");
+            EnvGuard(guard)
+        }
+    }
+
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
             std::env::remove_var("MEM_SESSION_IDLE_MINUTES");
         }
+    }
+
+    #[test]
+    fn idle_minutes_default_when_unset() {
+        let _env = EnvGuard::acquire();
         assert_eq!(idle_minutes_from_env(), 30);
     }
 }
