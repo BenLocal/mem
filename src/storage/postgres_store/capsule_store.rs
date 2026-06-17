@@ -235,6 +235,29 @@ impl PostgresCapsuleStore {
             .connect_with(opts)
             .await
             .map_err(sqlx_err)?;
+        // pgvector's `vector` type is a database-global extension, and the
+        // bare `CREATE EXTENSION IF NOT EXISTS vector` in 0002_embeddings.sql
+        // is NOT concurrency-safe: on a fresh database the first wave of
+        // parallel connect_fresh calls (cargo's multi-thread test runner) all
+        // see it absent and race the `pg_extension` insert — all but one fail
+        // with `duplicate key value violates unique constraint
+        // "pg_extension_name_index"`, after which `vector`-typed DDL in those
+        // tests fails with `type "vector" does not exist`. (The shared dev DB
+        // hides this — it already has the extension from a prior run; a fresh
+        // CI Postgres service does not, which is why CI failed 12/46 while
+        // local passed.) Serialize creation with a transaction-scoped
+        // advisory lock and pin it to `public` (the schema every test's
+        // search_path includes), so exactly one connection creates it and the
+        // later migration's IF NOT EXISTS is a clean no-op.
+        sqlx::raw_sql(
+            "BEGIN;\n\
+             SELECT pg_advisory_xact_lock(hashtext('mem_pgvector_extension'));\n\
+             CREATE EXTENSION IF NOT EXISTS vector SCHEMA public;\n\
+             COMMIT;",
+        )
+        .execute(&pool)
+        .await
+        .map_err(sqlx_err)?;
         sqlx::raw_sql(include_str!(
             "../../../migrations/postgres/0001_capsule_store.sql"
         ))
