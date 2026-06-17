@@ -678,8 +678,13 @@ impl DuckDbQuery {
         // ③ The embeddings table now holds N rows per message (one per
         // content chunk) that collapse to fewer distinct messages after
         // the GROUP BY below, so oversample the ANN branch harder than
-        // the historical ×2 to keep enough distinct messages.
-        let oversample = lim.saturating_mul(4);
+        // the historical ×2 to keep enough distinct messages. Capped so `k`
+        // stays bounded: `lim` is already clamped to 1024 (→ 4096 today), and
+        // the explicit ceiling keeps `k` sane if that clamp ever changes — a
+        // huge `k` scans a large slice of the table and, before the IVF
+        // partition-count fix, amplified the ragged-batch 500.
+        const MAX_ANN_OVERSAMPLE: i64 = 4_096;
+        let oversample = lim.saturating_mul(4).min(MAX_ANN_OVERSAMPLE);
         spawn_blocking_storage(move || {
             let conn = conn.lock().expect("duckdb_query mutex poisoned");
             let c_cols = CONVERSATION_COLS
@@ -712,10 +717,16 @@ impl DuckDbQuery {
                  ORDER BY e.best_distance ASC \
                  LIMIT ?3",
             );
+            // `e.best_distance` is the trailing SELECT column, right after the
+            // CONVERSATION_COLS projection — derive its index from the column
+            // list rather than hardcoding, so adding/removing a conversation
+            // column can't silently misread the wrong column (it would have
+            // read a `_distance` that's off-by-N, or type-mismatch-panic).
+            let distance_idx = CONVERSATION_COLS.split(',').count();
             let mut stmt = conn.prepare(&sql)?;
             let rows = stmt.query_map(params![oversample, tenant, lim], |row| {
                 let msg = row_to_conversation_message(row)?;
-                let l2_squared: f32 = row.get(16)?; // 16 conv cols → idx 16
+                let l2_squared: f32 = row.get(distance_idx)?;
                 Ok((msg, 1.0_f32 - l2_squared / 2.0_f32))
             })?;
             let mut out = Vec::new();

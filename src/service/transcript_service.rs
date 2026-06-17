@@ -41,6 +41,19 @@ pub struct TranscriptSearchFilters {
     pub time_to: Option<String>,
 }
 
+impl TranscriptSearchFilters {
+    /// True if any filter is set — drives the candidate-pool widening in
+    /// `search` so a strong filter doesn't under-recall behind the
+    /// oversample cutoff.
+    pub fn is_any_set(&self) -> bool {
+        self.session_id.is_some()
+            || self.role.is_some()
+            || self.block_type.is_some()
+            || self.time_from.is_some()
+            || self.time_to.is_some()
+    }
+}
+
 /// Optional, request-scoped recall tuning.
 #[derive(Debug, Clone, Default)]
 pub struct TranscriptSearchOpts {
@@ -290,6 +303,18 @@ impl TranscriptService {
             .filter(|n| *n > 0)
             .unwrap_or(4);
         let oversample = limit * oversample_factor;
+        // When the caller narrows by session/role/block_type/time, matching
+        // rows can rank beyond the per-channel oversample cutoff and never get
+        // fetched — the post-fetch filter (Phase 4) only sees what was pulled,
+        // so a strong filter silently under-recalls. Widen the candidate pool
+        // when any filter is set to cut that loss. (The complete fix pushes the
+        // predicates into the candidate SQL/ANN query; this is the low-risk
+        // mitigation that needs no signature changes across the channels.)
+        let oversample = if filters.is_any_set() {
+            oversample.saturating_mul(4)
+        } else {
+            oversample
+        };
         let context_window = opts.context_window.unwrap_or(2).min(10);
 
         // Phase-timing breakdown for profiling (debug! — off at the default

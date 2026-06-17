@@ -345,7 +345,7 @@ impl LanceStore {
             .execute()
             .await
             .map_err(lancedb_err)?;
-        // upsert = delete-then-insert once (Lance has no PK), then N adds.
+        // upsert = delete-then-insert once (Lance has no PK), then ONE add.
         table
             .delete(&format!(
                 "message_block_id = {}",
@@ -353,8 +353,14 @@ impl LanceStore {
             ))
             .await
             .map_err(lancedb_err)?;
+        // Build every chunk row up front and add them in a SINGLE commit.
+        // Per-chunk `table.add` wrote one Lance fragment per chunk — for a
+        // chunked message that's N fragments per upsert, feeding the fragment
+        // explosion the vacuum worker then has to compact back. One add =
+        // one fragment regardless of chunk count.
+        let mut batches = Vec::with_capacity(vectors.len());
         for vector in vectors {
-            let batch = conversation_message_embedding_to_record_batch(
+            batches.push(conversation_message_embedding_to_record_batch(
                 message_block_id,
                 tenant,
                 embedding_model,
@@ -363,8 +369,12 @@ impl LanceStore {
                 content_hash,
                 source_updated_at,
                 now,
-            )?;
-            table.add(batch).execute().await.map_err(lancedb_err)?;
+            )?);
+        }
+        if !batches.is_empty() {
+            // lancedb's `Scannable` is implemented for `Vec<RecordBatch>`, so
+            // one `add` over all chunk batches commits a single fragment.
+            table.add(batches).execute().await.map_err(lancedb_err)?;
         }
         Ok(())
     }
