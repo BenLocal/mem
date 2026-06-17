@@ -17,14 +17,14 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Instant;
 
-use tracing::debug;
+use tracing::{debug, warn};
 
 use crate::domain::{BlockType, ConversationMessage, MessageRole};
 use crate::embedding::EmbeddingProvider;
 use crate::pipeline::transcript_recall::{
     merge_windows, score_candidates, MergedWindow, PrimaryWithContext, ScoringOpts,
 };
-use crate::storage::{Backend, ContextWindow, StorageError};
+use crate::storage::{Backend, StorageError};
 
 /// Optional filters layered on top of the candidate set returned by
 /// scoring. All fields are AND-ed.
@@ -331,17 +331,32 @@ impl TranscriptService {
         let mut all_ids: HashSet<String> = HashSet::new();
 
         if !query.trim().is_empty() {
-            // BM25 channel — always available.
+            // BM25 channel. Soft-degrade: the lance FTS scan hits the SAME
+            // lancedb-0.30 / DuckDB-extension-4.0 ragged-record-batch read bug
+            // as the ANN scan (`IO Error: ... all columns in a record batch
+            // must have the same length`) for certain queries, recurring per
+            // index rebuild. Catch it and let the semantic channel carry
+            // rather than 500 the whole request.
             let t = Instant::now();
-            let bm25_hits = self
+            match self
                 .store
                 .bm25_transcript_candidates(tenant, query, oversample)
-                .await?;
-            bm25_ms = t.elapsed().as_millis();
-            for (rank0, m) in bm25_hits.iter().enumerate() {
-                lexical_ranks.insert(m.message_block_id.clone(), rank0 + 1);
-                all_ids.insert(m.message_block_id.clone());
+                .await
+            {
+                Ok(bm25_hits) => {
+                    for (rank0, m) in bm25_hits.iter().enumerate() {
+                        lexical_ranks.insert(m.message_block_id.clone(), rank0 + 1);
+                        all_ids.insert(m.message_block_id.clone());
+                    }
+                }
+                Err(e) => {
+                    warn!(
+                        error = %e,
+                        "transcript BM25 search failed; serving semantic-only results for this query"
+                    );
+                }
             }
+            bm25_ms = t.elapsed().as_millis();
 
             // Semantic channel — only if provider attached.
             // Routes through `Store::semantic_search_transcripts`,
@@ -358,35 +373,73 @@ impl TranscriptService {
                     .map_err(|e| StorageError::InvalidInput(format!("query embed failed: {e}")))?;
                 embed_ms = t.elapsed().as_millis();
                 let t = Instant::now();
-                let sem_hits = self
+                // Defense-in-depth: the ANN scan can fail on lancedb 0.30 /
+                // DuckDB lance-extension 4.0 with `IO Error: ... all columns
+                // in a record batch must have the same length` when a query's
+                // nearest IVF centroid is a degenerate (empty) partition.
+                // KMeans leaves some partitions empty on tightly-clustered
+                // embeddings, and which queries hit one varies per index
+                // rebuild (non-deterministic KMeans init) — so the
+                // partition-count fix only *reduces*, never eliminates, the
+                // failure. Rather than 500 the whole request, degrade to the
+                // always-on BM25 channel for this query and log it. Mirrors
+                // the capsule side's soft-degrade on a missing embeddings
+                // table.
+                match self
                     .store
                     .semantic_search_transcripts(tenant, &q_vec, oversample)
-                    .await?;
-                sem_ms = t.elapsed().as_millis();
-                for (rank0, (msg, _sim)) in sem_hits.iter().enumerate() {
-                    semantic_ranks.insert(msg.message_block_id.clone(), rank0 + 1);
-                    all_ids.insert(msg.message_block_id.clone());
+                    .await
+                {
+                    Ok(sem_hits) => {
+                        for (rank0, (msg, _sim)) in sem_hits.iter().enumerate() {
+                            semantic_ranks.insert(msg.message_block_id.clone(), rank0 + 1);
+                            all_ids.insert(msg.message_block_id.clone());
+                        }
+                    }
+                    Err(e) => {
+                        warn!(
+                            error = %e,
+                            "transcript ANN search failed; serving BM25-only results for this query"
+                        );
+                    }
                 }
+                sem_ms = t.elapsed().as_millis();
             }
         } else {
-            // Empty query: recent-time browse mode.
-            let recent = self
+            // Empty query: recent-time browse mode. Soft-degrade like the
+            // query channels — a lance read error here returns empty windows,
+            // not a 500.
+            match self
                 .store
                 .recent_conversation_messages(tenant, oversample)
-                .await?;
-            for m in recent {
-                all_ids.insert(m.message_block_id);
+                .await
+            {
+                Ok(recent) => {
+                    for m in recent {
+                        all_ids.insert(m.message_block_id);
+                    }
+                }
+                Err(e) => {
+                    warn!(error = %e, "transcript recent-browse failed; returning empty");
+                }
             }
         }
 
-        // Anchor session injection (independent of channel).
+        // Anchor session injection (independent of channel). Soft-degrade.
         if let Some(anchor) = opts.anchor_session_id.as_deref() {
-            let injected = self
+            match self
                 .store
                 .anchor_session_candidates(tenant, anchor, oversample)
-                .await?;
-            for id in injected {
-                all_ids.insert(id);
+                .await
+            {
+                Ok(injected) => {
+                    for id in injected {
+                        all_ids.insert(id);
+                    }
+                }
+                Err(e) => {
+                    warn!(error = %e, "transcript anchor-session injection failed; skipping");
+                }
             }
         }
 
@@ -394,14 +447,23 @@ impl TranscriptService {
             return Ok(TranscriptSearchResult { windows: vec![] });
         }
 
-        // ─── Phase 2: hydrate.
+        // ─── Phase 2: hydrate. Soft-degrade: this scans conversation_messages
+        // via the message_block_id BTree index, which can hit the same lance
+        // read bug — return empty windows rather than 500.
         let id_vec: Vec<String> = all_ids.into_iter().collect();
         let n_ids = id_vec.len();
         let t = Instant::now();
-        let candidates = self
+        let candidates = match self
             .store
             .fetch_conversation_messages_by_ids(tenant, &id_vec)
-            .await?;
+            .await
+        {
+            Ok(c) => c,
+            Err(e) => {
+                warn!(error = %e, "transcript hydrate failed; returning empty");
+                return Ok(TranscriptSearchResult { windows: vec![] });
+            }
+        };
         let hydrate_ms = t.elapsed().as_millis();
 
         // ─── Phase 3: score.
@@ -437,7 +499,10 @@ impl TranscriptService {
         let t = Instant::now();
         let mut items: Vec<PrimaryWithContext> = Vec::with_capacity(scored.len());
         for sb in scored {
-            let cw: ContextWindow = self
+            // Soft-degrade: a context-window scan failure drops only this
+            // primary's surrounding blocks (empty before/after), never the
+            // whole request.
+            let (before, after) = match self
                 .store
                 .context_window_for_block(
                     tenant,
@@ -446,11 +511,18 @@ impl TranscriptService {
                     context_window,
                     opts.include_tool_blocks_in_context,
                 )
-                .await?;
+                .await
+            {
+                Ok(cw) => (cw.before, cw.after),
+                Err(e) => {
+                    warn!(error = %e, "transcript context-window fetch failed; primary only");
+                    (Vec::new(), Vec::new())
+                }
+            };
             items.push(PrimaryWithContext {
                 primary: sb,
-                before: cw.before,
-                after: cw.after,
+                before,
+                after,
             });
         }
         let ctx_ms = t.elapsed().as_millis();

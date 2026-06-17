@@ -8,6 +8,25 @@ are organized by feature wave (merge commit ranges on `master`).
 
 ## [Unreleased]
 
+## 2026-06-17 — `0.1.6`
+
+### Fixed
+
+- **Transcript search 500 — the real fix** (defense-in-depth). The `0.1.4`
+  IVF partition-count fix only *reduced* the ragged-batch 500, and it turned
+  out the failing scan was usually the **FTS (BM25) channel**, not the ANN
+  one — the lancedb 0.30 / DuckDB lance-extension 4.0 `IO Error: ... all
+  columns in a record batch must have the same length` bug fires on *both*
+  index-scan kinds, and which queries hit it varies per index rebuild
+  (non-deterministic), so no index-tuning fix is reliable. `TranscriptService
+  ::search` now soft-degrades **every lance-scan boundary** — BM25, semantic
+  ANN, recent-browse, anchor injection, hydrate, and per-primary context
+  window: a lance read error on any one logs a `warn` and degrades (the other
+  channel carries, or empty windows / primary-only context) instead of
+  500ing the request. Verified: the query that 500'd now returns BM25-failed
+  → semantic-served results, 20/20 query sweep clean. The partition-count fix
+  is kept (it reduces how often the fallback triggers).
+
 ## 2026-06-17 — `0.1.5`
 
 ### Fixed
