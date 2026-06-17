@@ -8,6 +8,17 @@ are organized by feature wave (merge commit ranges on `master`).
 
 ## [Unreleased]
 
+## 2026-06-17 — `0.1.3`
+
+Storage upgrade + a month of lifecycle / governance / backend work.
+Headline: LanceDB 0.27 → 0.30 (arrow-array 57 → 58) completed as a
+proper migration — supersedes the bare dependabot bump (#30) that left
+arrow pinned at 57 and would not typecheck across the duckdb →
+`Table::add` boundary. Also lands the Postgres storage backend
+(opt-in via `MEM_BACKEND`), the self-evolution worker, retrieval
+reinforcement + idle-archive + ingest quality gate governance, the
+progressive-disclosure recall banner, and the Lance vacuum worker.
+
 ### Added
 
 - **Vacuum worker** (`src/worker/vacuum_worker.rs`) — daily Lance
