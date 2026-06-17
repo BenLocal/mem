@@ -8,6 +8,25 @@ are organized by feature wave (merge commit ranges on `master`).
 
 ## [Unreleased]
 
+## 2026-06-17 — `0.1.5`
+
+### Fixed
+
+- **Transcript semantic-search read-path hardening** (follow-ups from the
+  lance-0.30 bug sweep; the HIGH 500 was fixed in `0.1.4`).
+  - `semantic_search_transcripts` derives the `best_distance` column index
+    from `CONVERSATION_COLS` instead of a hardcoded `row.get(16)` — a column
+    add/remove would otherwise silently misread the wrong column.
+  - Cap the ANN oversample (`limit*4`) at `MAX_ANN_OVERSAMPLE = 4096` so `k`
+    stays bounded if `limit`'s clamp changes.
+  - Widen the candidate pool ×4 when any search filter (session / role /
+    block_type / time) is set — filters are applied post-fetch, so matching
+    rows ranked beyond the oversample cutoff were never pulled, silently
+    under-recalling. Adds `TranscriptSearchFilters::is_any_set`.
+  - Upsert all chunk embeddings in one `table.add(Vec<RecordBatch>)` instead
+    of one add per chunk, which wrote one Lance fragment per chunk and fed
+    the fragment explosion the vacuum worker has to compact.
+
 ## 2026-06-17 — `0.1.4`
 
 ### Fixed
