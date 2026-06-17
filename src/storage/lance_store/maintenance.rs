@@ -107,6 +107,35 @@ const MIN_ROWS_TO_INDEX: usize = 5_000;
 /// rebuild so the whole table is covered again.
 const REINDEX_DELTA_THRESHOLD: usize = 4_096;
 
+/// Target rows-per-partition for IVF vector index sizing.
+///
+/// lancedb 0.30 derives `num_partitions = num_rows / target_partition_size`.
+/// Its default over-partitioned our embedding tables — 256 partitions for the
+/// ~49k-row `conversation_message_embeddings`, i.e. ~190 rows each. The DuckDB
+/// lance extension (v4.0, the read side; the writer is now lance 7.0) then hit
+/// a ragged-record-batch bug materializing ANN results across that many small
+/// partitions — surfacing as `IO Error: ... all columns in a record batch must
+/// have the same length` → HTTP 500 on `/transcripts/search` for queries whose
+/// nearest centroid was a degenerate partition (others returned fine; capsule
+/// recall was unaffected — that table is flat-scanned, no IVF index).
+///
+/// Verified empirically: 256 partitions reliably reproduced the 500, while
+/// pinning ~1024 rows/partition (49k → 48 partitions, ~1025 rows each) cleared
+/// it across a broad query sweep. The empty-KMeans-cluster *ratio* was similar
+/// either way, so partition *size*, not emptiness, is the trigger — fewer,
+/// larger partitions keep the extension's materialization path happy and
+/// KMeans better-conditioned. Scales with the table as the archive grows.
+const IVF_TARGET_ROWS_PER_PARTITION: usize = 1_024;
+
+/// IVF partition count for a vector index over `row_count` rows. Scales with
+/// the table (robust as it grows) and is clamped to Lance's own `[1, 4096]`
+/// partition bound. At [`MIN_ROWS_TO_INDEX`] (5k) this is 4 partitions; at the
+/// current ~49k embedding rows, 48 (~1025 rows each) — large enough that the
+/// extension's ANN materialization no longer produces the ragged-batch 500.
+fn ivf_num_partitions(row_count: usize) -> u32 {
+    (row_count / IVF_TARGET_ROWS_PER_PARTITION).clamp(1, 4_096) as u32
+}
+
 /// What [`LanceStore::ensure_query_indexes`] should do for one table,
 /// factored out as a pure decision so it can be unit-tested without a
 /// live Lance dataset.
@@ -119,12 +148,20 @@ enum IndexAction {
 
 /// Pure policy: given a table's row count and (if an index exists) its
 /// unindexed-row delta, decide whether to build, rebuild, or skip.
-fn decide_index_action(row_count: usize, unindexed: Option<usize>) -> IndexAction {
+///
+/// `force` rebuilds an existing index regardless of its unindexed delta —
+/// used by `rebuild_query_indexes` (`POST /admin/reindex`) after an index
+/// *parameter* change (e.g. the IVF partition-count fix), where the on-disk
+/// index is stale in shape, not in coverage, so the delta check would
+/// otherwise Skip it. Tables below [`MIN_ROWS_TO_INDEX`] stay skipped even
+/// under force — a flat scan is already sub-second and PQ can't train.
+fn decide_index_action(row_count: usize, unindexed: Option<usize>, force: bool) -> IndexAction {
     if row_count < MIN_ROWS_TO_INDEX {
         return IndexAction::Skip;
     }
     match unindexed {
         None => IndexAction::Build,
+        Some(_) if force => IndexAction::Rebuild,
         Some(n) if n > REINDEX_DELTA_THRESHOLD => IndexAction::Rebuild,
         Some(_) => IndexAction::Skip,
     }
@@ -262,6 +299,21 @@ impl LanceStore {
     /// indexes ARE visible to the DuckDB lance extension's
     /// `lance_vector_search` — same as `ensure_fts_index` / `lance_fts`.
     pub async fn ensure_query_indexes(&self) -> Result<IndexMaintenanceStats, StorageError> {
+        self.ensure_query_indexes_inner(false).await
+    }
+
+    /// Force-rebuild every managed index regardless of its unindexed delta.
+    /// Used by `POST /admin/reindex` after an index *parameter* change (e.g.
+    /// the IVF partition-count fix) where [`Self::ensure_query_indexes`]'s
+    /// delta check would Skip an index that is stale in shape, not coverage.
+    pub async fn rebuild_query_indexes(&self) -> Result<IndexMaintenanceStats, StorageError> {
+        self.ensure_query_indexes_inner(true).await
+    }
+
+    async fn ensure_query_indexes_inner(
+        &self,
+        force: bool,
+    ) -> Result<IndexMaintenanceStats, StorageError> {
         let mut agg = IndexMaintenanceStats::default();
         for (table_name, column, kind) in MANAGED_INDEXES {
             let table = match self.conn.open_table(*table_name).execute().await {
@@ -290,17 +342,31 @@ impl LanceStore {
                 ),
                 None => None,
             };
-            let action = decide_index_action(row_count, unindexed);
+            let action = decide_index_action(row_count, unindexed, force);
             if action == IndexAction::Skip {
                 agg.tables_skipped += 1;
                 continue;
             }
             // `replace(true)` creates when absent and overwrites when
-            // rebuilding. The builders' defaults leave their tuning unset
-            // so Lance derives safe values (IVF partitions / sub-vectors
-            // from row count + dim; BTree needs no tuning).
+            // rebuilding. Vector indexes pin `num_partitions` explicitly —
+            // lancedb 0.30's default derivation over-partitions our embedding
+            // tables and the resulting empty KMeans clusters made the DuckDB
+            // lance extension return ragged record batches (see
+            // [`ivf_num_partitions`]). PQ sub-vectors + BTree/FTS keep Lance's
+            // derived defaults (those were never the problem).
             let index = match kind {
-                IndexKind::Vector => Index::IvfPq(IvfPqIndexBuilder::default()),
+                IndexKind::Vector => {
+                    let num_partitions = ivf_num_partitions(row_count);
+                    tracing::info!(
+                        table = *table_name,
+                        column = *column,
+                        row_count,
+                        num_partitions,
+                        ?action,
+                        "building IVF_PQ vector index"
+                    );
+                    Index::IvfPq(IvfPqIndexBuilder::default().num_partitions(num_partitions))
+                }
                 IndexKind::Scalar => Index::BTree(BTreeIndexBuilder::default()),
                 IndexKind::Fts => Index::FTS(FtsIndexBuilder::default()),
             };
@@ -326,9 +392,15 @@ mod tests {
 
     #[test]
     fn tiny_tables_are_skipped() {
-        assert_eq!(decide_index_action(0, None), IndexAction::Skip);
+        assert_eq!(decide_index_action(0, None, false), IndexAction::Skip);
         assert_eq!(
-            decide_index_action(MIN_ROWS_TO_INDEX - 1, None),
+            decide_index_action(MIN_ROWS_TO_INDEX - 1, None, false),
+            IndexAction::Skip
+        );
+        // Force does not override the floor — flat scan is sub-second and PQ
+        // can't train on a tiny table.
+        assert_eq!(
+            decide_index_action(MIN_ROWS_TO_INDEX - 1, Some(0), true),
             IndexAction::Skip
         );
     }
@@ -336,22 +408,53 @@ mod tests {
     #[test]
     fn large_unindexed_table_builds() {
         assert_eq!(
-            decide_index_action(MIN_ROWS_TO_INDEX, None),
+            decide_index_action(MIN_ROWS_TO_INDEX, None, false),
             IndexAction::Build
         );
-        assert_eq!(decide_index_action(1_000_000, None), IndexAction::Build);
+        assert_eq!(
+            decide_index_action(1_000_000, None, false),
+            IndexAction::Build
+        );
     }
 
     #[test]
     fn fresh_index_is_left_alone_until_delta_grows() {
-        assert_eq!(decide_index_action(50_000, Some(0)), IndexAction::Skip);
         assert_eq!(
-            decide_index_action(50_000, Some(REINDEX_DELTA_THRESHOLD)),
+            decide_index_action(50_000, Some(0), false),
             IndexAction::Skip
         );
         assert_eq!(
-            decide_index_action(50_000, Some(REINDEX_DELTA_THRESHOLD + 1)),
+            decide_index_action(50_000, Some(REINDEX_DELTA_THRESHOLD), false),
+            IndexAction::Skip
+        );
+        assert_eq!(
+            decide_index_action(50_000, Some(REINDEX_DELTA_THRESHOLD + 1), false),
             IndexAction::Rebuild
         );
+    }
+
+    #[test]
+    fn force_rebuilds_existing_index_below_delta() {
+        // Stale-in-shape (parameter change), not stale-in-coverage: a small
+        // delta would Skip without force, but rebuild_query_indexes forces it.
+        assert_eq!(
+            decide_index_action(50_000, Some(0), true),
+            IndexAction::Rebuild
+        );
+        // No index yet → Build regardless of force.
+        assert_eq!(decide_index_action(50_000, None, true), IndexAction::Build);
+    }
+
+    #[test]
+    fn ivf_partitions_scale_with_rows_and_avoid_empty_clusters() {
+        // The bug: lancedb's default gave 256 partitions for ~48k rows
+        // (~187 rows/partition) → empty clusters. The fix targets ~1024
+        // rows/partition, so 48k rows yields far fewer, well-trained ones.
+        assert_eq!(ivf_num_partitions(48_000), 46);
+        // Never zero (clamped to ≥1) even at the index floor.
+        assert_eq!(ivf_num_partitions(MIN_ROWS_TO_INDEX), 4);
+        assert!(ivf_num_partitions(1) >= 1);
+        // Clamped to Lance's 4096 partition ceiling on huge tables.
+        assert_eq!(ivf_num_partitions(usize::MAX), 4_096);
     }
 }

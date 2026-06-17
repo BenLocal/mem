@@ -65,6 +65,16 @@ pub trait MaintenanceStore: Send + Sync {
         Ok(IndexMaintenanceStats::default())
     }
 
+    /// Force-rebuild every managed index regardless of its unindexed delta.
+    /// Unlike [`Self::ensure_query_indexes`] (delta-driven), this is for
+    /// index *parameter* changes — e.g. the IVF partition-count fix — where
+    /// the on-disk index is stale in shape, not coverage. Lance-specific; the
+    /// default no-op lets non-Lance backends compile unchanged. Exposed via
+    /// `POST /admin/reindex`.
+    async fn rebuild_query_indexes(&self) -> Result<IndexMaintenanceStats, StorageError> {
+        Ok(IndexMaintenanceStats::default())
+    }
+
     /// Capsules eligible for auto-promote: `status=pending`,
     /// `updated_at < cutoff_updated_at`, `decay_score <
     /// max_decay_score`, and `capability_capsule_type ∈ types`.
@@ -109,6 +119,13 @@ impl MaintenanceStore for Store {
         // commit_lance_write marks the DuckDB snapshot dirty so the next
         // read refreshes and `lance_vector_search` picks up the new index.
         self.commit_lance_write(self.lance.ensure_query_indexes().await)
+            .await
+    }
+
+    async fn rebuild_query_indexes(&self) -> Result<IndexMaintenanceStats, StorageError> {
+        // Same snapshot-refresh contract as ensure_query_indexes — the next
+        // read must see the rebuilt (correctly-partitioned) index.
+        self.commit_lance_write(self.lance.rebuild_query_indexes().await)
             .await
     }
 

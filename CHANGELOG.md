@@ -8,6 +8,27 @@ are organized by feature wave (merge commit ranges on `master`).
 
 ## [Unreleased]
 
+## 2026-06-17 — `0.1.4`
+
+### Fixed
+
+- **Transcript semantic search 500 on LanceDB 0.30** (regression from
+  `0.1.3`). `POST /transcripts/search` returned `500 IO Error: ... all
+  columns in a record batch must have the same length` for queries whose
+  ANN vector landed on a degenerate IVF partition. Root cause: lancedb
+  0.30's `IvfPqIndexBuilder::default()` over-partitioned the ~49k-row
+  `conversation_message_embeddings` table (256 partitions ⇒ ~190 rows
+  each); the DuckDB lance extension (v4.0 read side, vs the lance-7.0
+  writer) then produced a ragged record batch materializing ANN results
+  across that many small partitions. Verified empirically — 256 partitions
+  reproduced it, ~1024 rows/partition (48 partitions) cleared it across a
+  broad query sweep; partition *size*, not the (similar) empty-cluster
+  ratio, was the trigger. Capsule recall was unaffected (that table is
+  flat-scanned, no IVF index). Fix: pin `num_partitions` from row count
+  (`ivf_num_partitions`) in `LanceStore::ensure_query_indexes`, and add
+  `POST /admin/reindex` (`MaintenanceStore::rebuild_query_indexes`) to
+  force-rebuild an index whose shape — not coverage — is stale.
+
 ## 2026-06-17 — `0.1.3`
 
 Storage upgrade + a month of lifecycle / governance / backend work.

@@ -1012,6 +1012,20 @@ impl CapabilityCapsuleService {
             .map_err(ServiceError::Storage)
     }
 
+    /// Service entry point for `POST /admin/reindex`: force-rebuild every
+    /// managed ANN/scalar/FTS index regardless of its unindexed delta.
+    /// Needed after an index *parameter* change (e.g. the IVF partition-count
+    /// fix) where the delta-driven `ensure_query_indexes` would Skip an index
+    /// that is stale in shape, not coverage. Non-Lance backends no-op.
+    pub async fn reindex(
+        &self,
+    ) -> Result<crate::storage::lance_store::IndexMaintenanceStats, ServiceError> {
+        self.store
+            .rebuild_query_indexes()
+            .await
+            .map_err(ServiceError::Storage)
+    }
+
     /// Supersede flow: accept a pending memory by replacing it with an edited active version.
     ///
     /// After storage is updated, the graph is kept consistent:

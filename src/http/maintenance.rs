@@ -1,7 +1,11 @@
-//! Operator-driven maintenance endpoints. Currently just one:
-//! `POST /admin/vacuum` to trigger an immediate Lance manifest prune
-//! across every managed table without waiting for the daily worker
-//! tick. Same backend as `crate::worker::vacuum_worker::sweep_once`.
+//! Operator-driven maintenance endpoints:
+//! - `POST /admin/vacuum` — immediate Lance manifest prune across every
+//!   managed table without waiting for the daily worker tick. Same backend
+//!   as `crate::worker::vacuum_worker::sweep_once`.
+//! - `POST /admin/reindex` — force-rebuild every managed ANN/scalar/FTS
+//!   index regardless of its unindexed delta, for index *parameter* changes
+//!   (e.g. the IVF partition-count fix) that the delta-driven worker won't
+//!   pick up on its own.
 //!
 //! These endpoints intentionally live outside `admin.rs` (which
 //! embeds the admin web SPA — a pure asset surface) so the SPA stays
@@ -10,10 +14,15 @@
 use axum::{extract::State, routing::post, Json, Router};
 use serde::Deserialize;
 
-use crate::{app::AppState, error::AppError, storage::VacuumStats};
+use crate::{
+    app::AppState, error::AppError, storage::lance_store::IndexMaintenanceStats,
+    storage::VacuumStats,
+};
 
 pub fn router() -> Router<AppState> {
-    Router::new().route("/admin/vacuum", post(vacuum))
+    Router::new()
+        .route("/admin/vacuum", post(vacuum))
+        .route("/admin/reindex", post(reindex))
 }
 
 /// `POST /admin/vacuum` body. Both fields are optional.
@@ -52,6 +61,18 @@ async fn vacuum(
     let stats = app
         .capability_capsule_service
         .vacuum(cutoff, aggressive)
+        .await
+        .map_err(AppError::from)?;
+    Ok(Json(stats))
+}
+
+/// `POST /admin/reindex` — force-rebuild every managed index regardless of
+/// its unindexed delta. No body. Returns the per-pass index-maintenance
+/// stats. Non-Lance backends no-op and return zero-stats.
+async fn reindex(State(app): State<AppState>) -> Result<Json<IndexMaintenanceStats>, AppError> {
+    let stats = app
+        .capability_capsule_service
+        .reindex()
         .await
         .map_err(AppError::from)?;
     Ok(Json(stats))
