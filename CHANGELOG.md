@@ -8,6 +8,34 @@ are organized by feature wave (merge commit ranges on `master`).
 
 ## [Unreleased]
 
+## 2026-06-18 — `0.1.7`
+
+Consolidation release. Supersedes `0.1.5` and `0.1.6` (both deprecated):
+their changelog/release notes carried a transcript-bug root-cause that was
+later disproven, and `0.1.5` was an unreleased intermediate. `0.1.7` is the
+clean reference point — same runtime behavior as `0.1.6` plus a green CI
+and corrected docs.
+
+### Fixed
+
+- **CI `postgres` job** (`fix(test)` 8f1d413): `connect_fresh` now creates
+  the pgvector extension under a transaction-scoped advisory lock + `SCHEMA
+  public`, so parallel integration tests on a fresh DB no longer race
+  `CREATE EXTENSION` (`duplicate key … pg_extension_name_index` →
+  `type "vector" does not exist`). Test-only; production unaffected.
+
+### Docs
+
+- **Transcript ragged-batch root cause corrected** (a5df25a): it is a Lance
+  **stale/partially-covering-index** scan bug (present in both the DuckDB
+  lance-extension 4.0 reader AND the lance-7.0 Rust reader — verified, so it
+  is NOT a reader/writer version skew, and NOT IVF over-partitioning). A
+  fresh `POST /admin/reindex` clears it; it recurs as the unindexed delta
+  regrows. Mitigation is unchanged from `0.1.6`: `TranscriptService::search`
+  soft-degrades every lance-scan boundary (never 500s). The `0.1.7` attempt
+  to reroute reads through the lance Rust API was reverted — the lance 7.0
+  reader hit the same bug.
+
 ## 2026-06-17 — `0.1.6`
 
 ### Fixed
