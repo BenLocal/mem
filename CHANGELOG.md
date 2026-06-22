@@ -8,6 +8,27 @@ are organized by feature wave (merge commit ranges on `master`).
 
 ## [Unreleased]
 
+## 2026-06-22 — `0.1.8`
+
+Memory-footprint release. Swaps the Rust global allocator from glibc malloc
+to jemalloc so a long-lived `mem serve` returns idle memory to the OS instead
+of ratcheting RSS upward.
+
+### Changed
+
+- **jemalloc as the global allocator** (`src/main.rs`, `Cargo.toml`): glibc's
+  per-thread arenas (8×nproc = 768 on the 96-core deployment box) retained
+  freed memory and never returned it to the OS, ratcheting RSS 5→8 GB over
+  days even with `MALLOC_ARENA_MAX` capped. `tikv-jemallocator` is now wired
+  as `#[global_allocator]`, and `main()` enables `background_thread` so
+  jemalloc's decay returns idle pages on a timer rather than only on
+  allocation activity. Governs all Rust-side allocations (the dominant churn
+  is local embedding inference via Candle/gemm); DuckDB's bundled-C
+  allocations still hit the system allocator and stay capped via
+  `MALLOC_ARENA_MAX`. Local A/B: ~57–94% of the idle rise returned to the OS
+  vs. glibc's 0%. `background_thread` is best-effort — unsupported on some
+  musl builds, where it no-ops and decay still runs lazily.
+
 ## 2026-06-18 — `0.1.7`
 
 Consolidation release. Supersedes `0.1.5` and `0.1.6` (both deprecated):

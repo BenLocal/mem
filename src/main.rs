@@ -2,6 +2,12 @@ use clap::{Parser, Subcommand};
 use mem::error;
 use tracing_subscriber::{fmt, EnvFilter};
 
+// jemalloc as the global allocator — replaces glibc malloc, whose per-thread
+// arenas ratcheted RSS on this many-core box and never returned freed memory
+// to the OS. Covers all Rust-side allocations (the embedding inference churn).
+#[global_allocator]
+static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
+
 #[derive(Debug, Parser)]
 #[command(
     name = "mem",
@@ -41,6 +47,14 @@ enum Command {
 }
 
 fn main() -> error::Result<()> {
+    // Turn on jemalloc's background purge thread so decayed/idle memory is
+    // returned to the OS on a timer. It defaults OFF — without it jemalloc
+    // only purges on allocation activity, so a quiet `mem serve` would ratchet
+    // RSS much like glibc did. jemalloc's default decay (dirty 10s) handles the
+    // rest. Best-effort: `background_thread` is unsupported on some musl builds,
+    // where this no-ops (decay still works, just lazily).
+    let _ = tikv_jemalloc_ctl::background_thread::write(true);
+
     // Build the runtime explicitly instead of `#[tokio::main]` so we can
     // cap `max_blocking_threads`. tokio's default is 512; on a many-core
     // box mem's heavy `spawn_blocking` load (every DuckDB read serializes

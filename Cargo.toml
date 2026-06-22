@@ -1,6 +1,6 @@
 [package]
 name = "mem"
-version = "0.1.7"
+version = "0.1.8"
 edition = "2021"
 default-run = "mem"
 
@@ -76,6 +76,15 @@ rust-embed = { version = "8", features = ["debug-embed"] }
 # tree transitively (via lancedb's storage layer); promoting it to a
 # direct dep so we can import it.
 fs4 = "0.8"
+# jemalloc as the Rust global allocator. glibc's per-thread arenas ratcheted
+# RSS on this 96-core box (5→8GB over days) and never returned freed memory to
+# the OS even capped with MALLOC_ARENA_MAX. jemalloc's decay + background_thread
+# return idle memory aggressively (local A/B: ~94% returned on idle). Governs
+# all Rust-side allocs (embedding inference via Candle/gemm is the dominant
+# churn); DuckDB's bundled-C allocs still hit the system allocator and are
+# capped separately via MALLOC_ARENA_MAX.
+tikv-jemallocator = "0.6"
+tikv-jemalloc-ctl = "0.6"
 
 [dev-dependencies]
 rand = "0.10"
