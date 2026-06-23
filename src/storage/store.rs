@@ -550,14 +550,20 @@ impl Store {
         &self,
         tenant: &str,
     ) -> Result<crate::domain::capability_capsule::CapsuleStats, StorageError> {
-        self.query.capsule_stats(tenant).await
+        match self.read_engine {
+            crate::config::ReadEngine::DuckDb => self.query.capsule_stats(tenant).await,
+            crate::config::ReadEngine::Lance => self.lance.capsule_stats(tenant).await,
+        }
     }
 
     pub async fn get_taxonomy(
         &self,
         tenant: &str,
     ) -> Result<Vec<(String, Vec<String>)>, StorageError> {
-        self.query.get_taxonomy(tenant).await
+        match self.read_engine {
+            crate::config::ReadEngine::DuckDb => self.query.get_taxonomy(tenant).await,
+            crate::config::ReadEngine::Lance => self.lance.get_taxonomy(tenant).await,
+        }
     }
 
     #[allow(clippy::too_many_arguments)]

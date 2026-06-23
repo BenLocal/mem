@@ -16,7 +16,9 @@ use super::{
     record_batch_to_embedding_job_rows, record_batch_to_feedback_events, sql_quote,
     EmbeddingJobRow, LanceStore,
 };
-use crate::domain::capability_capsule::{CapabilityCapsuleRecord, FeedbackSummary};
+use crate::domain::capability_capsule::{
+    CapabilityCapsuleRecord, CapabilityCapsuleStatus, CapsuleStats, FeedbackSummary,
+};
 use crate::domain::embeddings::EmbeddingJobInfo;
 use crate::embedding::wire::decode_f32_blob;
 use crate::storage::types::{ClaimedEmbeddingJob, EmbeddingJobInsert, FeedbackEvent, StorageError};
@@ -200,6 +202,79 @@ impl LanceStore {
             .enumerate()
             .map(|(idx, (id, _))| (id, idx as i64 + 1))
             .collect())
+    }
+
+    /// Route-B bucket "stats": native lancedb-Rust equivalent of
+    /// `DuckDbQuery::capsule_stats` — the DuckDB `GROUP BY status`
+    /// aggregation folded into the discrete fields on [`CapsuleStats`].
+    /// Fetches every row for `tenant` via
+    /// [`Self::query_capability_capsules`] and counts the per-row `status`
+    /// enum in Rust. `total` is the row count; each field is the count of
+    /// that status variant. Parity-gated by `tests/parity_golden.rs`.
+    pub async fn capsule_stats(&self, tenant: &str) -> Result<CapsuleStats, StorageError> {
+        let rows = self
+            .query_capability_capsules(format!("tenant = {}", sql_quote(tenant)), None)
+            .await?;
+        let mut stats = CapsuleStats::default();
+        for r in rows {
+            stats.total += 1;
+            // Match on the enum variant directly so the field mapping can't
+            // drift from the on-disk status strings. Mirrors the DuckDB
+            // backend's `GROUP BY status` fold (which keys off the same
+            // snake_case strings "active"/"archived"/… the enum serializes
+            // to).
+            match r.status {
+                CapabilityCapsuleStatus::PendingConfirmation => stats.pending_confirmation += 1,
+                CapabilityCapsuleStatus::Provisional => stats.provisional += 1,
+                CapabilityCapsuleStatus::Active => stats.active += 1,
+                CapabilityCapsuleStatus::Archived => stats.archived += 1,
+                CapabilityCapsuleStatus::Rejected => stats.rejected += 1,
+            }
+        }
+        Ok(stats)
+    }
+
+    /// Route-B bucket "taxonomy": native lancedb-Rust equivalent of
+    /// `DuckDbQuery::get_taxonomy` — the DuckDB
+    /// `WHERE project IS NOT NULL GROUP BY project, repo
+    /// ORDER BY project, repo` query folded into `[(project, Vec<repo>)]`.
+    /// Fetches rows for `tenant`, keeps only those with a project (mirrors
+    /// `project IS NOT NULL`), collects the DISTINCT `(project, repo)`
+    /// pairs, then folds consecutive same-project rows pushing only
+    /// `Some(repo)` values. Parity-gated by `tests/parity_golden.rs`.
+    pub async fn get_taxonomy(
+        &self,
+        tenant: &str,
+    ) -> Result<Vec<(String, Vec<String>)>, StorageError> {
+        let rows = self
+            .query_capability_capsules(format!("tenant = {}", sql_quote(tenant)), None)
+            .await?;
+        // DISTINCT (project, repo) for project-bearing rows. A `BTreeSet`
+        // dedups AND sorts by `(project, repo)` in one shot; `Option<String>`
+        // sorts `None` before `Some(_)`, matching DuckDB's `NULLS FIRST`
+        // default for `ORDER BY repo ASC` — verified against
+        // `tests/golden/taxonomy.json`.
+        let pairs: std::collections::BTreeSet<(String, Option<String>)> = rows
+            .into_iter()
+            .filter_map(|r| r.project.map(|p| (p, r.repo)))
+            .collect();
+        // Fold consecutive same-project rows — identical to the DuckDB
+        // backend's `grouped.last_mut()` fold.
+        let mut grouped: Vec<(String, Vec<String>)> = Vec::new();
+        for (project, repo) in pairs {
+            match grouped.last_mut() {
+                Some(last) if last.0 == project => {
+                    if let Some(r) = repo {
+                        last.1.push(r);
+                    }
+                }
+                _ => {
+                    let repos = repo.map(|r| vec![r]).unwrap_or_default();
+                    grouped.push((project, repos));
+                }
+            }
+        }
+        Ok(grouped)
     }
 
     /// Read all `embedding_jobs` rows matching `filter`, parsed into

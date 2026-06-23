@@ -549,4 +549,16 @@ async fn lance_parity_matches_golden() {
     let q_vec = deterministic_embedding("new decay formula anchors on last_used_at", DIM);
     let ann = repo.ann_candidate_ids("t1", &q_vec, 5).await.unwrap();
     assert_golden("ann", ranked(ann));
+
+    // ── stats ──
+    let stats = repo.capsule_stats("t1").await.unwrap();
+    assert_golden("stats", serde_json::to_value(stats).unwrap());
+
+    // ── taxonomy ── (sort outer + inner for stability — same as duckdb side)
+    let mut tax = repo.get_taxonomy("t1").await.unwrap();
+    for (_, vs) in tax.iter_mut() {
+        vs.sort();
+    }
+    tax.sort();
+    assert_golden("taxonomy", serde_json::to_value(tax).unwrap());
 }
