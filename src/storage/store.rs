@@ -651,7 +651,10 @@ impl Store {
         &self,
         tenant: &str,
     ) -> Result<Vec<CapabilityCapsuleRecord>, StorageError> {
-        self.query.search_candidates(tenant).await
+        match self.read_engine {
+            crate::config::ReadEngine::DuckDb => self.query.search_candidates(tenant).await,
+            crate::config::ReadEngine::Lance => self.lance.search_candidates(tenant).await,
+        }
     }
 
     pub async fn recent_active_capability_capsules(
@@ -688,9 +691,18 @@ impl Store {
         tenant: &str,
         capability_capsule_id: &str,
     ) -> Result<Vec<CapabilityCapsuleVersionLink>, StorageError> {
-        self.query
-            .list_capability_capsule_versions_for_tenant(tenant, capability_capsule_id)
-            .await
+        match self.read_engine {
+            crate::config::ReadEngine::DuckDb => {
+                self.query
+                    .list_capability_capsule_versions_for_tenant(tenant, capability_capsule_id)
+                    .await
+            }
+            crate::config::ReadEngine::Lance => {
+                self.lance
+                    .list_capability_capsule_versions_for_tenant(tenant, capability_capsule_id)
+                    .await
+            }
+        }
     }
 
     /// Cross-table hybrid recall: BM25 + vector + RRF fused inline

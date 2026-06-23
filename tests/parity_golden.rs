@@ -589,4 +589,24 @@ async fn lance_parity_matches_golden() {
             "graph_stats": serde_json::to_value(gstats).unwrap(),
         }),
     );
+
+    // ── version-chain ── (mirrors the duckdb block verbatim: version links
+    //    walked off cap_d_v2 + the NOT-EXISTS-deduped candidate pool)
+    let mut versions = repo
+        .list_capability_capsule_versions_for_tenant("t1", "cap_d_v2")
+        .await
+        .unwrap();
+    versions.sort_by(|a, b| {
+        a.capability_capsule_id
+            .cmp(&b.capability_capsule_id)
+            .then(a.version.cmp(&b.version))
+    });
+    let pool = repo.search_candidates("t1").await.unwrap();
+    assert_golden(
+        "version_chain",
+        json!({
+            "versions": serde_json::to_value(&versions).unwrap(),
+            "search_candidates_ids": sorted_ids(pool.into_iter().map(|c| c.capability_capsule_id)),
+        }),
+    );
 }

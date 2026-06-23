@@ -17,7 +17,8 @@ use super::{
     EmbeddingJobRow, LanceStore,
 };
 use crate::domain::capability_capsule::{
-    CapabilityCapsuleRecord, CapabilityCapsuleStatus, CapsuleStats, FeedbackSummary,
+    CapabilityCapsuleRecord, CapabilityCapsuleStatus, CapabilityCapsuleVersionLink, CapsuleStats,
+    FeedbackSummary,
 };
 use crate::domain::embeddings::EmbeddingJobInfo;
 use crate::embedding::wire::decode_f32_blob;
@@ -275,6 +276,215 @@ impl LanceStore {
             }
         }
         Ok(grouped)
+    }
+
+    /// Route-B bucket "version-chain": native lancedb-Rust equivalent of
+    /// `DuckDbQuery::search_candidates` — the lifecycle-pool loader.
+    ///
+    /// Fetches every row for `tenant` via
+    /// [`Self::query_capability_capsules`], then reproduces the DuckDB SQL
+    /// filter in Rust:
+    ///
+    /// 1. Keep rows with `status NOT IN ('rejected', 'archived')` and
+    ///    `capability_capsule_type != 'diary'`. (`PendingConfirmation` /
+    ///    `Provisional` / `Active` all pass — the SQL only excludes the
+    ///    two terminal statuses.)
+    /// 2. Drop any row that has been **superseded by another *active*
+    ///    row** in the same tenant (the DuckDB `NOT EXISTS` subquery —
+    ///    version-chain dedup at retrieve time). `s.supersedes = c.id AND
+    ///    s.tenant = c.tenant AND s.status = active`.
+    /// 3. Optional `MEM_RECALL_POOL_LIMIT` cap: unset / 0 / invalid →
+    ///    unbounded full pool (default; the test env does not set it).
+    ///    When `Some(n)`, `preference` / `workflow` guidance is ALWAYS
+    ///    kept (the floor-exempt guidance), plus the `n` most-recently-
+    ///    written (`updated_at DESC, ties unspecified`) NON-guidance rows
+    ///    drawn from the raw `status NOT IN (rejected, archived) AND type
+    ///    != diary` set (the same recency subquery the DuckDB
+    ///    `pool_bound_clause` runs — it does NOT re-apply the supersede
+    ///    dedup, so the cap is computed over the pre-dedup set).
+    ///
+    /// Ordering matches the DuckDB `ORDER BY updated_at DESC, version
+    /// DESC, capability_capsule_id ASC` so the returned `Vec` is
+    /// deterministic; the parity golden re-sorts the ids anyway.
+    /// Parity-gated by `tests/parity_golden.rs`.
+    pub async fn search_candidates(
+        &self,
+        tenant: &str,
+    ) -> Result<Vec<CapabilityCapsuleRecord>, StorageError> {
+        let rows = self
+            .query_capability_capsules(format!("tenant = {}", sql_quote(tenant)), None)
+            .await?;
+
+        // Mirror the DuckDB env read: unset / 0 / invalid → unbounded.
+        let pool_limit = std::env::var("MEM_RECALL_POOL_LIMIT")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .filter(|&n| n > 0);
+
+        let is_excluded_status = |s: &CapabilityCapsuleStatus| {
+            matches!(
+                s,
+                CapabilityCapsuleStatus::Rejected | CapabilityCapsuleStatus::Archived
+            )
+        };
+        let is_diary = |t: &crate::domain::capability_capsule::CapabilityCapsuleType| {
+            matches!(
+                t,
+                crate::domain::capability_capsule::CapabilityCapsuleType::Diary
+            )
+        };
+        let is_guidance = |t: &crate::domain::capability_capsule::CapabilityCapsuleType| {
+            matches!(
+                t,
+                crate::domain::capability_capsule::CapabilityCapsuleType::Preference
+                    | crate::domain::capability_capsule::CapabilityCapsuleType::Workflow
+            )
+        };
+
+        // Optional `MEM_RECALL_POOL_LIMIT` recency allow-list. Mirrors the
+        // DuckDB `pool_bound_clause` subquery: the N most-recently-written
+        // (`updated_at DESC`) rows over the raw `status NOT IN (rejected,
+        // archived) AND type != diary` set — NOT the supersede-deduped set,
+        // and NOT guidance-floored (guidance is exempted separately below).
+        let bound_ids: Option<std::collections::HashSet<String>> = pool_limit.map(|n| {
+            let mut candidates: Vec<&CapabilityCapsuleRecord> = rows
+                .iter()
+                .filter(|r| !is_excluded_status(&r.status) && !is_diary(&r.capability_capsule_type))
+                .collect();
+            candidates.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
+            candidates
+                .into_iter()
+                .take(n)
+                .map(|r| r.capability_capsule_id.clone())
+                .collect()
+        });
+
+        // The supersede dedup operates over the SAME tenant's rows: a row is
+        // dropped iff some other row supersedes it AND that superseder is
+        // `Active`. Index the active superseders by their target (owned so
+        // the borrow drops before `rows` is consumed below).
+        let active_supersede_targets: std::collections::HashSet<String> = rows
+            .iter()
+            .filter(|r| matches!(r.status, CapabilityCapsuleStatus::Active))
+            .filter_map(|r| r.supersedes_capability_capsule_id.clone())
+            .collect();
+
+        let mut out: Vec<CapabilityCapsuleRecord> = rows
+            .into_iter()
+            .filter(|r| !is_excluded_status(&r.status))
+            .filter(|r| !is_diary(&r.capability_capsule_type))
+            .filter(|r| !active_supersede_targets.contains(r.capability_capsule_id.as_str()))
+            .filter(|r| match &bound_ids {
+                // Cap on: keep guidance always, plus the recency allow-list.
+                Some(allow) => {
+                    is_guidance(&r.capability_capsule_type)
+                        || allow.contains(&r.capability_capsule_id)
+                }
+                None => true,
+            })
+            .collect();
+
+        // ORDER BY updated_at DESC, version DESC, capability_capsule_id ASC.
+        out.sort_by(|a, b| {
+            b.updated_at
+                .cmp(&a.updated_at)
+                .then_with(|| b.version.cmp(&a.version))
+                .then_with(|| a.capability_capsule_id.cmp(&b.capability_capsule_id))
+        });
+        Ok(out)
+    }
+
+    /// Route-B bucket "version-chain": native lancedb-Rust equivalent of
+    /// `DuckDbQuery::list_capability_capsule_versions_for_tenant` — the
+    /// supersede version-chain walk.
+    ///
+    /// Replaces the DuckDB `WITH RECURSIVE` CTE with an iterative BFS in
+    /// Rust over the tenant's rows. The CTE walks **both** directions of
+    /// the `supersedes_capability_capsule_id` link from every node already
+    /// in the chain:
+    ///   - BACKWARD: a row `c` joins when `c.id = ch.supersedes` (the
+    ///     predecessor the current node points at).
+    ///   - FORWARD: a row `c` joins when `c.supersedes = ch.id` (a
+    ///     successor pointing back at the current node).
+    ///
+    /// Tenant filters every step, so foreign-tenant id collisions never
+    /// leak in. Returns each link as a [`CapabilityCapsuleVersionLink`]
+    /// ordered `version DESC, updated_at DESC` (newest first) — identical
+    /// to the DuckDB `ORDER BY`. Parity-gated by `tests/parity_golden.rs`.
+    pub async fn list_capability_capsule_versions_for_tenant(
+        &self,
+        tenant: &str,
+        capability_capsule_id: &str,
+    ) -> Result<Vec<CapabilityCapsuleVersionLink>, StorageError> {
+        // Pull the tenant's rows once and index by id; the chain walk is a
+        // pure in-memory BFS (chains are tiny — typically 1–3 links).
+        let rows = self
+            .query_capability_capsules(format!("tenant = {}", sql_quote(tenant)), None)
+            .await?;
+        let by_id: std::collections::HashMap<&str, &CapabilityCapsuleRecord> = rows
+            .iter()
+            .map(|r| (r.capability_capsule_id.as_str(), r))
+            .collect();
+        // Forward adjacency: capsule_id -> ids of rows that supersede it.
+        let mut successors: std::collections::HashMap<&str, Vec<&str>> =
+            std::collections::HashMap::new();
+        for r in &rows {
+            if let Some(pred) = r.supersedes_capability_capsule_id.as_deref() {
+                successors
+                    .entry(pred)
+                    .or_default()
+                    .push(r.capability_capsule_id.as_str());
+            }
+        }
+
+        // BFS from the anchor (if it exists in this tenant). The recursive
+        // CTE's anchor row is only emitted when it matches tenant + id, so an
+        // absent / foreign-tenant id yields an empty chain — same as DuckDB.
+        let mut visited: std::collections::HashSet<&str> = std::collections::HashSet::new();
+        let mut queue: std::collections::VecDeque<&str> = std::collections::VecDeque::new();
+        if by_id.contains_key(capability_capsule_id) {
+            visited.insert(capability_capsule_id);
+            queue.push_back(capability_capsule_id);
+        }
+        while let Some(id) = queue.pop_front() {
+            let rec = match by_id.get(id) {
+                Some(r) => r,
+                None => continue,
+            };
+            // BACKWARD: the predecessor this row supersedes.
+            if let Some(pred) = rec.supersedes_capability_capsule_id.as_deref() {
+                if by_id.contains_key(pred) && visited.insert(pred) {
+                    queue.push_back(pred);
+                }
+            }
+            // FORWARD: rows that supersede this row.
+            if let Some(succs) = successors.get(id) {
+                for &succ in succs {
+                    if visited.insert(succ) {
+                        queue.push_back(succ);
+                    }
+                }
+            }
+        }
+
+        let mut out: Vec<CapabilityCapsuleVersionLink> = visited
+            .iter()
+            .filter_map(|id| by_id.get(id))
+            .map(|r| CapabilityCapsuleVersionLink {
+                capability_capsule_id: r.capability_capsule_id.clone(),
+                version: r.version,
+                status: r.status.clone(),
+                updated_at: r.updated_at.clone(),
+                supersedes_capability_capsule_id: r.supersedes_capability_capsule_id.clone(),
+            })
+            .collect();
+        // ORDER BY version DESC, updated_at DESC (newest first).
+        out.sort_by(|a, b| {
+            b.version
+                .cmp(&a.version)
+                .then_with(|| b.updated_at.cmp(&a.updated_at))
+        });
+        Ok(out)
     }
 
     /// Read all `embedding_jobs` rows matching `filter`, parsed into
