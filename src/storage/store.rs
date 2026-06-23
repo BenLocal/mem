@@ -86,6 +86,10 @@ pub struct Store {
     pub(crate) lance: Arc<LanceStore>,
     /// Reads flow here.
     pub(crate) query: Arc<DuckDbQuery>,
+    /// Per-bucket read-engine switch (`MEM_READ_ENGINE`) for the route-B
+    /// migration. Each read method routes on this; default `DuckDb`. See
+    /// `docs/remove-duckdb-keep-lance.md`.
+    pub(crate) read_engine: crate::config::ReadEngine,
     /// Open-time advisory lock — held for the full lifetime of every
     /// `Store` clone (`Arc` keeps it alive until the last clone drops).
     /// `None` when `MEM_OPEN_LOCK_DISABLED=1` skipped acquisition. See
@@ -110,6 +114,27 @@ impl Store {
         Ok(Self {
             lance: Arc::new(lance),
             query: Arc::new(query),
+            read_engine: crate::config::parse_read_engine(|k| std::env::var(k).ok()),
+            _open_lock: Arc::new(lock),
+        })
+    }
+
+    /// Like [`Self::open`] but forces the read engine, bypassing
+    /// `MEM_READ_ENGINE`. Used by the parity double-run
+    /// (`tests/parity_golden.rs`) to read the same seeded dataset under each
+    /// engine without racing a process-global env var.
+    pub async fn open_with_read_engine(
+        path: impl AsRef<Path>,
+        read_engine: crate::config::ReadEngine,
+    ) -> Result<Self, StorageError> {
+        let path = path.as_ref();
+        let lock = crate::storage::open_lock::acquire(path)?;
+        let lance = LanceStore::open(path).await?;
+        let query = DuckDbQuery::open(path).await?;
+        Ok(Self {
+            lance: Arc::new(lance),
+            query: Arc::new(query),
+            read_engine,
             _open_lock: Arc::new(lock),
         })
     }
@@ -134,6 +159,7 @@ impl Store {
         Ok(Self {
             lance: Arc::new(lance),
             query: Arc::new(query),
+            read_engine: crate::config::parse_read_engine(|k| std::env::var(k).ok()),
             _open_lock: Arc::new(lock),
         })
     }
@@ -506,7 +532,14 @@ impl Store {
         &self,
         tenant: &str,
     ) -> Result<Vec<CapabilityCapsuleRecord>, StorageError> {
-        self.query.list_capability_capsules_for_tenant(tenant).await
+        match self.read_engine {
+            crate::config::ReadEngine::DuckDb => {
+                self.query.list_capability_capsules_for_tenant(tenant).await
+            }
+            crate::config::ReadEngine::Lance => {
+                self.lance.list_capability_capsules_for_tenant(tenant).await
+            }
+        }
     }
 
     pub async fn list_wings(&self, tenant: &str) -> Result<Vec<String>, StorageError> {

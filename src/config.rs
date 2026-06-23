@@ -422,6 +422,28 @@ pub fn parse_backend(
     Ok((kind, url))
 }
 
+/// Read-engine selector (`MEM_READ_ENGINE`) for the route-B migration
+/// (`docs/remove-duckdb-keep-lance.md`). `DuckDb` = the lance-attached
+/// in-process SQL read engine (default, proven); `Lance` = native lancedb
+/// Rust reads, migrated bucket by bucket behind this switch. Per-bucket
+/// parity against the DuckDb golden is gated by `tests/parity_golden.rs`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ReadEngine {
+    #[default]
+    DuckDb,
+    Lance,
+}
+
+/// Parse `MEM_READ_ENGINE` (`duckdb` default | `lance`). Unknown / empty
+/// value silently falls back to `DuckDb` — a typo must never break reads;
+/// the safe default is the proven engine.
+pub fn parse_read_engine(get: impl Fn(&str) -> Option<String>) -> ReadEngine {
+    match get("MEM_READ_ENGINE").map(|s| s.trim().to_ascii_lowercase()) {
+        Some(s) if s == "lance" => ReadEngine::Lance,
+        _ => ReadEngine::DuckDb,
+    }
+}
+
 #[derive(Debug, Error)]
 pub enum ConfigError {
     #[error("invalid EMBEDDING_PROVIDER: {0} (expected fake, openai, or embedanything)")]

@@ -351,6 +351,23 @@ fn check_or_write(name: &str, value: serde_json::Value) {
     }
 }
 
+/// Phase-1 parity assertion: a MIGRATED bucket's lance-engine output must
+/// byte-match the committed DuckDB golden (never writes — the DuckDB side
+/// owns the golden via `check_or_write`).
+fn assert_golden(name: &str, value: serde_json::Value) {
+    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/golden")
+        .join(format!("{name}.json"));
+    let mut actual = serde_json::to_string_pretty(&value).unwrap();
+    actual.push('\n');
+    let expected = fs::read_to_string(&path)
+        .unwrap_or_else(|_| panic!("golden {name}.json missing — generate it via the DuckDB test"));
+    assert_eq!(
+        actual, expected,
+        "lance-engine parity drift for `{name}` vs DuckDB golden"
+    );
+}
+
 fn sorted_ids<I: IntoIterator<Item = String>>(ids: I) -> serde_json::Value {
     let mut v: Vec<String> = ids.into_iter().collect();
     v.sort();
@@ -499,5 +516,32 @@ async fn duckdb_parity_golden() {
             .into_iter()
             .map(|(m, _)| m.message_block_id)
             .collect::<Vec<_>>()),
+    );
+}
+
+/// Phase-1 parity double-run: seed the same fixture, read each MIGRATED
+/// bucket under `ReadEngine::Lance`, and assert it byte-matches the DuckDB
+/// golden (= lance == duckdb). Buckets are added here as they pass; an
+/// unmigrated bucket is simply absent. See `docs/remove-duckdb-keep-lance.md`
+/// §5 Phase 1.
+#[tokio::test]
+async fn lance_parity_matches_golden() {
+    let dir = tempdir().unwrap();
+    let db = dir.path().join("parity_lance.duckdb");
+    let repo = Arc::new(
+        Store::open_with_read_engine(&db, mem::config::ReadEngine::Lance)
+            .await
+            .unwrap(),
+    );
+    seed(&repo).await;
+
+    // ── filter ──
+    let listed = repo
+        .list_capability_capsules_for_tenant("t1")
+        .await
+        .unwrap();
+    assert_golden(
+        "filter",
+        sorted_ids(listed.into_iter().map(|c| c.capability_capsule_id)),
     );
 }

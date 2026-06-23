@@ -97,6 +97,18 @@ impl LanceStore {
         Ok(out)
     }
 
+    /// Route-B bucket "filter": native lancedb-Rust equivalent of
+    /// `DuckDbQuery::list_capability_capsules_for_tenant` — every row for
+    /// `tenant`, no ordering (callers sort). Parity-gated by
+    /// `tests/parity_golden.rs`.
+    pub async fn list_capability_capsules_for_tenant(
+        &self,
+        tenant: &str,
+    ) -> Result<Vec<CapabilityCapsuleRecord>, StorageError> {
+        self.query_capability_capsules(format!("tenant = {}", sql_quote(tenant)), None)
+            .await
+    }
+
     /// Read all `embedding_jobs` rows matching `filter`, parsed into
     /// [`EmbeddingJobRow`]s. Shared by every queue read path: the claim
     /// flow, `list_embedding_jobs`, `latest_embedding_job_status_for_hash`,
