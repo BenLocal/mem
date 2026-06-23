@@ -1,0 +1,24 @@
+{
+  "search_candidates_ids": [
+    "cap_a",
+    "cap_b",
+    "cap_c",
+    "cap_d_v2",
+    "cap_e_pending"
+  ],
+  "versions": [
+    {
+      "capability_capsule_id": "cap_d_v1",
+      "status": "active",
+      "updated_at": "00000000000000000004",
+      "version": 1
+    },
+    {
+      "capability_capsule_id": "cap_d_v2",
+      "status": "active",
+      "supersedes_capability_capsule_id": "cap_d_v1",
+      "updated_at": "00000000000000000005",
+      "version": 2
+    }
+  ]
+}

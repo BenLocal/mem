@@ -1,0 +1,45 @@
+{
+  "graph_stats": {
+    "active_edges": 3,
+    "closed_edges": 0,
+    "node_count": 4,
+    "top_relations": [
+      [
+        "mentions",
+        2
+      ],
+      [
+        "part_of",
+        1
+      ]
+    ],
+    "total_edges": 3
+  },
+  "neighbors_within_2hops": [
+    {
+      "from_node_id": "capability_capsule:cap_a",
+      "relation": "mentions",
+      "to_node_id": "entity:proj-mem",
+      "valid_from": "00000000000000000001",
+      "valid_to": null
+    },
+    {
+      "from_node_id": "capability_capsule:cap_b",
+      "relation": "mentions",
+      "to_node_id": "entity:proj-mem",
+      "valid_from": "00000000000000000002",
+      "valid_to": null
+    },
+    {
+      "from_node_id": "entity:proj-mem",
+      "relation": "part_of",
+      "to_node_id": "entity:org-x",
+      "valid_from": "00000000000000000003",
+      "valid_to": null
+    }
+  ],
+  "related_capsule_ids": [
+    "cap_a",
+    "cap_b"
+  ]
+}
