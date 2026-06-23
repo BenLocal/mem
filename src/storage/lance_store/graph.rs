@@ -1,12 +1,92 @@
-//! Graph edges (`graph_edges` table). LanceStore-side WRITE methods
-//! only — `sync_memory_edges`, `add_edge_direct`, `invalidate_edge`,
-//! `close_edges_for_capability_capsule`. Reads (neighbors, related
-//! capsule ids, BFS, kg_timeline, graph_stats) all live on
-//! `DuckDbQuery` and are reached via `Store::neighbors` etc.
+//! Graph edges (`graph_edges` table). LanceStore-side WRITE methods —
+//! `sync_memory_edges`, `add_edge_direct`, `invalidate_edge`,
+//! `close_edges_for_capability_capsule` — plus the Route-B "graph"
+//! bucket NATIVE READS: `neighbors_within` (iterative BFS),
+//! `related_capability_capsule_ids`, and `graph_stats`. These three
+//! mirror the DuckDB backend (`DuckDbQuery::*`) field-for-field and are
+//! parity-gated by `tests/parity_golden.rs`; `Store` routes between the
+//! two engines on `read_engine`. The remaining graph reads (neighbors,
+//! kg_timeline, query_predicate, tunnels) still live solely on
+//! `DuckDbQuery` until their own buckets migrate.
 
-use super::{graph_edge_to_record_batch, sql_quote, LanceStore};
-use crate::domain::capability_capsule::GraphEdge;
+use arrow_array::{Array, Float32Array, Int64Array, RecordBatch, StringArray};
+use futures::TryStreamExt;
+use lancedb::query::{ExecutableQuery, QueryBase};
+
+use super::{graph_edge_to_record_batch, parse_col, sql_quote, LanceStore};
+use crate::domain::capability_capsule::{GraphEdge, GraphStats};
 use crate::storage::types::GraphError;
+
+/// Upper cap on `neighbors_within` `max_hops`. Mirrors
+/// `DuckDbQuery::MAX_HOPS_CAP` so the two engines clamp identically.
+const MAX_HOPS_CAP: u32 = 3;
+
+/// Upper cap on the BFS visited-set size. Mirrors
+/// `DuckDbQuery::NEIGHBORS_VISITED_CAP`.
+const NEIGHBORS_VISITED_CAP: usize = 10_000;
+
+/// Top-N relation kinds reported by [`LanceStore::graph_stats`]. Mirrors
+/// the DuckDB `... ORDER BY c DESC, relation ASC LIMIT 16`.
+const TOP_RELATIONS_LIMIT: usize = 16;
+
+/// Parse one or more `graph_edges` record batches into [`GraphEdge`]s.
+/// Mirrors `DuckDbQuery::row_to_graph_edge` field-for-field: the five
+/// required columns plus the six nullable K1/K3/K9 columns.
+fn record_batch_to_graph_edges(batch: &RecordBatch) -> Result<Vec<GraphEdge>, GraphError> {
+    const TABLE: &str = "graph_edges";
+    let from = parse_col::<StringArray>(batch, TABLE, "from_node_id")?;
+    let to = parse_col::<StringArray>(batch, TABLE, "to_node_id")?;
+    let relation = parse_col::<StringArray>(batch, TABLE, "relation")?;
+    let valid_from = parse_col::<StringArray>(batch, TABLE, "valid_from")?;
+    let valid_to = parse_col::<StringArray>(batch, TABLE, "valid_to")?;
+    let confidence = parse_col::<Float32Array>(batch, TABLE, "confidence")?;
+    let extractor = parse_col::<StringArray>(batch, TABLE, "extractor")?;
+    let strength = parse_col::<Float32Array>(batch, TABLE, "strength")?;
+    let stability = parse_col::<Float32Array>(batch, TABLE, "stability")?;
+    let last_activated = parse_col::<StringArray>(batch, TABLE, "last_activated")?;
+    let access_count = parse_col::<Int64Array>(batch, TABLE, "access_count")?;
+    let mut out = Vec::with_capacity(batch.num_rows());
+    for i in 0..batch.num_rows() {
+        out.push(GraphEdge {
+            from_node_id: from.value(i).to_string(),
+            to_node_id: to.value(i).to_string(),
+            relation: relation.value(i).to_string(),
+            valid_from: valid_from.value(i).to_string(),
+            valid_to: opt_str(valid_to, i),
+            confidence: if confidence.is_null(i) {
+                None
+            } else {
+                Some(confidence.value(i))
+            },
+            extractor: opt_str(extractor, i),
+            strength: if strength.is_null(i) {
+                None
+            } else {
+                Some(strength.value(i))
+            },
+            stability: if stability.is_null(i) {
+                None
+            } else {
+                Some(stability.value(i))
+            },
+            last_activated: opt_str(last_activated, i),
+            access_count: if access_count.is_null(i) {
+                None
+            } else {
+                Some(access_count.value(i))
+            },
+        });
+    }
+    Ok(out)
+}
+
+fn opt_str(arr: &StringArray, i: usize) -> Option<String> {
+    if arr.is_null(i) {
+        None
+    } else {
+        Some(arr.value(i).to_string())
+    }
+}
 
 impl LanceStore {
     pub async fn sync_memory_edges(
@@ -237,6 +317,218 @@ impl LanceStore {
         } else {
             Ok(usize::try_from(result.rows_updated).unwrap_or(count))
         }
+    }
+
+    /// Run a `graph_edges` filter query and parse all returned batches
+    /// into [`GraphEdge`]s. Shared by the BFS hop reads and the
+    /// related-capsule scan. Mirrors `LanceStore::query_capability_capsules`.
+    async fn query_graph_edges(&self, filter: String) -> Result<Vec<GraphEdge>, GraphError> {
+        let table = self
+            .conn
+            .open_table("graph_edges")
+            .execute()
+            .await
+            .map_err(|e| GraphError::Backend(e.to_string()))?;
+        let stream = table
+            .query()
+            .only_if(filter)
+            .execute()
+            .await
+            .map_err(|e| GraphError::Backend(e.to_string()))?;
+        let batches: Vec<RecordBatch> = stream
+            .try_collect()
+            .await
+            .map_err(|e| GraphError::Backend(format!("lancedb stream: {e}")))?;
+        let mut out = Vec::new();
+        for b in &batches {
+            out.extend(record_batch_to_graph_edges(b)?);
+        }
+        Ok(out)
+    }
+
+    /// Route-B bucket "graph": native lancedb-Rust equivalent of
+    /// `DuckDbQuery::neighbors_within`. Iterative BFS (≤
+    /// `MAX_HOPS_CAP = 3` hops) over `graph_edges`, default active-only
+    /// (`valid_to IS NULL`) with optional point-in-time `as_of`. Each
+    /// hop reads its frontier node's incident edges via a lancedb
+    /// `only_if` query. Edge-set dedup on
+    /// `(from, to, relation, valid_from)`; output sorted
+    /// `(relation, from, to, valid_from)` — identical to the DuckDB
+    /// backend. Parity-gated by `tests/parity_golden.rs`.
+    pub async fn neighbors_within(
+        &self,
+        node_id: &str,
+        max_hops: u32,
+        as_of: Option<&str>,
+    ) -> Result<Vec<GraphEdge>, GraphError> {
+        let hops = max_hops.clamp(1, MAX_HOPS_CAP);
+
+        // BFS: `frontier` = nodes to expand this round, `visited` = every
+        // node seen, `edges` = accumulated edge set deduped on
+        // (from, to, relation, valid_from). Same shapes as the DuckDB impl.
+        let mut visited: std::collections::HashSet<String> =
+            std::collections::HashSet::from([node_id.to_string()]);
+        let mut frontier: Vec<String> = vec![node_id.to_string()];
+        let mut edges: std::collections::HashMap<(String, String, String, String), GraphEdge> =
+            std::collections::HashMap::new();
+
+        for _ in 0..hops {
+            if frontier.is_empty() {
+                break;
+            }
+            let mut next_frontier: Vec<String> = Vec::new();
+            for node in frontier.drain(..) {
+                // Per-node incident-edge query with the same validity
+                // filter the DuckDB backend applies: bitemporal window
+                // when `as_of` is supplied, else active-now.
+                let validity = match as_of {
+                    Some(ts) => format!(
+                        "valid_from <= {ts} AND (valid_to IS NULL OR valid_to > {ts})",
+                        ts = sql_quote(ts),
+                    ),
+                    None => "valid_to IS NULL".to_string(),
+                };
+                let filter = format!(
+                    "(from_node_id = {node} OR to_node_id = {node}) AND {validity}",
+                    node = sql_quote(&node),
+                );
+                let incident = self.query_graph_edges(filter).await?;
+                for edge in incident {
+                    let key = (
+                        edge.from_node_id.clone(),
+                        edge.to_node_id.clone(),
+                        edge.relation.clone(),
+                        edge.valid_from.clone(),
+                    );
+                    edges.entry(key).or_insert_with(|| edge.clone());
+                    for endpoint in [&edge.from_node_id, &edge.to_node_id] {
+                        if !visited.contains(endpoint.as_str()) {
+                            if visited.len() >= NEIGHBORS_VISITED_CAP {
+                                continue;
+                            }
+                            visited.insert(endpoint.clone());
+                            next_frontier.push(endpoint.clone());
+                        }
+                    }
+                }
+            }
+            frontier = next_frontier;
+        }
+
+        let mut out: Vec<GraphEdge> = edges.into_values().collect();
+        out.sort_by(|a, b| {
+            a.relation
+                .cmp(&b.relation)
+                .then_with(|| a.from_node_id.cmp(&b.from_node_id))
+                .then_with(|| a.to_node_id.cmp(&b.to_node_id))
+                .then_with(|| a.valid_from.cmp(&b.valid_from))
+        });
+        Ok(out)
+    }
+
+    /// Route-B bucket "graph": native lancedb-Rust equivalent of
+    /// `DuckDbQuery::related_capability_capsule_ids`. Selects active
+    /// edges (`valid_to IS NULL`) where either endpoint is in
+    /// `node_ids`, keeps the OPPOSITE endpoint when it carries the
+    /// literal `capability_capsule:` prefix, strips the prefix, dedups,
+    /// sorts. Bare ids without the prefix are intentionally excluded —
+    /// identical to the DuckDB backend. Parity-gated by
+    /// `tests/parity_golden.rs`.
+    pub async fn related_capability_capsule_ids(
+        &self,
+        node_ids: &[String],
+    ) -> Result<Vec<String>, GraphError> {
+        if node_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        // `from_node_id IN (...) OR to_node_id IN (...)` AND active.
+        let in_list = node_ids
+            .iter()
+            .map(|n| sql_quote(n))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let filter = format!(
+            "(from_node_id IN ({in_list}) OR to_node_id IN ({in_list})) AND valid_to IS NULL"
+        );
+        let edges = self.query_graph_edges(filter).await?;
+
+        let node_set: std::collections::HashSet<&str> =
+            node_ids.iter().map(|s| s.as_str()).collect();
+        let mut capsule_ids = std::collections::HashSet::new();
+        for edge in &edges {
+            for endpoint in [&edge.from_node_id, &edge.to_node_id] {
+                if !node_set.contains(endpoint.as_str()) {
+                    if let Some(cid) = endpoint.strip_prefix("capability_capsule:") {
+                        capsule_ids.insert(cid.to_string());
+                    }
+                }
+            }
+        }
+        let mut out: Vec<String> = capsule_ids.into_iter().collect();
+        out.sort();
+        Ok(out)
+    }
+
+    /// Route-B bucket "graph": native lancedb-Rust equivalent of
+    /// `DuckDbQuery::graph_stats`. Whole-graph aggregate (tenant-less —
+    /// `graph_edges` has no tenant column): `total_edges`,
+    /// `active_edges` (`valid_to IS NULL`), `closed_edges`,
+    /// `node_count` (DISTINCT over both endpoints), and the top-16
+    /// `(relation, count)` pairs ordered `count DESC, relation ASC`.
+    /// Counts are computed in Rust from a full scan of `graph_edges`
+    /// (LanceDB has no GROUP BY / DISTINCT); the orderings match the
+    /// DuckDB backend exactly. Parity-gated by `tests/parity_golden.rs`.
+    pub async fn graph_stats(&self) -> Result<GraphStats, GraphError> {
+        let table = self
+            .conn
+            .open_table("graph_edges")
+            .execute()
+            .await
+            .map_err(|e| GraphError::Backend(e.to_string()))?;
+        // Pull every edge — counts + distinct-node + relation histogram
+        // are all derived in Rust. (Empty filter = all rows.)
+        let stream = table
+            .query()
+            .execute()
+            .await
+            .map_err(|e| GraphError::Backend(e.to_string()))?;
+        let batches: Vec<RecordBatch> = stream
+            .try_collect()
+            .await
+            .map_err(|e| GraphError::Backend(format!("lancedb stream: {e}")))?;
+        let mut edges = Vec::new();
+        for b in &batches {
+            edges.extend(record_batch_to_graph_edges(b)?);
+        }
+
+        let total_edges = edges.len() as i64;
+        let active_edges = edges.iter().filter(|e| e.valid_to.is_none()).count() as i64;
+        let closed_edges = total_edges - active_edges;
+
+        let mut nodes: std::collections::HashSet<&str> = std::collections::HashSet::new();
+        let mut counts: std::collections::HashMap<&str, i64> = std::collections::HashMap::new();
+        for e in &edges {
+            nodes.insert(e.from_node_id.as_str());
+            nodes.insert(e.to_node_id.as_str());
+            *counts.entry(e.relation.as_str()).or_insert(0) += 1;
+        }
+        let node_count = nodes.len() as i64;
+
+        // `ORDER BY c DESC, relation ASC LIMIT 16`.
+        let mut top_relations: Vec<(String, i64)> = counts
+            .into_iter()
+            .map(|(r, c)| (r.to_string(), c))
+            .collect();
+        top_relations.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+        top_relations.truncate(TOP_RELATIONS_LIMIT);
+
+        Ok(GraphStats {
+            node_count,
+            total_edges,
+            active_edges,
+            closed_edges,
+            top_relations,
+        })
     }
 }
 

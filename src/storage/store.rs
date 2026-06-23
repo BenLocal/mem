@@ -1326,7 +1326,14 @@ impl Store {
         max_hops: u32,
         as_of: Option<&str>,
     ) -> Result<Vec<GraphEdge>, GraphError> {
-        self.query.neighbors_within(node_id, max_hops, as_of).await
+        match self.read_engine {
+            crate::config::ReadEngine::DuckDb => {
+                self.query.neighbors_within(node_id, max_hops, as_of).await
+            }
+            crate::config::ReadEngine::Lance => {
+                self.lance.neighbors_within(node_id, max_hops, as_of).await
+            }
+        }
     }
 
     pub async fn kg_timeline(&self, node_id: &str) -> Result<Vec<GraphEdge>, GraphError> {
@@ -1365,14 +1372,24 @@ impl Store {
     pub async fn graph_stats(
         &self,
     ) -> Result<crate::domain::capability_capsule::GraphStats, GraphError> {
-        self.query.graph_stats().await
+        match self.read_engine {
+            crate::config::ReadEngine::DuckDb => self.query.graph_stats().await,
+            crate::config::ReadEngine::Lance => self.lance.graph_stats().await,
+        }
     }
 
     pub async fn related_capability_capsule_ids(
         &self,
         node_ids: &[String],
     ) -> Result<Vec<String>, GraphError> {
-        self.query.related_capability_capsule_ids(node_ids).await
+        match self.read_engine {
+            crate::config::ReadEngine::DuckDb => {
+                self.query.related_capability_capsule_ids(node_ids).await
+            }
+            crate::config::ReadEngine::Lance => {
+                self.lance.related_capability_capsule_ids(node_ids).await
+            }
+        }
     }
 
     pub async fn incident_edges_for_nodes(

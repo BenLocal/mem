@@ -561,4 +561,32 @@ async fn lance_parity_matches_golden() {
     }
     tax.sort();
     assert_golden("taxonomy", serde_json::to_value(tax).unwrap());
+
+    // ── graph ── (mirrors the duckdb block verbatim: BFS neighbors +
+    //    related capsule ids + whole-graph stats)
+    let mut neighbors = repo
+        .neighbors_within("entity:proj-mem", 2, None)
+        .await
+        .unwrap();
+    neighbors.sort_by(|a, b| {
+        (&a.from_node_id, &a.to_node_id, &a.relation).cmp(&(
+            &b.from_node_id,
+            &b.to_node_id,
+            &b.relation,
+        ))
+    });
+    let mut related = repo
+        .related_capability_capsule_ids(&["entity:proj-mem".to_string()])
+        .await
+        .unwrap();
+    related.sort();
+    let gstats = repo.graph_stats().await.unwrap();
+    assert_golden(
+        "graph",
+        json!({
+            "neighbors_within_2hops": serde_json::to_value(&neighbors).unwrap(),
+            "related_capsule_ids": json!(related),
+            "graph_stats": serde_json::to_value(gstats).unwrap(),
+        }),
+    );
 }
