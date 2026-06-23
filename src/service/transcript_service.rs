@@ -367,43 +367,59 @@ impl TranscriptService {
             // the message body and similarity score here.
             if let Some(provider) = &self.provider {
                 let t = Instant::now();
-                let q_vec = provider
-                    .embed_text(query)
-                    .await
-                    .map_err(|e| StorageError::InvalidInput(format!("query embed failed: {e}")))?;
-                embed_ms = t.elapsed().as_millis();
-                let t = Instant::now();
-                // Defense-in-depth: the ANN scan can fail on lancedb 0.30 /
-                // DuckDB lance-extension 4.0 with `IO Error: ... all columns
-                // in a record batch must have the same length` when a query's
-                // nearest IVF centroid is a degenerate (empty) partition.
-                // KMeans leaves some partitions empty on tightly-clustered
-                // embeddings, and which queries hit one varies per index
-                // rebuild (non-deterministic KMeans init) — so the
-                // partition-count fix only *reduces*, never eliminates, the
-                // failure. Rather than 500 the whole request, degrade to the
-                // always-on BM25 channel for this query and log it. Mirrors
-                // the capsule side's soft-degrade on a missing embeddings
-                // table.
-                match self
-                    .store
-                    .semantic_search_transcripts(tenant, &q_vec, oversample)
-                    .await
-                {
-                    Ok(sem_hits) => {
-                        for (rank0, (msg, _sim)) in sem_hits.iter().enumerate() {
-                            semantic_ranks.insert(msg.message_block_id.clone(), rank0 + 1);
-                            all_ids.insert(msg.message_block_id.clone());
-                        }
-                    }
+                // Soft-degrade: query embedding is the prerequisite for the
+                // ANN channel, but a failure here is an infrastructure fault
+                // (local model reload / OOM / tensor error), NOT a malformed
+                // query — so degrade to the always-on BM25 channel rather than
+                // failing the whole request with a 400 and discarding the BM25
+                // hits already gathered above. Mirrors the capsule search side
+                // (`unwrap_or_default()` on the same call) and the ANN
+                // soft-degrade immediately below.
+                let q_vec = match provider.embed_text(query).await {
+                    Ok(v) => Some(v),
                     Err(e) => {
                         warn!(
                             error = %e,
-                            "transcript ANN search failed; serving BM25-only results for this query"
+                            "transcript query embed failed; serving BM25-only results for this query"
                         );
+                        None
                     }
+                };
+                embed_ms = t.elapsed().as_millis();
+                if let Some(q_vec) = q_vec {
+                    let t = Instant::now();
+                    // Defense-in-depth: the ANN scan can fail on lancedb 0.30 /
+                    // DuckDB lance-extension 4.0 with `IO Error: ... all columns
+                    // in a record batch must have the same length` when a query's
+                    // nearest IVF centroid is a degenerate (empty) partition.
+                    // KMeans leaves some partitions empty on tightly-clustered
+                    // embeddings, and which queries hit one varies per index
+                    // rebuild (non-deterministic KMeans init) — so the
+                    // partition-count fix only *reduces*, never eliminates, the
+                    // failure. Rather than 500 the whole request, degrade to the
+                    // always-on BM25 channel for this query and log it. Mirrors
+                    // the capsule side's soft-degrade on a missing embeddings
+                    // table.
+                    match self
+                        .store
+                        .semantic_search_transcripts(tenant, &q_vec, oversample)
+                        .await
+                    {
+                        Ok(sem_hits) => {
+                            for (rank0, (msg, _sim)) in sem_hits.iter().enumerate() {
+                                semantic_ranks.insert(msg.message_block_id.clone(), rank0 + 1);
+                                all_ids.insert(msg.message_block_id.clone());
+                            }
+                        }
+                        Err(e) => {
+                            warn!(
+                                error = %e,
+                                "transcript ANN search failed; serving BM25-only results for this query"
+                            );
+                        }
+                    }
+                    sem_ms = t.elapsed().as_millis();
                 }
-                sem_ms = t.elapsed().as_millis();
             }
         } else {
             // Empty query: recent-time browse mode. Soft-degrade like the
@@ -544,5 +560,92 @@ impl TranscriptService {
         // ─── Phase 6: merge windows.
         let windows = merge_windows(items);
         Ok(TranscriptSearchResult { windows })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::domain::{BlockType, ConversationMessage, MessageRole};
+    use crate::embedding::{EmbeddingError, EmbeddingProvider};
+    use crate::storage::Store;
+    use async_trait::async_trait;
+    use tempfile::tempdir;
+
+    /// A provider whose query embedding always fails — models a transient
+    /// local-inference fault (model reload, OOM, tensor error), which is the
+    /// real cause of `embed_text` errors on the embedanything path (NOT a bad
+    /// query, so it must not 400 the request).
+    struct AlwaysFailEmbed;
+
+    #[async_trait]
+    impl EmbeddingProvider for AlwaysFailEmbed {
+        fn name(&self) -> &'static str {
+            "always-fail"
+        }
+        fn model(&self) -> &str {
+            "always-fail"
+        }
+        fn dim(&self) -> usize {
+            64
+        }
+        async fn embed_text(&self, _text: &str) -> Result<Vec<f32>, EmbeddingError> {
+            Err(EmbeddingError::Internal("simulated embed failure".into()))
+        }
+    }
+
+    fn text_block(id: &str, content: &str) -> ConversationMessage {
+        ConversationMessage {
+            message_block_id: id.into(),
+            session_id: Some("S1".into()),
+            tenant: "local".into(),
+            caller_agent: "claude-code".into(),
+            transcript_path: format!("/tmp/{id}.jsonl"),
+            line_number: 1,
+            block_index: 0,
+            message_uuid: None,
+            role: MessageRole::Assistant,
+            block_type: BlockType::Text,
+            content: content.into(),
+            tool_name: None,
+            tool_use_id: None,
+            embed_eligible: true,
+            created_at: "00000001778000000000".into(),
+            meta_json: None,
+        }
+    }
+
+    /// MED-bug regression: when the query fails to embed (an infrastructure
+    /// fault, not a client error), transcript search must DEGRADE to the
+    /// always-on BM25 channel — not abort the whole request — so the lexical
+    /// hits already gathered are still served. Mirrors the capsule search
+    /// side, which uses `unwrap_or_default()` on the same call.
+    #[tokio::test]
+    async fn search_degrades_to_bm25_when_query_embed_fails() {
+        let dir = tempdir().unwrap();
+        let db = dir.path().join("mem.duckdb");
+        let store = Arc::new(Store::open(&db).await.unwrap());
+        store.set_transcript_job_provider("always-fail");
+
+        let svc = TranscriptService::new(store.clone(), Some(Arc::new(AlwaysFailEmbed)));
+        svc.ingest(text_block("mb-a", "we discussed the Rust project layout"))
+            .await
+            .unwrap();
+
+        let result = svc
+            .search(
+                "local",
+                "Rust",
+                &TranscriptSearchFilters::default(),
+                5,
+                &TranscriptSearchOpts::default(),
+            )
+            .await
+            .expect("query-embed failure must degrade to BM25, not error the whole request");
+
+        assert!(
+            !result.windows.is_empty(),
+            "BM25 channel should still surface the lexical 'Rust' hit despite the embed failure"
+        );
     }
 }
