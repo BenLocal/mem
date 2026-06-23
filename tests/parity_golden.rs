@@ -544,4 +544,9 @@ async fn lance_parity_matches_golden() {
         "filter",
         sorted_ids(listed.into_iter().map(|c| c.capability_capsule_id)),
     );
+
+    // ── ann ── (postfilter parity: top-k across tenants, then filter t1)
+    let q_vec = deterministic_embedding("new decay formula anchors on last_used_at", DIM);
+    let ann = repo.ann_candidate_ids("t1", &q_vec, 5).await.unwrap();
+    assert_golden("ann", ranked(ann));
 }

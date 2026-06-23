@@ -839,9 +839,18 @@ impl Store {
         query_embedding: &[f32],
         k: usize,
     ) -> Result<Vec<(String, i64)>, StorageError> {
-        self.query
-            .ann_candidate_ids(tenant, query_embedding, k)
-            .await
+        match self.read_engine {
+            crate::config::ReadEngine::DuckDb => {
+                self.query
+                    .ann_candidate_ids(tenant, query_embedding, k)
+                    .await
+            }
+            crate::config::ReadEngine::Lance => {
+                self.lance
+                    .ann_candidate_ids(tenant, query_embedding, k)
+                    .await
+            }
+        }
     }
 }
 

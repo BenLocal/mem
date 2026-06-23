@@ -109,6 +109,99 @@ impl LanceStore {
             .await
     }
 
+    /// Route-B bucket "ann": native lancedb-Rust equivalent of
+    /// `DuckDbQuery::ann_candidate_ids`.
+    ///
+    /// Returns `(capability_capsule_id, rank_sem)` 1-based, ordered by
+    /// `(_distance ASC, capability_capsule_id ASC)`.
+    ///
+    /// **POSTFILTER parity** (not prefilter): the DuckDB query runs
+    /// `lance_vector_search(... k => k)` over ALL tenants' vectors first,
+    /// then filters `WHERE tenant = ?`. So a tenant's result can contain
+    /// FEWER than `k` rows when another tenant's vectors are nearer (they
+    /// consume `k` slots, then drop in the post-filter). We replicate this
+    /// exactly: `nearest_to(...).limit(k)` WITHOUT a tenant predicate in
+    /// the vector query, then filter `tenant` in Rust afterward.
+    ///
+    /// Capsules carry exactly one embedding row each (no chunking), so no
+    /// GROUP BY / collapse is needed. Empty `query_embedding` or `k == 0`
+    /// → `Ok(vec![])`. Missing embeddings table (lazy-created on first
+    /// upsert) → `Ok(vec![])`, mirroring the DuckDB resilience.
+    pub async fn ann_candidate_ids(
+        &self,
+        tenant: &str,
+        query_embedding: &[f32],
+        k: usize,
+    ) -> Result<Vec<(String, i64)>, StorageError> {
+        if query_embedding.is_empty() || k == 0 {
+            return Ok(Vec::new());
+        }
+        // Lazy-created table: a brand-new store has no embeddings until the
+        // first upsert lands. Mirror DuckDB's
+        // `is_capability_capsule_embeddings_missing` → empty result.
+        let names = self
+            .conn
+            .table_names()
+            .execute()
+            .await
+            .map_err(lancedb_err)?;
+        if !names.iter().any(|n| n == "capability_capsule_embeddings") {
+            return Ok(Vec::new());
+        }
+        let table = self
+            .conn
+            .open_table("capability_capsule_embeddings")
+            .execute()
+            .await
+            .map_err(lancedb_err)?;
+        // POSTFILTER, not prefilter: take the top-k nearest ACROSS ALL
+        // tenants (no `.only_if` tenant predicate), then drop other tenants'
+        // rows in Rust. `nearest_to` adds a `_distance` (Float32) column and
+        // orders by it; `.limit(k)` caps the candidate set to `k` rows.
+        let stream = table
+            .query()
+            .nearest_to(query_embedding)
+            .map_err(lancedb_err)?
+            .limit(k)
+            .execute()
+            .await
+            .map_err(lancedb_err)?;
+        let batches: Vec<RecordBatch> = stream
+            .try_collect()
+            .await
+            .map_err(|e| StorageError::InvalidInput(format!("lancedb stream: {e}")))?;
+
+        const TABLE: &str = "capability_capsule_embeddings";
+        // (capability_capsule_id, _distance) for rows in this tenant. Other
+        // tenants' rows consumed top-k slots upstream but are dropped here —
+        // this is what makes a k=5 query return <5 rows when a foreign
+        // vector is among the 5 nearest.
+        let mut kept: Vec<(String, f32)> = Vec::new();
+        for b in &batches {
+            if b.num_rows() == 0 {
+                continue;
+            }
+            let ids = parse_col::<StringArray>(b, TABLE, "capability_capsule_id")?;
+            let tenants = parse_col::<StringArray>(b, TABLE, "tenant")?;
+            let dists = parse_col::<Float32Array>(b, TABLE, "_distance")?;
+            for i in 0..b.num_rows() {
+                if tenants.value(i) == tenant {
+                    kept.push((ids.value(i).to_string(), dists.value(i)));
+                }
+            }
+        }
+        // Match the DuckDB ORDER BY tie-break exactly: (_distance ASC,
+        // capability_capsule_id ASC). `nearest_to` already returns rows in
+        // ascending distance, but an explicit re-sort makes the id tie-break
+        // deterministic and independent of the upstream stream order.
+        kept.sort_by(|a, b| a.1.total_cmp(&b.1).then_with(|| a.0.cmp(&b.0)));
+        Ok(kept
+            .into_iter()
+            .enumerate()
+            .map(|(idx, (id, _))| (id, idx as i64 + 1))
+            .collect())
+    }
+
     /// Read all `embedding_jobs` rows matching `filter`, parsed into
     /// [`EmbeddingJobRow`]s. Shared by every queue read path: the claim
     /// flow, `list_embedding_jobs`, `latest_embedding_job_status_for_hash`,
