@@ -1205,9 +1205,18 @@ impl Store {
         query_embedding: &[f32],
         limit: usize,
     ) -> Result<Vec<(ConversationMessage, f32)>, StorageError> {
-        self.query
-            .semantic_search_transcripts(tenant, query_embedding, limit)
-            .await
+        match self.read_engine {
+            crate::config::ReadEngine::DuckDb => {
+                self.query
+                    .semantic_search_transcripts(tenant, query_embedding, limit)
+                    .await
+            }
+            crate::config::ReadEngine::Lance => {
+                self.lance
+                    .semantic_search_transcripts(tenant, query_embedding, limit)
+                    .await
+            }
+        }
     }
 }
 

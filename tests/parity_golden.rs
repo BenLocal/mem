@@ -609,4 +609,20 @@ async fn lance_parity_matches_golden() {
             "search_candidates_ids": sorted_ids(pool.into_iter().map(|c| c.capability_capsule_id)),
         }),
     );
+
+    // ── transcript: ann ── (mirrors the duckdb block verbatim: lance-native
+    //    nearest_to + chunk-collapse, postfilter tenant + embed_eligible,
+    //    distance-ordered ids)
+    let t_vec = deterministic_embedding("duckdb attaches the lance dataset for reads", DIM);
+    let t_ann = repo
+        .semantic_search_transcripts("t1", &t_vec, 5)
+        .await
+        .unwrap();
+    assert_golden(
+        "transcript_ann",
+        json!(t_ann
+            .into_iter()
+            .map(|(m, _)| m.message_block_id)
+            .collect::<Vec<_>>()),
+    );
 }

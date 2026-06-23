@@ -3,13 +3,13 @@
 //! conversation_message_embeddings upsert/delete. All inherent on
 //! LanceStore.
 
-use arrow_array::RecordBatch;
+use arrow_array::{Float32Array, RecordBatch, StringArray};
 use futures::TryStreamExt;
 use lancedb::query::{ExecutableQuery, QueryBase};
 
 use super::{
     conversation_message_embedding_to_record_batch, conversation_messages_to_record_batch,
-    ensure_conversation_message_embeddings_table, lancedb_err,
+    ensure_conversation_message_embeddings_table, lancedb_err, parse_col,
     record_batch_to_conversation_messages, record_batch_to_transcript_embedding_job_rows,
     sql_quote, transcript_embedding_job_row_to_record_batch,
     transcript_embedding_job_rows_to_record_batch, LanceStore, TranscriptEmbeddingJobRow,
@@ -631,6 +631,153 @@ impl LanceStore {
     // WRITE half (create_conversation_message,
     // create_conversation_messages, semantic_search_transcripts and
     // the embedding-job helpers below).
+
+    /// Route-B bucket "transcript_ann": native lancedb-Rust equivalent of
+    /// `DuckDbQuery::semantic_search_transcripts`.
+    ///
+    /// The DuckDB query runs `lance_vector_search(... k => oversample)` over
+    /// ALL tenants' chunk embeddings, collapses chunk-rows to one row per
+    /// `message_block_id` keeping the MIN `_distance`, JOINs back to
+    /// `conversation_messages` filtering `tenant = ? AND embed_eligible =
+    /// true`, orders `best_distance ASC`, and `LIMIT`s to `limit`. We mirror
+    /// each step with the native API:
+    ///
+    /// 1. Empty embedding / `limit == 0` → `Ok(vec![])`. Missing
+    ///    `conversation_message_embeddings` table (lazy-created on first
+    ///    upsert) → `Ok(vec![])`, mirroring the capsule-ANN resilience.
+    /// 2. `nearest_to(query_embedding).limit(oversample)` — NO tenant /
+    ///    embed_eligible predicate on the vector query (those columns aren't
+    ///    on the embeddings table; the JOIN supplies them → POSTFILTER).
+    /// 3. CHUNK-COLLAPSE in Rust: GROUP BY `message_block_id` keeping the MIN
+    ///    `_distance` (a message may carry N chunk-embeddings).
+    /// 4. Fetch the `ConversationMessage` rows for the collapsed ids
+    ///    (`fetch_conversation_messages_by_ids` would re-route through DuckDB;
+    ///    instead scan `conversation_messages` natively) and apply the JOIN
+    ///    filter `tenant == ? AND embed_eligible == true`.
+    /// 5. ORDER BY `best_distance ASC`, take `limit`, build
+    ///    `(ConversationMessage, similarity)` where `similarity = 1 -
+    ///    L²/2` — the same cosine derivation the DuckDB side uses for
+    ///    normalized embeddings. (The parity golden only compares
+    ///    `message_block_id`s, so the f32 just needs to be sane.)
+    ///
+    /// Parity-gated by `tests/parity_golden.rs`.
+    pub async fn semantic_search_transcripts(
+        &self,
+        tenant: &str,
+        query_embedding: &[f32],
+        limit: usize,
+    ) -> Result<Vec<(ConversationMessage, f32)>, StorageError> {
+        if query_embedding.is_empty() || limit == 0 {
+            return Ok(Vec::new());
+        }
+        // Lazy-created table: a brand-new store has no transcript embeddings
+        // until the first upsert. Mirror the DuckDB resilience → empty result.
+        let names = self
+            .conn
+            .table_names()
+            .execute()
+            .await
+            .map_err(lancedb_err)?;
+        if !names.iter().any(|n| n == "conversation_message_embeddings") {
+            return Ok(Vec::new());
+        }
+
+        // Same oversample clamp as the DuckDB source: clamp limit to
+        // [1, 1024], then `oversample = min(limit * 4, 4096)` so the ANN
+        // branch returns enough distinct messages after chunk-collapse.
+        let lim = i64::try_from(limit).unwrap_or(64).clamp(1, 1024);
+        const MAX_ANN_OVERSAMPLE: i64 = 4_096;
+        let oversample = lim.saturating_mul(4).min(MAX_ANN_OVERSAMPLE);
+
+        // POSTFILTER, not prefilter: `nearest_to(...).limit(oversample)`
+        // across ALL tenants' chunk vectors (no tenant / embed_eligible
+        // predicate — those columns live on `conversation_messages`, supplied
+        // by the JOIN below). `nearest_to` adds a `_distance` (Float32) column
+        // ordered ascending.
+        const TABLE: &str = "conversation_message_embeddings";
+        let table = self
+            .conn
+            .open_table(TABLE)
+            .execute()
+            .await
+            .map_err(lancedb_err)?;
+        let stream = table
+            .query()
+            .nearest_to(query_embedding)
+            .map_err(lancedb_err)?
+            .limit(usize::try_from(oversample).unwrap_or(usize::MAX))
+            .execute()
+            .await
+            .map_err(lancedb_err)?;
+        let batches: Vec<RecordBatch> = stream
+            .try_collect()
+            .await
+            .map_err(|e| StorageError::InvalidInput(format!("lancedb stream: {e}")))?;
+
+        // CHUNK-COLLAPSE: GROUP BY message_block_id keeping MIN(_distance).
+        // A message embedded as N chunk vectors yields N rows here; we fold
+        // them to one best-distance hit before the JOIN (behaviour-preserving
+        // for single-embedding messages). Mirrors the DuckDB inner subquery.
+        let mut best_distance: std::collections::HashMap<String, f32> =
+            std::collections::HashMap::new();
+        for b in &batches {
+            if b.num_rows() == 0 {
+                continue;
+            }
+            let ids = parse_col::<StringArray>(b, TABLE, "message_block_id")?;
+            let dists = parse_col::<Float32Array>(b, TABLE, "_distance")?;
+            for i in 0..b.num_rows() {
+                let id = ids.value(i).to_string();
+                let d = dists.value(i);
+                best_distance
+                    .entry(id)
+                    .and_modify(|cur| {
+                        if d < *cur {
+                            *cur = d;
+                        }
+                    })
+                    .or_insert(d);
+            }
+        }
+        if best_distance.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        // Fetch the collapsed messages and apply the JOIN filter
+        // `tenant == ? AND embed_eligible == true`. `fetch_conversation_
+        // messages_by_ids` lives on DuckDbQuery (would re-route off-engine),
+        // so scan `conversation_messages` natively here. An `id IN (...)`
+        // `only_if` over the (small) collapsed id-set keeps it to one read.
+        let id_list = best_distance
+            .keys()
+            .map(|id| sql_quote(id))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let messages = self
+            .query_conversation_messages(format!(
+                "tenant = {} AND embed_eligible = true AND message_block_id IN ({id_list})",
+                sql_quote(tenant),
+            ))
+            .await?;
+
+        // ORDER BY best_distance ASC, tie-break message_block_id ASC for a
+        // deterministic order, then take `limit`. Carry the raw distance
+        // through the sort, then map to `1 - L²/2` — the cosine similarity
+        // for normalized embeddings (same derivation as the DuckDB source).
+        let mut scored: Vec<(ConversationMessage, f32)> = messages
+            .into_iter()
+            .filter_map(|m| best_distance.get(&m.message_block_id).map(|&d| (m, d)))
+            .collect();
+        scored.sort_by(|a, b| {
+            a.1.total_cmp(&b.1)
+                .then_with(|| a.0.message_block_id.cmp(&b.0.message_block_id))
+        });
+        scored.truncate(limit);
+        Ok(scored
+            .into_iter()
+            .map(|(m, d)| (m, 1.0_f32 - d / 2.0_f32))
+            .collect())
+    }
 }
 
 #[cfg(test)]
