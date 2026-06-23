@@ -20,6 +20,7 @@ use crate::domain::capability_capsule::{CapabilityCapsuleRecord, FeedbackSummary
 use crate::domain::embeddings::EmbeddingJobInfo;
 use crate::embedding::wire::decode_f32_blob;
 use crate::storage::types::{ClaimedEmbeddingJob, EmbeddingJobInsert, FeedbackEvent, StorageError};
+use crate::storage::{timestamp_sub_ms, EMBEDDING_JOB_LEASE_MS};
 
 impl LanceStore {
     /// Apply a status transition to `(tenant, capability_capsule_id)` and return the
@@ -271,22 +272,32 @@ impl LanceStore {
             return Ok(vec![]);
         }
         // Eligible = available_at <= now AND (pending OR (failed AND
-        // attempt_count < max_retries)). LanceDB has no ORDER BY, so we
-        // pull all eligible rows and sort by (available_at, created_at)
-        // ASC in memory before slicing — queue depth is expected to be
-        // small (worker drains continuously) so the in-memory cost is
-        // negligible vs. the simpler code.
+        // attempt_count < max_retries) OR (processing AND lease expired)).
+        // LanceDB has no ORDER BY, so we pull all eligible rows and sort by
+        // (available_at, created_at) ASC in memory before slicing — queue
+        // depth is expected to be small (worker drains continuously) so the
+        // in-memory cost is negligible vs. the simpler code.
         //
-        // Note: unlike DuckDB we don't sweep orphan jobs here. LanceDB
-        // has no FK constraints, so the FK-loop pathology that motivated
-        // the orphan sweep on DuckDB cannot occur here. If a memory is
-        // deleted, its embedding_jobs rows simply stay until the worker
-        // touches them; the FK-error retry loop is a DuckDB-only bug.
+        // The `processing AND updated_at <= now - lease` disjunct reclaims
+        // ORPHANED in-flight jobs: a worker crash, a process restart
+        // mid-embed, or a mid-batch error (`tick` aborts the rest of the
+        // claimed batch on a transient storage error) leaves a row stuck in
+        // `processing`. Without this it would never be re-claimed — the
+        // capsule silently loses its embedding forever, and `try_enqueue`
+        // can't re-create the job because a live `processing` row blocks it.
+        // The lease is a visibility timeout (EMBEDDING_JOB_LEASE_MS), far
+        // above real embed latency so a genuinely in-flight job is never
+        // stolen. (This is unrelated to the DuckDB FK-loop orphan sweep,
+        // which guarded against deleted-memory orphans — that pathology
+        // can't occur on LanceDB, but worker-interruption orphans can.)
         let max_r = i64::from(max_retries);
+        let lease_cutoff = timestamp_sub_ms(now, EMBEDDING_JOB_LEASE_MS);
         let filter = format!(
-            "available_at <= {} AND (status = 'pending' OR (status = 'failed' AND attempt_count < {}))",
-            sql_quote(now),
-            max_r,
+            "available_at <= {now} AND (status = 'pending' \
+             OR (status = 'failed' AND attempt_count < {max_r}) \
+             OR (status = 'processing' AND updated_at <= {cutoff}))",
+            now = sql_quote(now),
+            cutoff = sql_quote(&lease_cutoff),
         );
         let mut rows = self.query_embedding_jobs(filter).await?;
         rows.sort_by(|a, b| {
@@ -308,15 +319,19 @@ impl LanceStore {
         let mut claimed = Vec::with_capacity(rows.len());
         for r in rows {
             // Optimistic claim: only update if status is still eligible
-            // (pending, or failed-with-budget). A second-instance race
-            // would see rows_updated == 0 and we'd skip the row — same
-            // shape as DuckDB's "updated == 0 → return None" branch.
+            // (pending, failed-with-budget, or a lease-expired processing
+            // orphan). A second-instance race would see rows_updated == 0 and
+            // we'd skip the row — same shape as DuckDB's "updated == 0 →
+            // return None" branch. Setting updated_at = now renews the lease,
+            // so a reclaimed orphan isn't immediately re-stolen.
             let result = table
                 .update()
                 .only_if(format!(
-                    "job_id = {} AND (status = 'pending' OR (status = 'failed' AND attempt_count < {}))",
-                    sql_quote(&r.job_id),
-                    max_r,
+                    "job_id = {job} AND (status = 'pending' \
+                     OR (status = 'failed' AND attempt_count < {max_r}) \
+                     OR (status = 'processing' AND updated_at <= {cutoff}))",
+                    job = sql_quote(&r.job_id),
+                    cutoff = sql_quote(&lease_cutoff),
                 ))
                 .column("status", "'processing'")
                 .column("updated_at", sql_quote(now))
@@ -1638,5 +1653,72 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(zero, 0);
+    }
+
+    /// HIGH-bug regression: a job left in `processing` (worker crash, process
+    /// restart mid-embed, or a mid-batch error abandoning the rest of the
+    /// claimed batch) must be reclaimable once its lease elapses — but NOT
+    /// before. Without lease-reclaim the claim filter never re-matches a
+    /// `processing` row, so the orphan silently loses its embedding forever
+    /// and `try_enqueue` can't re-create it (a live `processing` row blocks it).
+    #[tokio::test]
+    pub async fn claim_reclaims_orphaned_processing_jobs_after_lease() {
+        use crate::storage::{timestamp_add_ms, EMBEDDING_JOB_LEASE_MS};
+
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("lance.store");
+        let repo = LanceStore::open(&path).await.unwrap();
+
+        let m = fixture("mem_orph", "tenant-a");
+        repo.insert_capability_capsule(m).await.unwrap();
+
+        let claimed_at = "00000001778000000000";
+        repo.try_enqueue_embedding_job(EmbeddingJobInsert {
+            job_id: "job_orph".into(),
+            tenant: "tenant-a".into(),
+            capability_capsule_id: "mem_orph".into(),
+            target_content_hash: "hash_orph".into(),
+            provider: "fake-test".into(),
+            available_at: claimed_at.into(),
+            created_at: claimed_at.into(),
+            updated_at: claimed_at.into(),
+        })
+        .await
+        .unwrap();
+
+        // First claim → job goes to `processing`, updated_at = claimed_at.
+        let first = repo
+            .claim_next_n_embedding_jobs(claimed_at, 5, 5)
+            .await
+            .unwrap();
+        assert_eq!(first.len(), 1);
+        assert_eq!(first[0].job_id, "job_orph");
+
+        // Re-claim WITHIN the lease window: the job is still legitimately
+        // in-flight, so it must NOT be stolen.
+        let within_lease = timestamp_add_ms(claimed_at, EMBEDDING_JOB_LEASE_MS - 1);
+        let none = repo
+            .claim_next_n_embedding_jobs(&within_lease, 5, 5)
+            .await
+            .unwrap();
+        assert!(
+            none.is_empty(),
+            "a job within its lease must not be reclaimed"
+        );
+
+        // Re-claim AFTER the lease elapses: the orphan is reclaimed, and its
+        // attempt_count is unchanged (it was interrupted, not failed).
+        let past_lease = timestamp_add_ms(claimed_at, EMBEDDING_JOB_LEASE_MS + 1);
+        let reclaimed = repo
+            .claim_next_n_embedding_jobs(&past_lease, 5, 5)
+            .await
+            .unwrap();
+        assert_eq!(
+            reclaimed.len(),
+            1,
+            "orphaned processing job must be reclaimed after the lease"
+        );
+        assert_eq!(reclaimed[0].job_id, "job_orph");
+        assert_eq!(reclaimed[0].attempt_count, 0);
     }
 }

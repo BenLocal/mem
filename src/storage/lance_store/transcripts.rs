@@ -17,6 +17,7 @@ use super::{
 use crate::domain::ConversationMessage;
 use crate::embedding::wire::decode_f32_blob;
 use crate::storage::types::{ClaimedTranscriptEmbeddingJob, StorageError};
+use crate::storage::{timestamp_sub_ms, EMBEDDING_JOB_LEASE_MS};
 
 /// `query_transcript_embedding_jobs` was a helper inside the
 /// `update_status / query_capability_capsules / query_embedding_jobs` impl block
@@ -109,11 +110,18 @@ impl LanceStore {
         if n == 0 {
             return Ok(vec![]);
         }
+        // The `processing AND updated_at <= now - lease` disjunct reclaims
+        // orphaned in-flight jobs (worker crash / restart mid-embed /
+        // mid-batch error) — mirrors the capsule queue's lease-reclaim. See
+        // `claim_next_n_embedding_jobs` for the rationale.
         let max_r = i64::from(max_retries);
+        let lease_cutoff = timestamp_sub_ms(now, EMBEDDING_JOB_LEASE_MS);
         let filter = format!(
-            "available_at <= {} AND (status = 'pending' OR (status = 'failed' AND attempt_count < {}))",
-            sql_quote(now),
-            max_r,
+            "available_at <= {now} AND (status = 'pending' \
+             OR (status = 'failed' AND attempt_count < {max_r}) \
+             OR (status = 'processing' AND updated_at <= {cutoff}))",
+            now = sql_quote(now),
+            cutoff = sql_quote(&lease_cutoff),
         );
         let mut rows = self.query_transcript_embedding_jobs(filter).await?;
         rows.sort_by(|a, b| {
@@ -137,9 +145,11 @@ impl LanceStore {
             let result = table
                 .update()
                 .only_if(format!(
-                    "job_id = {} AND (status = 'pending' OR (status = 'failed' AND attempt_count < {}))",
-                    sql_quote(&r.job_id),
-                    max_r,
+                    "job_id = {job} AND (status = 'pending' \
+                     OR (status = 'failed' AND attempt_count < {max_r}) \
+                     OR (status = 'processing' AND updated_at <= {cutoff}))",
+                    job = sql_quote(&r.job_id),
+                    cutoff = sql_quote(&lease_cutoff),
                 ))
                 .column("status", "'processing'")
                 .column("updated_at", sql_quote(now))
@@ -803,5 +813,59 @@ mod tests {
         // must not touch the enqueue branch.
         let inserted = repo.create_conversation_messages_batch(&[]).await.unwrap();
         assert_eq!(inserted, 0);
+    }
+
+    /// Same HIGH-bug regression as the capsule queue, for the transcript
+    /// queue: an orphaned `processing` job (worker crash / restart mid-embed /
+    /// mid-batch error) must be reclaimable once its lease elapses, not before.
+    #[tokio::test]
+    pub async fn claim_reclaims_orphaned_processing_transcript_jobs_after_lease() {
+        use crate::storage::{timestamp_add_ms, EMBEDDING_JOB_LEASE_MS};
+
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("lance.store");
+        let repo = LanceStore::open(&path).await.unwrap();
+
+        let claimed_at = "00000001778000000000";
+        repo.try_enqueue_transcript_embedding_job(
+            "tjob_orph".into(),
+            "tenant-a".into(),
+            "mb-orph".into(),
+            "fake-test".into(),
+            claimed_at.into(),
+        )
+        .await
+        .unwrap();
+
+        let first = repo
+            .claim_next_n_transcript_embedding_jobs(claimed_at, 5, 5)
+            .await
+            .unwrap();
+        assert_eq!(first.len(), 1);
+        assert_eq!(first[0].job_id, "tjob_orph");
+
+        // Within the lease → still in-flight, must NOT be reclaimed.
+        let within = timestamp_add_ms(claimed_at, EMBEDDING_JOB_LEASE_MS - 1);
+        let none = repo
+            .claim_next_n_transcript_embedding_jobs(&within, 5, 5)
+            .await
+            .unwrap();
+        assert!(
+            none.is_empty(),
+            "in-lease transcript job must not be reclaimed"
+        );
+
+        // Past the lease → orphan reclaimed.
+        let past = timestamp_add_ms(claimed_at, EMBEDDING_JOB_LEASE_MS + 1);
+        let reclaimed = repo
+            .claim_next_n_transcript_embedding_jobs(&past, 5, 5)
+            .await
+            .unwrap();
+        assert_eq!(
+            reclaimed.len(),
+            1,
+            "orphaned transcript job must be reclaimed after the lease"
+        );
+        assert_eq!(reclaimed[0].job_id, "tjob_orph");
     }
 }

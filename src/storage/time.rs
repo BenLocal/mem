@@ -23,3 +23,45 @@ pub fn timestamp_add_ms(ts: &str, add_ms: u128) -> String {
     let base: u128 = digits.parse().unwrap_or(0);
     format!("{:020}", base.saturating_add(add_ms))
 }
+
+/// Subtracts `sub_ms` milliseconds from `ts` (a 20-digit millisecond string)
+/// and returns the result in the same encoding. Mirrors [`timestamp_add_ms`]:
+/// non-digit characters are stripped before parsing, an unparseable input is
+/// treated as `0`, and the result **saturates at 0** rather than underflowing.
+/// Used to compute a lease/visibility cutoff (`now - lease`) for reclaiming
+/// orphaned in-flight jobs.
+pub fn timestamp_sub_ms(ts: &str, sub_ms: u128) -> String {
+    let digits: String = ts.chars().filter(|c| c.is_ascii_digit()).collect();
+    let base: u128 = digits.parse().unwrap_or(0);
+    format!("{:020}", base.saturating_sub(sub_ms))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn timestamp_sub_ms_subtracts_and_zero_pads() {
+        // 1_778_000_010_000 - 300_000 = 1_777_999_710_000.
+        let out = timestamp_sub_ms("00000001778000010000", 300_000);
+        assert_eq!(out, "00000001777999710000");
+        assert_eq!(out.len(), 20);
+    }
+
+    #[test]
+    fn timestamp_sub_ms_saturates_at_zero() {
+        assert_eq!(
+            timestamp_sub_ms("00000000000000000100", 500),
+            "00000000000000000000"
+        );
+    }
+
+    #[test]
+    fn timestamp_sub_ms_strips_non_digits_like_add() {
+        // Same lenient parsing contract as timestamp_add_ms.
+        assert_eq!(
+            timestamp_sub_ms("1_778_000_010_000", 10_000),
+            "00000001778000000000"
+        );
+    }
+}

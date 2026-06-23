@@ -58,7 +58,18 @@ pub use mine_cursor_store::{MineCursor, MineCursorStore};
 pub use postgres_store::PostgresCapsuleStore;
 pub use session_store::SessionStore;
 pub use store::Store;
-pub use time::{current_timestamp, timestamp_add_ms};
+pub use time::{current_timestamp, timestamp_add_ms, timestamp_sub_ms};
+
+/// Visibility-timeout (lease) for an embedding job claimed into the
+/// `processing` state. A job that has been `processing` longer than this is
+/// treated as **orphaned** — its worker crashed, the process restarted
+/// mid-embed, or a mid-batch error abandoned it — and the next claim is
+/// allowed to reclaim it. Without this, an orphaned `processing` row is never
+/// re-picked (the claim filter only matches `pending`/`failed`) and the
+/// capsule silently loses its embedding forever. 5 minutes is far above the
+/// real embed latency (~100ms–1s) so it never steals a genuinely in-flight
+/// job, while still reclaiming orphans promptly.
+pub const EMBEDDING_JOB_LEASE_MS: u128 = 300_000;
 pub use transcript_store::TranscriptStore;
 pub use types::{
     ClaimedEmbeddingJob, ClaimedTranscriptEmbeddingJob, ContextWindow, EmbeddingJobInsert,
