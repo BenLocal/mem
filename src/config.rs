@@ -1292,7 +1292,17 @@ fn default_db_path() -> PathBuf {
     if let Some(home) = std::env::var_os("HOME") {
         let mem_dir = PathBuf::from(home).join(".mem");
         if std::fs::create_dir_all(&mem_dir).is_ok() {
-            return mem_dir.join("mem.duckdb");
+            // Default dataset dir. Prefer the current `mem.lance` name, but
+            // fall back to the legacy `mem.duckdb` name if an older install
+            // still has data there (both hold Lance datasets — the DuckDB
+            // read engine was removed in route-B). Keeps default-path
+            // installs non-breaking across the rename.
+            let current = mem_dir.join("mem.lance");
+            let legacy = mem_dir.join("mem.duckdb");
+            if !current.exists() && legacy.exists() {
+                return legacy;
+            }
+            return current;
         }
     }
 
