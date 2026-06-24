@@ -492,7 +492,15 @@ fn scored(pairs: Vec<(CapabilityCapsuleRecord, f32)>) -> serde_json::Value {
 async fn duckdb_parity_golden() {
     let dir = tempdir().unwrap();
     let db = dir.path().join("parity.duckdb");
-    let repo = Arc::new(Store::open(&db).await.unwrap());
+    // The default read engine is now `Lance` (route-B Phase 3), so pin the
+    // DuckDb engine explicitly here — this test GENERATES / verifies the
+    // goldens from the DuckDb side (the `check_or_write` exact-match owner),
+    // which must keep exercising DuckDb until the engine is deleted.
+    let repo = Arc::new(
+        Store::open_with_read_engine(&db, mem::config::ReadEngine::DuckDb)
+            .await
+            .unwrap(),
+    );
     seed(&repo).await;
 
     let q_text = "decay formula";

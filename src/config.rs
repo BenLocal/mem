@@ -423,24 +423,27 @@ pub fn parse_backend(
 }
 
 /// Read-engine selector (`MEM_READ_ENGINE`) for the route-B migration
-/// (`docs/remove-duckdb-keep-lance.md`). `DuckDb` = the lance-attached
-/// in-process SQL read engine (default, proven); `Lance` = native lancedb
-/// Rust reads, migrated bucket by bucket behind this switch. Per-bucket
-/// parity against the DuckDb golden is gated by `tests/parity_golden.rs`.
+/// (`docs/remove-duckdb-keep-lance.md`). `Lance` = native lancedb Rust reads
+/// (the **default** since Phase 3 — all 11 read buckets are lance-native and
+/// parity-green); `DuckDb` = the legacy lance-attached in-process SQL read
+/// engine (still selectable until the Phase-3 deletion commit lands). Per-
+/// bucket parity against the DuckDb golden is gated by `tests/parity_golden.rs`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum ReadEngine {
     #[default]
-    DuckDb,
     Lance,
+    DuckDb,
 }
 
-/// Parse `MEM_READ_ENGINE` (`duckdb` default | `lance`). Unknown / empty
-/// value silently falls back to `DuckDb` — a typo must never break reads;
-/// the safe default is the proven engine.
+/// Parse `MEM_READ_ENGINE` (`lance` default | `duckdb`). Unknown / empty
+/// value silently falls back to `Lance` — a typo must never break reads;
+/// the safe default is now the lance-native engine (proven parity-green in
+/// Phase 1). Set `MEM_READ_ENGINE=duckdb` to opt back into the legacy engine
+/// until it is deleted.
 pub fn parse_read_engine(get: impl Fn(&str) -> Option<String>) -> ReadEngine {
     match get("MEM_READ_ENGINE").map(|s| s.trim().to_ascii_lowercase()) {
-        Some(s) if s == "lance" => ReadEngine::Lance,
-        _ => ReadEngine::DuckDb,
+        Some(s) if s == "duckdb" => ReadEngine::DuckDb,
+        _ => ReadEngine::Lance,
     }
 }
 

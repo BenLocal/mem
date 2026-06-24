@@ -156,7 +156,16 @@ impl LanceStore {
             std::fs::create_dir_all(parent)?;
         }
 
-        let mut builder = lancedb::connect(uri);
+        // Strong read consistency (`read_consistency_interval = 0`): every
+        // read re-checks the latest on-disk manifest, so a warm read handle
+        // sees writes committed by ANOTHER handle immediately — no manual
+        // `checkout_latest()`. This replaces the DuckDB `refresh/mark_dirty`
+        // freshness machinery now that the default read engine is lance-native
+        // (route-B Phase 3). Proven by the Phase-0 probe
+        // `tests/lance_version_visibility.rs` CASE 2. The per-read manifest
+        // check is cheap (vs DuckDB's ~100ms full-connection rebuild).
+        let mut builder =
+            lancedb::connect(uri).read_consistency_interval(std::time::Duration::ZERO);
         if let Some(provider) = provider {
             let func = Arc::new(embedding::ProviderEmbeddingFunction::new(provider));
             let registry = Arc::new(MemoryRegistry::new());
