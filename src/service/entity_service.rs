@@ -52,10 +52,10 @@ impl EntityService {
     ///
     /// Read-then-write contract: the helper first runs a `lookup_alias`
     /// pre-check on every requested alias to ensure none belong to a
-    /// different entity, *before* any writes. DuckDB's single
-    /// `Arc<Mutex<Connection>>` serializes all writes in this process, so
-    /// the brief read window followed by writes under the same caller is
-    /// race-free for in-process callers; the pre-check exists primarily to
+    /// different entity, *before* any writes. Writes go through the
+    /// lance-native single writer and the `(tenant, alias_text)` PK
+    /// reconciles concurrent callers, so the brief read window followed by
+    /// writes under the same caller is safe; the pre-check exists primarily to
     /// avoid partial-state on conflict (no entity / alias rows leak when
     /// one of N aliases is contested).
     pub async fn create_with_aliases(

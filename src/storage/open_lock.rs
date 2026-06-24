@@ -1,8 +1,8 @@
 //! Multi-process write guard for `Store::open`.
 //!
-//! mem is single-writer by design — CLAUDE.md "Architecture" §1 states
-//! "Two HTTP services pointed at the same DB will fight; DuckDB is
-//! single-writer." Until this module landed, the documented contract
+//! mem is single-writer by design — two `mem serve` instances pointed at
+//! the same Lance dataset directory will fight (Lance is single-writer
+//! per dataset). Until this module landed, the documented contract
 //! had no runtime enforcement: a second `mem serve` against the same
 //! `MEM_DB_PATH` would open fine and silently race on writes, corrupting
 //! the lance manifest chain.
@@ -38,8 +38,8 @@
 //! ## What this does NOT guard against
 //!
 //! - Concurrent reads from a second process (those are safe; the lock
-//!   is only acquired by `Store::open`, and DuckDB read-only connections
-//!   from outside our process don't go through our open path).
+//!   is only acquired by `Store::open`, and a read-only opener from
+//!   outside our process doesn't go through our open path).
 //! - In-process double-open (one process calling `Store::open` twice
 //!   on the same path) — the second call gets the same `WouldBlock`
 //!   error, which is the right answer.

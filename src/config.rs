@@ -379,7 +379,7 @@ pub struct Config {
     pub cooccurrence: CooccurrenceSettings,
     pub evolution: EvolutionSettings,
     /// Which storage backend `mem serve` runs on. Default `Lance`
-    /// (Lance datasets + in-process DuckDB). `Postgres` requires the
+    /// (on-disk Lance datasets, read lance-native). `Postgres` requires the
     /// `postgres` cargo feature and `postgres_url`.
     pub backend: BackendKind,
     /// Connection string for the Postgres backend (`MEM_POSTGRES_URL`).
@@ -390,7 +390,7 @@ pub struct Config {
 /// Storage backend selector (`MEM_BACKEND`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum BackendKind {
-    /// Lance datasets + in-process DuckDB (the default; always built).
+    /// On-disk Lance datasets, read lance-native (the default; always built).
     #[default]
     Lance,
     /// Postgres (+ pgvector). Requires the `postgres` cargo feature.
@@ -496,9 +496,9 @@ impl EmbeddingSettings {
             // idle baseline of mem with workers polling at 1 Hz was
             // ~510% CPU + 800+ tokio blocking threads (spawn_blocking
             // accumulates each tick, EmbedAnything model + Rayon pool
-            // pile on, futex contention on the single DuckDB mutex
-            // dominates). Dropping to 10 s tick cuts the spawn-blocking
-            // / mutex-storm cost ~9× — measured 510% → ~56% CPU and
+            // pile on; under the old DuckDB read engine, futex contention
+            // on its single connection mutex dominated). Dropping to 10 s
+            // tick cuts the spawn-blocking cost ~9× — measured 510% → ~56% CPU and
             // 800 → 217 threads on the same workload. The trade-off is
             // worst-case 10 s latency between job enqueue and pick-up,
             // which is fine for the embedding queue (background work).

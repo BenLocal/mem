@@ -267,12 +267,12 @@ pub(super) fn parse_col<'a, T: 'static>(
 /// long-lived prod dbs created before it keep `UInt64` because
 /// `ensure_table` skips when the table already exists (no migration).
 ///
-/// `DuckDbQuery` read paths coerce UInt64→i64 silently via
-/// `row.get::<_, i64>`, so single-row gets / lists / searches work on
-/// drifted dbs. The Lance read paths (`update_status` → strict
-/// `Int64Array` downcast) do not, so `accept_pending` / `reject_pending`
-/// / `apply_feedback` on a drifted db blow up with `column type
-/// mismatch` immediately after a successful write.
+/// All reads are now lance-native with strict `Int64Array` downcasts, so
+/// a drifted db (UInt64 columns) blows up with `column type mismatch` on
+/// any read — single-row gets / lists / searches and the
+/// `accept_pending` / `reject_pending` / `apply_feedback` status writes
+/// alike. (The deleted DuckDB read path coerced UInt64→i64 silently,
+/// masking the drift on reads; that lenient fallback is gone.)
 ///
 /// This reader accepts either Arrow type and returns `i64`. The UInt64
 /// branch is unreachable on fresh dbs; deleting it is safe once every
@@ -319,8 +319,8 @@ pub(super) fn parse_version_column(
 /// Arrow schema for the `memories` LanceDB table. One column per
 /// [`CapabilityCapsuleRecord`] field; enums (`capability_capsule_type`, `status`, `scope`,
 /// `visibility`) are stored as their `serde` snake_case representation
-/// for symmetry with the JSON-string encoding the DuckDB backend uses
-/// in its `text` columns.
+/// for symmetry with the text encoding the Postgres backend uses
+/// in its enum columns.
 fn capability_capsules_schema() -> Schema {
     let str_list = DataType::List(Arc::new(Field::new("item", DataType::Utf8, true)));
     Schema::new(vec![

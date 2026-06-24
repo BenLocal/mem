@@ -296,8 +296,8 @@ pub trait CapsuleStore: Send + Sync {
 
 // ── Lance-backed impl: pure delegation through Store ───────────────
 //
-// The existing `Store` wires LanceStore writes + DuckDbQuery reads
-// + the refresh ceremony. Implementing the trait on `Store` is the
+// The existing `Store` wires LanceStore reads + writes (lance-native).
+// Implementing the trait on `Store` is the
 // cheapest way to give the existing production path a trait
 // surface; downstream callers get to choose between `Arc<Store>`
 // (concrete, all methods available) and `Arc<dyn CapsuleStore>`

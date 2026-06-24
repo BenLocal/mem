@@ -187,7 +187,7 @@ fn ingest_request_to_message(req: IngestRequest, id: String) -> ConversationMess
 // structured `(created_at, line_number, block_index)` tuple so ties on
 // `created_at` (multiple blocks ingested in the same millisecond) don't
 // drop or double-count rows. `since`/`until` are passed through as-is
-// (any string DuckDB can lexically compare against the column),
+// (any string that can be lexically compared against the column),
 // independent of the cursor.
 // ---------------------------------------------------------------------------
 

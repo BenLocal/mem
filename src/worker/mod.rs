@@ -41,9 +41,9 @@
 //! - `vacuum_worker` — daily Lance manifest pruning across every
 //!   managed table. Always-on maintenance (reclaims accumulated
 //!   copy-on-write history); opt out with `MEM_VACUUM_DISABLED=1`.
-//! - `decay_worker` — bulk SQL UPDATE of `memories.decay_score`
+//! - `decay_worker` — bulk UPDATE of `capability_capsules.decay_score`
 //!   (active rows only, capped at 1.0). Goes through
-//!   `Store::apply_time_decay` (DuckDB SQL via the lance extension).
+//!   `Store::apply_time_decay` (lancedb Rust `table.update()`).
 //! - `embedding_worker` — drains `embedding_jobs`, calls
 //!   `embed_batch`, upserts to `capability_capsule_embeddings`. Lance handles
 //!   vector indexing internally — no separate HNSW sidecar to

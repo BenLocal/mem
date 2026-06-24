@@ -227,11 +227,11 @@ async fn recall_prompt(p: &Value, remote: &RemoteArgs) -> Value {
     };
     // Capsule search FIRST, to completion. It is the primary signal and is
     // fast (~0.6s). Doing it before the transcript search is deliberate:
-    // reads serialize through a single DuckDB mutex, so running both
-    // concurrently let the slow transcript search (currently 5–11s) win the
-    // mutex and starve the capsule query until BOTH hit the timeout — making
-    // recall-prompt return `{}` even though capsule hits existed. Sequential
-    // capsule-first guarantees the capsule hits survive regardless of how
+    // capsule recall is the load-bearing signal, so running it to completion
+    // first guarantees its hits survive even if the slower transcript search
+    // (currently 5–11s) runs long and hits the timeout — otherwise
+    // recall-prompt could return `{}` even though capsule hits existed.
+    // Sequential capsule-first keeps the capsule hits regardless of how
     // slow the transcript search is.
     let cap = search_capsules(remote, &query, "", 1200, 35).await;
     // Transcript windows are secondary and the transcript search is currently

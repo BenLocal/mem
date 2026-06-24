@@ -1,4 +1,4 @@
-//! Wires `Store` (LanceDB+DuckDB-via-extension) into services + workers
+//! Wires `Store` (LanceDB, lance-native) into services + workers
 //! + HTTP routes. Single entry point: `AppState::from_config(config)`.
 
 use std::sync::Arc;

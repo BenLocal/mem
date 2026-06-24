@@ -97,9 +97,8 @@ const REINDEX_DELTA_THRESHOLD: usize = 4_096;
 ///
 /// lancedb 0.30 derives `num_partitions = num_rows / target_partition_size`.
 /// Its default over-partitioned our embedding tables — 256 partitions for the
-/// ~49k-row `conversation_message_embeddings`, i.e. ~190 rows each. The DuckDB
-/// lance extension (v4.0, the read side; the writer is now lance 7.0) then hit
-/// a ragged-record-batch bug materializing ANN results across that many small
+/// ~49k-row `conversation_message_embeddings`, i.e. ~190 rows each. lance's
+/// reader then hit a ragged-record-batch bug materializing ANN results across that many small
 /// partitions — surfacing as `IO Error: ... all columns in a record batch must
 /// have the same length` → HTTP 500 on `/transcripts/search` for queries whose
 /// nearest centroid was a degenerate partition (others returned fine; capsule
@@ -336,8 +335,8 @@ impl LanceStore {
             // `replace(true)` creates when absent and overwrites when
             // rebuilding. Vector indexes pin `num_partitions` explicitly —
             // lancedb 0.30's default derivation over-partitions our embedding
-            // tables and the resulting empty KMeans clusters made the DuckDB
-            // lance extension return ragged record batches (see
+            // tables and the resulting empty KMeans clusters made lance's
+            // reader return ragged record batches (see
             // [`ivf_num_partitions`]). PQ sub-vectors + the BTree scalar
             // index keep Lance's derived defaults (never the problem).
             let index = match kind {

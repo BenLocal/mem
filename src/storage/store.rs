@@ -1524,7 +1524,7 @@ mod tests {
     }
 
     /// `get_embedding_job_status`: enqueue a job via the lance side,
-    /// read its status through DuckDbQuery (SQL), confirm round-trip.
+    /// read its status back (lance-native), confirm round-trip.
     #[tokio::test(flavor = "multi_thread")]
     async fn store_get_embedding_job_status_round_trip() {
         let dir = tempdir().unwrap();
@@ -1915,8 +1915,8 @@ mod tests {
         assert!(matches!(err, StorageError::InvalidData(_)), "got {err:?}");
     }
 
-    /// Cross-stack batch round-trip: a multi-row insert reaches DuckDB
-    /// after a single refresh, and the rows survive intra-batch dedup
+    /// Batch round-trip: a multi-row insert lands in a single Lance write,
+    /// and the rows survive intra-batch dedup
     /// of identical (transcript_path, line_number, block_index) keys.
     #[tokio::test(flavor = "multi_thread")]
     async fn store_create_conversation_messages_batch_round_trip() {
@@ -1943,8 +1943,8 @@ mod tests {
         assert!(ids.contains(&"blk_b"));
     }
 
-    /// Cross-stack batch capsule insert: multiple capsules land via a
-    /// single refresh and are visible to the DuckDB read side.
+    /// Batch capsule insert: multiple capsules land via a
+    /// single Lance write and are visible to readers.
     #[tokio::test(flavor = "multi_thread")]
     async fn store_insert_capability_capsules_batch_round_trip() {
         let dir = tempdir().unwrap();

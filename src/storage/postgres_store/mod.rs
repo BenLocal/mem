@@ -1,5 +1,5 @@
 //! Postgres storage backend (opt-in via the `postgres` feature +
-//! `MEM_BACKEND=postgres`). Peer to the default Lance + DuckDB stack.
+//! `MEM_BACKEND=postgres`). Peer to the default Lance (lance-native) stack.
 //!
 //! - [`capsule_store`] — `PostgresCapsuleStore`: the `PgPool` wrapper +
 //!   `CapsuleStore` impl + migration bootstrap (`connect` / `connect_fresh`).

@@ -8,7 +8,7 @@
 //! EntityRegistry, SessionStore, MaintenanceStore, MineCursorStore,
 //! EvolutionCandidateStore) so the concrete type satisfies `Backend` and
 //! the blanket impl in `backend.rs` applies. Every method here is a real
-//! Postgres implementation behaviour-aligned with the Lance/DuckDB
+//! Postgres implementation behaviour-aligned with the Lance
 //! backend; the `MaintenanceStore::vacuum_old_versions_with` /
 //! `ensure_query_indexes` no-ops are deliberate (no Lance-manifest analog
 //! on Postgres).
@@ -42,8 +42,8 @@ use crate::storage::types::{
 // ─────────────────────────── CapsuleSearchStore ───────────────────────────
 //
 // postgres-backend P4 — hybrid retrieval (pgvector ANN + tsvector BM25 +
-// RRF fusion), behaviour-aligned with the Lance/DuckDB backend in
-// `duckdb_query/capability_capsules.rs` and `pipeline/retrieve.rs`.
+// RRF fusion), behaviour-aligned with the Lance backend in
+// `lance_store/capability_capsules.rs` and `pipeline/retrieve.rs`.
 //
 // Lance-semantic parity preserved:
 //   - `search_candidates`: live status (NOT rejected/archived), exclude
