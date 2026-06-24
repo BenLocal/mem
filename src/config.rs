@@ -1297,7 +1297,10 @@ fn default_db_path() -> PathBuf {
     }
 
     let sequence = APP_DB_SEQUENCE.fetch_add(1, Ordering::Relaxed);
-    std::env::temp_dir().join(format!("mem-app-{}-{sequence}.duckdb", std::process::id()))
+    // `.lance` suffix: this is a lance dataset directory, not a DuckDB file
+    // (the DuckDB read engine was removed in route-B). Deep fallback used
+    // only when both MEM_DB_PATH and HOME are unset.
+    std::env::temp_dir().join(format!("mem-app-{}-{sequence}.lance", std::process::id()))
 }
 
 #[cfg(test)]

@@ -11,7 +11,7 @@
 //! `crate::worker::vacuum_worker` and exposed on-demand via
 //! `POST /admin/vacuum`.
 
-use lancedb::index::scalar::{BTreeIndexBuilder, FtsIndexBuilder};
+use lancedb::index::scalar::BTreeIndexBuilder;
 use lancedb::index::vector::IvfPqIndexBuilder;
 use lancedb::index::Index;
 use lancedb::table::{CompactionOptions, Duration, OptimizeAction, OptimizeStats};
@@ -48,26 +48,18 @@ pub struct VacuumStats {
 #[derive(Debug, Clone, Copy)]
 enum IndexKind {
     /// IVF_PQ ANN index on a vector column (semantic search). Without it
-    /// `lance_vector_search` brute-force flat-scans the column.
+    /// a `nearest_to` query brute-force flat-scans the column.
     Vector,
     /// BTree scalar index on a high-cardinality column. Without it,
     /// equality / JOIN predicates on the column flat-scan the table.
     Scalar,
-    /// FTS (BM25 inverted) index on a text column. `ensure_fts_index`
-    /// builds this once at table-open, but only *if absent* — so once a
-    /// stale index exists from when the table was small it is never
-    /// refreshed, and `lance_fts` returns hits only from the originally
-    /// indexed rows (BM25 recall silently rots as the table grows). This
-    /// rebuilds it on the same delta policy as the others.
-    Fts,
 }
 
 /// Every index `ensure_query_indexes` keeps current, as `(table, column,
-/// kind)`. Lance does NOT auto-build these (the `mod.rs` comment claiming
-/// "ANN is auto-maintained" was wrong; the usearch sidecar that used to
-/// maintain the vector index was removed in QW-4 and never replaced).
-/// - The two `embedding` ANN indexes: `lance_vector_search` over an
-///   unindexed `conversation_message_embeddings` (118MB, ~28k×1024-dim)
+/// kind)`. Lance does NOT auto-build these (the usearch sidecar that used
+/// to maintain the vector index was removed in QW-4 and never replaced).
+/// - The two `embedding` ANN indexes: an unindexed `nearest_to` scan over
+///   `conversation_message_embeddings` (118MB, ~28k×1024-dim)
 ///   made transcript search 5–11s vs 0.6s for the tiny capsule table.
 /// - `conversation_messages.message_block_id` scalar index: the transcript
 ///   semantic query JOINs the ANN hits back to `conversation_messages` on
@@ -89,12 +81,6 @@ const MANAGED_INDEXES: &[(&str, &str, IndexKind)] = &[
         "message_block_id",
         IndexKind::Scalar,
     ),
-    // FTS on the BM25 channel. The open-time `ensure_fts_index` built this
-    // when conversation_messages was tiny and never refreshed it; profiling
-    // showed an 8KB index over 110MB of text (i.e. covering ~no rows) while
-    // the BM25 phase still cost ~455ms — recall over recent transcripts was
-    // silently broken. Rebuild it here when the unindexed delta grows.
-    ("conversation_messages", "content", IndexKind::Fts),
 ];
 
 /// Below this row count a brute-force flat scan is already sub-second, so
@@ -295,9 +281,9 @@ impl LanceStore {
     /// skipped without erroring.
     ///
     /// The build itself can take seconds on a large table, so callers run
-    /// this off the request path (the vacuum worker). lancedb-created
-    /// indexes ARE visible to the DuckDB lance extension's
-    /// `lance_vector_search` — same as `ensure_fts_index` / `lance_fts`.
+    /// this off the request path (the vacuum worker). The lance-native
+    /// read path (`query().nearest_to(...)`) picks up the committed index
+    /// transparently on its next query.
     pub async fn ensure_query_indexes(&self) -> Result<IndexMaintenanceStats, StorageError> {
         self.ensure_query_indexes_inner(false).await
     }
@@ -352,8 +338,8 @@ impl LanceStore {
             // lancedb 0.30's default derivation over-partitions our embedding
             // tables and the resulting empty KMeans clusters made the DuckDB
             // lance extension return ragged record batches (see
-            // [`ivf_num_partitions`]). PQ sub-vectors + BTree/FTS keep Lance's
-            // derived defaults (those were never the problem).
+            // [`ivf_num_partitions`]). PQ sub-vectors + the BTree scalar
+            // index keep Lance's derived defaults (never the problem).
             let index = match kind {
                 IndexKind::Vector => {
                     let num_partitions = ivf_num_partitions(row_count);
@@ -368,7 +354,6 @@ impl LanceStore {
                     Index::IvfPq(IvfPqIndexBuilder::default().num_partitions(num_partitions))
                 }
                 IndexKind::Scalar => Index::BTree(BTreeIndexBuilder::default()),
-                IndexKind::Fts => Index::FTS(FtsIndexBuilder::default()),
             };
             table
                 .create_index(&[*column], index)
@@ -384,7 +369,7 @@ impl LanceStore {
         }
         // Rebuild the Tantivy capsule + transcript BM25 indexes from the
         // live corpus (startup full-rebuild strategy — see
-        // `crate::storage::fts`). Unlike the lance IVF/FTS indexes there's
+        // `crate::storage::fts`). Unlike the lance IVF/scalar indexes there's
         // no per-table delta tracking — the rebuild is cheap (<1s at real
         // scale) and a full rebuild is the whole design. The Tantivy index
         // backs the only BM25 read path (`bm25_candidate_ids` /

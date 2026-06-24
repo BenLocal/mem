@@ -1,43 +1,30 @@
-//! LanceDB write half of the storage stack.
+//! LanceDB storage stack — the on-disk lance dataset is both the
+//! store and the read surface (route-B, 2026-06-24; the DuckDB read
+//! engine is gone).
 //!
-//! `LanceStore` holds a `lancedb::Connection` and owns every WRITE
-//! against the on-disk lance dataset directory (12 managed tables —
+//! `LanceStore` holds a `lancedb::Connection` and owns every read AND
+//! write against the on-disk lance dataset directory (managed tables —
 //! see `mod` declarations below + `ALL_TABLES` in `maintenance.rs`).
-//! It's `pub(crate)` since Phase 5+; external callers reach it
-//! through the `Backend` umbrella trait or one of the 9 sub-traits
-//! in `src/storage/*.rs`, never directly. Reads route through
-//! [`super::duckdb_query::DuckDbQuery`] instead — same on-disk lance
-//! directory, attached as a DuckDB schema via the `lance` extension.
+//! It's `pub(crate)`; external callers reach it through the `Backend`
+//! umbrella trait or one of the sub-traits in `src/storage/*.rs`,
+//! never directly.
 //!
-//! What survives in this file after Phase 5+ dead-code cleanup is
-//! exclusively WRITE methods plus a small read surface that's
-//! load-bearing for write paths:
+//! - Writes are `Connection::open_table` + `.add()` /
+//!   `.update().only_if(...)` / `.delete()`, one method per CRUD
+//!   operation, with bulk Arrow `RecordBatch` builders
+//!   (`*_to_record_batch`) and `record_batch_to_*` parsers.
+//! - Reads are lancedb queries — `query().only_if("<predicate>")`
+//!   filter scans, `query().nearest_to(vec)` vector ANN, and
+//!   `fetch_*_by_ids` hydration. Ranking, RRF fusion, version-chain
+//!   dedup and graph-BFS run in Rust on top (`pipeline/retrieve.rs`).
+//!   The read connection uses `read_consistency_interval(0)` (Strong),
+//!   so every read sees the latest committed version with no explicit
+//!   refresh.
 //!
-//! - Bulk Arrow `RecordBatch` builders (`*_to_record_batch`).
-//! - `Connection::open_table` + `.add()` / `.update().only_if(...)` /
-//!   `.delete()` driven writes, one method per CRUD operation.
-//! - Inline `lookup_alias` used by `resolve_or_create` / `add_alias`
-//!   as a precondition (sole entity read kept here).
-//! - `record_batch_to_capability_capsules` parser for cross-tenant
-//!   `get_capability_capsule` (the one read still hosted here per
-//!   `Store::get_capability_capsule`).
-//! - `query_capability_capsules` / `query_conversation_messages` /
-//!   `query_embedding_jobs` shared helpers — surviving callers are
-//!   inside-this-module writes (supersede idempotency, batch dedup).
-//!
-//! The bulk of the lance-side READ methods (`list_capability_capsules_for_tenant`,
-//! `neighbors`, `get_entity`, `bm25_transcript_candidates`, …) were
-//! deleted in commit 908ce91 when reads canonically routed through
-//! `DuckDbQuery`. If you find yourself adding a read method here,
-//! first check that the equivalent doesn't already exist in
-//! `duckdb_query/` — adding it back here only makes sense if the
-//! call is on a write hot-path that can't afford a DuckDB
-//! round-trip (e.g. embedding-job claim).
-//!
-//! ANN and FTS indexes are built into LanceDB 0.27 natively — no
-//! external sidecar. FTS index is built at table-open time
-//! (`ensure_fts_index`); ANN is auto-maintained on writes to the
-//! vector column.
+//! ANN (IVF_PQ) + scalar indexes are built by `ensure_query_indexes`
+//! in `maintenance.rs` (driven by the vacuum worker), NOT auto-built
+//! by Lance. BM25/FTS is a separate in-RAM Tantivy subsystem
+//! (`crate::storage::fts`), not a Lance index.
 
 use std::path::Path;
 use std::sync::Arc;
@@ -190,17 +177,12 @@ impl LanceStore {
         ensure_evolution_candidates_table(&conn).await?;
         // capability_capsule_embeddings is lazy-created on first upsert (dim is
         // provider-dependent and unknown here without provider).
-
-        // FTS indexes for the BM25 read paths. Built once at open
-        // time on empty tables — building the index is cheap when
-        // the table has no rows, and creating it up front lets the
-        // DuckDB query layer (`storage::duckdb_query`) call
-        // `lance_fts(...)` directly without first probing for an
-        // index. After this, every subsequent open is a no-op:
-        // `ensure_fts_index` checks `Table::list_indices` and skips
-        // creation when the column is already indexed.
-        ensure_fts_index(&conn, "capability_capsules", "content").await?;
-        ensure_fts_index(&conn, "conversation_messages", "content").await?;
+        //
+        // No FTS index is built on the lance tables: BM25 lives in the
+        // in-RAM Tantivy subsystem (`crate::storage::fts`), full-rebuilt
+        // from the source table at startup and by the vacuum worker. ANN
+        // (IVF_PQ) + scalar indexes are built by `ensure_query_indexes`
+        // (`maintenance.rs`), not here.
 
         Ok(Self {
             conn: Arc::new(conn),
@@ -235,41 +217,6 @@ impl LanceStore {
             .expect("transcript_job_provider lock poisoned")
             .clone()
     }
-}
-
-/// Idempotently ensure an FTS (BM25 inverted) index exists on
-/// `(table_name, column)`. The lance extension's `lance_fts(...)` SQL
-/// table function returns empty results — without erroring — when no
-/// FTS index is present on the queried column, which is a real-world
-/// trap: a typo'd column name silently turns into "no matches". Pinning
-/// the indexes at open() time means the DuckDB query side can call
-/// `lance_fts` and trust empty results to mean "no matching rows."
-async fn ensure_fts_index(
-    conn: &Connection,
-    table_name: &str,
-    column: &str,
-) -> Result<(), StorageError> {
-    let table = conn
-        .open_table(table_name)
-        .execute()
-        .await
-        .map_err(lancedb_err)?;
-    let indices = table.list_indices().await.map_err(lancedb_err)?;
-    let already = indices
-        .iter()
-        .any(|c| c.columns.iter().any(|col| col == column));
-    if already {
-        return Ok(());
-    }
-    table
-        .create_index(
-            &[column],
-            lancedb::index::Index::FTS(lancedb::index::scalar::FtsIndexBuilder::default()),
-        )
-        .execute()
-        .await
-        .map_err(lancedb_err)?;
-    Ok(())
 }
 
 /// Map a `lancedb::Error` into our generic [`StorageError`]. We lose the
