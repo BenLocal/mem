@@ -1,42 +1,24 @@
-//! Top-level storage handle. Composes [`LanceStore`] (writes) and
-//! [`DuckDbQuery`] (reads) behind a single owner so the service layer
-//! holds one `Arc<Store>` instead of two correlated handles.
+//! Top-level storage handle. Wraps [`LanceStore`] (the single
+//! read+write half) behind a single owner so the service layer holds
+//! one `Arc<Store>`.
 //!
 //! Architecture:
 //!
 //! ```text
-//!   ┌─────────────────────── Store ───────────────────────┐
-//!   │                                                     │
-//!   │  writes ──► LanceStore ──► .lance/ on-disk datasets │
-//!   │                                  ▲                  │
-//!   │  reads  ──► DuckDbQuery ─────────┘ (ATTACHed)       │
-//!   │                                                     │
-//!   └─────────────────────────────────────────────────────┘
+//!   ┌──────────────────── Store ────────────────────┐
+//!   │                                               │
+//!   │  reads + writes ──► LanceStore ──► .lance/     │
+//!   │                                  on-disk data  │
+//!   └────────────────────────────────────────────────┘
 //! ```
 //!
-//! Both handles point at the **same** lance directory. Writes go
-//! through LanceDB's Rust API (so the `EmbeddingFunction` adapter
-//! can auto-embed at write time when a provider is configured); reads
-//! go through DuckDB SQL via the `lance` core extension.
-//!
-//! ### Snapshot caching, and how `Store` works around it
-//!
-//! The lance DuckDB extension caches the dataset version at first
-//! query post-ATTACH. Subsequent writes via the LanceDB Rust API
-//! create a new version on disk, but the existing DuckDB connection
-//! keeps reading the cached snapshot. DETACH + re-ATTACH on the same
-//! connection does **not** clear that cache (verified empirically in
-//! the `store_open_write_read_round_trip` test); only a fresh
-//! `Connection::open_in_memory()` picks up the new version.
-//!
-//! `Store` resolves this by calling [`DuckDbQuery::refresh`] —
-//! which swaps in a brand-new in-process DuckDB connection — after
-//! every mutating method. The [`Store::commit_lance_write`] helper
-//! threads this through (was the `lance_write_then_refresh!` macro
-//! pre-QW-6); reads are unaffected (they pay nothing).
-//! Cost: about a connection-setup's worth of milliseconds per write
-//! (extension load + ATTACH on the new conn). For mem's typical
-//! write/read ratio this is negligible.
+//! Reads and writes both go through LanceDB's Rust API (so the
+//! `EmbeddingFunction` adapter can auto-embed at write time when a
+//! provider is configured). The lance read connection is opened with
+//! `read_consistency_interval(0)` (commit `67414f6`), so a read sees
+//! prior writes natively — there is no snapshot cache to invalidate
+//! and no per-write refresh ceremony. [`Store::commit_lance_write`]
+//! is now a thin pass-through that just forwards the write outcome.
 //!
 //! ### Portability annotation
 //!
@@ -57,15 +39,13 @@
 //! Phase 5 (2026-05-18) made `Store` an implementation detail behind
 //! the `Backend` umbrella trait — services / workers hold
 //! `Arc<dyn Backend>`. The 9 sub-traits in `src/storage/*.rs`
-//! delegate to either `self.lance.xxx` (writes; a handful of reads
-//! kept here for write hot-paths) or `self.query.xxx` (reads,
-//! canonical). Both halves are `pub(crate)` since Phase 5+ — the
-//! concrete types only appear inside this file and `app.rs`.
+//! delegate to `self.lance.xxx` (both reads and writes). `LanceStore`
+//! is `pub(crate)` since Phase 5+ — the concrete type only appears
+//! inside this file and `app.rs`.
 
 use std::path::Path;
 use std::sync::Arc;
 
-use super::duckdb_query::DuckDbQuery;
 use super::lance_store::LanceStore;
 use super::{
     ClaimedEmbeddingJob, ClaimedTranscriptEmbeddingJob, ContextWindow, EmbeddingJobInsert,
@@ -79,17 +59,11 @@ use crate::domain::session::Session;
 use crate::domain::{AddAliasOutcome, ConversationMessage, Entity, EntityKind, EntityWithAliases};
 
 /// Handle carried by every service / worker / HTTP component. Cheap
-/// to clone (just three `Arc`s).
+/// to clone (just two `Arc`s).
 #[derive(Clone)]
 pub struct Store {
-    /// Writes (and a handful of yet-to-be-migrated reads) flow here.
+    /// Reads and writes both flow here.
     pub(crate) lance: Arc<LanceStore>,
-    /// Reads flow here.
-    pub(crate) query: Arc<DuckDbQuery>,
-    /// Per-bucket read-engine switch (`MEM_READ_ENGINE`) for the route-B
-    /// migration. Each read method routes on this; default `DuckDb`. See
-    /// `docs/remove-duckdb-keep-lance.md`.
-    pub(crate) read_engine: crate::config::ReadEngine,
     /// Open-time advisory lock — held for the full lifetime of every
     /// `Store` clone (`Arc` keeps it alive until the last clone drops).
     /// `None` when `MEM_OPEN_LOCK_DISABLED=1` skipped acquisition. See
@@ -99,9 +73,8 @@ pub struct Store {
 }
 
 impl Store {
-    /// Open both halves at `path` (a directory holding lance datasets).
-    /// Creates the directory + lance datasets via `LanceStore::open`,
-    /// then opens an in-process DuckDB and ATTACHes the lance dir.
+    /// Open the lance datasets at `path` (a directory). Creates the
+    /// directory + lance datasets via `LanceStore::open`.
     ///
     /// **Advisory lock**: refuses to open if another `mem` process
     /// already holds a lock on `<path>.lock`. Opt out with
@@ -110,40 +83,15 @@ impl Store {
         let path = path.as_ref();
         let lock = crate::storage::open_lock::acquire(path)?;
         let lance = LanceStore::open(path).await?;
-        let query = DuckDbQuery::open(path).await?;
         Ok(Self {
             lance: Arc::new(lance),
-            query: Arc::new(query),
-            read_engine: crate::config::parse_read_engine(|k| std::env::var(k).ok()),
-            _open_lock: Arc::new(lock),
-        })
-    }
-
-    /// Like [`Self::open`] but forces the read engine, bypassing
-    /// `MEM_READ_ENGINE`. Used by the parity double-run
-    /// (`tests/parity_golden.rs`) to read the same seeded dataset under each
-    /// engine without racing a process-global env var.
-    pub async fn open_with_read_engine(
-        path: impl AsRef<Path>,
-        read_engine: crate::config::ReadEngine,
-    ) -> Result<Self, StorageError> {
-        let path = path.as_ref();
-        let lock = crate::storage::open_lock::acquire(path)?;
-        let lance = LanceStore::open(path).await?;
-        let query = DuckDbQuery::open(path).await?;
-        Ok(Self {
-            lance: Arc::new(lance),
-            query: Arc::new(query),
-            read_engine,
             _open_lock: Arc::new(lock),
         })
     }
 
     /// Like [`Self::open`], but registers an [`EmbeddingProvider`] on
-    /// the LanceStore side so vector columns can declare auto-embed
-    /// against `<provider>-<model>` via `EmbeddingDefinition`. The
-    /// DuckDB query side is unaffected — it reads whatever vectors
-    /// are on disk regardless of who computed them.
+    /// the LanceStore so vector columns can declare auto-embed against
+    /// `<provider>-<model>` via `EmbeddingDefinition`.
     ///
     /// Acquires the same multi-process write guard as [`Self::open`].
     ///
@@ -155,71 +103,33 @@ impl Store {
         let path = path.as_ref();
         let lock = crate::storage::open_lock::acquire(path)?;
         let lance = LanceStore::open_with_provider(path, provider).await?;
-        let query = DuckDbQuery::open(path).await?;
         Ok(Self {
             lance: Arc::new(lance),
-            query: Arc::new(query),
-            read_engine: crate::config::parse_read_engine(|k| std::env::var(k).ok()),
             _open_lock: Arc::new(lock),
         })
     }
 }
 
 impl Store {
-    /// Chain a completed `LanceStore` write with the `DuckDbQuery`
-    /// refresh ceremony the `Store` contract requires. Writes go
-    /// to lance; reads after the call must see the new version, so
-    /// the in-process DuckDB connection is reset (see
-    /// [`DuckDbQuery::refresh`] for why).
+    /// Pass-through for a completed `LanceStore` write.
     ///
-    /// `result` is the **already-awaited** outcome of the lance
-    /// write — callers compute the value first, then hand it to
-    /// this method. The pre-computed-result shape avoids the
-    /// closure-of-borrowed-future lifetime gymnastics a
-    /// `commit_write(write_fn)` form would need, at the cost of
-    /// repeating `self.lance.foo(...).await` at the callsite (which
-    /// was already there inside the legacy `lance_write_then_refresh!`
-    /// macro this method replaced).
-    ///
-    /// Refresh failures surface as `StorageError`; the write has
-    /// already committed at that point, so the caller sees the
-    /// value the write produced even if a future read from the
-    /// same `Store` happens to see a stale version (it'll converge
-    /// on the next mutation).
-    ///
-    /// Closes `backend-coupling.md` §6 Phase 1 QW-6. In Phase 2,
-    /// this ceremony will live on the LanceBackend impl behind the
-    /// portable trait surface; other backends won't need it.
+    /// Historically this chained every write with a `DuckDbQuery`
+    /// refresh so the in-process DuckDB read connection would pick up
+    /// the new lance version. With the DuckDB read engine deleted and
+    /// the lance read connection opened with
+    /// `read_consistency_interval(0)` (commit `67414f6`), reads see
+    /// writes natively — there is nothing to refresh. The method is
+    /// kept as a thin wrapper so the ~70 write callsites don't all
+    /// have to change shape; it just forwards `result`.
     pub(crate) async fn commit_lance_write<T>(
         &self,
         result: Result<T, StorageError>,
     ) -> Result<T, StorageError> {
-        // **D2 (2026-05-22)**: deferred refresh — flip the dirty flag
-        // here (cheap atomic store) instead of eagerly calling
-        // `refresh()` (which is ~100ms each: `Connection::open_in_memory`
-        // + `INSTALL lance; LOAD lance;` + `ATTACH 12 tables`). The
-        // next read on this `DuckDbQuery` instance calls
-        // `ensure_fresh()` which sees the dirty flag and pays the
-        // refresh cost once for N intervening writes.
-        //
-        // Trade-off: a caller that issues 10 writes back-to-back used
-        // to pay 10×100ms; now pays 0×100ms + one refresh on whatever
-        // read comes next. For worker tick loops (which write often
-        // but read rarely on the same connection), this is the dominant
-        // CPU win. For interactive flows (write → immediately read on
-        // a different connection), the refresh shifts from write-time
-        // to read-time but the user-visible latency stays the same.
-        //
-        // Mark-dirty + ensure_fresh ordering is documented on
-        // `DuckDbQuery::ensure_fresh` — concurrent writers can't lose
-        // updates because dirty=true is monotonic until the next
-        // reader's atomic swap.
-        self.query.mark_dirty();
         result
     }
 }
 
-// ── Memory writes (LanceStore + DuckDbQuery refresh) ────────────────
+// ── Memory writes (LanceStore) ──────────────────────────────────────
 impl Store {
     pub async fn insert_capability_capsule(
         &self,
@@ -553,47 +463,31 @@ impl Store {
     }
 }
 
-// ── Memory reads (DuckDbQuery) ──────────────────────────────────────
+// ── Memory reads (LanceStore) ───────────────────────────────────────
 impl Store {
     pub async fn list_capability_capsules_for_tenant(
         &self,
         tenant: &str,
     ) -> Result<Vec<CapabilityCapsuleRecord>, StorageError> {
-        match self.read_engine {
-            crate::config::ReadEngine::DuckDb => {
-                self.query.list_capability_capsules_for_tenant(tenant).await
-            }
-            crate::config::ReadEngine::Lance => {
-                self.lance.list_capability_capsules_for_tenant(tenant).await
-            }
-        }
+        self.lance.list_capability_capsules_for_tenant(tenant).await
     }
 
     pub async fn list_wings(&self, tenant: &str) -> Result<Vec<String>, StorageError> {
-        match self.read_engine {
-            crate::config::ReadEngine::DuckDb => self.query.list_wings(tenant).await,
-            crate::config::ReadEngine::Lance => self.lance.list_wings(tenant).await,
-        }
+        self.lance.list_wings(tenant).await
     }
 
     pub async fn capsule_stats(
         &self,
         tenant: &str,
     ) -> Result<crate::domain::capability_capsule::CapsuleStats, StorageError> {
-        match self.read_engine {
-            crate::config::ReadEngine::DuckDb => self.query.capsule_stats(tenant).await,
-            crate::config::ReadEngine::Lance => self.lance.capsule_stats(tenant).await,
-        }
+        self.lance.capsule_stats(tenant).await
     }
 
     pub async fn get_taxonomy(
         &self,
         tenant: &str,
     ) -> Result<Vec<(String, Vec<String>)>, StorageError> {
-        match self.read_engine {
-            crate::config::ReadEngine::DuckDb => self.query.get_taxonomy(tenant).await,
-            crate::config::ReadEngine::Lance => self.lance.get_taxonomy(tenant).await,
-        }
+        self.lance.get_taxonomy(tenant).await
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -609,38 +503,19 @@ impl Store {
         cursor: Option<(&str, &str)>,
         limit: usize,
     ) -> Result<(Vec<CapabilityCapsuleRecord>, bool), StorageError> {
-        match self.read_engine {
-            crate::config::ReadEngine::DuckDb => {
-                self.query
-                    .list_capability_capsules_in_scope(
-                        tenant,
-                        project,
-                        repo,
-                        module,
-                        capsule_type,
-                        status,
-                        source_agent,
-                        cursor,
-                        limit,
-                    )
-                    .await
-            }
-            crate::config::ReadEngine::Lance => {
-                self.lance
-                    .list_capability_capsules_in_scope(
-                        tenant,
-                        project,
-                        repo,
-                        module,
-                        capsule_type,
-                        status,
-                        source_agent,
-                        cursor,
-                        limit,
-                    )
-                    .await
-            }
-        }
+        self.lance
+            .list_capability_capsules_in_scope(
+                tenant,
+                project,
+                repo,
+                module,
+                capsule_type,
+                status,
+                source_agent,
+                cursor,
+                limit,
+            )
+            .await
     }
 
     pub async fn get_capability_capsule_for_tenant(
@@ -648,18 +523,9 @@ impl Store {
         tenant: &str,
         capability_capsule_id: &str,
     ) -> Result<Option<CapabilityCapsuleRecord>, StorageError> {
-        match self.read_engine {
-            crate::config::ReadEngine::DuckDb => {
-                self.query
-                    .get_capability_capsule_for_tenant(tenant, capability_capsule_id)
-                    .await
-            }
-            crate::config::ReadEngine::Lance => {
-                self.lance
-                    .get_capability_capsule_for_tenant(tenant, capability_capsule_id)
-                    .await
-            }
-        }
+        self.lance
+            .get_capability_capsule_for_tenant(tenant, capability_capsule_id)
+            .await
     }
 
     pub async fn get_pending(
@@ -667,14 +533,7 @@ impl Store {
         tenant: &str,
         capability_capsule_id: &str,
     ) -> Result<Option<CapabilityCapsuleRecord>, StorageError> {
-        match self.read_engine {
-            crate::config::ReadEngine::DuckDb => {
-                self.query.get_pending(tenant, capability_capsule_id).await
-            }
-            crate::config::ReadEngine::Lance => {
-                self.lance.get_pending(tenant, capability_capsule_id).await
-            }
-        }
+        self.lance.get_pending(tenant, capability_capsule_id).await
     }
 
     pub async fn find_by_idempotency_or_hash(
@@ -683,28 +542,16 @@ impl Store {
         idempotency_key: &Option<String>,
         content_hash: &str,
     ) -> Result<Option<CapabilityCapsuleRecord>, StorageError> {
-        match self.read_engine {
-            crate::config::ReadEngine::DuckDb => {
-                self.query
-                    .find_by_idempotency_or_hash(tenant, idempotency_key, content_hash)
-                    .await
-            }
-            crate::config::ReadEngine::Lance => {
-                self.lance
-                    .find_by_idempotency_or_hash(tenant, idempotency_key, content_hash)
-                    .await
-            }
-        }
+        self.lance
+            .find_by_idempotency_or_hash(tenant, idempotency_key, content_hash)
+            .await
     }
 
     pub async fn list_pending_review(
         &self,
         tenant: &str,
     ) -> Result<Vec<CapabilityCapsuleRecord>, StorageError> {
-        match self.read_engine {
-            crate::config::ReadEngine::DuckDb => self.query.list_pending_review(tenant).await,
-            crate::config::ReadEngine::Lance => self.lance.list_pending_review(tenant).await,
-        }
+        self.lance.list_pending_review(tenant).await
     }
 
     /// Auto-promote candidate set. Returns rows that match the
@@ -719,28 +566,16 @@ impl Store {
         types: &[crate::domain::capability_capsule::CapabilityCapsuleType],
         max_decay_score: f32,
     ) -> Result<Vec<CapabilityCapsuleRecord>, StorageError> {
-        match self.read_engine {
-            crate::config::ReadEngine::DuckDb => {
-                self.query
-                    .auto_promote_candidates(tenant, cutoff_updated_at, types, max_decay_score)
-                    .await
-            }
-            crate::config::ReadEngine::Lance => {
-                self.lance
-                    .auto_promote_candidates(tenant, cutoff_updated_at, types, max_decay_score)
-                    .await
-            }
-        }
+        self.lance
+            .auto_promote_candidates(tenant, cutoff_updated_at, types, max_decay_score)
+            .await
     }
 
     pub async fn search_candidates(
         &self,
         tenant: &str,
     ) -> Result<Vec<CapabilityCapsuleRecord>, StorageError> {
-        match self.read_engine {
-            crate::config::ReadEngine::DuckDb => self.query.search_candidates(tenant).await,
-            crate::config::ReadEngine::Lance => self.lance.search_candidates(tenant).await,
-        }
+        self.lance.search_candidates(tenant).await
     }
 
     pub async fn recent_active_capability_capsules(
@@ -748,18 +583,9 @@ impl Store {
         tenant: &str,
         limit: usize,
     ) -> Result<Vec<CapabilityCapsuleRecord>, StorageError> {
-        match self.read_engine {
-            crate::config::ReadEngine::DuckDb => {
-                self.query
-                    .recent_active_capability_capsules(tenant, limit)
-                    .await
-            }
-            crate::config::ReadEngine::Lance => {
-                self.lance
-                    .recent_active_capability_capsules(tenant, limit)
-                    .await
-            }
-        }
+        self.lance
+            .recent_active_capability_capsules(tenant, limit)
+            .await
     }
 
     pub async fn fetch_capability_capsules_by_ids(
@@ -767,36 +593,18 @@ impl Store {
         tenant: &str,
         ids: &[&str],
     ) -> Result<Vec<CapabilityCapsuleRecord>, StorageError> {
-        match self.read_engine {
-            crate::config::ReadEngine::DuckDb => {
-                self.query
-                    .fetch_capability_capsules_by_ids(tenant, ids)
-                    .await
-            }
-            crate::config::ReadEngine::Lance => {
-                self.lance
-                    .fetch_capability_capsules_by_ids(tenant, ids)
-                    .await
-            }
-        }
+        self.lance
+            .fetch_capability_capsules_by_ids(tenant, ids)
+            .await
     }
 
     pub async fn list_capability_capsule_ids_for_tenant(
         &self,
         tenant: &str,
     ) -> Result<Vec<String>, StorageError> {
-        match self.read_engine {
-            crate::config::ReadEngine::DuckDb => {
-                self.query
-                    .list_capability_capsule_ids_for_tenant(tenant)
-                    .await
-            }
-            crate::config::ReadEngine::Lance => {
-                self.lance
-                    .list_capability_capsule_ids_for_tenant(tenant)
-                    .await
-            }
-        }
+        self.lance
+            .list_capability_capsule_ids_for_tenant(tenant)
+            .await
     }
 
     pub async fn list_capability_capsule_versions_for_tenant(
@@ -804,40 +612,22 @@ impl Store {
         tenant: &str,
         capability_capsule_id: &str,
     ) -> Result<Vec<CapabilityCapsuleVersionLink>, StorageError> {
-        match self.read_engine {
-            crate::config::ReadEngine::DuckDb => {
-                self.query
-                    .list_capability_capsule_versions_for_tenant(tenant, capability_capsule_id)
-                    .await
-            }
-            crate::config::ReadEngine::Lance => {
-                self.lance
-                    .list_capability_capsule_versions_for_tenant(tenant, capability_capsule_id)
-                    .await
-            }
-        }
+        self.lance
+            .list_capability_capsule_versions_for_tenant(tenant, capability_capsule_id)
+            .await
     }
 
-    /// Cross-table hybrid recall: BM25 + vector + RRF fused inline
-    /// in DuckDB SQL. Returns `(record, rrf_score)` ordered by
-    /// `(rrf_score DESC, updated_at DESC, capability_capsule_id ASC)`.
-    /// See `DuckDbQuery::hybrid_candidates` for the full contract.
+    /// Cross-table hybrid recall: BM25 + vector + RRF. Returns
+    /// `(record, rrf_score)` ordered by `(rrf_score DESC, updated_at
+    /// DESC, capability_capsule_id ASC)`.
     ///
-    /// **LANCE-SPECIFIC** (kept as a LanceBackend optimization): the
-    /// implementation fuses `lance_fts(...)` and `lance_vector_search(...)`
-    /// in a single statement, which the QW-1 bench
-    /// (`examples/hybrid_compose_vs_fused_bench.rs`) measured at
-    /// **14–29% faster** than the equivalent Rust-compose form at
-    /// `k ∈ {10, 50, 100}` over N=500 capsules.
-    ///
-    /// **Portable equivalent**: [`Self::hybrid_candidates_compose`]
-    /// produces the same scores and orderings via
-    /// [`Self::bm25_candidate_ids`] + [`Self::ann_candidate_ids`] +
-    /// `pipeline::ranking::rrf_merge` + the existing
+    /// Routes to the backend-portable [`Self::hybrid_candidates_compose`]:
+    /// [`Self::bm25_candidate_ids`] (Tantivy) + [`Self::ann_candidate_ids`]
+    /// (lance ANN) + `pipeline::ranking::rrf_merge` +
     /// `fetch_capability_capsules_by_ids`. That's the path future
-    /// backends (Postgres, SQLite, in-memory) will compose; their
-    /// `hybrid_candidates` impl can either route to the portable
-    /// compose path or wire up a backend-specific fusion.
+    /// backends (Postgres, SQLite, in-memory) compose too; a backend
+    /// that can fuse BM25 + ANN in one query can override this with its
+    /// own fusion.
     pub async fn hybrid_candidates(
         &self,
         tenant: &str,
@@ -845,28 +635,8 @@ impl Store {
         query_embedding: &[f32],
         k: usize,
     ) -> Result<Vec<(CapabilityCapsuleRecord, f32)>, StorageError> {
-        match self.read_engine {
-            crate::config::ReadEngine::DuckDb => {
-                self.query
-                    .hybrid_candidates(tenant, query_text, query_embedding, k)
-                    .await
-            }
-            // Route-B: the fused-SQL fast path needs `lance_fts(...)` +
-            // `lance_vector_search(...)` (the DuckDB extension). On the lance
-            // engine we drop it for the portable compose
-            // (`hybrid_candidates_compose`: Tantivy BM25 + lance ANN + Rust
-            // RRF). Compose does NOT version-chain-dedup like the fused SQL —
-            // that dedup is redundant downstream (the `search_candidates`
-            // recall pool already excludes superseded rows), so the lance
-            // hybrid output matches `hybrid_compose.json`, not the fused
-            // `hybrid.json`. The QW-1 bench measured compose 14–29% slower
-            // than fused; that is the accepted route-B tradeoff.
-            // See docs/remove-duckdb-keep-lance.md §3.
-            crate::config::ReadEngine::Lance => {
-                self.hybrid_candidates_compose(tenant, query_text, query_embedding, k)
-                    .await
-            }
-        }
+        self.hybrid_candidates_compose(tenant, query_text, query_embedding, k)
+            .await
     }
 
     /// Backend-portable compose form of [`Self::hybrid_candidates`]:
@@ -966,27 +736,18 @@ impl Store {
         Ok(out)
     }
 
-    /// BM25 candidate ids. Routes on the `MEM_READ_ENGINE` switch: the
-    /// DuckDb arm goes through the lance `lance_fts(...)` table function
-    /// (LANCE-SPECIFIC, see `DuckDbQuery::bm25_candidate_ids`); the Lance
-    /// arm goes through the route-B Tantivy index (`LanceStore::bm25_candidate_ids`).
-    /// Backend-portable callers shouldn't reach for this directly — they
-    /// should use [`Self::hybrid_candidates`] which composes BM25 + ANN
-    /// behind a backend-agnostic shell.
+    /// BM25 candidate ids via the Tantivy index
+    /// (`LanceStore::bm25_candidate_ids`). Backend-portable callers
+    /// shouldn't reach for this directly — they should use
+    /// [`Self::hybrid_candidates`] which composes BM25 + ANN behind a
+    /// backend-agnostic shell.
     pub async fn bm25_candidate_ids(
         &self,
         tenant: &str,
         query_text: &str,
         k: usize,
     ) -> Result<Vec<(String, i64)>, StorageError> {
-        match self.read_engine {
-            crate::config::ReadEngine::DuckDb => {
-                self.query.bm25_candidate_ids(tenant, query_text, k).await
-            }
-            crate::config::ReadEngine::Lance => {
-                self.lance.bm25_candidate_ids(tenant, query_text, k).await
-            }
-        }
+        self.lance.bm25_candidate_ids(tenant, query_text, k).await
     }
 
     /// **LANCE-SPECIFIC** (see `DuckDbQuery::ann_candidate_ids`).
@@ -999,18 +760,9 @@ impl Store {
         query_embedding: &[f32],
         k: usize,
     ) -> Result<Vec<(String, i64)>, StorageError> {
-        match self.read_engine {
-            crate::config::ReadEngine::DuckDb => {
-                self.query
-                    .ann_candidate_ids(tenant, query_embedding, k)
-                    .await
-            }
-            crate::config::ReadEngine::Lance => {
-                self.lance
-                    .ann_candidate_ids(tenant, query_embedding, k)
-                    .await
-            }
-        }
+        self.lance
+            .ann_candidate_ids(tenant, query_embedding, k)
+            .await
     }
 }
 
@@ -1042,10 +794,7 @@ impl Store {
         &self,
         job_id: &str,
     ) -> Result<Option<String>, StorageError> {
-        match self.read_engine {
-            crate::config::ReadEngine::DuckDb => self.query.get_embedding_job_status(job_id).await,
-            crate::config::ReadEngine::Lance => self.lance.get_embedding_job_status(job_id).await,
-        }
+        self.lance.get_embedding_job_status(job_id).await
     }
 
     /// Same shape as [`Self::get_embedding_job_status`] for the
@@ -1054,14 +803,7 @@ impl Store {
         &self,
         job_id: &str,
     ) -> Result<Option<String>, StorageError> {
-        match self.read_engine {
-            crate::config::ReadEngine::DuckDb => {
-                self.query.get_transcript_embedding_job_status(job_id).await
-            }
-            crate::config::ReadEngine::Lance => {
-                self.lance.get_transcript_embedding_job_status(job_id).await
-            }
-        }
+        self.lance.get_transcript_embedding_job_status(job_id).await
     }
 
     /// Prune Lance version manifests older than `older_than_days`
@@ -1375,40 +1117,22 @@ impl Store {
         query_embedding: &[f32],
         limit: usize,
     ) -> Result<Vec<(ConversationMessage, f32)>, StorageError> {
-        match self.read_engine {
-            crate::config::ReadEngine::DuckDb => {
-                self.query
-                    .semantic_search_transcripts(tenant, query_embedding, limit)
-                    .await
-            }
-            crate::config::ReadEngine::Lance => {
-                self.lance
-                    .semantic_search_transcripts(tenant, query_embedding, limit)
-                    .await
-            }
-        }
+        self.lance
+            .semantic_search_transcripts(tenant, query_embedding, limit)
+            .await
     }
 }
 
-// ── Transcript reads (DuckDbQuery) ──────────────────────────────────
+// ── Transcript reads (LanceStore) ───────────────────────────────────
 impl Store {
     pub async fn get_conversation_messages_by_session(
         &self,
         tenant: &str,
         session_id: &str,
     ) -> Result<Vec<ConversationMessage>, StorageError> {
-        match self.read_engine {
-            crate::config::ReadEngine::DuckDb => {
-                self.query
-                    .get_conversation_messages_by_session(tenant, session_id)
-                    .await
-            }
-            crate::config::ReadEngine::Lance => {
-                self.lance
-                    .get_conversation_messages_by_session(tenant, session_id)
-                    .await
-            }
-        }
+        self.lance
+            .get_conversation_messages_by_session(tenant, session_id)
+            .await
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1423,32 +1147,18 @@ impl Store {
         cursor: Option<(&str, i64, i64)>,
         limit: usize,
     ) -> Result<(Vec<ConversationMessage>, bool), StorageError> {
-        match self.read_engine {
-            crate::config::ReadEngine::DuckDb => {
-                self.query
-                    .get_conversation_messages_by_session_paged(
-                        tenant, session_id, since, until, role, block_type, cursor, limit,
-                    )
-                    .await
-            }
-            crate::config::ReadEngine::Lance => {
-                self.lance
-                    .get_conversation_messages_by_session_paged(
-                        tenant, session_id, since, until, role, block_type, cursor, limit,
-                    )
-                    .await
-            }
-        }
+        self.lance
+            .get_conversation_messages_by_session_paged(
+                tenant, session_id, since, until, role, block_type, cursor, limit,
+            )
+            .await
     }
 
     pub async fn list_transcript_sessions(
         &self,
         tenant: &str,
     ) -> Result<Vec<TranscriptSessionSummary>, StorageError> {
-        match self.read_engine {
-            crate::config::ReadEngine::DuckDb => self.query.list_transcript_sessions(tenant).await,
-            crate::config::ReadEngine::Lance => self.lance.list_transcript_sessions(tenant).await,
-        }
+        self.lance.list_transcript_sessions(tenant).await
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1462,22 +1172,11 @@ impl Store {
         cursor: Option<(&str, i64, i64)>,
         limit: usize,
     ) -> Result<(Vec<ConversationMessage>, bool), StorageError> {
-        match self.read_engine {
-            crate::config::ReadEngine::DuckDb => {
-                self.query
-                    .list_conversation_messages_in_range(
-                        tenant, time_from, time_to, role, block_type, cursor, limit,
-                    )
-                    .await
-            }
-            crate::config::ReadEngine::Lance => {
-                self.lance
-                    .list_conversation_messages_in_range(
-                        tenant, time_from, time_to, role, block_type, cursor, limit,
-                    )
-                    .await
-            }
-        }
+        self.lance
+            .list_conversation_messages_in_range(
+                tenant, time_from, time_to, role, block_type, cursor, limit,
+            )
+            .await
     }
 
     pub async fn fetch_conversation_messages_by_ids(
@@ -1485,18 +1184,9 @@ impl Store {
         tenant: &str,
         ids: &[String],
     ) -> Result<Vec<ConversationMessage>, StorageError> {
-        match self.read_engine {
-            crate::config::ReadEngine::DuckDb => {
-                self.query
-                    .fetch_conversation_messages_by_ids(tenant, ids)
-                    .await
-            }
-            crate::config::ReadEngine::Lance => {
-                self.lance
-                    .fetch_conversation_messages_by_ids(tenant, ids)
-                    .await
-            }
-        }
+        self.lance
+            .fetch_conversation_messages_by_ids(tenant, ids)
+            .await
     }
 
     pub async fn context_window_for_block(
@@ -1507,30 +1197,9 @@ impl Store {
         k_after: usize,
         include_tool_blocks: bool,
     ) -> Result<ContextWindow, StorageError> {
-        match self.read_engine {
-            crate::config::ReadEngine::DuckDb => {
-                self.query
-                    .context_window_for_block(
-                        tenant,
-                        primary_id,
-                        k_before,
-                        k_after,
-                        include_tool_blocks,
-                    )
-                    .await
-            }
-            crate::config::ReadEngine::Lance => {
-                self.lance
-                    .context_window_for_block(
-                        tenant,
-                        primary_id,
-                        k_before,
-                        k_after,
-                        include_tool_blocks,
-                    )
-                    .await
-            }
-        }
+        self.lance
+            .context_window_for_block(tenant, primary_id, k_before, k_after, include_tool_blocks)
+            .await
     }
 
     pub async fn anchor_session_candidates(
@@ -1539,18 +1208,9 @@ impl Store {
         session_id: &str,
         k: usize,
     ) -> Result<Vec<String>, StorageError> {
-        match self.read_engine {
-            crate::config::ReadEngine::DuckDb => {
-                self.query
-                    .anchor_session_candidates(tenant, session_id, k)
-                    .await
-            }
-            crate::config::ReadEngine::Lance => {
-                self.lance
-                    .anchor_session_candidates(tenant, session_id, k)
-                    .await
-            }
-        }
+        self.lance
+            .anchor_session_candidates(tenant, session_id, k)
+            .await
     }
 
     pub async fn recent_conversation_messages(
@@ -1558,14 +1218,7 @@ impl Store {
         tenant: &str,
         limit: usize,
     ) -> Result<Vec<ConversationMessage>, StorageError> {
-        match self.read_engine {
-            crate::config::ReadEngine::DuckDb => {
-                self.query.recent_conversation_messages(tenant, limit).await
-            }
-            crate::config::ReadEngine::Lance => {
-                self.lance.recent_conversation_messages(tenant, limit).await
-            }
-        }
+        self.lance.recent_conversation_messages(tenant, limit).await
     }
 
     /// Route-B bucket "transcript_fts": BM25 lexical recall over
@@ -1583,28 +1236,16 @@ impl Store {
         query: &str,
         k: usize,
     ) -> Result<Vec<ConversationMessage>, StorageError> {
-        match self.read_engine {
-            crate::config::ReadEngine::DuckDb => {
-                self.query
-                    .bm25_transcript_candidates(tenant, query, k)
-                    .await
-            }
-            crate::config::ReadEngine::Lance => {
-                self.lance
-                    .bm25_transcript_candidates(tenant, query, k)
-                    .await
-            }
-        }
+        self.lance
+            .bm25_transcript_candidates(tenant, query, k)
+            .await
     }
 }
 
-// ── Graph (writes → LanceStore, reads → engine-routed by `read_engine`) ──
+// ── Graph (reads + writes → LanceStore) ─────────────────────────────
 impl Store {
     pub async fn neighbors(&self, node_id: &str) -> Result<Vec<GraphEdge>, GraphError> {
-        match self.read_engine {
-            crate::config::ReadEngine::DuckDb => self.query.neighbors(node_id).await,
-            crate::config::ReadEngine::Lance => self.lance.neighbors(node_id).await,
-        }
+        self.lance.neighbors(node_id).await
     }
 
     pub async fn neighbors_within(
@@ -1613,21 +1254,11 @@ impl Store {
         max_hops: u32,
         as_of: Option<&str>,
     ) -> Result<Vec<GraphEdge>, GraphError> {
-        match self.read_engine {
-            crate::config::ReadEngine::DuckDb => {
-                self.query.neighbors_within(node_id, max_hops, as_of).await
-            }
-            crate::config::ReadEngine::Lance => {
-                self.lance.neighbors_within(node_id, max_hops, as_of).await
-            }
-        }
+        self.lance.neighbors_within(node_id, max_hops, as_of).await
     }
 
     pub async fn kg_timeline(&self, node_id: &str) -> Result<Vec<GraphEdge>, GraphError> {
-        match self.read_engine {
-            crate::config::ReadEngine::DuckDb => self.query.kg_timeline(node_id).await,
-            crate::config::ReadEngine::Lance => self.lance.kg_timeline(node_id).await,
-        }
+        self.lance.kg_timeline(node_id).await
     }
 
     pub async fn query_predicate(
@@ -1635,17 +1266,11 @@ impl Store {
         predicate: &str,
         as_of: Option<&str>,
     ) -> Result<Vec<GraphEdge>, GraphError> {
-        match self.read_engine {
-            crate::config::ReadEngine::DuckDb => self.query.query_predicate(predicate, as_of).await,
-            crate::config::ReadEngine::Lance => self.lance.query_predicate(predicate, as_of).await,
-        }
+        self.lance.query_predicate(predicate, as_of).await
     }
 
     pub async fn list_user_tunnels(&self, limit: usize) -> Result<Vec<GraphEdge>, GraphError> {
-        match self.read_engine {
-            crate::config::ReadEngine::DuckDb => self.query.list_user_tunnels(limit).await,
-            crate::config::ReadEngine::Lance => self.lance.list_user_tunnels(limit).await,
-        }
+        self.lance.list_user_tunnels(limit).await
     }
 
     pub async fn find_tunnels(
@@ -1654,14 +1279,7 @@ impl Store {
         prefix_b: &str,
         limit: usize,
     ) -> Result<Vec<GraphEdge>, GraphError> {
-        match self.read_engine {
-            crate::config::ReadEngine::DuckDb => {
-                self.query.find_tunnels(prefix_a, prefix_b, limit).await
-            }
-            crate::config::ReadEngine::Lance => {
-                self.lance.find_tunnels(prefix_a, prefix_b, limit).await
-            }
-        }
+        self.lance.find_tunnels(prefix_a, prefix_b, limit).await
     }
 
     pub async fn follow_tunnels(
@@ -1669,45 +1287,27 @@ impl Store {
         node_id: &str,
         max_hops: u32,
     ) -> Result<Vec<GraphEdge>, GraphError> {
-        match self.read_engine {
-            crate::config::ReadEngine::DuckDb => self.query.follow_tunnels(node_id, max_hops).await,
-            crate::config::ReadEngine::Lance => self.lance.follow_tunnels(node_id, max_hops).await,
-        }
+        self.lance.follow_tunnels(node_id, max_hops).await
     }
 
     pub async fn graph_stats(
         &self,
     ) -> Result<crate::domain::capability_capsule::GraphStats, GraphError> {
-        match self.read_engine {
-            crate::config::ReadEngine::DuckDb => self.query.graph_stats().await,
-            crate::config::ReadEngine::Lance => self.lance.graph_stats().await,
-        }
+        self.lance.graph_stats().await
     }
 
     pub async fn related_capability_capsule_ids(
         &self,
         node_ids: &[String],
     ) -> Result<Vec<String>, GraphError> {
-        match self.read_engine {
-            crate::config::ReadEngine::DuckDb => {
-                self.query.related_capability_capsule_ids(node_ids).await
-            }
-            crate::config::ReadEngine::Lance => {
-                self.lance.related_capability_capsule_ids(node_ids).await
-            }
-        }
+        self.lance.related_capability_capsule_ids(node_ids).await
     }
 
     pub async fn incident_edges_for_nodes(
         &self,
         node_ids: &[String],
     ) -> Result<Vec<(String, String)>, GraphError> {
-        match self.read_engine {
-            crate::config::ReadEngine::DuckDb => {
-                self.query.incident_edges_for_nodes(node_ids).await
-            }
-            crate::config::ReadEngine::Lance => self.lance.incident_edges_for_nodes(node_ids).await,
-        }
+        self.lance.incident_edges_for_nodes(node_ids).await
     }
 
     pub async fn sync_memory_edges(
@@ -1715,10 +1315,7 @@ impl Store {
         edges: &[GraphEdge],
         now: &str,
     ) -> Result<(), GraphError> {
-        let result = self.lance.sync_memory_edges(edges, now).await;
-        // D2: defer refresh — flip dirty flag, let next read pay it.
-        self.query.mark_dirty();
-        result
+        self.lance.sync_memory_edges(edges, now).await
     }
 
     /// Caller-supplied direct edge write. Goes through the same Lance
@@ -1726,9 +1323,7 @@ impl Store {
     /// `valid_from` / `valid_to` verbatim (no server-side `now`
     /// override). Idempotent on active `(from, to, relation)`.
     pub async fn add_edge_direct(&self, edge: &GraphEdge) -> Result<bool, GraphError> {
-        let result = self.lance.add_edge_direct(edge).await;
-        self.query.mark_dirty();
-        result
+        self.lance.add_edge_direct(edge).await
     }
 
     /// K9: apply one Hebbian potentiation to the active
@@ -1744,24 +1339,15 @@ impl Store {
         relation: &str,
         now: &str,
     ) -> Result<bool, GraphError> {
-        let active = match self.read_engine {
-            crate::config::ReadEngine::DuckDb => {
-                self.query
-                    .get_active_edge(from_node_id, to_node_id, relation)
-                    .await?
-            }
-            crate::config::ReadEngine::Lance => {
-                self.lance
-                    .get_active_edge(from_node_id, to_node_id, relation)
-                    .await?
-            }
-        };
+        let active = self
+            .lance
+            .get_active_edge(from_node_id, to_node_id, relation)
+            .await?;
         let Some(mut edge) = active else {
             return Ok(false);
         };
         crate::domain::edge_dynamics::potentiate(&mut edge, now);
         let written = self.lance.update_edge_dynamics(&edge).await?;
-        self.query.mark_dirty();
         Ok(written)
     }
 
@@ -1775,28 +1361,22 @@ impl Store {
         to_node_id: &str,
         ended_at: &str,
     ) -> Result<usize, GraphError> {
-        let result = self
-            .lance
+        self.lance
             .invalidate_edge(from_node_id, predicate, to_node_id, ended_at)
-            .await;
-        self.query.mark_dirty();
-        result
+            .await
     }
 
     pub async fn close_edges_for_capability_capsule(
         &self,
         capability_capsule_id: &str,
     ) -> Result<usize, GraphError> {
-        let result = self
-            .lance
+        self.lance
             .close_edges_for_capability_capsule(capability_capsule_id)
-            .await;
-        self.query.mark_dirty();
-        result
+            .await
     }
 }
 
-// ── EntityRegistry (writes → LanceStore + refresh, reads → query) ───
+// ── EntityRegistry (reads + writes → LanceStore) ────────────────────
 impl Store {
     pub async fn resolve_or_create(
         &self,
@@ -1825,10 +1405,7 @@ impl Store {
         tenant: &str,
         entity_id: &str,
     ) -> Result<Option<EntityWithAliases>, StorageError> {
-        match self.read_engine {
-            crate::config::ReadEngine::DuckDb => self.query.get_entity(tenant, entity_id).await,
-            crate::config::ReadEngine::Lance => self.lance.get_entity(tenant, entity_id).await,
-        }
+        self.lance.get_entity(tenant, entity_id).await
     }
 
     pub async fn lookup_alias(
@@ -1836,10 +1413,7 @@ impl Store {
         tenant: &str,
         alias: &str,
     ) -> Result<Option<String>, StorageError> {
-        match self.read_engine {
-            crate::config::ReadEngine::DuckDb => self.query.lookup_alias(tenant, alias).await,
-            crate::config::ReadEngine::Lance => self.lance.lookup_alias(tenant, alias).await,
-        }
+        self.lance.lookup_alias(tenant, alias).await
     }
 
     pub async fn list_entities(
@@ -1849,18 +1423,9 @@ impl Store {
         query: Option<&str>,
         limit: usize,
     ) -> Result<Vec<Entity>, StorageError> {
-        match self.read_engine {
-            crate::config::ReadEngine::DuckDb => {
-                self.query
-                    .list_entities(tenant, kind_filter, query, limit)
-                    .await
-            }
-            crate::config::ReadEngine::Lance => {
-                self.lance
-                    .list_entities(tenant, kind_filter, query, limit)
-                    .await
-            }
-        }
+        self.lance
+            .list_entities(tenant, kind_filter, query, limit)
+            .await
     }
 }
 
@@ -1907,13 +1472,10 @@ mod tests {
         }
     }
 
-    /// Cross-stack round-trip: writes via the lance half are
-    /// immediately visible to reads via the duckdb-query half,
-    /// because every `Store` write triggers a `DuckDbQuery::refresh`
-    /// (rebuild of the in-process DuckDB connection). Without that
-    /// refresh the lance extension's snapshot cache would hide
-    /// post-attach lance writes — see [`Store::commit_lance_write`]
-    /// for the gory details.
+    /// Round-trip: writes through `LanceStore` are immediately visible
+    /// to subsequent reads — the lance read connection is opened with
+    /// `read_consistency_interval(0)`, so a read always sees the latest
+    /// committed version without any refresh ceremony.
     #[tokio::test(flavor = "multi_thread")]
     async fn store_open_write_read_round_trip() {
         let dir = tempdir().unwrap();
@@ -2055,11 +1617,9 @@ mod tests {
             .await
             .unwrap();
 
-        // The bulk UPDATE goes through DuckDbQuery's SQL path, which
-        // doesn't trigger the lance write→refresh dance (DuckDB-side
-        // writes invalidate the cache automatically). But subsequent
-        // reads through Store still go through DuckDbQuery, so they
-        // see the new state.
+        // The bulk decay UPDATE goes through the LanceStore Rust API;
+        // subsequent reads through Store see the new state natively
+        // (read_consistency_interval(0)).
         let active_after = store
             .get_capability_capsule_for_tenant("tenant-a", "m_decay")
             .await

@@ -1,7 +1,6 @@
 use std::sync::Arc;
 
 use mem::{
-    config::ReadEngine,
     domain::{
         capability_capsule::{
             CapabilityCapsuleType, IngestCapabilityCapsuleRequest, Scope, Visibility, WriteMode,
@@ -165,22 +164,16 @@ async fn unrelated_query_returns_empty_sections() {
     );
 }
 
-/// Residual #2 (route-B): on the Lance read engine, `bm25_candidate_ids` must
-/// return hits even when the vacuum worker NEVER ran `rebuild_query_indexes`
-/// (e.g. `MEM_VACUUM_DISABLED=1`). The Tantivy index is built lazily on first
-/// query via the `fts_built` latch — this test documents/guards that the
-/// lazy-build safety net keeps the route-B FTS bucket working standalone,
-/// which is what makes the lance-engine FTS gate (skipping the eager rebuild
-/// in DuckDb-default production) safe.
+/// `bm25_candidate_ids` must return hits even when the vacuum worker NEVER
+/// ran `rebuild_query_indexes` (e.g. `MEM_VACUUM_DISABLED=1`). The Tantivy
+/// index is built lazily on first query via the `fts_built` latch — this
+/// test documents/guards that the lazy-build safety net keeps the FTS bucket
+/// working standalone.
 #[tokio::test]
 async fn bm25_lazy_builds_on_lance_engine_without_rebuild() {
     let dir = tempdir().unwrap();
     let db = dir.path().join("bm25_lazy.lance");
-    let repo = Arc::new(
-        Store::open_with_read_engine(&db, ReadEngine::Lance)
-            .await
-            .unwrap(),
-    );
+    let repo = Arc::new(Store::open(&db).await.unwrap());
     let svc = CapabilityCapsuleService::with_providers(repo.clone(), "fake".into(), None);
 
     let target = svc

@@ -23,17 +23,16 @@ sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio",
 # `pgvector::Vector` implements sqlx Encode/Decode for the PG `vector`
 # type. Only pulled in under the `postgres` feature.
 pgvector = { version = "0.4", default-features = false, features = ["sqlx"], optional = true }
-# LanceDB is the storage backend (on-disk Lance datasets) and DuckDB
-# is the SQL query engine on top via the `lance` core extension. Both
-# are unconditional dependencies — there's only one storage path now.
+# LanceDB is the storage backend (on-disk Lance datasets) for both
+# reads and writes — reads go through the lancedb Rust API natively
+# (read_consistency_interval(0)). Single, unconditional storage path.
 lancedb = "0.30"
 # arrow-array must track lancedb's transitive arrow major — lancedb 0.30
-# (and duckdb 1.x's bundled arrow) are both on 58.x, so our direct dep
-# has to be 58 too. Otherwise cargo keeps a second `arrow-array` 57.x in
-# the graph for our dep, leaving two distinct `RecordBatch` types that
-# fail to typecheck across the duckdb → `Table::add` boundary. (lancedb
-# re-exports `arrow_schema` via `lancedb::arrow::arrow_schema`, so we
-# don't need a direct dep on that.)
+# is on 58.x, so our direct dep has to be 58 too. Otherwise cargo keeps
+# a second `arrow-array` 57.x in the graph for our dep, leaving two
+# distinct `RecordBatch` types that fail to typecheck across the
+# `Table::add` boundary. (lancedb re-exports `arrow_schema` via
+# `lancedb::arrow::arrow_schema`, so we don't need a direct dep on that.)
 arrow-array = "58"
 # `futures::TryStreamExt::try_collect` collapses LanceDB's
 # `SendableRecordBatchStream` into a `Vec<RecordBatch>`. lancedb
@@ -44,12 +43,6 @@ anyhow = "1"
 async-trait = "0.1"
 axum = "0.8"
 clap = { version = "4", features = ["derive", "env"] }
-# duckdb is the SQL query engine: in-process Connection with the
-# `lance` core extension loaded, ATTACHing the on-disk lance datasets
-# under namespace `ns`. No DuckDB tables of our own; all storage is in
-# Lance. The `bundled` feature compiles the duckdb library statically
-# so we don't need a system-wide install.
-duckdb = { version = "1", features = ["bundled"] }
 rmcp = { version = "1.5", features = ["server", "macros", "transport-io"] }
 schemars = "1.2"
 embed_anything = { git = "https://github.com/StarlightSearch/EmbedAnything" }
@@ -81,12 +74,11 @@ fs4 = "0.8"
 # the OS even capped with MALLOC_ARENA_MAX. jemalloc's decay + background_thread
 # return idle memory aggressively (local A/B: ~94% returned on idle). Governs
 # all Rust-side allocs (embedding inference via Candle/gemm is the dominant
-# churn); DuckDB's bundled-C allocs still hit the system allocator and are
-# capped separately via MALLOC_ARENA_MAX.
+# churn).
 tikv-jemallocator = "0.6"
 tikv-jemalloc-ctl = "0.6"
-# Tantivy is the route-B full-text (BM25) subsystem replacing the
-# DuckDB `lance_fts` path (see `docs/remove-duckdb-keep-lance.md` §4).
+# Tantivy is the route-B full-text (BM25) subsystem (replaced the old
+# DuckDB `lance_fts` path; see `docs/remove-duckdb-keep-lance.md` §4).
 # A pure-Rust embedded inverted index — no external service, fits the
 # local-first single-binary constraint. `tantivy-jieba` is the Chinese
 # segmenter (jieba precision mode) registered on the `content` field;
@@ -100,17 +92,3 @@ jieba-rs = "0.9"
 
 [dev-dependencies]
 rand = "0.10"
-
-# PoC: probe the Lance DuckDB extension's row-level DML capabilities
-# and Rust-write→DuckDB-read visibility model. Run with:
-#   cargo run --example lance_duckdb_poc
-# Requires network at first run (community extension download).
-[[example]]
-name = "lance_duckdb_poc"
-
-# PoC: cross-table hybrid search (lance_fts + lance_vector_search joined
-# on capability_capsule_id, with RRF computed in DuckDB SQL). Validates
-# the no-schema-change route to native hybrid retrieval. Run with:
-#   cargo run --example hybrid_sql_poc
-[[example]]
-name = "hybrid_sql_poc"

@@ -1,31 +1,27 @@
 //! Storage layer.
 //!
-//! The whole layer is LanceDB on disk + DuckDB as a SQL query
-//! engine on top via the lance core extension. Single backend; no
-//! traits, no abstraction.
+//! The whole layer is LanceDB on disk, read and written through the
+//! lancedb Rust API. Single backend; no traits, no abstraction.
 //!
 //! Layout:
 //!
-//! - `lance_store::LanceStore` — write half. Holds the
-//!   `lancedb::Connection`. Inherent methods cover memory CRUD,
-//!   embedding-job queues (memory + transcript), graph edges,
-//!   entity registry, transcripts.
-//! - `duckdb_query::DuckDbQuery` — read half. Holds an in-process
-//!   `duckdb::Connection` with `INSTALL lance; LOAD lance;` +
-//!   `ATTACH '<path>' AS ns`. Inherent methods cover all SELECT-
-//!   shaped reads plus bulk SQL writes (decay sweep).
-//! - `store::Store` — composes the two halves. The handle every
-//!   service / worker / HTTP layer carries.
+//! - `lance_store::LanceStore` — the storage half. Holds the
+//!   `lancedb::Connection` (opened with `read_consistency_interval(0)`
+//!   so reads see writes natively). Inherent methods cover memory CRUD,
+//!   embedding-job queues (memory + transcript), graph edges, entity
+//!   registry, transcripts, and all reads.
+//! - `store::Store` — composes `LanceStore` with the open-lock and
+//!   exposes the method surface every service / worker / HTTP layer
+//!   carries.
 //! - `types` — shared row payloads + `StorageError` + `GraphError`.
 
 pub mod backend;
 pub mod capsule_search_store;
 pub mod capsule_store;
-// The two storage halves are implementation detail. External
-// callers go through `Backend` (umbrella) or one of the 9
-// sub-traits — never the concrete halves. `pub(crate)` blocks
-// cross-crate access; intra-storage modules still see them.
-pub(crate) mod duckdb_query;
+// The storage half (`LanceStore`) is an implementation detail. External
+// callers go through `Backend` (umbrella) or one of the 9 sub-traits —
+// never the concrete type. `pub(crate)` blocks cross-crate access;
+// intra-storage modules still see it.
 pub mod embedding_job_store;
 pub mod embedding_vector_store;
 pub mod entity_registry;

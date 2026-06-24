@@ -1,7 +1,8 @@
-//! D2 — deferred-refresh test. Verifies that writes mark the
-//! DuckDbQuery dirty but don't refresh eagerly; subsequent reads
-//! still observe the write. The contract isn't "no refresh ever" —
-//! it's "reads after writes always see the write," same as before.
+//! Write→read visibility test. Verifies that reads after writes always
+//! observe the write — the contract the storage layer must uphold. The
+//! DuckDB read engine (and its deferred-refresh machinery) is gone;
+//! the lance read connection uses `read_consistency_interval(0)`, so
+//! these guarantees now hold natively. Kept as a regression guard.
 
 use std::sync::Arc;
 

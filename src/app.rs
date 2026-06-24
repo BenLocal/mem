@@ -67,8 +67,8 @@ impl AppState {
             tokio::sync::mpsc::UnboundedSender<crate::worker::last_used_worker::CapsuleUsed>,
         ) = match config.backend {
             crate::config::BackendKind::Lance => {
-                // LanceStore creates the schema + FTS indexes; DuckDbQuery
-                // ATTACHes the lance dir. We hold a concrete `Arc<Store>`
+                // LanceStore creates the schema + FTS indexes and serves
+                // both reads and writes. We hold a concrete `Arc<Store>`
                 // here so we can call `set_transcript_job_provider`
                 // (Lance-only configuration — not on any sub-trait) and
                 // spawn the two Store-glue workers, then upcast to

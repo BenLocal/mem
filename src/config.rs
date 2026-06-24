@@ -422,31 +422,6 @@ pub fn parse_backend(
     Ok((kind, url))
 }
 
-/// Read-engine selector (`MEM_READ_ENGINE`) for the route-B migration
-/// (`docs/remove-duckdb-keep-lance.md`). `Lance` = native lancedb Rust reads
-/// (the **default** since Phase 3 — all 11 read buckets are lance-native and
-/// parity-green); `DuckDb` = the legacy lance-attached in-process SQL read
-/// engine (still selectable until the Phase-3 deletion commit lands). Per-
-/// bucket parity against the DuckDb golden is gated by `tests/parity_golden.rs`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum ReadEngine {
-    #[default]
-    Lance,
-    DuckDb,
-}
-
-/// Parse `MEM_READ_ENGINE` (`lance` default | `duckdb`). Unknown / empty
-/// value silently falls back to `Lance` — a typo must never break reads;
-/// the safe default is now the lance-native engine (proven parity-green in
-/// Phase 1). Set `MEM_READ_ENGINE=duckdb` to opt back into the legacy engine
-/// until it is deleted.
-pub fn parse_read_engine(get: impl Fn(&str) -> Option<String>) -> ReadEngine {
-    match get("MEM_READ_ENGINE").map(|s| s.trim().to_ascii_lowercase()) {
-        Some(s) if s == "duckdb" => ReadEngine::DuckDb,
-        _ => ReadEngine::Lance,
-    }
-}
-
 #[derive(Debug, Error)]
 pub enum ConfigError {
     #[error("invalid EMBEDDING_PROVIDER: {0} (expected fake, openai, or embedanything)")]
@@ -533,13 +508,9 @@ impl EmbeddingSettings {
             worker_poll_interval_ms: 10_000,
             // Failure attempts allowed before permanent `failed` (initial pending try + retries).
             max_retries: 4,
-            // **Default 8** (was 1 pre-2026-05-21). Each `embedding_worker`
-            // tick triggers one `DuckDbQuery::refresh()` regardless of how
-            // many jobs were processed — that's ~100ms of `INSTALL lance;
-            // LOAD lance; ATTACH` per tick (see `duckdb_query::refresh` doc).
-            // Going from 1 → 8 cuts refresh frequency 8x for backlog drain,
+            // **Default 8** (was 1 pre-2026-05-21). Going from 1 → 8
             // amortizes EmbedAnything's CPU inference cost (the local Qwen3
-            // model dominates per-batch latency once the batch is non-trivial),
+            // model dominates per-batch latency once the batch is non-trivial)
             // and turns one HTTP call into N for OpenAI. Set
             // `EMBEDDING_BATCH_SIZE=1` to restore the per-job behavior if
             // a downstream cares about per-job ordering / failure isolation.
@@ -1361,7 +1332,7 @@ mod tests {
         // defaults verbatim. Update both sides together when those defaults
         // change (last touched: `47aff1e` flipped to EmbedAnything;
         // 2026-05-21 flipped `batch_size` 1 → 8 to amortize the per-tick
-        // `DuckDbQuery::refresh()` cost — see config doc-comment).
+        // refresh cost — see config doc-comment).
         let s = EmbeddingSettings::from_env_vars(|_| None).unwrap();
         assert_eq!(s.provider, EmbeddingProviderKind::EmbedAnything);
         assert_eq!(s.model, "Qwen/Qwen3-Embedding-0.6B");

@@ -1,7 +1,5 @@
 //! Shared storage data types — row payloads, error types, summaries.
-//! Previously lived under `storage/duckdb/{mod,graph_store,transcript_repo}.rs`
-//! when that module was the storage layer; now centralised here so
-//! `LanceStore` / `DuckDbQuery` / `Store` share a single home.
+//! Centralised here so `LanceStore` / `Store` share a single home.
 
 use serde::Serialize;
 use thiserror::Error;
@@ -86,14 +84,10 @@ pub struct ContextWindow {
 /// data-validation flavors plus a `NotFound(&'static str)` for
 /// internal-consistency lookup misses.
 ///
-/// `DuckDb` variant carries SQL errors surfaced from the
-/// `DuckDbQuery` read layer (mostly row-decode mismatches at the
-/// `lance` extension boundary). Lance-side errors flow through
-/// `InvalidInput(String)` via `lancedb_err`.
+/// Lance-side errors flow through `InvalidInput(String)` via
+/// `lancedb_err`.
 #[derive(Debug, Error)]
 pub enum StorageError {
-    #[error("duckdb error: {0}")]
-    DuckDb(#[from] duckdb::Error),
     #[error("io error: {0}")]
     Io(#[from] std::io::Error),
     #[error("serialization error: {0}")]
@@ -125,12 +119,6 @@ pub enum GraphError {
 
 impl From<StorageError> for GraphError {
     fn from(e: StorageError) -> Self {
-        GraphError::Backend(e.to_string())
-    }
-}
-
-impl From<duckdb::Error> for GraphError {
-    fn from(e: duckdb::Error) -> Self {
         GraphError::Backend(e.to_string())
     }
 }

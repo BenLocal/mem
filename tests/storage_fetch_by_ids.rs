@@ -1,6 +1,5 @@
 use std::sync::Arc;
 
-use mem::config::ReadEngine;
 use mem::domain::capability_capsule::{
     CapabilityCapsuleType, IngestCapabilityCapsuleRequest, Scope, Visibility, WriteMode,
 };
@@ -82,20 +81,15 @@ fn tmsg(id: &str, tenant: &str, line: u64, content: &str, stamp: &str) -> Conver
     }
 }
 
-/// Residual #1 (route-B): both fetch-by-ids buckets must work on the
-/// **Lance** read engine — the compose hydration path no longer touches
-/// DuckDB. Seeds a couple of capsules + transcript messages, opens the store
-/// with `ReadEngine::Lance`, and asserts both fetch-by-ids methods return the
+/// Both fetch-by-ids buckets must work on the lance-native read path —
+/// the compose hydration path is pure lance. Seeds a couple of capsules +
+/// transcript messages and asserts both fetch-by-ids methods return the
 /// right records (correct set + order + tenant isolation).
 #[tokio::test]
 async fn fetch_by_ids_lance_engine_capsules_and_transcripts() {
     let dir = tempdir().unwrap();
     let db = dir.path().join("fetch_lance.lance");
-    let store = Arc::new(
-        Store::open_with_read_engine(&db, ReadEngine::Lance)
-            .await
-            .unwrap(),
-    );
+    let store = Arc::new(Store::open(&db).await.unwrap());
     store.set_transcript_job_provider("fake-test");
     let svc = CapabilityCapsuleService::new(store.clone());
 

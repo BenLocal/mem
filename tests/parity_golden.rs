@@ -1,32 +1,27 @@
-//! Parity golden scaffold for the "remove DuckDB, keep Lance" plan
-//! (`docs/remove-duckdb-keep-lance.md` §5 Phase 0 / §7).
+//! Parity goldens for the "remove DuckDB, keep Lance" migration
+//! (`docs/remove-duckdb-keep-lance.md` §5).
 //!
-//! Captures the CURRENT DuckDB read engine's output, on a fixed
-//! deterministic fixture, across every capability bucket the lance-native
-//! read engine will have to replace:
+//! The `tests/golden/*.json` files are now **FROZEN ground-truth
+//! fixtures** — they were originally captured from the (since-deleted)
+//! DuckDB read engine, across every capability bucket the lance-native
+//! read engine had to replace:
 //!
-//!   filter · ann · fts · hybrid (fused + compose) · stats · taxonomy ·
-//!   graph · transcript (fts + ann) · version-chain.
+//!   filter · ann · fts · hybrid · stats · taxonomy · graph ·
+//!   transcript (fts + ann) · version-chain.
 //!
-//! These goldens are the baseline for the per-bucket parity diff in
-//! Phase 1: once a bucket is reimplemented on lancedb-native + Tantivy,
-//! its output is diffed against the same golden (see §7).
-//!
-//! REPEATABLE / REFRESHABLE:
-//!   - `cargo test --test parity_golden`                 → verifies current
-//!     DuckDB output still matches the committed `tests/golden/*.json`
-//!     (a determinism guard on the fixture + queries + serialization).
-//!   - `REFRESH_GOLDEN=1 cargo test --test parity_golden` → regenerates the
-//!     golden files from the current engine.
+//! `lance_parity_matches_golden` seeds the deterministic fixture, reads
+//! each bucket through the lance-native path, and asserts it matches the
+//! frozen golden (byte-match for exact buckets; soft overlap for the
+//! different-BM25-engine buckets — Tantivy is not byte-compatible with
+//! DuckDB's `lance_fts`). The goldens are never regenerated here.
 //!
 //! Determinism rules: fixed ids / timestamps / content-hashes; deterministic
 //! embeddings (`deterministic_embedding`); floats captured as rounded
 //! integers; non-semantic orderings sorted, semantic (ranking) orderings
-//! preserved (the DuckDB queries break ties by id, so ranking order is
-//! itself deterministic).
+//! preserved (ties broken by id, so ranking order is deterministic).
 //!
-//! NON-DESTRUCTIVE: this only READS through the existing engine + seeds a
-//! throwaway tempdir store. It does not touch any production read path.
+//! NON-DESTRUCTIVE: this only READS + seeds a throwaway tempdir store. It
+//! does not touch any production read path.
 
 use std::fs;
 use std::path::PathBuf;
@@ -430,40 +425,20 @@ async fn seed(repo: &Store) {
     repo.rebuild_query_indexes().await.unwrap();
 }
 
-/// Verify-or-refresh one bucket's golden under `tests/golden/<name>.json`.
-fn check_or_write(name: &str, value: serde_json::Value) {
-    let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/golden");
-    let path = dir.join(format!("{name}.json"));
-    let mut actual = serde_json::to_string_pretty(&value).unwrap();
-    actual.push('\n');
-    if std::env::var("REFRESH_GOLDEN").as_deref() == Ok("1") {
-        fs::create_dir_all(&dir).unwrap();
-        fs::write(&path, &actual).unwrap();
-    } else {
-        let expected = fs::read_to_string(&path).unwrap_or_else(|_| {
-            panic!("golden {name}.json missing — run `REFRESH_GOLDEN=1 cargo test --test parity_golden`")
-        });
-        assert_eq!(
-            actual, expected,
-            "parity golden drift for `{name}` (run REFRESH_GOLDEN=1 to refresh)"
-        );
-    }
-}
-
-/// Phase-1 parity assertion: a MIGRATED bucket's lance-engine output must
-/// byte-match the committed DuckDB golden (never writes — the DuckDB side
-/// owns the golden via `check_or_write`).
+/// Parity assertion: a bucket's lance-native output must byte-match the
+/// FROZEN committed golden under `tests/golden/<name>.json`. Read-only —
+/// the goldens are ground-truth fixtures and are never regenerated here.
 fn assert_golden(name: &str, value: serde_json::Value) {
     let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("tests/golden")
         .join(format!("{name}.json"));
     let mut actual = serde_json::to_string_pretty(&value).unwrap();
     actual.push('\n');
-    let expected = fs::read_to_string(&path)
-        .unwrap_or_else(|_| panic!("golden {name}.json missing — generate it via the DuckDB test"));
+    let expected =
+        fs::read_to_string(&path).unwrap_or_else(|_| panic!("frozen golden {name}.json missing"));
     assert_eq!(
         actual, expected,
-        "lance-engine parity drift for `{name}` vs DuckDB golden"
+        "lance-native parity drift for `{name}` vs frozen golden"
     );
 }
 
@@ -607,570 +582,18 @@ fn ranked(pairs: Vec<(String, i64)>) -> serde_json::Value {
         .collect::<Vec<_>>())
 }
 
-/// `Vec<(record, score_f32)>` → `[[id, round(score*1e6)], …]` in engine order.
-fn scored(pairs: Vec<(CapabilityCapsuleRecord, f32)>) -> serde_json::Value {
-    json!(pairs
-        .into_iter()
-        .map(|(rec, s)| json!([rec.capability_capsule_id, (s * 1_000_000.0).round() as i64]))
-        .collect::<Vec<_>>())
-}
-
-#[tokio::test]
-async fn duckdb_parity_golden() {
-    let dir = tempdir().unwrap();
-    let db = dir.path().join("parity.duckdb");
-    // The default read engine is now `Lance` (route-B Phase 3), so pin the
-    // DuckDb engine explicitly here — this test GENERATES / verifies the
-    // goldens from the DuckDb side (the `check_or_write` exact-match owner),
-    // which must keep exercising DuckDb until the engine is deleted.
-    let repo = Arc::new(
-        Store::open_with_read_engine(&db, mem::config::ReadEngine::DuckDb)
-            .await
-            .unwrap(),
-    );
-    seed(&repo).await;
-
-    let q_text = "decay formula";
-    let q_vec = deterministic_embedding("new decay formula anchors on last_used_at", DIM);
-
-    // ── filter ──
-    let listed = repo
-        .list_capability_capsules_for_tenant("t1")
-        .await
-        .unwrap();
-    check_or_write(
-        "filter",
-        sorted_ids(listed.into_iter().map(|c| c.capability_capsule_id)),
-    );
-
-    // ── batch-A: list_wings ── (distinct projects, alpha order; set-stable)
-    let wings = repo.list_wings("t1").await.unwrap();
-    check_or_write("list_wings", sorted_ids(wings));
-
-    // ── batch-A: get_pending ── (the one PendingConfirmation row, + a miss)
-    let pending = repo.get_pending("t1", "cap_e_pending").await.unwrap();
-    let pending_miss = repo.get_pending("t1", "cap_a").await.unwrap();
-    check_or_write(
-        "get_pending",
-        json!({
-            "hit": pending.map(|c| c.capability_capsule_id),
-            "miss_active": pending_miss.map(|c| c.capability_capsule_id),
-        }),
-    );
-
-    // ── batch-A: list_pending_review ── (created_at DESC; ordered ids)
-    let pending_review = repo.list_pending_review("t1").await.unwrap();
-    check_or_write(
-        "list_pending_review",
-        json!(pending_review
-            .into_iter()
-            .map(|c| c.capability_capsule_id)
-            .collect::<Vec<_>>()),
-    );
-
-    // ── batch-A: recent_active ── (updated_at DESC, version DESC, id ASC;
-    //    excludes rejected/archived + diary; ORDER is load-bearing → ordered)
-    let recent = repo
-        .recent_active_capability_capsules("t1", 10)
-        .await
-        .unwrap();
-    check_or_write(
-        "recent_active",
-        json!(recent
-            .into_iter()
-            .map(|c| c.capability_capsule_id)
-            .collect::<Vec<_>>()),
-    );
-
-    // ── batch-A: list_ids ── (updated_at DESC; ALL statuses; ordered ids)
-    let ids = repo
-        .list_capability_capsule_ids_for_tenant("t1")
-        .await
-        .unwrap();
-    check_or_write("list_ids", json!(ids));
-
-    // ── batch-A: list_in_scope ── (project=mem, repo=mem; limit=3 forces a
-    //    has_more=true page; ORDER updated_at DESC, id ASC is load-bearing)
-    let (scope_p1, scope_more) = repo
-        .list_capability_capsules_in_scope(
-            "t1",
-            Some("mem"),
-            Some("mem"),
-            None,
-            None,
-            None,
-            None,
-            None,
-            3,
-        )
-        .await
-        .unwrap();
-    check_or_write(
-        "list_in_scope",
-        json!({
-            "page1_ids": scope_p1
-                .into_iter()
-                .map(|c| c.capability_capsule_id)
-                .collect::<Vec<_>>(),
-            "has_more": scope_more,
-        }),
-    );
-
-    // ── final-batch: find_by_idempotency_or_hash ── (key-match wins over a
-    //    hash collision; hash-only match; total miss → None)
-    let idem_by_key = repo
-        .find_by_idempotency_or_hash("t1", &Some("idem-key-1".into()), "no-such-hash")
-        .await
-        .unwrap();
-    let idem_by_hash = repo
-        .find_by_idempotency_or_hash("t1", &None, "hash-cap_a")
-        .await
-        .unwrap();
-    let idem_miss = repo
-        .find_by_idempotency_or_hash("t1", &Some("nope".into()), "nope-hash")
-        .await
-        .unwrap();
-    check_or_write(
-        "find_by_idempotency_or_hash",
-        json!({
-            "by_key": idem_by_key.map(|c| c.capability_capsule_id),
-            "by_hash": idem_by_hash.map(|c| c.capability_capsule_id),
-            "miss": idem_miss.map(|c| c.capability_capsule_id),
-        }),
-    );
-
-    // ── final-batch: get_capability_capsule_for_tenant ── (hit + miss)
-    let cap_hit = repo
-        .get_capability_capsule_for_tenant("t1", "cap_a")
-        .await
-        .unwrap();
-    let cap_miss = repo
-        .get_capability_capsule_for_tenant("t1", "does-not-exist")
-        .await
-        .unwrap();
-    check_or_write(
-        "get_capability_capsule_for_tenant",
-        json!({
-            "hit": cap_hit.map(|c| c.capability_capsule_id),
-            "miss_is_none": cap_miss.is_none(),
-        }),
-    );
-
-    // ── final-batch: auto_promote_candidates ── (PendingConfirmation rows of
-    //    eligible type, updated_at < cutoff, decay < max; created_at ASC is
-    //    load-bearing → ordered ids. cutoff after every seed stamp; empty
-    //    types short-circuits to []).
-    let promote = repo
-        .auto_promote_candidates(
-            "t1",
-            "00000000000000000099",
-            &[
-                CapabilityCapsuleType::Experience,
-                CapabilityCapsuleType::Episode,
-            ],
-            0.5,
-        )
-        .await
-        .unwrap();
-    let promote_empty = repo
-        .auto_promote_candidates("t1", "00000000000000000099", &[], 0.5)
-        .await
-        .unwrap();
-    check_or_write(
-        "auto_promote_candidates",
-        json!({
-            "ids": promote
-                .into_iter()
-                .map(|c| c.capability_capsule_id)
-                .collect::<Vec<_>>(),
-            "empty_types_len": promote_empty.len(),
-        }),
-    );
-
-    // ── final-batch: list_entities ── (kind filter + LIKE substring + a miss;
-    //    created_at DESC ordering, project STABLE shape not the UUIDv7 id)
-    let ents_all = repo.list_entities("t1", None, None, 50).await.unwrap();
-    let ents_kind = repo
-        .list_entities("t1", Some(mem::domain::EntityKind::Topic), None, 50)
-        .await
-        .unwrap();
-    let ents_like = repo
-        .list_entities("t1", None, Some("Rust"), 50)
-        .await
-        .unwrap();
-    let ents_miss = repo
-        .list_entities("t1", None, Some("zzz-no-match"), 50)
-        .await
-        .unwrap();
-    let proj = |es: Vec<mem::domain::Entity>| {
-        es.into_iter()
-            .map(|e| json!([e.canonical_name, serde_json::to_value(e.kind).unwrap()]))
-            .collect::<Vec<_>>()
-    };
-    check_or_write(
-        "list_entities",
-        json!({
-            "all": proj(ents_all),
-            "kind_topic": proj(ents_kind),
-            "like_rust": proj(ents_like),
-            "miss_len": ents_miss.len(),
-        }),
-    );
-
-    // ── ann ──
-    let ann = repo.ann_candidate_ids("t1", &q_vec, 5).await.unwrap();
-    check_or_write("ann", ranked(ann));
-
-    // ── fts ──
-    let fts = repo.bm25_candidate_ids("t1", q_text, 5).await.unwrap();
-    check_or_write("fts", ranked(fts));
-
-    // ── hybrid (fused-SQL fast path) ──
-    let hybrid = repo
-        .hybrid_candidates("t1", q_text, &q_vec, 5)
-        .await
-        .unwrap();
-    check_or_write("hybrid", scored(hybrid));
-
-    // ── hybrid (portable compose path) — captured separately so Phase 1 can
-    //    diff lance-native compose against BOTH the fused golden and this. ──
-    let compose = repo
-        .hybrid_candidates_compose("t1", q_text, &q_vec, 5)
-        .await
-        .unwrap();
-    check_or_write("hybrid_compose", scored(compose));
-
-    // ── stats ──
-    let stats = repo.capsule_stats("t1").await.unwrap();
-    check_or_write("stats", serde_json::to_value(stats).unwrap());
-
-    // ── taxonomy ── (sort outer + inner for stability)
-    let mut tax = repo.get_taxonomy("t1").await.unwrap();
-    for (_, vs) in tax.iter_mut() {
-        vs.sort();
-    }
-    tax.sort();
-    check_or_write("taxonomy", serde_json::to_value(tax).unwrap());
-
-    // ── version-chain ── version links + the NOT-EXISTS-deduped candidate pool
-    let mut versions = repo
-        .list_capability_capsule_versions_for_tenant("t1", "cap_d_v2")
-        .await
-        .unwrap();
-    versions.sort_by(|a, b| {
-        a.capability_capsule_id
-            .cmp(&b.capability_capsule_id)
-            .then(a.version.cmp(&b.version))
-    });
-    let pool = repo.search_candidates("t1").await.unwrap();
-    check_or_write(
-        "version_chain",
-        json!({
-            "versions": serde_json::to_value(&versions).unwrap(),
-            "search_candidates_ids": sorted_ids(pool.into_iter().map(|c| c.capability_capsule_id)),
-        }),
-    );
-
-    // ── graph ──
-    let mut neighbors = repo
-        .neighbors_within("entity:proj-mem", 2, None)
-        .await
-        .unwrap();
-    neighbors.sort_by(|a, b| {
-        (&a.from_node_id, &a.to_node_id, &a.relation).cmp(&(
-            &b.from_node_id,
-            &b.to_node_id,
-            &b.relation,
-        ))
-    });
-    let mut related = repo
-        .related_capability_capsule_ids(&["entity:proj-mem".to_string()])
-        .await
-        .unwrap();
-    related.sort();
-    let gstats = repo.graph_stats().await.unwrap();
-    check_or_write(
-        "graph",
-        json!({
-            "neighbors_within_2hops": serde_json::to_value(&neighbors).unwrap(),
-            "related_capsule_ids": json!(related),
-            "graph_stats": serde_json::to_value(gstats).unwrap(),
-        }),
-    );
-
-    // ── batch-C graph-tunnel reads ──
-    // neighbors (1-hop active, on the shared entity node)
-    let neighbors_1hop = repo.neighbors("entity:proj-mem").await.unwrap();
-    // kg_timeline (cap_a is on a mentions edge + a closed user_tunnel) —
-    // closed edges MUST surface here.
-    let timeline = repo.kg_timeline("capability_capsule:cap_a").await.unwrap();
-    // query_predicate: every `mentions` assertion (active + closed), and a
-    // point-in-time as_of probe that excludes future-dated edges.
-    let predicate_all = repo.query_predicate("mentions", None).await.unwrap();
-    let predicate_as_of = repo
-        .query_predicate("mentions", Some("00000000000000000001"))
-        .await
-        .unwrap();
-    // list_user_tunnels: the two ACTIVE user-tunnel edges (closed excluded).
-    let user_tunnels = repo.list_user_tunnels(100).await.unwrap();
-    // find_tunnels: active user-tunnels between capability_capsule:* nodes
-    // (both prefixes equal → dedup path exercised) and a broad any↔any scan.
-    let tunnels_caps = repo
-        .find_tunnels("capability_capsule:", "capability_capsule:", 100)
-        .await
-        .unwrap();
-    let tunnels_any = repo.find_tunnels("", "", 100).await.unwrap();
-    // follow_tunnels: BFS from cap_b following only user-tunnel edges.
-    let followed = repo
-        .follow_tunnels("capability_capsule:cap_b", 3)
-        .await
-        .unwrap();
-    // incident_edges_for_nodes: active 1-hop endpoint pairs around the
-    // shared entity (no load-bearing order → sorted).
-    let incident = repo
-        .incident_edges_for_nodes(&["entity:proj-mem".to_string()])
-        .await
-        .unwrap();
-    check_or_write(
-        "graph_tunnel",
-        json!({
-            "neighbors_1hop": graph_edges_json(neighbors_1hop),
-            "kg_timeline_cap_a": graph_edges_json(timeline),
-            "query_predicate_mentions": graph_edges_json(predicate_all),
-            "query_predicate_mentions_as_of": graph_edges_json(predicate_as_of),
-            "list_user_tunnels": graph_edges_json(user_tunnels),
-            "find_tunnels_caps": graph_edges_json(tunnels_caps),
-            "find_tunnels_any": graph_edges_json(tunnels_any),
-            "follow_tunnels_cap_b": graph_edges_json(followed),
-            "incident_edges_proj_mem": sorted_pairs(incident),
-        }),
-    );
-
-    // ── transcript: fts + ann ──
-    let t_fts = repo
-        .bm25_transcript_candidates("t1", "lance", 5)
-        .await
-        .unwrap();
-    check_or_write(
-        "transcript_fts",
-        json!(t_fts
-            .into_iter()
-            .map(|m| m.message_block_id)
-            .collect::<Vec<_>>()),
-    );
-
-    let t_vec = deterministic_embedding("duckdb attaches the lance dataset for reads", DIM);
-    let t_ann = repo
-        .semantic_search_transcripts("t1", &t_vec, 5)
-        .await
-        .unwrap();
-    check_or_write(
-        "transcript_ann",
-        json!(t_ann
-            .into_iter()
-            .map(|(m, _)| m.message_block_id)
-            .collect::<Vec<_>>()),
-    );
-
-    // ── batch-B: get_embedding_job_status ── (hit = seeded job, miss = gone)
-    let job_hit = repo.get_embedding_job_status("job_cap_b").await.unwrap();
-    let job_miss = repo.get_embedding_job_status("nope").await.unwrap();
-    check_or_write(
-        "embedding_job_status",
-        json!({ "hit": job_hit, "miss": job_miss }),
-    );
-
-    // ── batch-B: get_transcript_embedding_job_status ── (hit + miss)
-    let tjob_hit = repo
-        .get_transcript_embedding_job_status("job_tr_b")
-        .await
-        .unwrap();
-    let tjob_miss = repo
-        .get_transcript_embedding_job_status("nope")
-        .await
-        .unwrap();
-    check_or_write(
-        "transcript_embedding_job_status",
-        json!({ "hit": tjob_hit, "miss": tjob_miss }),
-    );
-
-    // ── batch-B: get_entity ── (entity_id is a non-deterministic UUIDv7, so
-    //    project a STABLE shape: canonical name / kind / ordered aliases +
-    //    whether the fetched id matches the alias lookup, never the raw id)
-    let looked_up = repo.lookup_alias("t1", "rust async").await.unwrap();
-    let entity = repo
-        .get_entity("t1", looked_up.as_deref().unwrap())
-        .await
-        .unwrap()
-        .expect("seeded entity exists");
-    let entity_miss = repo.get_entity("t1", "does-not-exist").await.unwrap();
-    check_or_write(
-        "get_entity",
-        json!({
-            "canonical_name": entity.entity.canonical_name,
-            "tenant": entity.entity.tenant,
-            "kind": serde_json::to_value(entity.entity.kind).unwrap(),
-            "aliases": entity.aliases,
-            "id_matches_lookup": Some(&entity.entity.entity_id) == looked_up.as_ref(),
-            "miss_is_none": entity_miss.is_none(),
-        }),
-    );
-
-    // ── batch-B: lookup_alias ── (id is a UUIDv7 → project consistency, not
-    //    the raw id: both aliases resolve to the SAME entity; miss is None)
-    let look_a = repo.lookup_alias("t1", "rust async").await.unwrap();
-    let look_b = repo.lookup_alias("t1", "Tokio").await.unwrap();
-    let look_ws = repo.lookup_alias("t1", "  RUST   ASYNC  ").await.unwrap();
-    let look_miss = repo.lookup_alias("t1", "unknown").await.unwrap();
-    check_or_write(
-        "lookup_alias",
-        json!({
-            "both_aliases_same_entity": look_a.is_some() && look_a == look_b,
-            "normalized_ws_same_entity": look_a == look_ws,
-            "miss_is_none": look_miss.is_none(),
-        }),
-    );
-
-    // ── batch-B: list_transcript_sessions ── (per-session aggregate;
-    //    last_at DESC; fully deterministic values)
-    let sessions = repo.list_transcript_sessions("t1").await.unwrap();
-    check_or_write(
-        "list_transcript_sessions",
-        serde_json::to_value(&sessions).unwrap(),
-    );
-
-    // ── batch-B: recent_conversation_messages ── (created_at DESC,
-    //    line_number DESC, block_index DESC; ordered ids are load-bearing)
-    let recent_msgs = repo.recent_conversation_messages("t1", 10).await.unwrap();
-    check_or_write(
-        "recent_conversation_messages",
-        json!(recent_msgs
-            .into_iter()
-            .map(|m| m.message_block_id)
-            .collect::<Vec<_>>()),
-    );
-
-    // ── final-batch: get_conversation_messages_by_session ── (chronological
-    //    ASC; ordered ids load-bearing)
-    let by_session = repo
-        .get_conversation_messages_by_session("t1", "S1")
-        .await
-        .unwrap();
-    check_or_write(
-        "get_conversation_messages_by_session",
-        json!(by_session
-            .into_iter()
-            .map(|m| m.message_block_id)
-            .collect::<Vec<_>>()),
-    );
-
-    // ── final-batch: get_conversation_messages_by_session_paged ── (limit=2
-    //    forces a has_more page; then resume via the composite cursor)
-    let (paged_p1, paged_more) = repo
-        .get_conversation_messages_by_session_paged("t1", "S1", None, None, None, None, None, 2)
-        .await
-        .unwrap();
-    // Cursor = last row of page 1: (created_at, line_number, block_index).
-    let cursor = paged_p1.last().map(|m| {
-        (
-            m.created_at.clone(),
-            m.line_number as i64,
-            m.block_index as i64,
-        )
-    });
-    let (paged_p2, p2_more) = match &cursor {
-        Some((at, ln, bi)) => repo
-            .get_conversation_messages_by_session_paged(
-                "t1",
-                "S1",
-                None,
-                None,
-                None,
-                None,
-                Some((at.as_str(), *ln, *bi)),
-                2,
-            )
-            .await
-            .unwrap(),
-        None => (Vec::new(), false),
-    };
-    check_or_write(
-        "get_conversation_messages_by_session_paged",
-        json!({
-            "page1_ids": paged_p1.iter().map(|m| m.message_block_id.clone()).collect::<Vec<_>>(),
-            "page1_has_more": paged_more,
-            "page2_ids": paged_p2.iter().map(|m| m.message_block_id.clone()).collect::<Vec<_>>(),
-            "page2_has_more": p2_more,
-        }),
-    );
-
-    // ── final-batch: list_conversation_messages_in_range ── (cross-session
-    //    range; bounded window excludes the first block; limit=10)
-    let (range_all, range_more) = repo
-        .list_conversation_messages_in_range("t1", None, None, None, None, None, 10)
-        .await
-        .unwrap();
-    let (range_win, win_more) = repo
-        .list_conversation_messages_in_range(
-            "t1",
-            Some("00000000000000000021"),
-            None,
-            None,
-            None,
-            None,
-            10,
-        )
-        .await
-        .unwrap();
-    check_or_write(
-        "list_conversation_messages_in_range",
-        json!({
-            "all_ids": range_all.iter().map(|m| m.message_block_id.clone()).collect::<Vec<_>>(),
-            "all_has_more": range_more,
-            "windowed_ids": range_win.iter().map(|m| m.message_block_id.clone()).collect::<Vec<_>>(),
-            "windowed_has_more": win_more,
-        }),
-    );
-
-    // ── final-batch: anchor_session_candidates ── (most-recent embed_eligible
-    //    blocks in S1, capped; k=0 short-circuits)
-    let anchor = repo.anchor_session_candidates("t1", "S1", 2).await.unwrap();
-    let anchor_zero = repo.anchor_session_candidates("t1", "S1", 0).await.unwrap();
-    check_or_write(
-        "anchor_session_candidates",
-        json!({ "k2": anchor, "k0_len": anchor_zero.len() }),
-    );
-
-    // ── final-batch: context_window_for_block ── (mb_2 is the middle block;
-    //    1 before + 1 after; before/after returned chronological ASC)
-    let window = repo
-        .context_window_for_block("t1", "mb_2", 1, 1, true)
-        .await
-        .unwrap();
-    check_or_write(
-        "context_window_for_block",
-        json!({
-            "primary": window.primary.message_block_id,
-            "before": window.before.iter().map(|m| m.message_block_id.clone()).collect::<Vec<_>>(),
-            "after": window.after.iter().map(|m| m.message_block_id.clone()).collect::<Vec<_>>(),
-        }),
-    );
-}
-
-/// Phase-1 parity double-run: seed the same fixture, read each MIGRATED
-/// bucket under `ReadEngine::Lance`, and assert it byte-matches the DuckDB
-/// golden (= lance == duckdb). Buckets are added here as they pass; an
-/// unmigrated bucket is simply absent. See `docs/remove-duckdb-keep-lance.md`
-/// §5 Phase 1.
+/// Parity assertion: seed the fixture, read each bucket through the
+/// (now sole) lance-native read path, and assert it matches the FROZEN
+/// `tests/golden/*.json` ground-truth fixtures (byte-match for the
+/// exact buckets, soft overlap for the different-BM25-engine buckets).
+/// The DuckDB read engine that originally generated these goldens is
+/// gone; the goldens are frozen and this is the one remaining parity
+/// guard. See `docs/remove-duckdb-keep-lance.md` §5.
 #[tokio::test]
 async fn lance_parity_matches_golden() {
     let dir = tempdir().unwrap();
-    let db = dir.path().join("parity_lance.duckdb");
-    let repo = Arc::new(
-        Store::open_with_read_engine(&db, mem::config::ReadEngine::Lance)
-            .await
-            .unwrap(),
-    );
+    let db = dir.path().join("parity_lance.lance");
+    let repo = Arc::new(Store::open(&db).await.unwrap());
     seed(&repo).await;
 
     // ── filter ──

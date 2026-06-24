@@ -291,7 +291,7 @@ impl FtsIndex {
             let id = stored
                 .get_first(self.fields.id)
                 .and_then(|v| v.as_str())
-                .ok_or_else(|| StorageError::InvalidData("fts: hit missing id"))?
+                .ok_or(StorageError::InvalidData("fts: hit missing id"))?
                 .to_string();
             scored.push((id, score));
         }

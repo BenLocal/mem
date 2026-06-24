@@ -269,17 +269,17 @@ async fn legacy_uint64_version_column_round_trips_via_lance_parser() {
     drop(table);
     drop(conn);
     let store = Arc::new(Store::open(&db_path).await.unwrap());
-    // Reads route through DuckDbQuery which coerces UInt64 silently,
-    // so this check is mostly a smoke test that the file is intact.
-    // The real signal is the lance-side parse below.
-    let from_duckdb = store
+    // The tenant-scoped read must coerce the UInt64 `version` column
+    // silently; this check is mostly a smoke test that the file is intact.
+    // The real signal is the cross-tenant parse below.
+    let by_tenant = store
         .get_capability_capsule_for_tenant("local", "legacy_001")
         .await
         .unwrap()
-        .expect("row must be visible to DuckDB read path");
-    assert_eq!(from_duckdb.version, 7);
+        .expect("row must be visible to the tenant-scoped read path");
+    assert_eq!(by_tenant.version, 7);
 
-    // The lance-side parser (the one update_status uses) lives behind
+    // The cross-tenant parser (the one update_status uses) lives behind
     // `Store::get_capability_capsule` which routes to LanceStore on
     // cross-tenant lookups. That's the path that was failing on prod.
     let from_lance = store

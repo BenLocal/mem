@@ -382,34 +382,22 @@ impl LanceStore {
                 IndexAction::Skip => unreachable!("skip handled above"),
             }
         }
-        // Route-B: rebuild the Tantivy capsule + transcript BM25 indexes
-        // from the live corpus (startup full-rebuild strategy — see
+        // Rebuild the Tantivy capsule + transcript BM25 indexes from the
+        // live corpus (startup full-rebuild strategy — see
         // `crate::storage::fts`). Unlike the lance IVF/FTS indexes there's
         // no per-table delta tracking — the rebuild is cheap (<1s at real
-        // scale) and a full rebuild is the whole design.
-        //
-        // **Lance-engine-gated**: the Tantivy index is only ever queried on
-        // the `Lance` read engine (`bm25_candidate_ids` /
-        // `bm25_transcript_candidates`). In DuckDb-default production nobody
-        // reads it, so rebuilding it on every vacuum sweep would burn CPU +
-        // RAM for an index no query touches. We read `MEM_READ_ENGINE` from
-        // env here — `ensure_query_indexes_inner` is a `LanceStore` method
-        // and the engine lives on `Store`, so an env read is the pragmatic
-        // gate. On the Lance engine the eager rebuild keeps the index fresh;
-        // when it's skipped, `bm25_candidate_ids` / `bm25_transcript_candidates`
-        // still lazy-build on first query (the `*_fts_built` latch), so the
-        // index is never missing — gating only drops the redundant eager work.
-        // When run, this is what makes the "seed → rebuild_query_indexes →
-        // query" test flow cover the route-B capsule_fts AND transcript_fts
-        // buckets; each counts as one rebuilt index in the stats.
-        if crate::config::parse_read_engine(|k| std::env::var(k).ok())
-            == crate::config::ReadEngine::Lance
-        {
-            self.rebuild_capsule_fts().await?;
-            agg.indexes_rebuilt += 1;
-            self.rebuild_transcript_fts().await?;
-            agg.indexes_rebuilt += 1;
-        }
+        // scale) and a full rebuild is the whole design. The Tantivy index
+        // backs the only BM25 read path (`bm25_candidate_ids` /
+        // `bm25_transcript_candidates`); the eager rebuild here keeps it
+        // fresh, and if it's ever skipped both readers still lazy-build on
+        // first query (the `*_fts_built` latch), so the index is never
+        // missing. This is what makes the "seed → rebuild_query_indexes →
+        // query" test flow cover the capsule_fts AND transcript_fts buckets;
+        // each counts as one rebuilt index in the stats.
+        self.rebuild_capsule_fts().await?;
+        agg.indexes_rebuilt += 1;
+        self.rebuild_transcript_fts().await?;
+        agg.indexes_rebuilt += 1;
         Ok(agg)
     }
 }
