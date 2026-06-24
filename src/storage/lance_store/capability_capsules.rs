@@ -461,13 +461,11 @@ impl LanceStore {
     /// Returns `(capability_capsule_id, rank_sem)` 1-based, ordered by
     /// `(_distance ASC, capability_capsule_id ASC)`.
     ///
-    /// **POSTFILTER parity** (not prefilter): the DuckDB query runs
-    /// `lance_vector_search(... k => k)` over ALL tenants' vectors first,
-    /// then filters `WHERE tenant = ?`. So a tenant's result can contain
-    /// FEWER than `k` rows when another tenant's vectors are nearer (they
-    /// consume `k` slots, then drop in the post-filter). We replicate this
-    /// exactly: `nearest_to(...).limit(k)` WITHOUT a tenant predicate in
-    /// the vector query, then filter `tenant` in Rust afterward.
+    /// **POSTFILTER** (not prefilter): the vector query runs over ALL
+    /// tenants' vectors first — `nearest_to(...).limit(k)` with NO tenant
+    /// predicate — then filters `tenant` in Rust afterward. So a tenant's
+    /// result can contain FEWER than `k` rows when another tenant's vectors
+    /// are nearer (they consume `k` slots, then drop in the post-filter).
     ///
     /// Capsules carry exactly one embedding row each (no chunking), so no
     /// GROUP BY / collapse is needed. Empty `query_embedding` or `k == 0`

@@ -8,10 +8,10 @@
 //!
 //! The provider is `Option<Arc<dyn EmbeddingProvider>>` so unit/integration
 //! tests can construct a service with no provider; in that mode, non-empty
-//! semantic queries skip the vector-search channel (BM25 via the Lance FTS
-//! index still works) and the empty-query path falls back to the recent-time
-//! SQL listing. With or without a provider, the response shape is
-//! `Vec<MergedWindow>`.
+//! semantic queries skip the vector-search channel (BM25 via the in-RAM
+//! Tantivy index still works) and the empty-query path falls back to the
+//! recent-time lance-native listing. With or without a provider, the response
+//! shape is `Vec<MergedWindow>`.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -109,7 +109,7 @@ impl TranscriptService {
 
     /// Inserts a single transcript block via the repository's idempotent
     /// `create_conversation_message`. Embedding job enqueueing is handled
-    /// inside the repository; this method does not touch the HNSW index.
+    /// inside the repository; this method does not touch the vector index.
     pub async fn ingest(&self, msg: ConversationMessage) -> Result<(), StorageError> {
         self.store.create_conversation_message(&msg).await
     }
@@ -269,7 +269,7 @@ impl TranscriptService {
     }
 
     /// Three-channel hybrid recall:
-    ///   - HNSW (semantic) ranks via `Arc<VectorIndex>`
+    ///   - semantic ranks via lance vector ANN (`Store::semantic_search_transcripts`)
     ///   - BM25 (lexical) ranks via `repo.bm25_transcript_candidates`
     ///   - Optional anchor-session injection (no rank; bonus only)
     ///

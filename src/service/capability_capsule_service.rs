@@ -1319,8 +1319,8 @@ impl CapabilityCapsuleService {
 
         // Wake-up fast path: SessionStart hooks call us with `intent="wake_up"`
         // and an empty `query` to seed "Recent Context" at session boot.
-        // The full pipeline (embedding the empty string, HNSW lookup, scanning
-        // every active memory for BM25, graph-aware ranking, tiktoken-based
+        // The full pipeline (embedding the empty string, lance vector ANN
+        // lookup, scanning every active memory for BM25, graph-aware ranking, tiktoken-based
         // compression of the entire live set) was observed to take 11–200 s
         // on a moderately-loaded local DB and made claude-code start sluggish.
         //
@@ -1398,11 +1398,10 @@ impl CapabilityCapsuleService {
             return Ok(response);
         }
 
-        // Single SQL hybrid call replaces the dual lex/sem fan-out:
-        // `Store::hybrid_candidates` runs `lance_fts` +
-        // `lance_vector_search` joined by capability_capsule_id with
-        // RRF (k=60) computed inline in DuckDB SQL. See
-        // `examples/hybrid_sql_poc.rs` for the standalone validation.
+        // `Store::hybrid_candidates` composes the two recall channels:
+        // `bm25_candidate_ids` (in-RAM Tantivy) + `ann_candidate_ids`
+        // (lance vector ANN), fused by capability_capsule_id with RRF
+        // (k=60) in Rust (`pipeline::ranking::rrf_merge`).
         //
         // The lifecycle pool (`search_candidates`) still pulls the full
         // active tenant set in parallel — Preference / Workflow rows
@@ -1497,9 +1496,10 @@ impl CapabilityCapsuleService {
 /// maps `(tenant, alias, kind)` to a stable `entity_id`; the resulting node id
 /// is `entity:<id>`.
 ///
-/// Each call to `resolve_or_create` acquires-and-releases the DuckDB connection
-/// mutex (see `entity_repo.rs`) — the locks are sequenced, not nested. Pure
-/// async; the caller passes `now` so timestamps stay deterministic in tests.
+/// Each `resolve_or_create` is a lance-native lookup-then-insert against the
+/// `entities` / `entity_aliases` tables (`lance_store/entities.rs`); concurrent
+/// callers are reconciled by the `(tenant, alias_text)` PK. Pure async; the
+/// caller passes `now` so timestamps stay deterministic in tests.
 ///
 /// Wired into `CapabilityCapsuleService::ingest` and `edit_and_accept_pending` by Task 9
 /// of the entity-registry roadmap.

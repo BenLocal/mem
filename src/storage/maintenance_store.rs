@@ -56,8 +56,8 @@ pub trait MaintenanceStore: Send + Sync {
         aggressive: bool,
     ) -> Result<VacuumStats, StorageError>;
 
-    /// Build/refresh ANN vector indexes on the embedding tables so
-    /// `lance_vector_search` doesn't brute-force a large unindexed table
+    /// Build/refresh ANN vector indexes on the embedding tables so a
+    /// `nearest_to` query doesn't brute-force a large unindexed table
     /// (the transcript-search 5–11s root cause). Lance-specific; the
     /// default is a zero-stats no-op so non-Lance backends compile
     /// unchanged. Driven on a cadence by `crate::worker::vacuum_worker`.
@@ -105,8 +105,8 @@ impl MaintenanceStore for Store {
         older_than_days: i64,
         aggressive: bool,
     ) -> Result<VacuumStats, StorageError> {
-        // commit_lance_write refreshes the DuckDB snapshot so the
-        // post-vacuum manifest set is visible immediately to readers.
+        // commit_lance_write is a no-op pass-through (route-B); the
+        // post-vacuum manifest set is visible to readers natively.
         self.commit_lance_write(
             self.lance
                 .vacuum_old_versions_with(older_than_days, aggressive)
@@ -116,15 +116,15 @@ impl MaintenanceStore for Store {
     }
 
     async fn ensure_query_indexes(&self) -> Result<IndexMaintenanceStats, StorageError> {
-        // commit_lance_write marks the DuckDB snapshot dirty so the next
-        // read refreshes and `lance_vector_search` picks up the new index.
+        // commit_lance_write is a no-op pass-through (route-B); the next
+        // lance-native `nearest_to` query picks up the new index natively.
         self.commit_lance_write(self.lance.ensure_query_indexes().await)
             .await
     }
 
     async fn rebuild_query_indexes(&self) -> Result<IndexMaintenanceStats, StorageError> {
-        // Same snapshot-refresh contract as ensure_query_indexes — the next
-        // read must see the rebuilt (correctly-partitioned) index.
+        // Same as ensure_query_indexes — the next lance-native query must
+        // see the rebuilt (correctly-partitioned) index.
         self.commit_lance_write(self.lance.rebuild_query_indexes().await)
             .await
     }

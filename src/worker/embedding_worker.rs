@@ -250,11 +250,12 @@ async fn post_embed(
         )
         .await?;
 
-    // Lance handles vector indexing automatically when the embedding
-    // is added to the capability_capsule_embeddings table — no separate HNSW
-    // sidecar to update (the legacy DuckDB-as-storage backend
-    // maintained a usearch index manually here; that whole code path
-    // is gone in the new architecture).
+    // The embedding is just added to the capability_capsule_embeddings
+    // table; the ANN (IVF_PQ) index is maintained out-of-band by the
+    // vacuum worker (`ensure_query_indexes`), so there's no separate
+    // vector sidecar to update here. (The legacy DuckDB-as-storage backend
+    // maintained a usearch index manually at this point; that whole code
+    // path is gone in the route-B architecture.)
 
     store.complete_embedding_job(&job.job_id, &now).await?;
     info!(

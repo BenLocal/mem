@@ -36,8 +36,8 @@ pub async fn run(store: Arc<dyn Backend>, settings: VacuumSettings) {
         "vacuum_worker started",
     );
     // Build the query indexes (vector ANN + scalar BTree) promptly at
-    // startup (before the first sleep) — without them `lance_vector_search`
-    // brute-forces the transcript embeddings table and the transcript JOIN
+    // startup (before the first sleep) — without them a `nearest_to` query
+    // brute-forces the transcript embeddings table and the transcript hydrate
     // flat-scans conversation_messages (together 5–11s). One-time on a fresh
     // build, skipped thereafter; the in-loop call below folds in later growth.
     ensure_query_indexes_once(&*store).await;
