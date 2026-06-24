@@ -10,7 +10,7 @@ jobs:
   rust:
     runs-on: ubuntu-latest
     # Drop debuginfo from the test profile. Linking the `cargo test`
-    # binaries against the full lance + duckdb dependency tree is
+    # binaries against the heavy lance dependency tree is
     # memory-heavy, and debuginfo is the bulk of that — it OOM-killed
     # `cc`/`ld` on the 7 GB ubuntu-latest runner ("error: linking with
     # `cc` failed"), intermittently and only in CI (local boxes have
@@ -26,7 +26,7 @@ jobs:
         with:
           components: rustfmt, clippy
       # Cache the cargo registry + target dir. Without this the job
-      # cold-compiled the full lance + duckdb dependency tree (~20 min)
+      # cold-compiled the heavy lance dependency tree (~20 min)
       # on every push; an incremental restore cuts that to a few
       # minutes. Distinct `shared-key` from the cross job so the two
       # don't clobber each other's caches (different targets/profiles).
