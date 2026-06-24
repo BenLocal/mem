@@ -56,6 +56,7 @@ use lancedb::Connection;
 use serde::{de::DeserializeOwned, Serialize};
 
 mod capability_capsules;
+mod decay;
 mod embedding;
 mod entities;
 mod episodes;

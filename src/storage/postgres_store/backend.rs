@@ -2896,7 +2896,7 @@ impl MaintenanceStore for PostgresCapsuleStore {
         ms_per_day: f64,
         now_ms_str: &str,
     ) -> Result<(), StorageError> {
-        // Mirror the DuckDB decay sweep (duckdb_query/decay.rs) in PG
+        // Mirror the lance decay sweep (lance_store/decay.rs) in PG
         // dialect, in one transaction:
         //   1. hard-expiry archive (expires_at deadline passed),
         //   2. decay the active set, anchoring the clock on

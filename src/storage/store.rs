@@ -958,11 +958,21 @@ impl Store {
     /// `crate::worker::vacuum_worker` on a daily cadence and
     /// exposed on-demand via `POST /admin/vacuum`.
     ///
-    /// Bulk decay sweep over `memories.decay_score`. Routes to
-    /// DuckDbQuery — issued as a single SQL UPDATE via the lance
-    /// extension (per-row Rust iteration is not viable for this
-    /// shape). DuckDB-side writes invalidate the connection's own
-    /// cache, so no `Store::refresh` is needed.
+    /// Bulk decay sweep over `capability_capsules.decay_score`. Routes
+    /// through the **LanceDB Rust API** (`table.update()`, the same
+    /// writer ingest uses) — three batched UPDATEs (hard-expiry + two
+    /// WHERE-disjoint decay passes); see
+    /// [`LanceStore::apply_time_decay`] for the exact semantics. A
+    /// `commit_lance_write` marks the DuckDB read snapshot dirty so the
+    /// next read sees the post-sweep `decay_score`/`last_used_at`.
+    ///
+    /// **Route-B Phase 2 (2026-06-24):** migrated off the DuckDB lance
+    /// extension. Decay and ingest are now the same single Rust-API
+    /// writer, retiring the dual-writer + vacuum-pruned-stale-base
+    /// commit race; the remaining lance optimistic-concurrency conflict
+    /// is retried natively inside `table.update()` (lance 7.0
+    /// `execute_with_retry`, 10×/30 s) with a thin outer safety net in
+    /// [`LanceStore::apply_time_decay`].
     pub async fn apply_time_decay(
         &self,
         decay_rate_per_day: f64,
@@ -970,27 +980,35 @@ impl Store {
         ms_per_day: f64,
         now_ms_str: &str,
     ) -> Result<(), StorageError> {
-        self.query
-            .apply_time_decay(decay_rate_per_day, now_ms, ms_per_day, now_ms_str)
-            .await
+        self.commit_lance_write(
+            self.lance
+                .apply_time_decay(decay_rate_per_day, now_ms, ms_per_day, now_ms_str)
+                .await,
+        )
+        .await
     }
 
-    /// Stamp `last_used_at = now` on a batch of capsules (roadmap O1
-    /// retrieval reinforcement). Routes to DuckDbQuery — a single SQL
-    /// UPDATE via the lance extension, which invalidates the
-    /// connection's own cache, so no `Store::refresh` is needed (same
-    /// model as [`Self::apply_time_decay`]). Driven off the read path by
-    /// `crate::worker::last_used_worker`. Best-effort — see
-    /// `DuckDbQuery::bump_last_used_at` for why no rowcount is returned.
+    /// Stamp `last_used_at = now` (decay clock) **and**
+    /// `last_recalled_at = now` (durable recall signal) on a batch of
+    /// capsules (roadmap O1 retrieval reinforcement). Routes through the
+    /// **LanceDB Rust API** (`table.update()` per id) — same writer +
+    /// same native commit-conflict retry as
+    /// [`Self::apply_time_decay`]; a `commit_lance_write` marks the
+    /// DuckDB read snapshot dirty. Driven off the read path by
+    /// `crate::worker::last_used_worker`. Best-effort — no rowcount is
+    /// returned (see [`LanceStore::bump_last_used_at`]).
     pub async fn bump_last_used_at(
         &self,
         tenant: &str,
         capability_capsule_ids: &[String],
         now_ms_str: &str,
     ) -> Result<(), StorageError> {
-        self.query
-            .bump_last_used_at(tenant, capability_capsule_ids, now_ms_str)
-            .await
+        self.commit_lance_write(
+            self.lance
+                .bump_last_used_at(tenant, capability_capsule_ids, now_ms_str)
+                .await,
+        )
+        .await
     }
 
     /// Session lifecycle (touch / open / close) — all mutations.

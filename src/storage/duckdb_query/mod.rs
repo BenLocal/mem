@@ -45,7 +45,6 @@ use crate::domain::capability_capsule::GraphEdge;
 use crate::domain::{Entity, EntityKind};
 
 mod capability_capsules;
-mod decay;
 mod embedding_jobs;
 mod entities;
 mod graph;

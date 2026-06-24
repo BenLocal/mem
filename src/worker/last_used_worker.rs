@@ -10,7 +10,7 @@
 //! `last_used_at` is the decay clock: pushing it forward makes the next
 //! `apply_time_decay` sweep accrue a smaller slice for these rows, so
 //! capsules that keep getting retrieved decay slower than untouched
-//! ones (see `decay_worker` / `DuckDbQuery::apply_time_decay`).
+//! ones (see `decay_worker` / `LanceStore::apply_time_decay`).
 //!
 //! Events are best-effort: a process restart drops whatever was queued.
 //! That's acceptable — "used" is a statistical salience signal, not
