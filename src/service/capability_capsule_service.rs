@@ -407,7 +407,7 @@ impl CapabilityCapsuleService {
     /// Bulk version of [`Self::ingest`]. Each request is prepared
     /// independently (idempotency probe / verbatim validation / session
     /// resolve / record build), then the new rows are flushed as a single
-    /// Lance write + single DuckDB refresh — same for the graph-edge sync
+    /// Lance write — same for the graph-edge sync
     /// and the embedding-job enqueue. Per-item failures are isolated:
     /// the slot in the result vector becomes `BatchIngestItem::Err`,
     /// other items still land. Output preserves input order 1:1.

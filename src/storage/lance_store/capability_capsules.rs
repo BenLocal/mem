@@ -551,9 +551,8 @@ impl LanceStore {
     /// Rebuild the Tantivy capsule FTS index from the current
     /// `capability_capsules` corpus. Scans every row across all tenants
     /// (the index is tenant-tagged and filters at query time), excluding
-    /// the rows the DuckDB `lance_fts` query excludes — archived /
-    /// rejected status and `diary` type — so BM25 parity holds (the
-    /// DuckDB SQL carries `status NOT IN (rejected, archived) AND
+    /// archived / rejected status and `diary` type so BM25 recall matches
+    /// the capsule search filter (`status NOT IN (rejected, archived) AND
     /// capability_capsule_type != 'diary'`). A full rebuild, matching the
     /// route-B "startup full-rebuild" strategy (see `crate::storage::fts`).
     ///
@@ -565,8 +564,8 @@ impl LanceStore {
         };
         // Scan all tenants — the FTS index is tenant-tagged and filters
         // tenant at query time (POSTFILTER, same posture as the rest of
-        // route-B). No `WHERE` clause beyond "everything", then drop the
-        // excluded rows in Rust to mirror the DuckDB BM25 filter.
+        // route-B). No filter beyond "everything", then drop the
+        // excluded rows in Rust to match the capsule BM25 filter.
         let rows = self
             .query_capability_capsules("true".to_string(), None)
             .await?;

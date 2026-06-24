@@ -1723,7 +1723,7 @@ impl MemMcpServer {
 
     // ------------------- capability_capsule_batch_ingest -------------------
     #[tool(
-        description = "Bulk-insert multiple capsules in one call (server folds N rows into one Lance write + one DuckDB refresh; bench shows 9-227x speedup over looping `capability_capsule_ingest`). Returns 201 with per-item {result: ok | err} preserving input order, or 207 if any item failed."
+        description = "Bulk-insert multiple capsules in one call (server folds N rows into one Lance write; bench shows 9-227x speedup over looping `capability_capsule_ingest`). Returns 201 with per-item {result: ok | err} preserving input order, or 207 if any item failed."
     )]
     async fn capability_capsule_batch_ingest(
         &self,

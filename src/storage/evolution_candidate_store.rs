@@ -38,9 +38,9 @@ impl EvolutionCandidateStore for Store {
         &self,
         candidate: EvolutionCandidate,
     ) -> Result<(), StorageError> {
-        // commit_lance_write keeps the per-write DuckDB refresh
-        // contract uniform (no DuckDB read path queries this table
-        // today — same rationale as mine_cursors).
+        // Route the write through commit_lance_write for a uniform write
+        // shape (it's a pass-through since route-B removed the DuckDB read
+        // engine; reads are lance-native — same rationale as mine_cursors).
         self.commit_lance_write(self.lance.upsert_evolution_candidate(candidate).await)
             .await
     }

@@ -331,12 +331,13 @@ impl TranscriptService {
         let mut all_ids: HashSet<String> = HashSet::new();
 
         if !query.trim().is_empty() {
-            // BM25 channel. Soft-degrade: the lance FTS scan hits the SAME
-            // lancedb-0.30 / DuckDB-extension-4.0 ragged-record-batch read bug
-            // as the ANN scan (`IO Error: ... all columns in a record batch
-            // must have the same length`) for certain queries, recurring per
-            // index rebuild. Catch it and let the semantic channel carry
-            // rather than 500 the whole request.
+            // BM25 channel (route-B in-RAM Tantivy index). Soft-degrade:
+            // keep the request alive if the BM25 lookup errors (e.g. a
+            // Tantivy rebuild race) by letting the semantic channel carry
+            // rather than 500 the whole request. (Before route-B this
+            // channel was a lance FTS scan that hit the stale-index
+            // ragged-batch read bug; the Tantivy index removed that
+            // failure mode.)
             let t = Instant::now();
             match self
                 .store
@@ -360,8 +361,8 @@ impl TranscriptService {
 
             // Semantic channel — only if provider attached.
             // Routes through `Store::semantic_search_transcripts`,
-            // which runs `lance_vector_search` against
-            // `conversation_message_embeddings` and JOINs back to
+            // which runs a lance-native vector ANN (`nearest_to`) over
+            // `conversation_message_embeddings` and hydrates against
             // `conversation_messages` for the full row. We only need
             // the message_block_id + rank position, so we discard
             // the message body and similarity score here.
@@ -389,9 +390,9 @@ impl TranscriptService {
                 if let Some(q_vec) = q_vec {
                     let t = Instant::now();
                     // Defense-in-depth: the ANN scan can fail on lancedb 0.30 /
-                    // DuckDB lance-extension 4.0 with `IO Error: ... all columns
-                    // in a record batch must have the same length` when a query's
-                    // nearest IVF centroid is a degenerate (empty) partition.
+                    // lance 7.0 with `IO Error: ... all columns in a record
+                    // batch must have the same length` when a query's nearest
+                    // IVF centroid is a degenerate (empty) partition.
                     // KMeans leaves some partitions empty on tightly-clustered
                     // embeddings, and which queries hit one varies per index
                     // rebuild (non-deterministic KMeans init) — so the

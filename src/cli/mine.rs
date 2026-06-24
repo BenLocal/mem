@@ -78,8 +78,8 @@ pub struct MineArgs {
 }
 
 /// Chunk size used by `mine` when fanning out to the `/batch` endpoints.
-/// Sized so that one chunk fits comfortably in a single Lance write +
-/// DuckDB refresh while keeping HTTP body sizes reasonable.
+/// Sized so that one chunk fits comfortably in a single Lance write
+/// while keeping HTTP body sizes reasonable.
 const MINE_BATCH_CHUNK: usize = 100;
 
 pub struct ExtractedMemory {

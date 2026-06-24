@@ -26,8 +26,8 @@
 //! CRUD over typed records that any reasonable storage engine could
 //! re-implement. The handful of methods that bind to LanceDB-specific
 //! behavior (Lance manifest pruning, lazy-create embedding tables,
-//! `update().only_if()` optimistic-claim semantics, fused
-//! `lance_fts` + `lance_vector_search` SQL, non-atomic two-op
+//! `update().only_if()` optimistic-claim semantics, lance-native
+//! vector ANN (`nearest_to`), non-atomic two-op
 //! writes that exploit Lance's no-transactions stance) are marked
 //! **LANCE-SPECIFIC** in their doc comments. The unmarked default is
 //! portable. This labelling is the input to the
@@ -139,8 +139,8 @@ impl Store {
             .await
     }
 
-    /// Multi-row insert. Single Lance write + single DuckDB refresh,
-    /// regardless of `memories.len()`. No-op (and no refresh) when empty.
+    /// Multi-row insert. Single Lance write regardless of
+    /// `memories.len()`. No-op when empty.
     pub async fn insert_capability_capsules(
         &self,
         memories: &[CapabilityCapsuleRecord],
@@ -640,17 +640,13 @@ impl Store {
     }
 
     /// Backend-portable compose form of [`Self::hybrid_candidates`]:
-    /// `bm25_candidate_ids` + `ann_candidate_ids` + `rrf_merge` +
-    /// `fetch_capability_capsules_by_ids` + final sort. Produces the
-    /// same scores and orderings as the fused-SQL default to within
-    /// f32 rounding noise.
+    /// `bm25_candidate_ids` (Tantivy) + `ann_candidate_ids` (lance ANN)
+    /// + `rrf_merge` + `fetch_capability_capsules_by_ids` + final sort.
     ///
-    /// Used by `examples/hybrid_compose_vs_fused_bench.rs` and serves
-    /// as the reference shape for the Phase 2 trait — backends that
-    /// can't fuse BM25 + ANN in a single SQL statement should route
-    /// their `hybrid_candidates` impl through compose. On LanceBackend
-    /// this path is currently slower (see the fused-SQL doc above);
-    /// don't use it in hot paths.
+    /// This IS the recall path on LanceBackend — `hybrid_candidates`
+    /// just calls it. Route-B removed the fused-SQL fast path it used to
+    /// delegate to; the compose form is also the reference shape future
+    /// backends (Postgres, SQLite, in-memory) route through.
     pub async fn hybrid_candidates_compose(
         &self,
         tenant: &str,
@@ -666,8 +662,6 @@ impl Store {
 
         // Oversample each candidate set so the post-filter (status /
         // capsule_type) doesn't truncate the merged result below k.
-        // Same `k * 2` posture the fused-SQL query carries inside its
-        // CTE definitions.
         let oversample = k.saturating_mul(2);
         let bm25 = if has_text {
             self.bm25_candidate_ids(tenant, query_text, oversample)
@@ -724,8 +718,7 @@ impl Store {
             })
             .collect();
 
-        // Final ordering: rrf_score DESC, updated_at DESC, id ASC —
-        // matches the fused-SQL outer ORDER BY.
+        // Final ordering: rrf_score DESC, updated_at DESC, id ASC.
         out.sort_by(|a, b| {
             b.1.partial_cmp(&a.1)
                 .unwrap_or(std::cmp::Ordering::Equal)
@@ -750,7 +743,7 @@ impl Store {
         self.lance.bm25_candidate_ids(tenant, query_text, k).await
     }
 
-    /// **LANCE-SPECIFIC** (see `DuckDbQuery::ann_candidate_ids`).
+    /// **LANCE-SPECIFIC**: lance-native vector ANN (`nearest_to`).
     /// Returns an empty Vec when the lazy-created embeddings table
     /// doesn't exist yet. Backend-portable callers should reach for
     /// [`Self::hybrid_candidates`] instead.
@@ -789,7 +782,7 @@ impl Store {
 impl Store {
     /// Read embedding-job status by id. Used by the embedding worker
     /// to skip mid-flight processing when a concurrent caller has
-    /// already marked the job stale. Routes to DuckDbQuery (SQL).
+    /// already marked the job stale. Routes to LanceStore.
     pub async fn get_embedding_job_status(
         &self,
         job_id: &str,
@@ -806,21 +799,14 @@ impl Store {
         self.lance.get_transcript_embedding_job_status(job_id).await
     }
 
-    /// Prune Lance version manifests older than `older_than_days`
-    /// across every managed table. Issued through LanceStore's Rust
-    /// API (not DuckDB SQL), so a DuckDB-side `refresh()` is needed
-    /// afterwards to invalidate the snapshot cache — see
-    /// [`Self::commit_lance_write`]. Driven by
-    /// `crate::worker::vacuum_worker` on a daily cadence and
-    /// exposed on-demand via `POST /admin/vacuum`.
-    ///
     /// Bulk decay sweep over `capability_capsules.decay_score`. Routes
     /// through the **LanceDB Rust API** (`table.update()`, the same
     /// writer ingest uses) — three batched UPDATEs (hard-expiry + two
     /// WHERE-disjoint decay passes); see
-    /// [`LanceStore::apply_time_decay`] for the exact semantics. A
-    /// `commit_lance_write` marks the DuckDB read snapshot dirty so the
-    /// next read sees the post-sweep `decay_score`/`last_used_at`.
+    /// [`LanceStore::apply_time_decay`] for the exact semantics. Reads
+    /// see the post-sweep `decay_score`/`last_used_at` natively (route-B
+    /// opened the lance read connection with `read_consistency_interval(0)`;
+    /// `commit_lance_write` is now a pass-through).
     ///
     /// **Route-B Phase 2 (2026-06-24):** migrated off the DuckDB lance
     /// extension. Decay and ingest are now the same single Rust-API
@@ -849,8 +835,9 @@ impl Store {
     /// capsules (roadmap O1 retrieval reinforcement). Routes through the
     /// **LanceDB Rust API** (`table.update()` per id) — same writer +
     /// same native commit-conflict retry as
-    /// [`Self::apply_time_decay`]; a `commit_lance_write` marks the
-    /// DuckDB read snapshot dirty. Driven off the read path by
+    /// [`Self::apply_time_decay`]; reads see the update natively
+    /// (`commit_lance_write` is a pass-through since route-B). Driven off
+    /// the read path by
     /// `crate::worker::last_used_worker`. Best-effort — no rowcount is
     /// returned (see [`LanceStore::bump_last_used_at`]).
     pub async fn bump_last_used_at(
@@ -868,7 +855,7 @@ impl Store {
     }
 
     /// Session lifecycle (touch / open / close) — all mutations.
-    /// Routed to LanceStore + DuckDbQuery refresh.
+    /// Routed to LanceStore.
     pub async fn touch_session(
         &self,
         session_id: &str,
@@ -925,10 +912,9 @@ impl Store {
 
     /// Multi-row variant of [`Self::create_conversation_message`]. One
     /// bulk dedup probe + one Lance write for the messages table + one
-    /// Lance write for the embedding-jobs table + one DuckDB refresh,
-    /// regardless of `msgs.len()`. Returns the number of rows that
-    /// actually landed (input minus dedup-skipped rows). No-op (and no
-    /// refresh) when empty.
+    /// Lance write for the embedding-jobs table, regardless of
+    /// `msgs.len()`. Returns the number of rows that actually landed
+    /// (input minus dedup-skipped rows). No-op when empty.
     pub async fn create_conversation_messages(
         &self,
         msgs: &[ConversationMessage],
@@ -1028,7 +1014,7 @@ impl Store {
     }
 
     /// Upsert a transcript-block embedding (transcript embedding
-    /// worker's hot path). Routes to LanceStore + DuckDbQuery refresh.
+    /// worker's hot path). Routes to LanceStore.
     ///
     /// **LANCE-SPECIFIC**: `conversation_message_embeddings` is
     /// lazy-created on first call (provider-dependent dim) — same
@@ -1103,14 +1089,15 @@ impl Store {
         .await
     }
 
-    /// Semantic recall over transcript blocks. Routes to DuckDbQuery
-    /// (lance_vector_search SQL + JOIN conversation_messages, cosine
-    /// similarity via `1 - L²/2` for normalized embeddings).
+    /// Semantic recall over transcript blocks. Routes to
+    /// `LanceStore::semantic_search_transcripts` — lance-native vector
+    /// ANN (`nearest_to`) over `conversation_message_embeddings`,
+    /// chunk-collapsed and hydrated against `conversation_messages` in
+    /// Rust, cosine similarity via `1 - L²/2` for normalized embeddings.
     ///
-    /// **LANCE-SPECIFIC**: depends on the lance DuckDB extension's
-    /// `lance_vector_search(...)` SQL table function. Trait
-    /// extraction should expose a portable `top_k_vector_candidates`
-    /// primitive that each backend implements with its own ANN path.
+    /// **LANCE-SPECIFIC**: lance vector ANN. Trait extraction should
+    /// expose a portable `top_k_vector_candidates` primitive that each
+    /// backend implements with its own ANN path.
     pub async fn semantic_search_transcripts(
         &self,
         tenant: &str,
@@ -1224,12 +1211,10 @@ impl Store {
     /// Route-B bucket "transcript_fts": BM25 lexical recall over
     /// `conversation_messages.content`.
     ///
-    /// - **DuckDb** arm uses the `lance_fts(...)` SQL table function from
-    ///   the lance DuckDB extension (LANCE-SPECIFIC).
-    /// - **Lance** arm goes through the route-B Tantivy index
-    ///   (`LanceStore::bm25_transcript_candidates`) — same machinery as
-    ///   the capsule `bm25_candidate_ids` bucket, indexed over the
-    ///   transcript corpus.
+    /// Goes through the route-B in-RAM Tantivy index
+    /// (`LanceStore::bm25_transcript_candidates`) — same machinery as
+    /// the capsule `bm25_candidate_ids` bucket, indexed over the
+    /// transcript corpus.
     pub async fn bm25_transcript_candidates(
         &self,
         tenant: &str,

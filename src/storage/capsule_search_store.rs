@@ -6,16 +6,17 @@
 //! `search_candidates`, `recent_active_capability_capsules`,
 //! `fetch_capability_capsules_by_ids`).
 //!
-//! **LANCE-SPECIFIC bits** (already annotated on `Store`):
-//! - `hybrid_candidates`: fused-SQL fast path (lance_fts +
-//!   lance_vector_search in one statement). 14–29% faster than
-//!   compose at k ∈ {10,50,100} per QW-1 bench.
-//! - `bm25_candidate_ids` / `ann_candidate_ids`: lance_fts /
-//!   lance_vector_search wrappers.
+//! Recall mechanics (route-B, lance-native):
+//! - `hybrid_candidates` composes `bm25_candidate_ids` +
+//!   `ann_candidate_ids` + Rust-side RRF (it just calls
+//!   `hybrid_candidates_compose`). There is no fused-SQL fast path —
+//!   the DuckDB read engine that ran it was removed in route-B.
+//! - `bm25_candidate_ids`: the in-RAM Tantivy BM25 index
+//!   (`crate::storage::fts`).
+//! - `ann_candidate_ids`: lance-native vector ANN (`nearest_to`).
 //!
-//! Other backends implement `hybrid_candidates` by routing to
-//! `hybrid_candidates_compose` (the portable form). Trait surface
-//! is uniform; the optimization knob is per-backend.
+//! The trait surface is uniform across backends; a backend that can
+//! fuse BM25 + ANN in one query may override `hybrid_candidates`.
 //!
 //! See `docs/backend-coupling.md` §3.1 + §4.1 + §6.4.
 
@@ -72,8 +73,8 @@ pub trait CapsuleSearchStore: Send + Sync {
     /// `(record, rrf_score)` ordered by
     /// `(rrf_score DESC, updated_at DESC, capability_capsule_id ASC)`.
     /// Three input shapes (text + vec, text-only, vec-only); both
-    /// empty returns `Ok(vec![])`. The default impl on each backend
-    /// may use a fused SQL path (Lance) or the compose form (others).
+    /// empty returns `Ok(vec![])`. The default impl composes
+    /// `bm25_candidate_ids` + `ann_candidate_ids` + Rust-side RRF.
     async fn hybrid_candidates(
         &self,
         tenant: &str,

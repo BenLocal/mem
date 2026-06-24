@@ -1085,9 +1085,9 @@ impl LanceStore {
     /// Route-B bucket "transcript_ann": native lancedb-Rust equivalent of
     /// `DuckDbQuery::semantic_search_transcripts`.
     ///
-    /// The DuckDB query runs `lance_vector_search(... k => oversample)` over
-    /// ALL tenants' chunk embeddings, collapses chunk-rows to one row per
-    /// `message_block_id` keeping the MIN `_distance`, JOINs back to
+    /// Runs a lance-native vector ANN (`nearest_to`) over ALL tenants'
+    /// chunk embeddings, collapses chunk-rows to one row per
+    /// `message_block_id` keeping the MIN `_distance`, hydrates against
     /// `conversation_messages` filtering `tenant = ? AND embed_eligible =
     /// true`, orders `best_distance ASC`, and `LIMIT`s to `limit`. We mirror
     /// each step with the native API:
@@ -1270,11 +1270,11 @@ impl LanceStore {
     /// Route-B bucket "transcript_fts": native (Tantivy) equivalent of
     /// `DuckDbQuery::bm25_transcript_candidates`.
     ///
-    /// The DuckDB query runs `lance_fts('conversation_messages', 'content',
-    /// query, k => k*2)`, filters `tenant = ? AND embed_eligible = true`,
-    /// orders by BM25 `_score DESC`, and `LIMIT`s to `k`. We mirror it with
-    /// the Tantivy index ([`crate::storage::fts::FtsIndex`]) built from the
-    /// transcript corpus via [`Self::rebuild_transcript_fts`] — eagerly by
+    /// Queries the in-RAM Tantivy index
+    /// ([`crate::storage::fts::FtsIndex`]) built from the transcript
+    /// corpus, filtering `tenant = ? AND embed_eligible = true`,
+    /// ordering by BM25 score DESC and limiting to `k`. The index is
+    /// (re)built via [`Self::rebuild_transcript_fts`] — eagerly by
     /// `rebuild_query_indexes`, or lazily here on first use if it was never
     /// built (so the route-B read engine works standalone). The query is
     /// term-split through the jieba tokenizer so unspaced CJK runs match

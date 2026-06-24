@@ -5,9 +5,11 @@
 //! per-session listing, cursor-paged range queries, ANN/BM25 recall,
 //! context-window stitching, and anchor lookups.
 //!
-//! **LANCE-SPECIFIC bits**:
-//! - `bm25_transcript_candidates` uses `lance_fts(...)`.
-//! - `semantic_search_transcripts` uses `lance_vector_search(...)`.
+//! Recall mechanics (route-B, lance-native):
+//! - `bm25_transcript_candidates`: the in-RAM Tantivy BM25 index
+//!   (`crate::storage::fts`).
+//! - `semantic_search_transcripts`: lance-native vector ANN
+//!   (`nearest_to`).
 //! - `create_conversation_message(s)` also enqueues
 //!   `transcript_embedding_jobs` inline when blocks are
 //!   embed-eligible — the trait surface hides that fan-out.
@@ -132,8 +134,8 @@ pub trait TranscriptStore: Send + Sync {
         limit: usize,
     ) -> Result<Vec<ConversationMessage>, StorageError>;
 
-    /// Top-k BM25 candidates over `conversation_messages.content`.
-    /// **LANCE-SPECIFIC**: uses `lance_fts(...)`.
+    /// Top-k BM25 candidates over `conversation_messages.content`
+    /// via the in-RAM Tantivy index (`crate::storage::fts`).
     async fn bm25_transcript_candidates(
         &self,
         tenant: &str,
@@ -142,9 +144,8 @@ pub trait TranscriptStore: Send + Sync {
     ) -> Result<Vec<ConversationMessage>, StorageError>;
 
     /// Top-k semantic candidates over
-    /// `conversation_message_embeddings.embedding`. Returns
-    /// `(message, cosine_similarity)`.
-    /// **LANCE-SPECIFIC**: uses `lance_vector_search(...)`.
+    /// `conversation_message_embeddings.embedding` via lance-native
+    /// vector ANN (`nearest_to`). Returns `(message, cosine_similarity)`.
     async fn semantic_search_transcripts(
         &self,
         tenant: &str,

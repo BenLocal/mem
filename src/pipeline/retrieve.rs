@@ -152,10 +152,10 @@ fn diversify_by_source(
 /// `pool` carries the always-applicable Preference / Workflow rows
 /// regardless of whether they hit the query — they pass `finalize`'s
 /// floor exemption. `hybrid_hits` carries the relevance signal: an
-/// (id → rrf_score) map driven by `lance_fts` + `lance_vector_search`
-/// joined and RRF-fused inline in DuckDB SQL. Items in both inputs
-/// score with rrf_score + lifecycle signals; items only in the pool
-/// score from lifecycle alone.
+/// (id → rrf_score) map driven by Tantivy BM25 + lance vector ANN,
+/// RRF-merged in Rust (`Store::hybrid_candidates`). Items in both
+/// inputs score with rrf_score + lifecycle signals; items only in the
+/// pool score from lifecycle alone.
 ///
 /// Graph expansion follows the same two-pass shape as the pre-hybrid
 /// path: derive anchors from the unfiltered top-N, fetch related
@@ -363,7 +363,7 @@ fn graph_boosts_from_edges(
 /// Computes the additive non-recall portion of a memory's score (the
 /// "lifecycle" stack: scope, intent, confidence, validation, freshness,
 /// staleness, graph boost, status penalty). Used by `score_with_hybrid`
-/// after the SQL-side RRF score has been added.
+/// after the Rust-side RRF score has been added.
 /// handles the common rest.
 #[allow(dead_code)] // callers are wired in subsequent Tasks 3-5
 fn apply_lifecycle_score(
@@ -399,8 +399,8 @@ fn apply_lifecycle_score(
     score
 }
 
-/// Score each candidate with the SQL-side RRF (already-fused
-/// lex+sem signal as a Float32) plus the lifecycle / scope / intent
+/// Score each candidate with the Rust-side RRF (the fused lex+sem
+/// signal as a Float32) plus the lifecycle / scope / intent
 /// / freshness / decay / graph stack. Items not in `hybrid_scores`
 /// score zero on relevance — they survive only via the lifecycle
 /// stack and the always-applicable `Preference` / `Workflow` floor
@@ -425,7 +425,7 @@ fn score_with_hybrid(
         .map(|memory| {
             let mut score = 0i64;
 
-            // SQL-side RRF score is already (1/(60+lex_rank))
+            // The RRF score (from `rrf_merge`) is already (1/(60+lex_rank))
             // + (1/(60+sem_rank)) ∈ ~[0, 0.033]. Scale it into the
             // i64 score domain via `RRF_SCALE` so a rank-1 dual hit
             // contributes about the same as the legacy manual RRF
@@ -629,10 +629,10 @@ fn parse_scope_filters(filters: &[String]) -> HashMap<String, Vec<String>> {
 }
 
 fn memory_type_score(capability_capsule_type: &CapabilityCapsuleType, intent: &str) -> i64 {
-    // Diary entries are filtered out at SQL level (see
-    // `hybrid_candidates` outer WHERE), so they shouldn't reach this
-    // scorer. Score 0 as a defense-in-depth fallback in case the SQL
-    // filter ever drifts.
+    // Diary entries are filtered out in `hybrid_candidates_compose`'s
+    // Rust post-fetch filter, so they shouldn't reach this scorer.
+    // Score 0 as a defense-in-depth fallback in case that filter ever
+    // drifts.
     if matches!(capability_capsule_type, CapabilityCapsuleType::Diary) {
         return 0;
     }
@@ -840,9 +840,9 @@ mod tests {
             - staleness_penalty(memory.decay_score)
     }
 
-    /// RRF score equivalent to `lance_fts`/`lance_vector_search`'s SQL
-    /// output: sum of `1.0/(60+rank)` per source. Used in tests to
-    /// build the same Float32 score the SQL hybrid produces.
+    /// RRF score: sum of `1.0/(60+rank)` per source — the same formula
+    /// `pipeline::ranking::rrf_merge` produces. Used in tests to build
+    /// the Float32 score the hybrid recall path yields.
     fn sql_rrf(lex_rank: Option<usize>, sem_rank: Option<usize>) -> f32 {
         let lex = lex_rank.map(|r| 1.0 / (60.0 + r as f32)).unwrap_or(0.0);
         let sem = sem_rank.map(|r| 1.0 / (60.0 + r as f32)).unwrap_or(0.0);

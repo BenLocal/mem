@@ -48,10 +48,10 @@ impl MineCursorStore for Store {
         last_line_number: i64,
         updated_at: &str,
     ) -> Result<(), StorageError> {
-        // Writes go through commit_lance_write so DuckDB read paths
-        // see the new cursor on subsequent reads (not strictly
-        // required here since no read path queries mine_cursors via
-        // DuckDB, but keeps the per-write refresh contract uniform).
+        // Route the write through commit_lance_write for a uniform write
+        // shape (it's a pass-through since route-B removed the DuckDB read
+        // engine; reads are lance-native, and nothing reads mine_cursors
+        // on the recall path anyway).
         self.commit_lance_write(
             self.lance
                 .upsert_mine_cursor(transcript_path, last_line_number, updated_at)
