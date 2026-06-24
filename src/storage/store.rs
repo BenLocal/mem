@@ -672,9 +672,18 @@ impl Store {
         tenant: &str,
         ids: &[&str],
     ) -> Result<Vec<CapabilityCapsuleRecord>, StorageError> {
-        self.query
-            .fetch_capability_capsules_by_ids(tenant, ids)
-            .await
+        match self.read_engine {
+            crate::config::ReadEngine::DuckDb => {
+                self.query
+                    .fetch_capability_capsules_by_ids(tenant, ids)
+                    .await
+            }
+            crate::config::ReadEngine::Lance => {
+                self.lance
+                    .fetch_capability_capsules_by_ids(tenant, ids)
+                    .await
+            }
+        }
     }
 
     pub async fn list_capability_capsule_ids_for_tenant(
@@ -1310,9 +1319,18 @@ impl Store {
         tenant: &str,
         ids: &[String],
     ) -> Result<Vec<ConversationMessage>, StorageError> {
-        self.query
-            .fetch_conversation_messages_by_ids(tenant, ids)
-            .await
+        match self.read_engine {
+            crate::config::ReadEngine::DuckDb => {
+                self.query
+                    .fetch_conversation_messages_by_ids(tenant, ids)
+                    .await
+            }
+            crate::config::ReadEngine::Lance => {
+                self.lance
+                    .fetch_conversation_messages_by_ids(tenant, ids)
+                    .await
+            }
+        }
     }
 
     pub async fn context_window_for_block(

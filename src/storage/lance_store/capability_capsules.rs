@@ -112,6 +112,45 @@ impl LanceStore {
             .await
     }
 
+    /// Route-B bucket "fetch-by-ids": native lancedb-Rust equivalent of
+    /// `DuckDbQuery::fetch_capability_capsules_by_ids` — bulk fetch by
+    /// `capability_capsule_id` list, scoped to `tenant`.
+    ///
+    /// **Order parity**: the DuckDB version uses `WHERE … IN (…)` and
+    /// returns rows in **DB-natural order, NOT input-slice order** (its
+    /// docstring spells this out; the only caller — `hybrid_candidates_compose`
+    /// — reshapes via a HashMap and re-sorts, so it never depends on the order).
+    /// A lance `only_if` scan likewise returns table order, not IN-list order,
+    /// so neither side is input-ordered and the contract holds. Empty `ids`
+    /// short-circuits to `Ok(vec![])` (mirrors DuckDB). Missing ids are simply
+    /// absent from the scan result (same as the DuckDB `IN` semantics).
+    ///
+    /// Parity-exercised by `tests/parity_golden.rs::lance_parity_matches_golden`
+    /// (the compose block hydrates capsules through this on the Lance engine)
+    /// and `tests/storage_fetch_by_ids.rs`.
+    pub async fn fetch_capability_capsules_by_ids(
+        &self,
+        tenant: &str,
+        ids: &[&str],
+    ) -> Result<Vec<CapabilityCapsuleRecord>, StorageError> {
+        if ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let id_list = ids
+            .iter()
+            .map(|id| sql_quote(id))
+            .collect::<Vec<_>>()
+            .join(", ");
+        self.query_capability_capsules(
+            format!(
+                "tenant = {} AND capability_capsule_id IN ({id_list})",
+                sql_quote(tenant),
+            ),
+            None,
+        )
+        .await
+    }
+
     /// Route-B bucket "ann": native lancedb-Rust equivalent of
     /// `DuckDbQuery::ann_candidate_ids`.
     ///

@@ -450,6 +450,55 @@ impl LanceStore {
         }
         Ok(out)
     }
+
+    /// Route-B bucket "transcript fetch-by-ids": native lancedb-Rust
+    /// equivalent of `DuckDbQuery::fetch_conversation_messages_by_ids` — bulk
+    /// fetch by `message_block_id` list, scoped to `tenant`.
+    ///
+    /// **Order parity**: the DuckDB version returns rows in **input-slice
+    /// order**, with missing ids silently dropped (post-search hydration
+    /// tolerates rows that disappeared between search and fetch). A lance
+    /// `only_if … IN (…)` scan returns table order, so we re-order the scanned
+    /// rows back to the input-id order in Rust via a HashMap (exactly as the
+    /// DuckDB impl does), then drop any id that didn't come back. Empty `ids`
+    /// short-circuits to `Ok(vec![])` (mirrors DuckDB).
+    ///
+    /// Parity-exercised by `tests/storage_fetch_by_ids.rs`.
+    pub async fn fetch_conversation_messages_by_ids(
+        &self,
+        tenant: &str,
+        ids: &[String],
+    ) -> Result<Vec<ConversationMessage>, StorageError> {
+        if ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let id_list = ids
+            .iter()
+            .map(|id| sql_quote(id))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let rows = self
+            .query_conversation_messages(format!(
+                "tenant = {} AND message_block_id IN ({id_list})",
+                sql_quote(tenant),
+            ))
+            .await?;
+        // Re-order the table-order scan back to input-id order, dropping any
+        // id that didn't come back (wrong tenant / vanished) — mirrors the
+        // DuckDB impl's HashMap reshape so callers see input-slice order.
+        let mut by_id: std::collections::HashMap<String, ConversationMessage> =
+            std::collections::HashMap::with_capacity(rows.len());
+        for m in rows {
+            by_id.insert(m.message_block_id.clone(), m);
+        }
+        let mut out = Vec::with_capacity(ids.len());
+        for id in ids {
+            if let Some(m) = by_id.remove(id) {
+                out.push(m);
+            }
+        }
+        Ok(out)
+    }
 }
 
 /// Transcript-side methods — previously bound by the
