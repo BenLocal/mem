@@ -137,7 +137,7 @@ FEEDBACK  ── 隐式 / 自动 ──
 **触点**：capsule schema（加列）、`pipeline/compress.rs`（输出即 bump 的 hook）、`worker/decay_worker.rs`（衰减锚）、`pipeline/retrieve.rs`（可选 bonus）。
 **风险**：低-中。bump 必须**异步、读路径外**，不能阻塞召回；写放大用"每会话每 capsule 至多 bump 一次"收口（与显式 feedback 的"每会话至多一条"同纪律）。
 
-**已落地（`808cb59` 加列 + `709c648` 行为，以代码为权威）**：实际形态与上面 (b)(c) 有两处偏离，都是 lance DuckDB 扩展的 UPDATE 限制逼出来的：
+**已落地（`808cb59` 加列 + `709c648` 行为，以代码为权威）**：实际形态与上面 (b)(c) 有两处偏离，都是 lance 的 UPDATE 限制逼出来的（route-B 后 decay 写经 lancedb Rust `table.update()`，非 DuckDB 扩展）：
 - (b) bump 触发点**没放进 `compress.rs`**（那是个纯函数，无 store/异步）。改成：`search` 在 `compress()` 返回后收集**真正写进输出**的 capsule_id（directives+facts+patterns，见 `SearchCapabilityCapsuleResponse::emitted_capsule_ids`），经 unbounded channel 异步丢给新的 **always-on `last_used_worker`**（仿 `potentiation_worker`）；worker 攒批去重后 `Store::bump_last_used_at` 盖 `last_used_at`，每 tenant 每 tick 一次批量 flush。"used"=进输出的语义不变，且彻底不在读路径上写。
 - (c) decay 锚**不能直接写 `COALESCE(last_used_at, updated_at)`**：lance UPDATE 的 SET 表达式不支持 `COALESCE`（"Not implemented"），且 WHERE 不支持多值 `IN`（"pushed table filters"）。改成：decay sweep 拆**两条 WHERE 互斥的 UPDATE**（`last_used_at IS NOT NULL` 锚 last_used_at、`IS NULL` 锚 updated_at，每行只命中一次）；bump 逐 id 单等值 UPDATE。额外精化：sweep 的**每 tick 重置列从 `updated_at` 改成 `last_used_at`**，于是 `updated_at` 回归纯写时间 freshness（旧账：原本被 sweep 每小时刷平），`decay_score` 仍是累加器、feedback delta 不被抹。可选的 retrieve freshness bonus **未做**（标 optional，留待后续）。
 - 旧表迁移：`migrate_capability_capsules_add_columns`（`add_columns(AllNulls)`）回填旧行 NULL → sweep 回落 `updated_at`，由 `legacy_uint64_version_compat` 端到端验证。新增 env `MEM_LAST_USED_FLUSH_SECS`（默认 5）。

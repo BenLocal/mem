@@ -219,7 +219,7 @@ override_value
 
 ### 2.6 `capability_capsule_batch_ingest`
 
-**描述**：`Bulk-insert multiple capsules in one call (server folds N rows into one Lance write + one DuckDB refresh; bench shows 9-227x speedup over looping capability_capsule_ingest). Returns 201 with per-item {result: ok | err} preserving input order, or 207 if any item failed.`
+**描述**：`Bulk-insert multiple capsules in one call (server folds N rows into one Lance write; bench shows 9-227x speedup over looping capability_capsule_ingest). Returns 201 with per-item {result: ok | err} preserving input order, or 207 if any item failed.`
 
 **参数** (`CapabilityCapsuleBatchIngestArgs`)
 
@@ -232,7 +232,7 @@ override_value
 
 **返回**：`{items: [{result: "ok", capability_capsule_id, status} | {result: "err", error}]}`，全成功 201，部分失败 207 Multi-Status。
 
-**Service**：`CapabilityCapsuleService::ingest_batch`（`service/capability_capsule_service.rs`），把 N 条的 idempotency 探针 + session resolve + 验证保留 per-row，但 **insert / graph edge sync / embedding job enqueue / touch_session 全部合并成单次调用**——一次 Lance manifest commit + 一次 DuckDB refresh。
+**Service**：`CapabilityCapsuleService::ingest_batch`（`service/capability_capsule_service.rs`），把 N 条的 idempotency 探针 + session resolve + 验证保留 per-row，但 **insert / graph edge sync / embedding job enqueue / touch_session 全部合并成单次调用**——一次 Lance manifest commit。
 
 **典型用法**：`mem mine` 类批量回填、agent 一次任务完成后多 capsule 落地。bench 数据见 [`api-data-flow.md §3.7`](./api-data-flow.md#37-批量写入端点性能bench)：N=100 时 capsule path 9.1×、transcript path 226×。
 
@@ -518,7 +518,7 @@ tags                    = [...] + ["caller_agent:<caller_agent>"]
 
 **返回**：`EntityWithAliases { entity_id, canonical_name, kind, created_at, aliases: [...] }` 或 404。
 
-**Service**：`EntityService::get` → `Store::get_entity`（DuckDB JOIN entities + entity_aliases）。
+**Service**：`EntityService::get` → `Store::get_entity`（lance-native，`lance_store/entities.rs`，entities + entity_aliases 在 Rust 侧关联）。
 
 **典型用法**：拿到一个 `entity:<uuid>` 想查它实际是哪个名字 / 有哪些别名时用。
 

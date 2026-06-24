@@ -76,7 +76,7 @@
 
 ## 2. 表卡片（schema + 调用关系）
 
-每张卡片格式：① schema 字段；② 写入方法（Lance）；③ 读取方法（DuckDB / Lance native）；④ Store 包装；⑤ Service / Pipeline 调用方；⑥ 跨表依赖。
+每张卡片格式：① schema 字段；② 写入方法（Lance）；③ 读取方法（Lance native）；④ Store 包装；⑤ Service / Pipeline 调用方；⑥ 跨表依赖。
 
 ### 2.1 `capability_capsules`
 
@@ -121,7 +121,7 @@
 | `delete_capability_capsule_hard` | 硬删除（admin Web） |
 | `apply_feedback` | 写 `feedback_events` + 调整本表 confidence/decay/status |
 
-**读取** (`duckdb_query/capability_capsules.rs`)
+**读取** (`lance_store/capability_capsules.rs`)
 
 | 方法 | 用途 |
 |---|---|
@@ -213,7 +213,7 @@
 
 **读取**
 
-- DuckDB: `get_embedding_job_status`（`duckdb_query/embedding_jobs.rs`）— 查单 job 状态
+- Lance: `get_embedding_job_status`（`lance_store/capability_capsules.rs`）— 查单 job 状态
 - LanceStore native: `list_embedding_jobs` / `latest_embedding_job_status_for_hash` / `stale_live_embedding_jobs_for_capability_capsule`（admin Web + ingest hot path）
 
 **Service 调用**
@@ -326,7 +326,7 @@ verbatim 对话归档，零业务规则。
 - `create_conversation_message` — 单行 + count_rows dedup
 - `create_conversation_messages_batch` — 批量，一次 filter 拉所有现有 key 做内存 dedup + 一次 multi-row add + 一次 multi-row 入队 `transcript_embedding_jobs`
 
-**读取** (`duckdb_query/transcripts.rs`)：
+**读取** (`lance_store/transcripts.rs`)：
 
 | 方法 | 用途 |
 |---|---|
@@ -385,7 +385,7 @@ verbatim 对话归档，零业务规则。
 - `sync_memory_edges` — UPSERT 活态边（先关闭旧的 `valid_to`，再插新的）
 - `close_edges_for_capability_capsule` — 硬删胶囊时关闭关联边
 
-**读取** (`duckdb_query/graph.rs`)：
+**读取** (`lance_store/graph.rs`)：
 
 - `neighbors` — 时间点查询（默认 now，过滤 `valid_to IS NULL`）
 - `related_capability_capsule_ids` — 多跳邻居展开 + 回到胶囊节点
@@ -416,7 +416,7 @@ verbatim 对话归档，零业务规则。
 
 **写入** — `resolve_or_create`（先查 alias，找到则返；否则插实体 + 插 alias）。
 
-**读取** — `get_entity` / `list_entities`（DuckDB SQL，JOIN aliases）。
+**读取** — `get_entity` / `list_entities`（lance-native，`lance_store/entities.rs`，alias 关联在 Rust 侧）。
 
 **Service 调用** — `EntityService` + `service/capability_capsule_service.rs::resolve_drafts_to_edges`（ingest 时把 topics 字符串解析成 entity_id）。
 

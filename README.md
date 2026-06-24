@@ -1,6 +1,6 @@
 # mem
 
-Local-first Rust `axum` memory service for multi-agent engineering workflows. The MVP supports memory ingest, pending review, detail lookup, graph diagnostics, compressed search, feedback updates, and episode-driven workflow extraction backed by DuckDB. Beyond CRUD, memories have a **lifecycle**: retrieval reinforcement, time decay, hard expiry, opt-in governance sweeps (idle-archive, ingest quality gate), and an opt-in **self-evolution** worker that merges and generalizes related capsules — every governance / evolution path defaults **OFF**, previews via dry-run, and is verbatim-safe (never rewrites or physically deletes a fact).
+Local-first Rust `axum` memory service for multi-agent engineering workflows. The MVP supports memory ingest, pending review, detail lookup, graph diagnostics, compressed search, feedback updates, and episode-driven workflow extraction, backed by on-disk Lance datasets (read natively via the lancedb Rust API — vector ANN via lance `nearest_to`, BM25 via an in-RAM Tantivy index, hybrid fused with RRF in Rust). Beyond CRUD, memories have a **lifecycle**: retrieval reinforcement, time decay, hard expiry, opt-in governance sweeps (idle-archive, ingest quality gate), and an opt-in **self-evolution** worker that merges and generalizes related capsules — every governance / evolution path defaults **OFF**, previews via dry-run, and is verbatim-safe (never rewrites or physically deletes a fact).
 
 ## Run Locally
 
@@ -8,7 +8,7 @@ Local-first Rust `axum` memory service for multi-agent engineering workflows. Th
 cargo run
 ```
 
-The server binds to `127.0.0.1:3000` by default. Set `MEM_DB_PATH` to point at a specific DuckDB file if you do not want to use the default local dev path.
+The server binds to `127.0.0.1:3000` by default. Set `MEM_DB_PATH` to point at a specific Lance dataset directory if you do not want to use the default local dev path.
 
 ## Codex / MCP (shared memory)
 
@@ -36,7 +36,7 @@ The MCP server forwards 20 tools to the HTTP service over `MEM_BASE_URL` (defaul
 
 | Backend | Select with | Storage | Notes |
 |---------|-------------|---------|-------|
-| **Lance + DuckDB** (default) | `MEM_BACKEND=lance` (or unset) | On-disk Lance datasets at `MEM_DB_PATH`, queried via an in-process DuckDB with the `lance` extension | Zero external services. The standard single-node deployment. |
+| **Lance** (default) | `MEM_BACKEND=lance` (or unset) | On-disk Lance datasets at `MEM_DB_PATH`, read natively via the lancedb Rust API — vector ANN via lance `nearest_to`, BM25 via an in-RAM Tantivy index, hybrid fused with RRF in Rust | Zero external services. The standard single-node deployment. |
 | **Postgres** | `MEM_BACKEND=postgres` + `MEM_POSTGRES_URL=…` | A Postgres database with the [`pgvector`](https://github.com/pgvector/pgvector) extension | ANN via pgvector, BM25 via `tsvector`/GIN, hybrid recall fused with RRF. Build with `--features postgres`. |
 
 The Postgres backend is gated behind the `postgres` cargo feature, so the default build does not pull `sqlx`/`pgvector` into the dependency graph:
@@ -70,7 +70,7 @@ cross build --release --target x86_64-unknown-linux-musl
 
 Output: `target/x86_64-unknown-linux-musl/release/mem` (suitable for glibc-free environments such as Alpine).
 
-Docker must be installed and running locally (`cross` provides the linking environment through a container). When `duckdb` is built with `bundled` and a target fails to compile, upgrade `cross` first, or switch that `target` to a newer `image` tag in `Cross.toml`.
+Docker must be installed and running locally (`cross` provides the linking environment through a container). If a target fails to compile (for example a native dependency's build script), upgrade `cross` first, or switch that `target` to a newer `image` tag in `Cross.toml`.
 
 CI (`.github/workflows/ci.yml`) runs **`cross build --release`** on PRs / pushes, targeting **`x86_64-unknown-linux-gnu`** and **`x86_64-unknown-linux-musl`** (matching `Cross.toml` / the Docker builder). On a `v*.*.*` tag, the Release workflow uploads both **`mem-<tag>-x86_64-unknown-linux-gnu`** and **`mem-<tag>-x86_64-unknown-linux-musl`** to the GitHub Release.
 
@@ -107,7 +107,7 @@ comments) live in [`deploy/`](deploy/): [`mem.config.env.example`](deploy/mem.co
 `EnvironmentFile=` and a shell `source` read them identically):
 
 ```ini
-MEM_DB_PATH=/var/lib/mem/mem.duckdb
+MEM_DB_PATH=/var/lib/mem/mem.lance
 MEM_TENANT=local
 BIND_ADDR=127.0.0.1:3000
 EMBEDDING_PROVIDER=fake        # fake | embedanything | openai
@@ -182,7 +182,7 @@ docker run --rm -p 3000:3000 -v mem_data:/data mem:local
 
 Example compose (build context is repo root): [deploy/docker-compose.yml](deploy/docker-compose.yml).
 
-Default in the image: `BIND_ADDR=0.0.0.0:3000`, `MEM_DB_PATH=/data/mem.duckdb`. Point MCP clients at the same host with `MEM_BASE_URL` (for example `http://127.0.0.1:3000`).
+Default in the image: `BIND_ADDR=0.0.0.0:3000`, `MEM_DB_PATH=/data/mem.lance`. Point MCP clients at the same host with `MEM_BASE_URL` (for example `http://127.0.0.1:3000`).
 
 ## Release (GHCR + binaries)
 

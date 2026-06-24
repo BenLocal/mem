@@ -1,6 +1,10 @@
 # mem HTTP API — 数据流转 / 技术栈 / 优化方向
 
-> ⚠️ **本文档部分内容过期**（2026-05-16）：写于 DuckDB-as-storage 时期，多处仍引用已不存在的模块（`DuckDbRepository`、`src/storage/duckdb.rs`、`src/storage/vector_index.rs`、`src/storage/graph_store.rs`、`src/service/embedding_worker.rs` 等）。**当前架构**是 `LanceStore` 写 + `DuckDbQuery` 读 + `src/worker/*.rs`，详见 `AGENTS.md` 架构段与 `docs/backend-coupling.md`。HNSW sidecar 已不存在——向量索引由 Lance 内置。**完整重写本文档列在后续 docs 任务里**；在那之前以 `AGENTS.md` 和实际代码为准。
+> ⚠️ **本文档大面积过期**（原写于 2026-05-16 DuckDB-as-storage 时期；route-B（2026-06-24）删掉 DuckDB 读引擎后更甚）。**§2 起的数据流仍引用已删除的模块**（`DuckDbRepository`、`src/storage/duckdb_query/`、`VectorIndex`/HNSW sidecar、`fts_worker`、`Arc<Mutex<Connection>>` 单写串行等）——不要照 §2 理解现状，以实际代码为准。
+>
+> **当前架构（route-B）**：存储与读取都是 **lance-native**（`LanceStore` + lancedb Rust API）；**没有** DuckDB（读引擎与 `duckdb` crate 已删除）、没有 `ATTACH`、没有 in-process DuckDB 连接、没有 HNSW sidecar。BM25 走 in-RAM **Tantivy** 子系统（`src/storage/fts.rs`，启动全量重建）；向量 ANN 走 lance 原生 `nearest_to`（IVF_PQ 索引由 vacuum worker 建）；hybrid 召回在 **Rust 侧 RRF** 融合；decay/last-used 经 lancedb `table.update()` 同一写者，`commit_lance_write` 已是 no-op（读经 `read_consistency_interval(0)` 直接看到写）。默认数据目录名 `mem.lance`。详见 `AGENTS.md` 架构段、`docs/remove-duckdb-keep-lance.md`、`docs/backend-coupling.md`。
+>
+> 下方 **§1 技术栈表已据 route-B 订正**；§0 架构图与 §2+ 数据流是 DuckDB 期旧内容，完整重写列在后续 docs 任务。
 >
 > **目的**：给一个真正能用上的"接口地图"——每条 HTTP 路由对应哪条服务/管线/存储调用链、用到的技术、可优化点。半年后回头改任何一条接口前先读这个。
 >
@@ -67,15 +71,15 @@ caller (codex/   │                                                            
 | HTTP | **axum 0.x** + **tokio** + tower middleware | `src/http/*.rs`, `src/main.rs` |
 | 序列化 | serde (snake_case) | `src/domain/*.rs` |
 | 错误 | `thiserror` + 自家 `AppError` (HTTP status mapping) | `src/error.rs` |
-| 存储 | **Lance** (列式，copy-on-write) + 进程内 **DuckDB** (lance extension `ATTACH ... TYPE LANCE`) | `src/storage/lance_store/` + `src/storage/duckdb_query/` + `src/storage/store.rs` |
-| ANN | **Lance native vector search**（`lance_vector_search()` SQL 表函数，无外部 sidecar） | `src/storage/lance_store/mod.rs` schemas |
-| 词法 | **Lance FTS index**（`lance_fts()` SQL 表函数，BM25） | `src/storage/lance_store/mod.rs::ensure_fts_index` |
+| 存储 | **Lance** (列式，copy-on-write)，读写都经 **lancedb Rust API**（无 DuckDB、无 `ATTACH`、无 in-process 连接） | `src/storage/lance_store/` + `src/storage/store.rs` |
+| ANN | **Lance 原生向量检索**（`query().nearest_to()`，IVF_PQ 索引由 vacuum worker 建，无外部 sidecar） | `src/storage/lance_store/maintenance.rs`（索引）+ `capability_capsules.rs` / `transcripts.rs`（查询） |
+| 词法 | **in-RAM Tantivy BM25**（jieba 分词，启动全量重建，非 lance 索引） | `src/storage/fts.rs` |
 | 排序 | **RRF**（k=60，×1000 scale）+ **lifecycle 加性层**（intent×memory_type / scope / freshness / decay / graph_boost） | `src/pipeline/retrieve.rs::score_candidates_hybrid_rrf` + `apply_lifecycle_score` |
 | Tokenizer | **tiktoken-rs**（`o200k_base`，CJK 友好）用于压缩输出 | `src/pipeline/compress.rs` |
 | 哈希 | **sha2** SHA-256（content_hash 跨进程稳定，迁移自 SipHash） | `src/pipeline/ingest.rs::compute_content_hash` |
 | Embedding | **embed_anything** (本地 Qwen3, dim=1024 默认) / **OpenAI** BYOK / **fake** (测试) — `Arc<dyn EmbeddingProvider>` | `src/embedding/` |
-| Graph | DuckDB 表 `graph_edges`（valid_from / valid_to 时序），mempalace-diff §5 | `src/storage/graph_store.rs` |
-| Entity registry | DuckDB 表 `entities` + `entity_aliases`（PK = `(tenant, alias_text)`，normalize lower+ws-collapsed） | `src/storage/entity_repo.rs` |
+| Graph | Lance 表 `graph_edges`（valid_from / valid_to 时序，Rust BFS），mempalace-diff §5 | `src/storage/lance_store/graph.rs` |
+| Entity registry | Lance 表 `entities` + `entity_aliases`（PK = `(tenant, alias_text)`，normalize lower+ws-collapsed） | `src/storage/lance_store/entities.rs` |
 | Async workers | tokio::spawn × 3：embedding / transcript-embedding / decay | `src/service/embedding_worker.rs` 等 |
 | 观测 | `tracing` (env filter via `RUST_LOG`) | 全局 |
 

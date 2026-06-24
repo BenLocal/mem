@@ -1,10 +1,10 @@
 # Postgres Backend Implementation Plan
 
-> **For agentic workers:** phased plan, repo design-doc convention (cf. `evolution-worker.md`). Each phase is TDD, three-gate-green, committed with `… (closes postgres-backend P#)`. Default backend stays Lance+DuckDB; Postgres is opt-in.
+> **For agentic workers:** phased plan, repo design-doc convention (cf. `evolution-worker.md`). Each phase is TDD, three-gate-green, committed with `… (closes postgres-backend P#)`. Default backend stays Lance (lance-native); Postgres is opt-in.
 
-**Goal:** Make `mem serve` able to run entirely on a single Postgres instance — a real peer to the Lance+DuckDB backend, not a degraded one — selected at runtime, with Lance+DuckDB remaining the default.
+**Goal:** Make `mem serve` able to run entirely on a single Postgres instance — a real peer to the Lance backend, not a degraded one — selected at runtime, with Lance remaining the default.
 
-**Architecture:** A concrete `PostgresBackend` (an `sqlx::PgPool` wrapper) implements all 11 storage sub-traits, so the existing blanket `impl<T> Backend for T` applies unchanged. `app::AppState::from_config` chooses between `Store` (Lance+DuckDB) and `PostgresBackend` by `MEM_BACKEND`, upcasting either to `Arc<dyn Backend>` — the rest of the service/worker layer is backend-agnostic already. Semantic search uses **pgvector** (`<=>` cosine + HNSW index); lexical search uses Postgres `tsvector`/GIN; the two fuse with the same RRF the Lance path uses. The whole module is behind the `postgres` cargo feature so the default build never pulls `sqlx`.
+**Architecture:** A concrete `PostgresBackend` (an `sqlx::PgPool` wrapper) implements all 11 storage sub-traits, so the existing blanket `impl<T> Backend for T` applies unchanged. `app::AppState::from_config` chooses between `Store` (Lance, lance-native) and `PostgresBackend` by `MEM_BACKEND`, upcasting either to `Arc<dyn Backend>` — the rest of the service/worker layer is backend-agnostic already. Semantic search uses **pgvector** (`<=>` cosine + HNSW index); lexical search uses Postgres `tsvector`/GIN; the two fuse with the same RRF the Lance path uses. The whole module is behind the `postgres` cargo feature so the default build never pulls `sqlx`.
 
 **Tech Stack:** Rust, `sqlx` 0.8 (runtime-tokio, tls-rustls, postgres, uuid), **pgvector** Postgres extension, Docker Postgres for integration tests.
 
@@ -25,7 +25,7 @@
 
 1. **向量检索 = pgvector**（真 ANN，对等 Lance）。embeddings 列用 `vector(dim)`，建 HNSW 索引，距离用 `<=>`（cosine）。部署的 PG 实例需 `CREATE EXTENSION vector`。
 2. **本轮做完整后端**：11 子 trait 全实现 + 选择 + 迁移 + 集成测试，`mem serve` 能真跑 PG。
-3. **默认仍 Lance+DuckDB**：`MEM_BACKEND=lance`（默认）`| postgres`；`postgres` 时读 `MEM_POSTGRES_URL`（缺则 `DATABASE_URL`）。整模块在 `postgres` cargo feature 之后——默认构建不拉 sqlx。若 `MEM_BACKEND=postgres` 而二进制没编 `postgres` feature → 启动时清晰报错。
+3. **默认仍 Lance**：`MEM_BACKEND=lance`（默认）`| postgres`；`postgres` 时读 `MEM_POSTGRES_URL`（缺则 `DATABASE_URL`）。整模块在 `postgres` cargo feature 之后——默认构建不拉 sqlx。若 `MEM_BACKEND=postgres` 而二进制没编 `postgres` feature → 启动时清晰报错。
 4. **schema 漂移沿用 spike 笔记**（0001 已定）：时间戳留 TEXT（20 位零填充 ms 串，对齐 trait `&str` 面）、枚举存 TEXT + CHECK（域枚举已是 snake_case 串）。新表沿用同口径，避免转换层。
 
 ## 2. 测试基建（贯穿所有 phase）
@@ -83,7 +83,7 @@
 
 - **GraphStore**（28）：`graph_edges` 表（`valid_from`/`valid_to`）；`neighbors_within` BFS 用**递归 CTE**（`WITH RECURSIVE`，`MAX_HOPS_CAP=3`）；时点查询 `valid_to IS NULL OR valid_to > as_of`；`invalidate_edge` / `close_edges_for_capability_capsule` / `graph_stats`。
 - **TranscriptStore**（24）：`conversation_messages` + range/session 读；搜索侧若需嵌入则复用 P3 的 conversation embeddings。
-- **EmbeddingJobStore**（队列）：`claim_next_n` 用 `SELECT … FOR UPDATE SKIP LOCKED`（PG 原生队列原语，比 DuckDB 干净）。
+- **EmbeddingJobStore**（队列）：`claim_next_n` 用 `SELECT … FOR UPDATE SKIP LOCKED`（PG 原生队列原语，比 Lance 后端的乐观并发 claim 干净）。
 - **EntityRegistry**（10）/ **SessionStore**（12）/ **MineCursorStore**（4）/ **EvolutionCandidateStore**（4）：直 CRUD，UPSERT 用 `ON CONFLICT`。
 - **MaintenanceStore**（9）：Lance 的 vacuum/manifest 在 PG 无对应——实现为 `ANALYZE` / no-op + 文档说明语义差异。
 - **迁移** `0004_graph_transcripts_misc.sql` 等覆盖上述表。
