@@ -1,10 +1,6 @@
 # mem HTTP API — 数据流转 / 技术栈 / 优化方向
 
-> ⚠️ **本文档大面积过期**（原写于 2026-05-16 DuckDB-as-storage 时期；route-B（2026-06-24）删掉 DuckDB 读引擎后更甚）。**§2 起的数据流仍引用已删除的模块**（`DuckDbRepository`、`src/storage/duckdb_query/`、`VectorIndex`/HNSW sidecar、`fts_worker`、`Arc<Mutex<Connection>>` 单写串行等）——不要照 §2 理解现状，以实际代码为准。
->
-> **当前架构（route-B）**：存储与读取都是 **lance-native**（`LanceStore` + lancedb Rust API）；**没有** DuckDB（读引擎与 `duckdb` crate 已删除）、没有 `ATTACH`、没有 in-process DuckDB 连接、没有 HNSW sidecar。BM25 走 in-RAM **Tantivy** 子系统（`src/storage/fts.rs`，启动全量重建）；向量 ANN 走 lance 原生 `nearest_to`（IVF_PQ 索引由 vacuum worker 建）；hybrid 召回在 **Rust 侧 RRF** 融合；decay/last-used 经 lancedb `table.update()` 同一写者，`commit_lance_write` 已是 no-op（读经 `read_consistency_interval(0)` 直接看到写）。默认数据目录名 `mem.lance`。详见 `AGENTS.md` 架构段、`docs/remove-duckdb-keep-lance.md`、`docs/backend-coupling.md`。
->
-> 下方 **§1 技术栈表已据 route-B 订正**；§0 架构图与 §2+ 数据流是 DuckDB 期旧内容，完整重写列在后续 docs 任务。
+> **架构（route-B，2026-06-24）**：存储与读取都是 **lance-native**（`LanceStore` + lancedb Rust API）——没有 DuckDB（读引擎与 `duckdb` crate 已删）、没有 `ATTACH`、没有 in-process 连接。BM25 走 in-RAM **Tantivy** 子系统（`src/storage/fts.rs`，jieba 分词，启动全量重建，非 lance 索引）；向量 ANN 走 lance 原生 `query().nearest_to()`（IVF_PQ 索引由 vacuum worker 建，无 sidecar）；hybrid 召回在 **Rust 侧 RRF**（`pipeline::ranking::rrf_merge`）融合后过 lifecycle 评分栈；decay/last-used 经 lancedb `table.update()` 同一写者，`commit_lance_write` 已是 no-op（读经 `read_consistency_interval(0)` Strong 直接看到写）。默认数据目录名 `mem.lance`。详见 `AGENTS.md` 架构段、`docs/remove-duckdb-keep-lance.md`、`docs/backend-coupling.md`。
 >
 > **目的**：给一个真正能用上的"接口地图"——每条 HTTP 路由对应哪条服务/管线/存储调用链、用到的技术、可优化点。半年后回头改任何一条接口前先读这个。
 >
@@ -17,50 +13,47 @@
 ## 0. 总体架构
 
 ```
-                 ┌───────────────────────── HTTP (axum :3000) ─────────────────────────┐
-caller (codex/   │                                                                      │
- cursor/CI/CLI) ─┼─→  /memories       /memories/search   /memories/feedback             │
-                 │   /memories/{id}   /reviews/*         /entities/*                    │
-                 │   /episodes        /graph/neighbors   /transcripts/*                 │
-                 │   /embeddings/*    /health                                           │
-                 └─────┬────────────────────────────────────────────────────┬───────────┘
-                       │                                                    │
-              ┌────────▼─────────┐                              ┌───────────▼──────────┐
-              │ MemoryService    │                              │ TranscriptService    │
-              │ EntityService    │  (service 层 = 编排，无业务规则) │ (verbatim archive)   │
-              └────────┬─────────┘                              └───────────┬──────────┘
-                       │                                                    │
-              ┌────────▼─────────┐                              ┌───────────▼──────────┐
-              │ pipeline/        │   ingest / retrieve /        │ Lance FTS BM25 +     │
-              │  ingest          │   compress / workflow        │ Lance vector search  │
-              │  retrieve(RRF)   │                              │ context window merge │
-              │  compress(tok.)  │                              │                      │
-              │  workflow        │                              │                      │
-              └────────┬─────────┘                              └───────────┬──────────┘
-                       │                                                    │
-                  ┌────▼────────────────── storage ─────────────────────────▼────┐
-                  │  Store (LanceStore writes + DuckDbQuery reads, same .lance/) │
-                  │   ├ capability_capsules / capability_capsule_embeddings      │
-                  │   ├ embedding_jobs / feedback_events / sessions / episodes   │
-                  │   ├ graph_edges (LanceStore + DuckDbQuery graph methods)     │
-                  │   ├ entities / entity_aliases (EntityRegistry)               │
-                  │   └ conversation_messages / conversation_message_embeddings  │
-                  │       / transcript_embedding_jobs                            │
-                  │  ANN & BM25 indexes: Lance native (no sidecar)               │
-                  └──────────────────────────┬────────────────────────────────────┘
-                                             │
-                       ┌─────────────────────┴────────────────────┐
-                       │       后台 worker（tokio::spawn）         │
-                       │  embedding_worker  →  embedding_jobs      │
-                       │  transcript_embedding_worker              │
-                       │  decay_worker      →  低频时间衰减         │
-                       └──────────────────────────────────────────┘
+          ┌─────────────────── HTTP (axum :3000, src/http/*) ───────────────────┐
+caller    │ /capability_capsules[ /search /batch /list /{id} /stats /taxonomy ]  │
+(codex/   ─┼ /capability_capsules/feedback  /episodes  /reviews/*  /entities/*    │
+ cursor/   │ /graph/*  /fact_check  /transcripts[ /messages /search /range ]      │
+ CLI/mcp)  │ /embeddings/*  /mine/cursors  /admin/*  /health                      │
+          └──────┬───────────────────────────────────────────────┬───────────────┘
+                 │                                                │
+       ┌─────────▼──────────────┐                     ┌───────────▼────────────┐
+       │ CapabilityCapsuleService│  (service = 编排,    │ TranscriptService       │
+       │ EntityService / FactCheck│   无业务规则)        │ (verbatim 对话归档)     │
+       └─────────┬──────────────┘                     └───────────┬────────────┘
+                 │                                                │
+       ┌─────────▼──────────── pipeline (src/pipeline/*) ─────────▼────────────┐
+       │ ingest(status·hash·graph-draft) · retrieve(RRF + lifecycle + graph)   │
+       │ ranking(rrf_merge) · compress(token budget→4段) · transcript_recall   │
+       └─────────┬────────────────────────────────────────────────────────────┘
+                 │  读: query().only_if(<谓词>) · query().nearest_to(vec) · fetch_*_by_ids
+                 │  写: open_table().add() / .update().only_if() / .delete()
+       ┌─────────▼──────── storage = LanceStore (src/storage/lance_store/*) ────────┐
+       │ on-disk Lance 数据集 @ MEM_DB_PATH (默认 mem.lance) — 读写都走 lancedb Rust API │
+       │  ├ capability_capsules / capability_capsule_embeddings / embedding_jobs      │
+       │  ├ feedback_events / sessions / episodes / mine_cursors / evolution_candidates│
+       │  ├ graph_edges (Rust BFS) · entities / entity_aliases (EntityRegistry)       │
+       │  └ conversation_messages / conversation_message_embeddings / transcript_embedding_jobs│
+       │  词法 BM25: in-RAM Tantivy (src/storage/fts.rs, jieba, 启动全量重建)          │
+       │  向量 ANN: lance 原生 nearest_to + IVF_PQ 索引 (vacuum worker 建, 无 sidecar) │
+       └─────────┬──────────────────────────────────────────────────────────────────┘
+                 │
+   ┌─────────────▼──────────── 后台 worker (tokio::spawn, src/worker/*) ─────────────┐
+   │ embedding_worker / transcript_embedding_worker → 消费 *_embedding_jobs 队列写向量 │
+   │ vacuum_worker → manifest 修剪 + ensure_query_indexes(IVF_PQ) + Tantivy 重建      │
+   │ decay_worker → 时间衰减   last_used_worker → 检索强化 (last_used_at)             │
+   │ auto_promote(默认ON) · idle_archive / dedup / evolution / cooccurrence /          │
+   │ potentiation / topic_tunnel (多数 opt-in, 默认 OFF)                              │
+   └──────────────────────────────────────────────────────────────────────────────┘
 ```
 
 **核心约束**（值得被反复念）：
-- DuckDB 是 **single-writer**，整个进程通过 `Arc<Mutex<Connection>>` 串行访问；并发的代价已经付了，不要再叠"伪并发"。
-- 检索层的两路（BM25 + HNSW）在 `merge_and_rank_hybrid_scored` 里**顺序**执行，**没有并行**——优化机会，详见 §3.6。
-- `memories.content` 是 verbatim 事实源，`memories.summary` 是索引提示——**输出层永远基于 content**（见 mempalace-diff §7）。
+- **读写都是 lance-native，无 DuckDB / 无 SQL 引擎**：写 `open_table().add()/.update().only_if()/.delete()`，读 `query().only_if(<sql 谓词>)` / `nearest_to(vec)` / `fetch_*_by_ids`；排序、聚合、RRF、图-BFS、版本链去重都在 **Rust 侧**做。读连接用 `read_consistency_interval(0)`（Strong），写后即可见，`commit_lance_write` 是 no-op pass-through。
+- **召回两路在 Rust 侧融合**：BM25（Tantivy）+ 向量 ANN（lance `nearest_to`）各取候选 id，`pipeline::ranking::rrf_merge`（k=60）融合，再过 lifecycle 加性评分栈（intent×type / scope / confidence / freshness − decay + graph_boost）。当前两路**顺序**取候选（优化机会见 §3.6 / §4.2）。
+- `capability_capsules.content` 是 verbatim 事实源，`summary` 是索引提示——**输出层永远基于 content**（见 mempalace-diff §7）。
 
 ---
 
@@ -93,100 +86,108 @@ caller (codex/   │                                                            
 HTTP handler → service 方法 → pipeline / storage 调用链 → 写入哪些表 / 读哪些索引
 ```
 
-### 2.1 Memory 生命周期
+### 2.1 Capsule 生命周期
 
-#### `POST /memories` — 写一条 memory
+#### `POST /capability_capsules` — 写一条 capsule
 
 ```
-memory.rs::ingest_memory
- → MemoryService::ingest
-   → pipeline::ingest::initial_status                      # write_mode + memory_type → status
+capability_capsule.rs::ingest_capability_capsule
+ → CapabilityCapsuleService::ingest
    → pipeline::ingest::compute_content_hash (SHA-256)
-   → DuckDbRepository::find_by_idempotency_or_hash         # 幂等 / 去重
-   → DuckDbRepository::insert_memory                       ← 写 memories 表
+   → Store::find_by_idempotency_or_hash                    # 幂等 / 去重 → 命中直接返回
+   → pipeline::ingest::initial_status                      # capsule_type + write_mode → status
+   → pipeline::ingest::{validate_verbatim, validate_scope_boundary, assess_ingest_quality}
+   → pipeline::session::resolve_session                    ← 读/写 sessions
+   → Store::insert_capability_capsule                      ← 写 capability_capsules
    → pipeline::ingest::extract_graph_edge_drafts
-   → service::memory_service::resolve_drafts_to_edges      # 含 EntityRegistry::resolve_or_create
-   → DuckDbGraphStore::sync_memory_edges                   ← 写 graph_edges
-   → DuckDbRepository::try_enqueue_embedding_job           ← 写 embedding_jobs（pending）
+   → service::resolve_drafts_to_edges                      # 含 EntityRegistry::resolve_or_create → entities/entity_aliases
+   → Store::sync_memory_edges                              ← 写 graph_edges
+   → Store::enqueue_embedding_job_for_memory               ← 写 embedding_jobs（pending）
+   → Store::touch_session                                  ← 写 sessions
 ```
 
-**写入**：`memories` / `graph_edges` / `entities` / `entity_aliases` / `embedding_jobs`。
+**写入**：`capability_capsules` / `graph_edges` / `entities` / `entity_aliases` / `embedding_jobs` / `sessions`。
 **特点**：embed 异步——HTTP **不等** embedding 完成，job 入队就返回 201。
 
-#### `POST /memories/search` — 检索（核心读路径）
+#### `POST /capability_capsules/search` — 检索（核心读路径）
 
 ```
-memory.rs::search_memory
- → MemoryService::search
-   ┌─ 词法路：DuckDbRepository::lexical_candidates
-   │     → ensure_fts_index_fresh (按 dirty flag 重建 FTS)   ← 读 FTS index
-   │     → bm25_candidates (LEFT JOIN memories)              ← 读 memories
-   ├─ 语义路：embedding_provider.embed_text(query)            ← 调用本地/OpenAI 推理
-   │     → DuckDbRepository::semantic_search_memories
-   │       → VectorIndex::search (HNSW ANN)                  ← 读 HNSW sidecar
-   │       → fetch_memories_by_ids                           ← 读 memories
-   ├─ 融合：pipeline::retrieve::rank_with_graph_hybrid
-   │     → merge_and_rank_hybrid_scored
-   │     → score_candidates_hybrid_rrf  (RRF k=60, ×1000)
-   │     → apply_lifecycle_score        (decay/confidence/scope/intent/graph)
-   │     [graph 扩展] graph.related_memory_ids(anchors)      ← 读 graph_edges
-   └─ 输出：pipeline::compress::compress
-         → tiktoken o200k_base 切 token_budget
-         → 4 段：directives / facts / patterns / workflow
+capability_capsule.rs::search_capability_capsule
+ → CapabilityCapsuleService::search
+   ├─ wake-up 快路（intent="wake_up" + 空 query）：
+   │     Store::recent_active_capability_capsules → compress::compress   # 跳过排序
+   │     [+ TranscriptService::recent_for_wake_up → compress_recent_sessions]
+   └─ 正常路：
+      tokio::join!(
+        Store::search_candidates(tenant)             ← lifecycle pool：全活跃集（lance only_if 扫描）
+        embedding_provider.embed_text(query)         ← 本地/OpenAI 推理出 query 向量
+      )
+      → Store::hybrid_candidates(tenant, query, vec, k=48)
+          → bm25_candidate_ids                       ← Tantivy BM25（src/storage/fts.rs）
+          → ann_candidate_ids                        ← lance nearest_to（capability_capsule_embeddings）
+          → pipeline::ranking::rrf_merge（k=60）
+      → pipeline::retrieve::rank_with_hybrid_and_graph
+          → 合并 pool + hybrid hits，is_expired 过滤（硬过期）
+          → score_with_hybrid：RRF 分 + lifecycle 栈（memory_type×intent / scope / confidence / freshness − decay）
+          → [expand_graph] graph_anchor_nodes → compute_graph_boosts（GRAPH_BOOST=12，fanout 稀释，K9 边动态）  ← 读 graph_edges
+          → finalize：relevance floor + O3 per-source cap
+      → pipeline::compress::compress（tiktoken o200k_base 切 token_budget → 4 段）
+      → enqueue_capsules_used                        # O1：异步标 last_used（读路径外）
 ```
 
-**读取**：`memories` / FTS index / `memory_embeddings` (HNSW sidecar) / `graph_edges`。
-**特点**：lexical 与 semantic 当前**串行**调用；HNSW 走 ID → memories 二次 SQL；graph 扩展是可选（`expand_graph=true` 才走）。
+**读取**：`capability_capsules` / Tantivy BM25 / `capability_capsule_embeddings`（lance ANN）/ `graph_edges`。
+**特点**：lifecycle pool 与 query 向量并行（`tokio::join!`）；BM25 + ANN 两路在 `hybrid_candidates` 内顺序取候选；graph 扩展可选（`expand_graph=true`），graph 出错自动降级为无 graph boost 重试。
 
-#### `GET /memories/{id}` — 单条详情
+#### `GET /capability_capsules/{id}` — 单条详情
 
 ```
-memory.rs::get_memory → MemoryService::get_memory
-  → DuckDbRepository::get_memory_for_tenant
-  → embedding_meta_for_memory       # = memory_embeddings + 最近 embedding_jobs.status
-  → DuckDbGraphStore::neighbors     # 该 memory 的活动图边
-  → list_memory_versions_for_tenant # supersedes 链
+capability_capsule.rs::get_capability_capsule → CapabilityCapsuleService::get_capability_capsule
+  → Store::get_capability_capsule         # 跨租户取行
+  → embedding_meta                        # = capability_capsule_embeddings + 最近 embedding_jobs.status
+  → Store::neighbors                      # 该 capsule 的活动图边 ← 读 graph_edges
+  → list_capability_capsule_versions      # supersedes 链
   → feedback_summary
 ```
 
 只读。带 embedding 状态、图边、版本链。
 
-#### `POST /memories/feedback` — 反馈
+#### `POST /capability_capsules/feedback` — 反馈
 
 ```
-memory.rs::submit_feedback → MemoryService::submit_feedback
-  → DuckDbRepository::get_memory_for_tenant
-  → DuckDbRepository::apply_feedback   ← 写 feedback_events，调权 confidence/decay
+capability_capsule.rs::submit_feedback → CapabilityCapsuleService::submit_feedback
+  → Store::get_capability_capsule_for_tenant
+  → Store::apply_feedback   ← 写 feedback_events，调权 confidence/decay/status
 ```
 
-不动 embedding / 索引；只更新行 + 写事件。
+不动 embedding / 索引；只更新行 + 写事件。`incorrect` → status=Archived。
 
 #### `POST /episodes` — 工作流原料
 
 ```
-memory.rs::ingest_episode → MemoryService::ingest_episode
-  → list_successful_episodes_for_tenant
+capability_capsule.rs::ingest_episode → CapabilityCapsuleService::ingest_episode
+  → Store::list_successful_episodes_for_tenant
   → pipeline::workflow::maybe_extract_workflow
-  ├ 命中 → 递归 MemoryService::ingest（创建 workflow memory，又触发 embed）
-  └ DuckDbRepository::insert_episode    ← 写 episodes
+  ├ 命中 → 递归 CapabilityCapsuleService::ingest（创建 workflow capsule，又触发 embed）
+  └ Store::insert_episode    ← 写 episodes
 ```
 
-可能触发 `try_enqueue_embedding_job`（间接经过 workflow ingest）。
+可能触发 embedding job 入队（间接经过 workflow ingest）。
 
 ### 2.2 Review（人工审核 / pending）
 
 | 路由 | 服务 | 关键写入 |
 |---|---|---|
-| `GET /reviews/pending` | `MemoryService::list_pending_review` → `list_pending_review` | 只读 |
-| `POST /reviews/pending/accept` | `accept_pending` | `memories.status` → Active |
-| `POST /reviews/pending/reject` | `reject_pending` | `memories.status` → Rejected |
-| `POST /reviews/pending/edit_accept` | `edit_and_accept_pending` → `replace_pending_with_successor` + `close_edges_for_memory` + `extract_graph_edge_drafts` + `sync_memory_edges` + `enqueue_embedding_job_for_memory` | memories（supersede）/ graph_edges / embedding_jobs |
+| `GET /reviews/pending` | `CapabilityCapsuleService::list_pending_review` | 只读 |
+| `POST /reviews/pending/accept` | `accept_pending` | `capability_capsules.status` → Active |
+| `POST /reviews/pending/reject` | `reject_pending` | `capability_capsules.status` → Rejected |
+| `POST /reviews/pending/edit_accept` | `edit_and_accept_pending` → `replace_pending_with_successor` + `close_edges_for_capability_capsule` + `extract_graph_edge_drafts` + `sync_memory_edges` + 重新入队 embedding job | capability_capsules（supersede）/ graph_edges / embedding_jobs |
+| `POST /reviews/{auto_promote,idle_archive,evolution}` | `auto_promote_sweep` / `idle_archive_sweep` / `evolution_sweep`（`{dry_run}`） | 治理 sweep（预览 vs 执行；详见 README「治理 / 自进化」） |
 
 `edit_accept` 是最重的——本质是"在审核里改完接受"，会重做一遍 ingest 路径。
 
 ### 2.3 Graph
 
-`GET /graph/neighbors/{node_id}` → `MemoryService::graph_neighbors` → `DuckDbGraphStore::neighbors`。读 `graph_edges` 默认 `valid_to IS NULL`（活动边）。`node_id` 含 `:` 必须 URL-encode。
+`GET /graph/neighbors/{node_id}` → `CapabilityCapsuleService::graph_neighbors` → `Store::neighbors`。读 `graph_edges` 默认 `valid_to IS NULL`（活动边），多跳走 `neighbors_within`（Rust 迭代 BFS，`MAX_HOPS_CAP=3`）。其余：`/graph/edges`(+`/invalidate`)、`/graph/stats`、`/graph/timeline`、`/graph/predicate`、`/graph/tunnels`(`/find`·`/follow`)。`node_id` 含 `:` 必须 URL-encode。
 
 ### 2.4 Entities（消歧 / 别名）
 
@@ -194,47 +195,47 @@ memory.rs::ingest_episode → MemoryService::ingest_episode
 |---|---|---|
 | `POST /entities` | `EntityService::create_with_aliases` → `lookup_alias` 预检 + `resolve_or_create` + 多次 `add_alias` | entities / entity_aliases |
 | `GET /entities` | `list_entities` | 只读 |
-| `GET /entities/{id}` | `get_entity` | 只读 |
+| `GET /entities/{id}` | `get_entity`（lance-native，alias 在 Rust 侧关联） | 只读 |
 | `POST /entities/{id}/aliases` | `add_alias` | entity_aliases |
 
-并发安全靠 `Arc<Mutex<Connection>>` 串行 + transaction；**没有 DB 级 unique partial index**（DuckDB bundled 不支持），靠应用层 PK `(tenant, alias_text)` 兜底。
+别名匹配 lowercase + whitespace-collapsed，PK `(tenant, alias_text)` 兜重；并发安全靠 lance 的乐观并发提交 + Rust 侧 `resolve_or_create`（先查 alias，命中即返，否则插实体 + 插 alias）。
 
 ### 2.5 Embeddings（运维 / 调试）
 
 | 路由 | 行为 | 数据源 |
 |---|---|---|
 | `GET /embeddings/jobs` | 读队列状态 | `embedding_jobs` |
-| `POST /embeddings/rebuild` | 给某 tenant 全量或指定 id 列表重建：可选清旧 sidecar 行 + stale 旧 job + 重新 enqueue | `memory_embeddings` / `embedding_jobs` / HNSW sidecar |
+| `POST /embeddings/rebuild` | 给某 tenant 全量或指定 id 列表重建：stale 旧 job + 重新 enqueue（`force` 绕去重） | `embedding_jobs` / `capability_capsule_embeddings` |
 | `GET /embeddings/providers` | 当前 provider 配置 | 只读 (config) |
 
-`/embeddings/*` 默认在 MCP 隐藏（`MEM_MCP_EXPOSE_EMBEDDINGS=1` 才暴露）；HTTP 默认开。
+`/embeddings/*` 默认在 MCP 隐藏（`MEM_MCP_EXPOSE_EMBEDDINGS=1` 才暴露）；HTTP 默认开。向量由 `embedding_worker` 异步算入 `capability_capsule_embeddings`，ANN 的 IVF_PQ 索引由 `vacuum_worker` 维护。
 
 ### 2.6 Transcripts（对话归档 / parallel pipeline）
 
-> 与 memories 完全不共享：单独的表、单独的队列、单独的 HNSW sidecar。详见 mempalace-diff §14。
+> 与 capsules 完全不共享：单独的表（`conversation_messages`）、单独队列（`transcript_embedding_jobs`）、单独向量表（`conversation_message_embeddings`）。详见 mempalace-diff §14。
 
 ```
-POST /transcripts/messages → TranscriptService::ingest
-  → DuckDbRepository::create_conversation_message       ← 写 conversation_messages
-  → set_transcripts_fts_dirty                           # FTS 标 dirty，下次 search 重建
-  → 可选 enqueue transcript_embedding_jobs              # MEM_TRANSCRIPT_EMBED_DISABLED=1 跳过
+POST /transcripts/messages(/batch) → TranscriptService::ingest(_batch)
+  → Store::create_conversation_message(s)               ← 写 conversation_messages
+       （内联按 embed_eligible 入队 transcript_embedding_jobs；MEM_TRANSCRIPT_EMBED_DISABLED=1 跳过嵌入）
 
 POST /transcripts/search → TranscriptService::search
-  → bm25_transcript_candidates                          ← 读 FTS (conversation_messages)
-  → 可选 VectorIndex(transcript).search                  ← 读 transcript HNSW sidecar
-  → fetch_conversation_messages_by_ids
-  → score_candidates + merge_windows                    # 上下文窗口合并
+  ├ BM25 路：Store::bm25_transcript_candidates           ← Tantivy（conversation_messages.content）
+  ├ 语义路：embed_text(query) → Store::semantic_search_transcripts
+  │         ← lance nearest_to（conversation_message_embeddings，chunk-collapse MIN _distance）
+  │   （任一 lance-scan 出错 → warn! 软降级，另一路兜底，绝不 500）
+  → transcript_recall::{score_candidates, merge_windows}  # 上下文窗口合并（±context_window，anchor / 共现加权）
+  → fetch_conversation_messages_by_ids                    # hydrate
 
-POST /transcripts {session_id, tenant, [limit, cursor, since, until]}
-  → get_conversation_messages_by_session  (when limit omitted)
-  → get_conversation_messages_by_session_paged  (cursor scroll)
+GET /transcripts?session_id=… → get_by_session / get_by_session_paged（cursor scroll）
+GET /transcripts/range（跨 session 范围）  ·  GET /transcripts/sessions（会话列表）
 ```
 
-**MCP 表面不暴露**——transcript 搜索 HTTP 独占，agent 走 `memory_search` → 命中后用 `session_id` 拉对应 transcript。
+**MCP 表面不暴露**——transcript 搜索 HTTP 独占，agent 走 capsule search → 命中后用 `session_id` 拉对应 transcript。
 
 ### 2.7 Health
 
-`GET /health` 返回纯文本 `ok`。**不**校验 DB 可写、HNSW 完整、embedding worker 存活——只确认进程在监听。需要更严的 readiness 检查就再加一条（见 §4 优化方向）。
+`GET /health` 返回纯文本 `ok`。**不**校验 Lance 数据集可写、Tantivy 索引就绪、embedding worker 存活——只确认进程在监听。需要更严的 readiness 检查就再加一条（见 §4 优化方向）。
 
 ---
 
