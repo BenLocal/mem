@@ -1,6 +1,7 @@
 use std::sync::Arc;
 
 use mem::{
+    config::ReadEngine,
     domain::{
         capability_capsule::{
             CapabilityCapsuleType, IngestCapabilityCapsuleRequest, Scope, Visibility, WriteMode,
@@ -162,4 +163,59 @@ async fn unrelated_query_returns_empty_sections() {
         "expected no suggested_workflow, got {:?}",
         response.suggested_workflow
     );
+}
+
+/// Residual #2 (route-B): on the Lance read engine, `bm25_candidate_ids` must
+/// return hits even when the vacuum worker NEVER ran `rebuild_query_indexes`
+/// (e.g. `MEM_VACUUM_DISABLED=1`). The Tantivy index is built lazily on first
+/// query via the `fts_built` latch — this test documents/guards that the
+/// lazy-build safety net keeps the route-B FTS bucket working standalone,
+/// which is what makes the lance-engine FTS gate (skipping the eager rebuild
+/// in DuckDb-default production) safe.
+#[tokio::test]
+async fn bm25_lazy_builds_on_lance_engine_without_rebuild() {
+    let dir = tempdir().unwrap();
+    let db = dir.path().join("bm25_lazy.lance");
+    let repo = Arc::new(
+        Store::open_with_read_engine(&db, ReadEngine::Lance)
+            .await
+            .unwrap(),
+    );
+    let svc = CapabilityCapsuleService::with_providers(repo.clone(), "fake".into(), None);
+
+    let target = svc
+        .ingest(ingest_request(
+            "classroomhoststatehistory ClassName column width truncation bug",
+            "classroomhoststatehistory truncation",
+        ))
+        .await
+        .unwrap();
+    svc.ingest(ingest_request(
+        "unrelated scheduler rotation ledger starvation",
+        "scheduler starvation",
+    ))
+    .await
+    .unwrap();
+
+    // NOTE: we deliberately do NOT call `rebuild_query_indexes()` — this is the
+    // "vacuum disabled" path. The first BM25 query must lazy-build the Tantivy
+    // index from the live corpus and still return the textual match.
+    let hits = repo
+        .bm25_candidate_ids("t1", "classroomhoststatehistory truncation", 5)
+        .await
+        .unwrap();
+    let ids: Vec<&str> = hits.iter().map(|(id, _)| id.as_str()).collect();
+    assert!(
+        ids.contains(&target.capability_capsule_id.as_str()),
+        "lazy-built BM25 index must surface the textual match without an explicit rebuild; got {ids:?}"
+    );
+
+    // A second query reuses the now-built index (the `fts_built` latch is set)
+    // and still returns the hit — proving lazy-build is idempotent.
+    let again = repo
+        .bm25_candidate_ids("t1", "classroomhoststatehistory truncation", 5)
+        .await
+        .unwrap();
+    let again_ids: Vec<&str> = again.iter().map(|(id, _)| id.as_str()).collect();
+    assert!(again_ids.contains(&target.capability_capsule_id.as_str()));
 }
