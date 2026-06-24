@@ -367,9 +367,9 @@ impl Store {
         .await
     }
 
-    /// The single status-transition primitive (LanceStore +
-    /// DuckDbQuery dirty-mark). `accept_pending` / `reject_pending` /
-    /// O2 review-flagging are thin callers.
+    /// The single status-transition primitive (LanceStore write).
+    /// `accept_pending` / `reject_pending` / O2 review-flagging are thin
+    /// callers.
     pub async fn set_capsule_status(
         &self,
         tenant: &str,

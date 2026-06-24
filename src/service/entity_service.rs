@@ -2,7 +2,7 @@
 //! docs/superpowers/specs/2026-05-02-entity-registry-design.md.
 //!
 //! Thin shim over [`Store`]'s entity surface: the HTTP layer never
-//! touches `LanceStore` or `DuckDbQuery` directly. Method bodies stay
+//! touches `LanceStore` or the storage layer directly. Method bodies stay
 //! simple — the only non-trivial helper is `create_with_aliases`,
 //! which sequences `resolve_or_create` + zero-or-more `add_alias`
 //! calls and re-fetches the resulting [`EntityWithAliases`] for the
@@ -34,7 +34,7 @@ pub struct EntityService {
     /// Shared storage handle. Phase 5: erased to `Arc<dyn Backend>`
     /// (umbrella supertrait over the 9 storage sub-traits, including
     /// `EntityRegistry`). The HTTP layer never touches `LanceStore`
-    /// or `DuckDbQuery` directly.
+    /// or the storage layer directly.
     store: Arc<dyn Backend>,
 }
 
