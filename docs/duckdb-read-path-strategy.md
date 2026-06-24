@@ -1,5 +1,14 @@
 # DuckDB Read-Path Strategy & Decision Record
 
+> ⚠️ **SUPERSEDED (2026-06-24).** The central decision of this doc — "keep DuckDB
+> as the read engine, it isn't worth replacing" — was **reversed**. In route-B the
+> DuckDB read engine was **removed entirely** (the `duckdb` crate, `src/storage/duckdb_query/`,
+> the `refresh`/`mark_dirty`/`ensure_fresh` machinery, the r2d2 read pool, `MEM_DUCKDB_THREADS`,
+> and the dual-writer commit race are all gone); reads are now lancedb-native + a Tantivy
+> FTS subsystem. See **`docs/remove-duckdb-keep-lance.md`** for the new decision and the
+> migration record. **The body below is kept verbatim as a historical record** of why
+> DuckDB was originally retained — do not treat its present-tense statements as current.
+
 > Status: **decided** (2026-06-15). Supersedes the abandoned `duckdb-r2d2-pool.md`
 > connection-pool plan. Scope of the round that produced this doc: ship the
 > fire-fight (blocking-pool cap + DuckDB thread cap), capture the probe

@@ -1,5 +1,7 @@
 # mem storage 层耦合剖析与 backend trait 演进 (v1 — 2026-05-15)
 
+> ⚠️ **过时提示 (2026-06-24)**：本篇写于 DuckDB 仍是读引擎的时代。route-B 已**删除 DuckDB 读引擎**（`DuckDbQuery`、`ATTACH` 读路径、`refresh`/`mark_dirty`/`ensure_fresh` / `lance_write_then_refresh!` 刷新机制全部移除），读面改为 lancedb-native + Tantivy FTS。详见 `docs/remove-duckdb-keep-lance.md`。下文凡把 DuckDB / 写后刷新描述为「当前实现」的论断都应按已移除理解；耦合点分析作为 trait 化历史记录保留。
+
 > 这一篇竖向解剖 mem 自家 `src/storage/`，回答"能不能把 store 抽成 backend trait 接 Postgres / SQLite / 其他后端"。与 `mempalace-diff-v2.md` 是不同维度——那篇横向对照 MemPalace 的 MCP 表面层，本篇只看自家 storage 内部。
 >
 > 用途：评估 backend trait 抽象的**可行性**与**落实路径**。结论是可行但不简单，建议分 5 phase 渐进推进，第一个真正的验证点在 Phase 2（抽 `CapsuleStore` + 一个 in-memory 替代实现跑通）。

@@ -1,8 +1,10 @@
 # mem 存储层 — 表 / Schema / 依赖关系
 
+> ⚠️ **过时提示 (2026-06-24)**：route-B 已**移除 DuckDB 读引擎**——读路径不再走 `DuckDbQuery` / `ATTACH` / 写后刷新，而是 lancedb-native（`query().only_if(...)` / `nearest_to(...)` / `fetch_*_by_ids`）+ Tantivy FTS 子系统（`src/storage/fts.rs`）。详见 `docs/remove-duckdb-keep-lance.md`。本文档的**表 schema 仍然准确**（schema 没变），但下文凡把 DuckDB / ATTACH / 写后刷新描述为读路径的地方都已过时——读方法现位于 `src/storage/lance_store/**` 而非 `src/storage/duckdb_query/**`。
+>
 > **目的**：12 张 LanceDB 表的 schema、写入路径、查询路径、跨表依赖。半年后回头查"`graph_edges` 是哪个 service 在写 / 在读"，先翻这个。
 >
-> **同步源**：`src/storage/lance_store/mod.rs` 的 `*_schema()` 函数 + `src/storage/lance_store/**` 写入方法 + `src/storage/duckdb_query/**` 读取方法。改 schema 时**先改代码，再来更新本文档**，commit 引用本文件章节号（`docs(schema): … (closes schema §X)`）。
+> **同步源**：`src/storage/lance_store/mod.rs` 的 `*_schema()` 函数 + `src/storage/lance_store/**` 写入与读取方法（route-B 后读方法也在 `lance_store/`，旧的 `src/storage/duckdb_query/**` 已删除）。改 schema 时**先改代码，再来更新本文档**，commit 引用本文件章节号（`docs(schema): … (closes schema §X)`）。
 >
 > 配套文档：HTTP 接口流向看 [`api-data-flow.md`](./api-data-flow.md)，路线图看 [`ROADMAP.MD`](./ROADMAP.MD)，本文档专注于"存储模型"。
 
@@ -26,28 +28,26 @@
                        │ (blanket impl       │      （pub —— 是给 storage 外部用的句柄）
                        │  Backend for Store) │
                        │ commit_lance_write()│
-                       │ 写后刷新 DuckDB     │
-                       └──────┬───────┬──────┘
-                              │       │
-                       写 ←───┘       └─→ 读
-                       ▼                  ▼
-          ┌──────────────────┐    ┌──────────────────┐
-          │  LanceStore      │    │  DuckDbQuery     │
-          │ (pub(crate)，    │    │ (pub(crate)，    │
-          │  实现细节，外部  │    │  实现细节，外部  │
-          │  代码不可直接拿) │    │  代码不可直接拿) │
-          └────────┬─────────┘    └────────┬─────────┘
-                   │                       │
-                   └────── ATTACH ─────────┘
-                              ▼
-                     同一个 lance 数据集目录
-                     （12 张表共存于 .lance/ 下）
+                       └──────────┬──────────┘
+                                  │
+                          写 + 读（同一 lancedb Rust API）
+                                  ▼
+                       ┌──────────────────────┐
+                       │  LanceStore          │  ← 写 + 读都在这里
+                       │ (pub(crate)，实现细节)│     route-B 后 DuckDbQuery 已删除
+                       └──────────┬───────────┘
+                                  ▼
+                         同一个 lance 数据集目录
+                         （12 张表共存于 .lance/ 下）
+                       + Tantivy FTS 内存倒排索引（src/storage/fts.rs）
 ```
+
+> 上面是 route-B（2026-06-24）后的形态。**历史**：原来 `Store` 还持有一个 `Arc<DuckDbQuery>` 读句柄，通过 `lance` 扩展 `ATTACH` 同一目录承担绝大多数读路径，每次写后 swap 一个新的 in-memory DuckDB 连接（`commit_lance_write`，QW-6 把 `lance_write_then_refresh!` 宏改成显式 method）。该读引擎已整体删除。
 
 **核心约束**：
 
-- LanceDB 是**单写者**。所有写入必须经过 `LanceStore`；同一进程多个 `Store` 句柄共享 `Arc<LanceStore>`，不共享 `Connection`（`open_in_memory` swap 解决 snapshot 缓存）。
-- DuckDB 端通过 `lance` 扩展 ATTACH 同一目录，承担**绝大多数读路径**。`Store::commit_lance_write` 在每次写入后 swap 一个新的 in-memory DuckDB 连接（Phase 1 QW-6 把 `lance_write_then_refresh!` 宏改成了显式 method）。
+- LanceDB 是**单写者**。所有写入必须经过 `LanceStore`；同一进程多个 `Store` 句柄共享 `Arc<LanceStore>`。
+- 读路径现在也走 `LanceStore`（lancedb Rust API：`only_if` 过滤 / `nearest_to` ANN / `fetch_*_by_ids`），读连接用 `read_consistency_interval(0)` 保证写后立即可见——不再需要写后刷新。FTS/BM25 走独立的 Tantivy 内存倒排索引（`src/storage/fts.rs`），不是 Lance 索引。
 - **Phase 5 之后**，service / worker / pipeline 持 `Arc<dyn Backend>`（umbrella trait），不再持 `Arc<Store>`。`LanceStore` / `DuckDbQuery` 都收窄成 `pub(crate)`——外部代码物理上无法直接拿到具体实现的句柄，必须经 `Backend` 或 9 个 sub-trait 的某一个。`Store` 自身仍是 `pub`，因为 `app.rs::from_config` 需要 `Store::open` + 一次 `set_transcript_job_provider`（Lance-only 配置），然后立刻 upcast 成 `Arc<dyn Backend>`。
 - **未来要换 backend**（如 Postgres）：再写一个 struct 把 9 个 sub-trait 实现一遍，blanket impl 自动让它满足 `Backend`，`app.rs` 改一个 binding 就完成切换——这是 Phase 5 抽 trait 的最终交付物。
 
