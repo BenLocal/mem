@@ -1071,16 +1071,15 @@ impl LanceStore {
         Ok(to_insert.len())
     }
 
-    // The transcript READ methods (get_by_session,
-    // get_by_session_paged, list_transcript_sessions, fetch_by_ids,
-    // context_window_for_block, anchor_session_candidates,
-    // recent_conversation_messages, bm25_transcript_candidates) all
-    // lived here historically. Reads moved to DuckDbQuery — see
-    // `src/storage/duckdb_query/transcripts.rs` for the canonical
-    // implementations and their tests. This file keeps only the
-    // WRITE half (create_conversation_message,
-    // create_conversation_messages, semantic_search_transcripts and
-    // the embedding-job helpers below).
+    // Transcript reads + writes are both lance-native and live in this
+    // module (route-B): writes (create_conversation_message,
+    // create_conversation_messages) and reads (get_by_session,
+    // get_by_session_paged, list_transcript_sessions,
+    // fetch_conversation_messages_by_ids, context_window_for_block,
+    // anchor_session_candidates, recent_conversation_messages,
+    // semantic_search_transcripts, bm25_transcript_candidates), plus the
+    // embedding-job helpers below. Read shapes are parity-gated by
+    // `tests/parity_golden.rs`.
 
     /// Route-B bucket "transcript_ann": native lancedb-Rust equivalent of
     /// `DuckDbQuery::semantic_search_transcripts`.
@@ -1100,9 +1099,9 @@ impl LanceStore {
     ///    on the embeddings table; the JOIN supplies them → POSTFILTER).
     /// 3. CHUNK-COLLAPSE in Rust: GROUP BY `message_block_id` keeping the MIN
     ///    `_distance` (a message may carry N chunk-embeddings).
-    /// 4. Fetch the `ConversationMessage` rows for the collapsed ids
-    ///    (`fetch_conversation_messages_by_ids` would re-route through DuckDB;
-    ///    instead scan `conversation_messages` natively) and apply the JOIN
+    /// 4. Fetch the `ConversationMessage` rows for the collapsed ids by
+    ///    scanning `conversation_messages` natively (one read over the
+    ///    small collapsed id-set) and apply the JOIN
     ///    filter `tenant == ? AND embed_eligible == true`.
     /// 5. ORDER BY `best_distance ASC`, take `limit`, build
     ///    `(ConversationMessage, similarity)` where `similarity = 1 -
@@ -1194,9 +1193,9 @@ impl LanceStore {
         }
 
         // Fetch the collapsed messages and apply the JOIN filter
-        // `tenant == ? AND embed_eligible == true`. `fetch_conversation_
-        // messages_by_ids` lives on DuckDbQuery (would re-route off-engine),
-        // so scan `conversation_messages` natively here. An `id IN (...)`
+        // `tenant == ? AND embed_eligible == true` by scanning
+        // `conversation_messages` natively here (one read over the small
+        // collapsed id-set). An `id IN (...)`
         // `only_if` over the (small) collapsed id-set keeps it to one read.
         let id_list = best_distance
             .keys()
@@ -1397,10 +1396,10 @@ mod tests {
     // `list_transcript_sessions`, `fetch_conversation_messages_by_ids`,
     // `context_window_for_block`, `anchor_session_candidates`,
     // `recent_conversation_messages`, `bm25_transcript_candidates`).
-    // The canonical read tests live in
-    // `src/storage/duckdb_query/transcripts.rs::tests`, which seed
-    // via `LanceStore::create_conversation_message` and assert the
-    // read shape via the DuckDB-extension path.
+    // The read shapes are parity-gated by `tests/parity_golden.rs`
+    // (the `transcript_*` buckets), which seed via
+    // `LanceStore::create_conversation_message` and assert the
+    // lance-native read output against frozen goldens.
 
     /// Bulk insert path: dedup against existing rows + intra-batch
     /// dedup + bulk job enqueue. Counts must match `inserted` and the
@@ -1495,9 +1494,9 @@ mod tests {
 
         // Verify the table actually contains pre_1 + new_a + new_b
         // (3 distinct ids). We go through the lance-side
-        // `query_conversation_messages` helper directly because the
+        // `query_conversation_messages` helper directly rather than the
         // session-scoped reader (`get_conversation_messages_by_session`)
-        // moved to `DuckDbQuery`.
+        // to keep this write-path test independent of the read layer.
         let all = repo
             .query_conversation_messages(format!(
                 "tenant = {} AND session_id = {}",

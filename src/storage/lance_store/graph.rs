@@ -796,14 +796,9 @@ impl LanceStore {
     }
 }
 
-// Tests removed: this file used to host a `lancedb_graph_store_round_trip`
-// that wrote via `sync_memory_edges` and read back via `neighbors` /
-// `related_capability_capsule_ids` on `LanceStore`. The reads now
-// live solely on `DuckDbQuery`, so the round trip is canonically
-// tested in `src/storage/duckdb_query/graph.rs::tests` —
-// `neighbors_within_walks_multi_hop_and_dedupes`,
-// `kg_timeline_includes_closed_edges_in_chrono_order`,
-// `list_user_tunnels_filters_by_relation_prefix`,
-// `graph_stats_counts_split_and_top_relations` — all of which seed
-// data with `sync_memory_edges` and assert the read shape via the
-// canonical DuckDB-side methods.
+// Graph reads (`neighbors`, `related_capability_capsule_ids`,
+// `neighbors_within`, `kg_timeline`, `list_user_tunnels`, `graph_stats`,
+// …) are lance-native and live in this file. Their read shapes are
+// parity-gated by `tests/parity_golden.rs` (the `graph` / `graph_tunnel`
+// buckets), which seed data with `sync_memory_edges` and assert the
+// lance-native read output against frozen goldens.

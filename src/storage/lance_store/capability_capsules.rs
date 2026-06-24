@@ -2111,11 +2111,11 @@ mod tests {
     // `search_candidates`, `recent_active_capability_capsules`,
     // `fetch_capability_capsules_by_ids`,
     // `list_capability_capsule_versions_for_tenant`,
-    // `list_capability_capsule_ids_for_tenant`). The canonical reads
-    // are on `DuckDbQuery` and validated by
-    // `src/storage/duckdb_query/capability_capsules.rs::tests`, which
+    // `list_capability_capsule_ids_for_tenant`). These reads are
+    // lance-native and parity-gated by `tests/parity_golden.rs`, which
     // exercises every filter + the version-chain walk against
-    // LanceStore-written data through the DuckDB-extension path.
+    // LanceStore-written data and asserts the output against frozen
+    // goldens.
 
     /// Mutating-method round-trip: accept_pending, reject_pending,
     /// replace_pending_with_successor, delete_capability_capsule_hard.
@@ -2150,11 +2150,10 @@ mod tests {
             .unwrap();
         assert_eq!(rejected.status, CapabilityCapsuleStatus::Rejected);
 
-        // (The previous `list_pending_review` follow-up assertion was
-        // dropped along with the lance-side reader — the
-        // accept/reject status assertions above are the canonical
-        // check; the queue-emptiness invariant is covered in
-        // `src/storage/duckdb_query/capability_capsules.rs::tests`.)
+        // (The accept/reject status assertions above are the canonical
+        // check; the `list_pending_review` queue-emptiness invariant is
+        // covered by the `list_pending_review` bucket in
+        // `tests/parity_golden.rs`.)
 
         // replace_pending_with_successor: archive r, insert successor
         let mut succ = fixture("mem_r_v2", "tenant");

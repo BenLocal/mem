@@ -624,8 +624,8 @@ pub async fn run_with_counts(args: MineArgs) -> anyhow::Result<MineCounts> {
     // ── Capsules: chunked POST to /capability_capsules/batch.
     //
     // Each request body is the same shape as the single endpoint plus
-    // the array wrapper; the server flushes one Lance write + one DuckDB
-    // refresh per chunk (vs. per row). 201 = all-ok, 207 = mixed; in
+    // the array wrapper; the server flushes one Lance write per chunk
+    // (vs. per row). 201 = all-ok, 207 = mixed; in
     // both cases we parse the per-item `result` field. Any pre-existing
     // capsule (idempotency_key match) returns `result: ok` because the
     // service treats dedup-hit-with-existing-row as success.
@@ -759,8 +759,9 @@ pub async fn run_with_counts(args: MineArgs) -> anyhow::Result<MineCounts> {
     // actually inserted. The server deduplicates by (transcript_path,
     // line_number, block_index) for transcript blocks and by
     // idempotency_key for memories, so re-running mine on the same file
-    // returns 2xx without double-inserting. Use `mem-cli` / DuckDB queries
-    // to count rows on disk if you need exact insert deltas.
+    // returns 2xx without double-inserting. Query the HTTP read endpoints
+    // (e.g. `GET /capability_capsules/stats`) or `mem-cli` to count rows
+    // if you need exact insert deltas.
 
     // v3 #32 cursor write — advance the high-water mark only when
     // every batch this run shipped landed cleanly (no per-item failures

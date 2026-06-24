@@ -1,7 +1,7 @@
-//! Entity registry: `entities` + `entity_aliases` tables. Only the
-//! WRITE half lives here — `resolve_or_create`, `add_alias`, and
-//! the in-write `lookup_alias` precondition. The full read surface
-//! (`get_entity`, `list_entities`) is canonical on `DuckDbQuery`.
+//! Entity registry: `entities` + `entity_aliases` tables. Both halves
+//! are lance-native and live here — writes (`resolve_or_create`,
+//! `add_alias`, the in-write `lookup_alias` precondition) and reads
+//! (`get_entity`, `list_entities`).
 
 use arrow_array::{RecordBatch, StringArray};
 use futures::TryStreamExt;
@@ -350,9 +350,9 @@ mod tests {
     /// Writes-only round trip: `resolve_or_create` + `add_alias` +
     /// `lookup_alias`. The read-shape assertions (`get_entity`,
     /// `list_entities` with kind / LIKE filters) live in
-    /// `src/storage/duckdb_query/entities.rs::tests` — that file
-    /// seeds via `resolve_or_create` / `add_alias` on `LanceStore`
-    /// then reads back through the canonical DuckDB query path.
+    /// `tests/entity_registry.rs` — they seed via `resolve_or_create` /
+    /// `add_alias` then read back through the lance-native
+    /// `get_entity` / `list_entities`.
     #[tokio::test]
     pub async fn lancedb_entity_registry_writes_round_trip() {
         let dir = tempdir().unwrap();
