@@ -234,7 +234,7 @@ impl LanceStore {
                     && !matches!(r.capability_capsule_type, T::Diary)
             })
             .map(|r| crate::storage::fts::FtsDoc {
-                capability_capsule_id: r.capability_capsule_id,
+                id: r.capability_capsule_id,
                 tenant: r.tenant,
                 content: r.content,
             })
@@ -242,7 +242,7 @@ impl LanceStore {
         // Tantivy writes are synchronous + CPU-bound; run them off the
         // async reactor.
         let fts = self.fts.clone();
-        tokio::task::spawn_blocking(move || fts.rebuild_from_capsules(&docs))
+        tokio::task::spawn_blocking(move || fts.rebuild(&docs))
             .await
             .map_err(|e| StorageError::InvalidInput(format!("fts rebuild join: {e}")))??;
         self.fts_built

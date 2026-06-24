@@ -419,6 +419,52 @@ fn assert_golden_soft(name: &str, lance_ranked: Vec<(String, i64)>) {
     );
 }
 
+/// SOFT parity assertion for a different-engine result whose golden is a
+/// **plain ordered id array** (`["mb_2", …]`), not `[[id, rank], …]`. Used
+/// for the `transcript_fts` bucket — Tantivy is a different BM25 engine
+/// than DuckDB's `lance_fts`, so it won't byte-match the golden, but the
+/// same honesty bar applies as [`assert_golden_soft`]:
+///
+/// 1. `overlap@10 ≥ 0.8` (overlap of the top-10 id sets:
+///    `|intersection| / |golden top-10|`), AND
+/// 2. the lance id set is equal-or-superset of the golden id set — every
+///    golden id must appear in the lance result.
+fn assert_golden_soft_ids(name: &str, lance_ids: Vec<String>) {
+    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/golden")
+        .join(format!("{name}.json"));
+    let raw = fs::read_to_string(&path)
+        .unwrap_or_else(|_| panic!("golden {name}.json missing — generate it via the DuckDB test"));
+    // Golden shape is a plain ordered id array `["id", …]`.
+    let golden_ids: Vec<String> = serde_json::from_str::<Vec<String>>(&raw)
+        .unwrap_or_else(|e| panic!("golden {name}.json not a [\"id\", …] array: {e}"));
+
+    let golden_refs: Vec<&str> = golden_ids.iter().map(|s| s.as_str()).collect();
+    let lance_refs: Vec<&str> = lance_ids.iter().map(|s| s.as_str()).collect();
+    let golden_set: std::collections::HashSet<&str> = golden_refs.iter().copied().collect();
+    let lance_set: std::collections::HashSet<&str> = lance_refs.iter().copied().collect();
+
+    // overlap@10: |golden_top10 ∩ lance_top10| / |golden_top10|.
+    let g10: std::collections::HashSet<&str> = golden_refs.iter().take(10).copied().collect();
+    let l10: std::collections::HashSet<&str> = lance_refs.iter().take(10).copied().collect();
+    let inter = g10.intersection(&l10).count();
+    let overlap = if g10.is_empty() {
+        1.0
+    } else {
+        inter as f64 / g10.len() as f64
+    };
+    assert!(
+        overlap >= 0.8,
+        "soft parity `{name}`: overlap@10 = {overlap:.3} < 0.8\n  golden={golden_refs:?}\n  lance ={lance_refs:?}"
+    );
+    // Equal-or-superset: every golden id must be present in the lance set.
+    let missing: Vec<&str> = golden_set.difference(&lance_set).copied().collect();
+    assert!(
+        missing.is_empty(),
+        "soft parity `{name}`: lance result is not a superset of golden — missing {missing:?}\n  golden={golden_refs:?}\n  lance ={lance_refs:?}"
+    );
+}
+
 fn sorted_ids<I: IntoIterator<Item = String>>(ids: I) -> serde_json::Value {
     let mut v: Vec<String> = ids.into_iter().collect();
     v.sort();
@@ -686,5 +732,22 @@ async fn lance_parity_matches_golden() {
             .into_iter()
             .map(|(m, _)| m.message_block_id)
             .collect::<Vec<_>>()),
+    );
+
+    // ── transcript: fts ── SOFT parity: Tantivy is a different BM25 engine
+    //    than DuckDB's lance_fts, so it won't byte-match the golden's exact
+    //    id order. We assert overlap@10 ≥ 0.8 + superset of the golden id
+    //    set (§7). The fixture's golden set is {mb_2} (the only block whose
+    //    content mentions "lance") — Tantivy must return it.
+    let t_fts = repo
+        .bm25_transcript_candidates("t1", "lance", 5)
+        .await
+        .unwrap();
+    assert_golden_soft_ids(
+        "transcript_fts",
+        t_fts
+            .into_iter()
+            .map(|m| m.message_block_id)
+            .collect::<Vec<_>>(),
     );
 }

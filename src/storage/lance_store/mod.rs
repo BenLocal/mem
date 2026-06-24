@@ -101,6 +101,15 @@ pub struct LanceStore {
     /// lazily (so the route-B read engine works even if
     /// `rebuild_query_indexes` was never called).
     fts_built: Arc<std::sync::atomic::AtomicBool>,
+    /// Route-B Tantivy BM25 index over transcript (`conversation_messages`)
+    /// `content`. Same machinery as `fts`, separate corpus. Built empty at
+    /// open, populated via [`Self::rebuild_transcript_fts`] (called from
+    /// `rebuild_query_indexes` and lazily on first
+    /// `bm25_transcript_candidates`). See `crate::storage::fts`.
+    transcript_fts: Arc<crate::storage::fts::FtsIndex>,
+    /// Whether the transcript FTS index has been populated at least once
+    /// (lazy-build latch — mirrors `fts_built`).
+    transcript_fts_built: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl LanceStore {
@@ -188,6 +197,8 @@ impl LanceStore {
             transcript_job_provider: Arc::new(std::sync::RwLock::new(None)),
             fts: Arc::new(crate::storage::fts::FtsIndex::new()?),
             fts_built: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            transcript_fts: Arc::new(crate::storage::fts::FtsIndex::new()?),
+            transcript_fts_built: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         })
     }
 

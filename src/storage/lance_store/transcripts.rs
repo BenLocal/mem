@@ -778,6 +778,129 @@ impl LanceStore {
             .map(|(m, d)| (m, 1.0_f32 - d / 2.0_f32))
             .collect())
     }
+
+    /// Rebuild the Tantivy transcript FTS index from the current
+    /// `conversation_messages` corpus. Scans every row across all tenants
+    /// (the index is tenant-tagged and filters at query time), keeping
+    /// only `embed_eligible = true` rows — the same scope the DuckDB
+    /// `bm25_transcript_candidates` query enforces in its outer WHERE
+    /// (`tenant = ? AND embed_eligible = true`). A full rebuild, matching
+    /// the route-B "startup full-rebuild" strategy (see
+    /// `crate::storage::fts`). Marks the index built so the lazy path in
+    /// [`Self::bm25_transcript_candidates`] doesn't redundantly rebuild.
+    pub async fn rebuild_transcript_fts(&self) -> Result<(), StorageError> {
+        // Scan all tenants — the FTS index is tenant-tagged and filters
+        // tenant at query time (POSTFILTER, same posture as the rest of
+        // route-B). `embed_eligible = true` mirrors the DuckDB BM25 outer
+        // filter; the index never holds ineligible blocks.
+        let rows = self
+            .query_conversation_messages("embed_eligible = true".to_string())
+            .await?;
+        let docs: Vec<crate::storage::fts::FtsDoc> = rows
+            .into_iter()
+            .map(|m| crate::storage::fts::FtsDoc {
+                id: m.message_block_id,
+                tenant: m.tenant,
+                content: m.content,
+            })
+            .collect();
+        // Tantivy writes are synchronous + CPU-bound; run them off the
+        // async reactor.
+        let fts = self.transcript_fts.clone();
+        tokio::task::spawn_blocking(move || fts.rebuild(&docs))
+            .await
+            .map_err(|e| {
+                StorageError::InvalidInput(format!("transcript fts rebuild join: {e}"))
+            })??;
+        self.transcript_fts_built
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        Ok(())
+    }
+
+    /// Route-B bucket "transcript_fts": native (Tantivy) equivalent of
+    /// `DuckDbQuery::bm25_transcript_candidates`.
+    ///
+    /// The DuckDB query runs `lance_fts('conversation_messages', 'content',
+    /// query, k => k*2)`, filters `tenant = ? AND embed_eligible = true`,
+    /// orders by BM25 `_score DESC`, and `LIMIT`s to `k`. We mirror it with
+    /// the Tantivy index ([`crate::storage::fts::FtsIndex`]) built from the
+    /// transcript corpus via [`Self::rebuild_transcript_fts`] — eagerly by
+    /// `rebuild_query_indexes`, or lazily here on first use if it was never
+    /// built (so the route-B read engine works standalone). The query is
+    /// term-split through the jieba tokenizer so unspaced CJK runs match
+    /// (the load-bearing CJK fix — see `fts` module docs).
+    ///
+    /// Steps:
+    /// 1. Empty / whitespace `query` or `k == 0` → `Ok(vec![])`.
+    /// 2. `bm25(tenant, query, k)` → top-k `message_block_id`s in BM25
+    ///    score order (the index already filters `tenant` + only holds
+    ///    `embed_eligible` rows).
+    /// 3. Fetch the `ConversationMessage` rows for those ids (one native
+    ///    `conversation_messages` scan, defensively re-applying `tenant =
+    ///    ? AND embed_eligible = true`) and return them in BM25 order,
+    ///    dropping any id that vanished between index build and fetch.
+    pub async fn bm25_transcript_candidates(
+        &self,
+        tenant: &str,
+        query: &str,
+        k: usize,
+    ) -> Result<Vec<ConversationMessage>, StorageError> {
+        if query.trim().is_empty() || k == 0 {
+            return Ok(Vec::new());
+        }
+        // Lazy build: a route-B store that never ran rebuild_query_indexes
+        // still needs a populated index. Idempotent — the eager path flips
+        // `transcript_fts_built` so this only fires once.
+        if !self
+            .transcript_fts_built
+            .load(std::sync::atomic::Ordering::SeqCst)
+        {
+            self.rebuild_transcript_fts().await?;
+        }
+        // BM25 ranking off the reactor (synchronous Tantivy search).
+        let ranked = {
+            let fts = self.transcript_fts.clone();
+            let tenant_owned = tenant.to_string();
+            let query_owned = query.to_string();
+            tokio::task::spawn_blocking(move || fts.bm25(&tenant_owned, &query_owned, k))
+                .await
+                .map_err(|e| {
+                    StorageError::InvalidInput(format!("transcript fts query join: {e}"))
+                })??
+        };
+        if ranked.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        // Hydrate the ranked ids → ConversationMessage rows. One native scan
+        // over the (small) ranked id-set, re-applying the JOIN filter
+        // `tenant = ? AND embed_eligible = true` defensively.
+        let id_list = ranked
+            .iter()
+            .map(|(id, _)| sql_quote(id))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let messages = self
+            .query_conversation_messages(format!(
+                "tenant = {} AND embed_eligible = true AND message_block_id IN ({id_list})",
+                sql_quote(tenant),
+            ))
+            .await?;
+
+        // Return in BM25 rank order, dropping any id that vanished between
+        // index build and fetch (same tolerance the DuckDB JOIN has).
+        let by_id: std::collections::HashMap<String, ConversationMessage> = messages
+            .into_iter()
+            .map(|m| (m.message_block_id.clone(), m))
+            .collect();
+        let mut out = Vec::with_capacity(ranked.len());
+        for (id, _rank) in ranked {
+            if let Some(m) = by_id.get(&id) {
+                out.push(m.clone());
+            }
+        }
+        Ok(out)
+    }
 }
 
 #[cfg(test)]

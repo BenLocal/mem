@@ -1,6 +1,13 @@
 //! Route-B full-text (BM25) subsystem — a self-contained Tantivy
 //! inverted index that replaces the DuckDB `lance_fts(...)` read path
-//! for capsule search (see `docs/remove-duckdb-keep-lance.md` §4).
+//! for capsule AND transcript search (see
+//! `docs/remove-duckdb-keep-lance.md` §4).
+//!
+//! The index is corpus-agnostic: it stores an opaque `id` (the capsule's
+//! `capability_capsule_id` or a transcript block's `message_block_id`), a
+//! `tenant` filter field, and tokenized `content`. `LanceStore` holds one
+//! [`FtsIndex`] per bucket (capsule + transcript), each rebuilt from its
+//! own Lance table.
 //!
 //! ## Why Tantivy
 //!
@@ -24,7 +31,7 @@
 //!
 //! The index lives entirely in a [`tantivy::directory::RamDirectory`]
 //! (`Index::create_in_ram`) and is rebuilt from scratch via
-//! [`FtsIndex::rebuild_from_capsules`]. At real scale (~31k docs) a full
+//! [`FtsIndex::rebuild`]. At real scale (~31k docs) a full
 //! rebuild is <1s; at 10× (~314k) it's ~6s — well under the 30s gate
 //! (§6). A RAM index is the simplest sane choice for `mem serve` startup:
 //! no on-disk path to thread through `LanceStore`, no stale-index window,
@@ -61,11 +68,12 @@ fn fts_err(e: impl std::fmt::Display) -> StorageError {
     StorageError::InvalidInput(format!("tantivy fts: {e}"))
 }
 
-/// A capsule row as the FTS index needs it: the id to return, the tenant
-/// to filter on, and the verbatim content to tokenize + index.
+/// A corpus row as the FTS index needs it: the opaque `id` to return
+/// (a `capability_capsule_id` or a `message_block_id`), the tenant to
+/// filter on, and the verbatim content to tokenize + index.
 #[derive(Clone, Debug)]
 pub struct FtsDoc {
-    pub capability_capsule_id: String,
+    pub id: String,
     pub tenant: String,
     pub content: String,
 }
@@ -74,7 +82,7 @@ pub struct FtsDoc {
 /// them up by name on every call.
 struct Fields {
     content: Field,
-    capability_capsule_id: Field,
+    id: Field,
     tenant: Field,
 }
 
@@ -97,9 +105,9 @@ pub struct FtsIndex {
 
 impl FtsIndex {
     /// Build the shared schema: `content` (TEXT, jieba tokenizer,
-    /// WithFreqsAndPositions), `capability_capsule_id` (STRING, STORED —
-    /// the id we return), `tenant` (STRING, INDEXED — for tenant
-    /// filtering as a `Must` term in the BM25 query).
+    /// WithFreqsAndPositions), `id` (STRING, STORED — the opaque id we
+    /// return), `tenant` (STRING, INDEXED — for tenant filtering as a
+    /// `Must` term in the BM25 query).
     fn build_schema() -> (Schema, Fields) {
         let mut builder = Schema::builder();
         // `TEXT` is tokenized + WithFreqsAndPositions by default; we
@@ -113,8 +121,7 @@ impl FtsIndex {
         let content = builder.add_text_field("content", content_options);
         // STRING = raw (un-tokenized) single-token field; STORED so we
         // can read the id back off a hit.
-        let capability_capsule_id =
-            builder.add_text_field("capability_capsule_id", STRING | STORED);
+        let id = builder.add_text_field("id", STRING | STORED);
         // tenant is a raw STRING term used as a `Must` filter. `STRING`
         // is already indexed + untokenized (single-token), exactly what a
         // tenant exact-match filter needs; not stored (we already know
@@ -125,7 +132,7 @@ impl FtsIndex {
             schema,
             Fields {
                 content,
-                capability_capsule_id,
+                id,
                 tenant,
             },
         )
@@ -147,8 +154,8 @@ impl FtsIndex {
         Ok(Live { index, reader })
     }
 
-    /// Create an empty FtsIndex. Call [`Self::rebuild_from_capsules`]
-    /// to populate it from the capsule corpus.
+    /// Create an empty FtsIndex. Call [`Self::rebuild`] to populate it
+    /// from a corpus (capsules or transcript blocks).
     pub fn new() -> Result<Self, StorageError> {
         let (schema, fields) = Self::build_schema();
         let live = Self::fresh_index(&schema)?;
@@ -165,7 +172,7 @@ impl FtsIndex {
     /// The new index is swapped in under the write lock — concurrent
     /// `bm25` readers see either the old or the new index, never a
     /// half-built one.
-    pub fn rebuild_from_capsules(&self, docs: &[FtsDoc]) -> Result<(), StorageError> {
+    pub fn rebuild(&self, docs: &[FtsDoc]) -> Result<(), StorageError> {
         let next = Self::fresh_index(&self.schema)?;
         {
             // 50 MB writer heap — ample for the route-B corpus (tens of
@@ -175,7 +182,7 @@ impl FtsIndex {
                 writer
                     .add_document(doc!(
                         self.fields.content => d.content.as_str(),
-                        self.fields.capability_capsule_id => d.capability_capsule_id.as_str(),
+                        self.fields.id => d.id.as_str(),
                         self.fields.tenant => d.tenant.as_str(),
                     ))
                     .map_err(fts_err)?;
@@ -219,8 +226,8 @@ impl FtsIndex {
     /// BM25 search: term-split `query_text` (see [`Self::split_terms`]),
     /// build a `should`/OR boolean query over the content terms AND a
     /// `must` tenant filter, score by BM25, and return up to `k`
-    /// `(capability_capsule_id, rank)` pairs. Ranks are 1-based, ordered
-    /// by score desc with a deterministic tie-break on id asc.
+    /// `(id, rank)` pairs. Ranks are 1-based, ordered by score desc with
+    /// a deterministic tie-break on id asc.
     ///
     /// Empty / whitespace `query_text` or `k == 0` → `Ok(vec![])`. A
     /// query that tokenizes to no terms (e.g. all punctuation) likewise
@@ -282,9 +289,9 @@ impl FtsIndex {
         for (score, addr) in hits {
             let stored: TantivyDocument = searcher.doc(addr).map_err(fts_err)?;
             let id = stored
-                .get_first(self.fields.capability_capsule_id)
+                .get_first(self.fields.id)
                 .and_then(|v| v.as_str())
-                .ok_or_else(|| StorageError::InvalidData("fts: hit missing capsule id"))?
+                .ok_or_else(|| StorageError::InvalidData("fts: hit missing id"))?
                 .to_string();
             scored.push((id, score));
         }
@@ -308,7 +315,7 @@ mod tests {
 
     fn d(id: &str, tenant: &str, content: &str) -> FtsDoc {
         FtsDoc {
-            capability_capsule_id: id.into(),
+            id: id.into(),
             tenant: tenant.into(),
             content: content.into(),
         }
@@ -321,8 +328,7 @@ mod tests {
     #[test]
     fn empty_query_and_zero_k_are_empty() {
         let fts = FtsIndex::new().unwrap();
-        fts.rebuild_from_capsules(&[d("a", "t1", "hello world")])
-            .unwrap();
+        fts.rebuild(&[d("a", "t1", "hello world")]).unwrap();
         assert!(fts.bm25("t1", "", 5).unwrap().is_empty());
         assert!(fts.bm25("t1", "   ", 5).unwrap().is_empty());
         assert!(fts.bm25("t1", "hello", 0).unwrap().is_empty());
@@ -331,7 +337,7 @@ mod tests {
     #[test]
     fn english_bm25_matches_and_ranks() {
         let fts = FtsIndex::new().unwrap();
-        fts.rebuild_from_capsules(&[
+        fts.rebuild(&[
             d("a", "t1", "old decay formula uses updated_at only"),
             d("b", "t1", "new decay formula anchors on last_used_at"),
             d("c", "t1", "always run fmt and clippy before every commit"),
@@ -350,7 +356,7 @@ mod tests {
     #[test]
     fn tenant_filter_isolates() {
         let fts = FtsIndex::new().unwrap();
-        fts.rebuild_from_capsules(&[
+        fts.rebuild(&[
             d("a", "t1", "decay formula here"),
             d("x", "t2", "decay formula leaks?"),
         ])
@@ -362,7 +368,7 @@ mod tests {
     #[test]
     fn cjk_unspaced_run_is_term_split_not_phrase() {
         let fts = FtsIndex::new().unwrap();
-        fts.rebuild_from_capsules(&[
+        fts.rebuild(&[
             d("zh1", "t1", "向量检索与全文检索的混合排序"),
             d("zh2", "t1", "完全无关的内容"),
         ])
@@ -376,12 +382,10 @@ mod tests {
     #[test]
     fn rebuild_replaces_corpus() {
         let fts = FtsIndex::new().unwrap();
-        fts.rebuild_from_capsules(&[d("a", "t1", "decay formula")])
-            .unwrap();
+        fts.rebuild(&[d("a", "t1", "decay formula")]).unwrap();
         assert_eq!(fts.bm25("t1", "decay", 5).unwrap().len(), 1);
         // Rebuild with a disjoint corpus — the old doc is gone.
-        fts.rebuild_from_capsules(&[d("b", "t1", "unrelated text")])
-            .unwrap();
+        fts.rebuild(&[d("b", "t1", "unrelated text")]).unwrap();
         assert!(fts.bm25("t1", "decay", 5).unwrap().is_empty());
         assert_eq!(fts.bm25("t1", "unrelated", 5).unwrap().len(), 1);
     }

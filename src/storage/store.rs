@@ -1328,20 +1328,33 @@ impl Store {
         self.query.recent_conversation_messages(tenant, limit).await
     }
 
-    /// **LANCE-SPECIFIC**: uses `lance_fts(...)` SQL table function
-    /// from the lance DuckDB extension. Trait extraction should
-    /// expose a `top_k_bm25_candidates` primitive — each backend can
-    /// implement via its native FTS (Postgres tsvector + GIN, SQLite
-    /// FTS5, Tantivy, etc).
+    /// Route-B bucket "transcript_fts": BM25 lexical recall over
+    /// `conversation_messages.content`.
+    ///
+    /// - **DuckDb** arm uses the `lance_fts(...)` SQL table function from
+    ///   the lance DuckDB extension (LANCE-SPECIFIC).
+    /// - **Lance** arm goes through the route-B Tantivy index
+    ///   (`LanceStore::bm25_transcript_candidates`) — same machinery as
+    ///   the capsule `bm25_candidate_ids` bucket, indexed over the
+    ///   transcript corpus.
     pub async fn bm25_transcript_candidates(
         &self,
         tenant: &str,
         query: &str,
         k: usize,
     ) -> Result<Vec<ConversationMessage>, StorageError> {
-        self.query
-            .bm25_transcript_candidates(tenant, query, k)
-            .await
+        match self.read_engine {
+            crate::config::ReadEngine::DuckDb => {
+                self.query
+                    .bm25_transcript_candidates(tenant, query, k)
+                    .await
+            }
+            crate::config::ReadEngine::Lance => {
+                self.lance
+                    .bm25_transcript_candidates(tenant, query, k)
+                    .await
+            }
+        }
     }
 }
 
