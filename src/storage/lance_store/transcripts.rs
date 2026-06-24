@@ -17,7 +17,7 @@ use super::{
 use crate::domain::ConversationMessage;
 use crate::embedding::wire::decode_f32_blob;
 use crate::storage::types::{
-    ClaimedTranscriptEmbeddingJob, StorageError, TranscriptSessionSummary,
+    ClaimedTranscriptEmbeddingJob, ContextWindow, StorageError, TranscriptSessionSummary,
 };
 use crate::storage::{timestamp_sub_ms, EMBEDDING_JOB_LEASE_MS};
 
@@ -622,6 +622,284 @@ impl LanceStore {
         rows.truncate(lim);
         Ok(rows)
     }
+
+    /// Route-B native equivalent of
+    /// `DuckDbQuery::get_conversation_messages_by_session`: all conversation
+    /// blocks for `(tenant, session_id)`, ordered chronologically
+    /// `(created_at ASC, line_number ASC, block_index ASC)`. LanceDB has no
+    /// `ORDER BY`, so the sort runs in Rust to reproduce the DuckDB tie-break.
+    pub async fn get_conversation_messages_by_session(
+        &self,
+        tenant: &str,
+        session_id: &str,
+    ) -> Result<Vec<ConversationMessage>, StorageError> {
+        let mut rows = self
+            .query_conversation_messages(format!(
+                "tenant = {} AND session_id = {}",
+                sql_quote(tenant),
+                sql_quote(session_id),
+            ))
+            .await?;
+        rows.sort_by(chrono_asc);
+        Ok(rows)
+    }
+
+    /// Route-B native equivalent of
+    /// `DuckDbQuery::get_conversation_messages_by_session_paged`: paginated
+    /// per-session scroll. `since` / `until` apply to `created_at` (inclusive
+    /// lower, exclusive upper); `role` / `block_type` are optional equality
+    /// filters; the composite cursor `(created_at, line_number, block_index)`
+    /// resumes strictly after the last row seen, all under the chronological
+    /// `(created_at, line_number, block_index)` ASC ordering. `has_more` via
+    /// the N+1 trick. LanceDB has no `ORDER BY` / `LIMIT`-with-sort, so the
+    /// cursor + ordering + slice run in Rust.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn get_conversation_messages_by_session_paged(
+        &self,
+        tenant: &str,
+        session_id: &str,
+        since: Option<&str>,
+        until: Option<&str>,
+        role: Option<&str>,
+        block_type: Option<&str>,
+        cursor: Option<(&str, i64, i64)>,
+        limit: usize,
+    ) -> Result<(Vec<ConversationMessage>, bool), StorageError> {
+        let lim = i64::try_from(limit).unwrap_or(64);
+        let mut clauses = vec![
+            format!("tenant = {}", sql_quote(tenant)),
+            format!("session_id = {}", sql_quote(session_id)),
+        ];
+        if let Some(s) = since {
+            clauses.push(format!("created_at >= {}", sql_quote(s)));
+        }
+        if let Some(u) = until {
+            clauses.push(format!("created_at < {}", sql_quote(u)));
+        }
+        if let Some(r) = role {
+            clauses.push(format!("role = {}", sql_quote(r)));
+        }
+        if let Some(b) = block_type {
+            clauses.push(format!("block_type = {}", sql_quote(b)));
+        }
+        let mut rows = self
+            .query_conversation_messages(clauses.join(" AND "))
+            .await?;
+        if let Some((cur_at, cur_line, cur_idx)) = cursor {
+            rows.retain(|m| cursor_after(m, cur_at, cur_line, cur_idx));
+        }
+        rows.sort_by(chrono_asc);
+        let fetch = lim.saturating_add(1) as usize;
+        let has_more = rows.len() >= fetch;
+        rows.truncate(lim.max(0) as usize);
+        Ok((rows, has_more))
+    }
+
+    /// Route-B native equivalent of
+    /// `DuckDbQuery::list_conversation_messages_in_range`: cross-session range
+    /// scan over the half-open `[time_from, time_to)` window (each bound
+    /// optional), optionally narrowed by `role` / `block_type`, ordered
+    /// chronologically and paginated by the same composite cursor as
+    /// [`Self::get_conversation_messages_by_session_paged`]. Null-session
+    /// blocks are excluded (anchored to a conversation). LanceDB has no
+    /// `ORDER BY`, so cursor + ordering + N+1 slice run in Rust.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn list_conversation_messages_in_range(
+        &self,
+        tenant: &str,
+        time_from: Option<&str>,
+        time_to: Option<&str>,
+        role: Option<&str>,
+        block_type: Option<&str>,
+        cursor: Option<(&str, i64, i64)>,
+        limit: usize,
+    ) -> Result<(Vec<ConversationMessage>, bool), StorageError> {
+        let lim = i64::try_from(limit).unwrap_or(64);
+        let mut clauses = vec![
+            format!("tenant = {}", sql_quote(tenant)),
+            "session_id IS NOT NULL".to_string(),
+        ];
+        if let Some(s) = time_from {
+            clauses.push(format!("created_at >= {}", sql_quote(s)));
+        }
+        if let Some(u) = time_to {
+            clauses.push(format!("created_at < {}", sql_quote(u)));
+        }
+        if let Some(r) = role {
+            clauses.push(format!("role = {}", sql_quote(r)));
+        }
+        if let Some(b) = block_type {
+            clauses.push(format!("block_type = {}", sql_quote(b)));
+        }
+        let mut rows = self
+            .query_conversation_messages(clauses.join(" AND "))
+            .await?;
+        if let Some((cur_at, cur_line, cur_idx)) = cursor {
+            rows.retain(|m| cursor_after(m, cur_at, cur_line, cur_idx));
+        }
+        rows.sort_by(chrono_asc);
+        let fetch = lim.saturating_add(1) as usize;
+        let has_more = rows.len() >= fetch;
+        rows.truncate(lim.max(0) as usize);
+        Ok((rows, has_more))
+    }
+
+    /// Route-B native equivalent of `DuckDbQuery::context_window_for_block`:
+    /// the primary block + `k_before` predecessors + `k_after` successors in
+    /// the same session, neighbors ordered chronologically ASC. The primary is
+    /// always returned (even when `include_tool_blocks=false` and its own
+    /// block_type is tool_use/tool_result); the filter applies to neighbors
+    /// only. Returns `Err(StorageError::NotFound("transcript primary block"))`
+    /// when no row matches the primary id under this tenant, and empty
+    /// `before`/`after` when the primary has no session_id.
+    ///
+    /// Mirrors the DuckDB three-scan shape: primary fetch, then predecessors
+    /// (strict tuple `<`, take nearest `k_before`, return ASC) and successors
+    /// (strict tuple `>`, take nearest `k_after`). LanceDB has no `ORDER BY` /
+    /// `LIMIT`, so the tuple comparison + ordering + cap run in Rust.
+    pub async fn context_window_for_block(
+        &self,
+        tenant: &str,
+        primary_id: &str,
+        k_before: usize,
+        k_after: usize,
+        include_tool_blocks: bool,
+    ) -> Result<ContextWindow, StorageError> {
+        // 1. Primary fetch.
+        let primary_rows = self
+            .query_conversation_messages(format!(
+                "tenant = {} AND message_block_id = {}",
+                sql_quote(tenant),
+                sql_quote(primary_id),
+            ))
+            .await?;
+        let Some(primary) = primary_rows.into_iter().next() else {
+            return Err(StorageError::NotFound("transcript primary block"));
+        };
+
+        // 2. No session → no neighbors.
+        let Some(session_id) = primary.session_id.clone() else {
+            return Ok(ContextWindow {
+                primary,
+                before: Vec::new(),
+                after: Vec::new(),
+            });
+        };
+
+        // 3. Scan the session once, then split into before/after in Rust.
+        let mut session_rows = self
+            .query_conversation_messages(format!(
+                "tenant = {} AND session_id = {}",
+                sql_quote(tenant),
+                sql_quote(&session_id),
+            ))
+            .await?;
+        // Optional block_type filter applies to NEIGHBORS only (text/thinking).
+        if !include_tool_blocks {
+            use crate::domain::BlockType;
+            session_rows.retain(|m| matches!(m.block_type, BlockType::Text | BlockType::Thinking));
+        }
+
+        let p_at = primary.created_at.as_str();
+        let p_line = primary.line_number as i64;
+        let p_idx = primary.block_index as i64;
+
+        // Predecessors: strict tuple `<` primary; nearest `k_before` (sort DESC,
+        // take k, reverse to ASC for the caller).
+        let mut before: Vec<ConversationMessage> = session_rows
+            .iter()
+            .filter(|m| tuple_lt(m, p_at, p_line, p_idx))
+            .cloned()
+            .collect();
+        before.sort_by(chrono_desc);
+        before.truncate(k_before);
+        before.reverse();
+
+        // Successors: strict tuple `>` primary; nearest `k_after` (sort ASC,
+        // take k).
+        let mut after: Vec<ConversationMessage> = session_rows
+            .iter()
+            .filter(|m| tuple_gt(m, p_at, p_line, p_idx))
+            .cloned()
+            .collect();
+        after.sort_by(chrono_asc);
+        after.truncate(k_after);
+
+        Ok(ContextWindow {
+            primary,
+            before,
+            after,
+        })
+    }
+
+    /// Route-B native equivalent of `DuckDbQuery::anchor_session_candidates`:
+    /// the most-recent `embed_eligible` blocks in `(tenant, session_id)`,
+    /// capped at `k`, ordered `created_at DESC`, returning `message_block_id`s
+    /// only. `k == 0` short-circuits to `Ok(vec![])` (matches DuckDB). LanceDB
+    /// has no `ORDER BY` / `LIMIT`, so the sort + cap run in Rust.
+    ///
+    /// The DuckDB query orders by `created_at DESC` with no secondary
+    /// tie-break; to stay deterministic on a `created_at` tie we add a stable
+    /// `(line_number DESC, block_index DESC)` secondary key (consistent with
+    /// `recent_conversation_messages`).
+    pub async fn anchor_session_candidates(
+        &self,
+        tenant: &str,
+        session_id: &str,
+        k: usize,
+    ) -> Result<Vec<String>, StorageError> {
+        if k == 0 {
+            return Ok(Vec::new());
+        }
+        let k_cap = i64::try_from(k).unwrap_or(64) as usize;
+        let mut rows = self
+            .query_conversation_messages(format!(
+                "tenant = {} AND session_id = {} AND embed_eligible = true",
+                sql_quote(tenant),
+                sql_quote(session_id),
+            ))
+            .await?;
+        rows.sort_by(chrono_desc);
+        rows.truncate(k_cap);
+        Ok(rows.into_iter().map(|m| m.message_block_id).collect())
+    }
+}
+
+/// Chronological ASC comparator `(created_at, line_number, block_index)` —
+/// the DuckDB `ORDER BY created_at ASC, line_number ASC, block_index ASC`.
+fn chrono_asc(a: &ConversationMessage, b: &ConversationMessage) -> std::cmp::Ordering {
+    a.created_at
+        .cmp(&b.created_at)
+        .then_with(|| a.line_number.cmp(&b.line_number))
+        .then_with(|| a.block_index.cmp(&b.block_index))
+}
+
+/// Chronological DESC comparator (reverse of [`chrono_asc`]).
+fn chrono_desc(a: &ConversationMessage, b: &ConversationMessage) -> std::cmp::Ordering {
+    chrono_asc(b, a)
+}
+
+/// `(created_at, line_number, block_index)` strictly greater than the cursor
+/// tuple — the DuckDB paged/range resume predicate (rows AFTER the cursor
+/// under chronological ASC ordering).
+fn cursor_after(m: &ConversationMessage, cur_at: &str, cur_line: i64, cur_idx: i64) -> bool {
+    tuple_gt(m, cur_at, cur_line, cur_idx)
+}
+
+/// `m`'s `(created_at, line_number, block_index)` tuple `>` `(at, line, idx)`.
+fn tuple_gt(m: &ConversationMessage, at: &str, line: i64, idx: i64) -> bool {
+    let ml = m.line_number as i64;
+    let mi = m.block_index as i64;
+    m.created_at.as_str() > at
+        || (m.created_at.as_str() == at && (ml > line || (ml == line && mi > idx)))
+}
+
+/// `m`'s `(created_at, line_number, block_index)` tuple `<` `(at, line, idx)`.
+fn tuple_lt(m: &ConversationMessage, at: &str, line: i64, idx: i64) -> bool {
+    let ml = m.line_number as i64;
+    let mi = m.block_index as i64;
+    m.created_at.as_str() < at
+        || (m.created_at.as_str() == at && (ml < line || (ml == line && mi < idx)))
 }
 
 /// Transcript-side methods — previously bound by the

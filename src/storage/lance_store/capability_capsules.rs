@@ -25,6 +25,18 @@ use crate::embedding::wire::decode_f32_blob;
 use crate::storage::types::{ClaimedEmbeddingJob, EmbeddingJobInsert, FeedbackEvent, StorageError};
 use crate::storage::{timestamp_sub_ms, EMBEDDING_JOB_LEASE_MS};
 
+/// Sort priority for `find_by_idempotency_or_hash`'s `ORDER BY`: an
+/// idempotency-key match ranks first (0) when the caller supplied a key AND
+/// the row carries that exact key; everything else (content-hash-only match)
+/// is 1. Mirrors the DuckDB
+/// `CASE WHEN ?2 IS NOT NULL AND idempotency_key = ?2 THEN 0 ELSE 1 END`.
+fn key_priority(rec: &CapabilityCapsuleRecord, idempotency_key: &Option<String>) -> i32 {
+    match idempotency_key {
+        Some(k) if rec.idempotency_key.as_deref() == Some(k.as_str()) => 0,
+        _ => 1,
+    }
+}
+
 impl LanceStore {
     /// Apply a status transition to `(tenant, capability_capsule_id)` and return the
     /// updated row. Shared by `accept_pending` / `reject_pending` (and a
@@ -195,6 +207,91 @@ impl LanceStore {
             )
             .await?;
         Ok(rows.into_iter().next())
+    }
+
+    /// Route-B native equivalent of `DuckDbQuery::find_by_idempotency_or_hash`
+    /// — the ingest-path idempotency check. Matches on either an
+    /// `idempotency_key` (only when the caller supplied one) **or** the
+    /// `content_hash` (always), scoped to `tenant`.
+    ///
+    /// Ranking parity (the DuckDB `ORDER BY`): idempotency-key matches rank
+    /// first (priority 0) so a caller-asserted identity wins over a
+    /// content-hash collision; ties break by `updated_at DESC`. We replicate
+    /// exactly — scan the union of (key-match ∪ hash-match) rows, then in Rust
+    /// pick the top under `(key_match_first, updated_at DESC)`. Returns the top
+    /// row or `None`. LanceDB has no `ORDER BY` / `CASE`, so the priority +
+    /// tie-break runs in Rust.
+    pub async fn find_by_idempotency_or_hash(
+        &self,
+        tenant: &str,
+        idempotency_key: &Option<String>,
+        content_hash: &str,
+    ) -> Result<Option<CapabilityCapsuleRecord>, StorageError> {
+        // Filter: tenant AND (idempotency_key matches when supplied OR
+        // content_hash matches). When no key is supplied, only the hash arm
+        // applies — mirrors the DuckDB `(?2 IS NOT NULL AND ...) OR ...`.
+        let key_clause = match idempotency_key {
+            Some(k) => format!("idempotency_key = {} OR ", sql_quote(k)),
+            None => String::new(),
+        };
+        let filter = format!(
+            "tenant = {} AND ({key_clause}content_hash = {})",
+            sql_quote(tenant),
+            sql_quote(content_hash),
+        );
+        let mut rows = self.query_capability_capsules(filter, None).await?;
+        // ORDER BY (key-match THEN 0 ELSE 1), updated_at DESC. A row's key
+        // priority is 0 iff the caller supplied a key and the row carries it.
+        rows.sort_by(|a, b| {
+            let pa = key_priority(a, idempotency_key);
+            let pb = key_priority(b, idempotency_key);
+            pa.cmp(&pb).then_with(|| b.updated_at.cmp(&a.updated_at))
+        });
+        Ok(rows.into_iter().next())
+    }
+
+    /// Route-B native equivalent of `DuckDbQuery::auto_promote_candidates` —
+    /// the auto-promote sweep candidate set. Returns `PendingConfirmation`
+    /// rows under `tenant` whose `capability_capsule_type` is in `types`,
+    /// `updated_at < cutoff_updated_at`, and `decay_score < max_decay_score`,
+    /// ordered `created_at ASC` (oldest first, so a per-sweep N cap doesn't
+    /// re-see young rows).
+    ///
+    /// Empty `types` short-circuits to `Ok(vec![])` (matches DuckDB — an empty
+    /// allow-list disables the sweep without flipping the master switch).
+    /// LanceDB has no `ORDER BY`, so the `created_at ASC` sort runs in Rust.
+    pub async fn auto_promote_candidates(
+        &self,
+        tenant: &str,
+        cutoff_updated_at: &str,
+        types: &[crate::domain::capability_capsule::CapabilityCapsuleType],
+        max_decay_score: f32,
+    ) -> Result<Vec<CapabilityCapsuleRecord>, StorageError> {
+        if types.is_empty() {
+            return Ok(Vec::new());
+        }
+        let status = enum_to_str(&CapabilityCapsuleStatus::PendingConfirmation)?;
+        let type_strs = types
+            .iter()
+            .map(enum_to_str)
+            .collect::<Result<Vec<_>, _>>()?;
+        let type_list = type_strs
+            .iter()
+            .map(|t| sql_quote(t))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let filter = format!(
+            "tenant = {} AND status = {} AND updated_at < {} \
+             AND decay_score < {} AND capability_capsule_type IN ({type_list})",
+            sql_quote(tenant),
+            sql_quote(&status),
+            sql_quote(cutoff_updated_at),
+            max_decay_score,
+        );
+        let mut rows = self.query_capability_capsules(filter, None).await?;
+        // ORDER BY created_at ASC.
+        rows.sort_by(|a, b| a.created_at.cmp(&b.created_at));
+        Ok(rows)
     }
 
     /// Route-B batch-A bucket "list_pending_review": native lancedb-Rust

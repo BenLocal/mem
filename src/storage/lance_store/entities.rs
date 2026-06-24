@@ -258,6 +258,87 @@ impl LanceStore {
 
         Ok(Some(EntityWithAliases { entity, aliases }))
     }
+
+    /// Route-B native equivalent of `DuckDbQuery::list_entities`: scan the
+    /// `entities` table for `tenant`, optionally narrowed by `kind_filter`
+    /// (exact match on the snake_case kind string) and `query` (a
+    /// **case-sensitive substring** match on `canonical_name`, mirroring the
+    /// DuckDB `canonical_name LIKE '%q%'`), ordered `created_at DESC`, capped
+    /// at `clamp(limit, 1, 1024)`.
+    ///
+    /// The `kind` equality is pushed into the lance `only_if` predicate; the
+    /// substring filter + ordering + limit run in Rust (LanceDB has no
+    /// `ORDER BY` and the LIKE-with-user-text is simpler/safer to apply
+    /// post-scan than to escape into a predicate). Parity-gated by
+    /// `tests/parity_golden.rs`.
+    pub async fn list_entities(
+        &self,
+        tenant: &str,
+        kind_filter: Option<EntityKind>,
+        query: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<Entity>, StorageError> {
+        const ENTITIES: &str = "entities";
+        let lim = i64::try_from(limit).unwrap_or(64).clamp(1, 1024) as usize;
+        let mut clauses = vec![format!("tenant = {}", sql_quote(tenant))];
+        if let Some(k) = kind_filter {
+            clauses.push(format!("kind = {}", sql_quote(k.as_db_str())));
+        }
+        let filter = clauses.join(" AND ");
+
+        let table = self
+            .conn
+            .open_table(ENTITIES)
+            .execute()
+            .await
+            .map_err(lancedb_err)?;
+        let stream = table
+            .query()
+            .only_if(filter)
+            .execute()
+            .await
+            .map_err(lancedb_err)?;
+        let batches: Vec<RecordBatch> = stream
+            .try_collect()
+            .await
+            .map_err(|e| StorageError::InvalidInput(format!("lancedb stream: {e}")))?;
+
+        let mut out: Vec<Entity> = Vec::new();
+        for b in &batches {
+            if b.num_rows() == 0 {
+                continue;
+            }
+            let entity_id = parse_col::<StringArray>(b, ENTITIES, "entity_id")?;
+            let tenant_col = parse_col::<StringArray>(b, ENTITIES, "tenant")?;
+            let canonical_name = parse_col::<StringArray>(b, ENTITIES, "canonical_name")?;
+            let kind = parse_col::<StringArray>(b, ENTITIES, "kind")?;
+            let created_at = parse_col::<StringArray>(b, ENTITIES, "created_at")?;
+            for i in 0..b.num_rows() {
+                let name = canonical_name.value(i);
+                // `canonical_name LIKE '%q%'` — case-sensitive substring.
+                if let Some(q) = query {
+                    if !name.contains(q) {
+                        continue;
+                    }
+                }
+                let kind_str = kind.value(i);
+                let parsed_kind = EntityKind::from_db_str(kind_str).ok_or_else(|| {
+                    StorageError::InvalidInput(format!("invalid entity kind {kind_str:?}"))
+                })?;
+                out.push(Entity {
+                    entity_id: entity_id.value(i).to_string(),
+                    tenant: tenant_col.value(i).to_string(),
+                    canonical_name: name.to_string(),
+                    kind: parsed_kind,
+                    created_at: created_at.value(i).to_string(),
+                });
+            }
+        }
+        // ORDER BY created_at DESC, then LIMIT.
+        out.sort_by(|a, b| b.created_at.cmp(&a.created_at));
+        out.truncate(lim);
+        Ok(out)
+    }
 }
 
 #[cfg(test)]

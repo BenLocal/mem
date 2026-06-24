@@ -254,6 +254,28 @@ async fn seed(repo: &Store) {
             "00000000000000000008",
         ),
     ];
+    // A capsule carrying an explicit idempotency_key + a distinctive
+    // content_hash, so `find_by_idempotency_or_hash` has both a key-match and
+    // a hash-match path to exercise. PendingConfirmation + type Episode +
+    // old updated_at + zero decay so it ALSO qualifies for the auto-promote
+    // candidate set (the Episode type is in the default allow-list).
+    let mut cap_idem = cap(
+        "cap_idem",
+        "t1",
+        CapabilityCapsuleType::Episode,
+        CapabilityCapsuleStatus::PendingConfirmation,
+        Scope::Repo,
+        "episode capsule with an idempotency key for the find-by lookup",
+        &["idem"],
+        1,
+        None,
+        "00000000000000000009",
+    );
+    cap_idem.idempotency_key = Some("idem-key-1".into());
+
+    let mut caps = caps;
+    caps.push(cap_idem);
+
     for c in &caps {
         repo.insert_capability_capsule(c.clone()).await.unwrap();
         repo.upsert_capability_capsule_embedding(
@@ -694,6 +716,107 @@ async fn duckdb_parity_golden() {
         }),
     );
 
+    // ── final-batch: find_by_idempotency_or_hash ── (key-match wins over a
+    //    hash collision; hash-only match; total miss → None)
+    let idem_by_key = repo
+        .find_by_idempotency_or_hash("t1", &Some("idem-key-1".into()), "no-such-hash")
+        .await
+        .unwrap();
+    let idem_by_hash = repo
+        .find_by_idempotency_or_hash("t1", &None, "hash-cap_a")
+        .await
+        .unwrap();
+    let idem_miss = repo
+        .find_by_idempotency_or_hash("t1", &Some("nope".into()), "nope-hash")
+        .await
+        .unwrap();
+    check_or_write(
+        "find_by_idempotency_or_hash",
+        json!({
+            "by_key": idem_by_key.map(|c| c.capability_capsule_id),
+            "by_hash": idem_by_hash.map(|c| c.capability_capsule_id),
+            "miss": idem_miss.map(|c| c.capability_capsule_id),
+        }),
+    );
+
+    // ── final-batch: get_capability_capsule_for_tenant ── (hit + miss)
+    let cap_hit = repo
+        .get_capability_capsule_for_tenant("t1", "cap_a")
+        .await
+        .unwrap();
+    let cap_miss = repo
+        .get_capability_capsule_for_tenant("t1", "does-not-exist")
+        .await
+        .unwrap();
+    check_or_write(
+        "get_capability_capsule_for_tenant",
+        json!({
+            "hit": cap_hit.map(|c| c.capability_capsule_id),
+            "miss_is_none": cap_miss.is_none(),
+        }),
+    );
+
+    // ── final-batch: auto_promote_candidates ── (PendingConfirmation rows of
+    //    eligible type, updated_at < cutoff, decay < max; created_at ASC is
+    //    load-bearing → ordered ids. cutoff after every seed stamp; empty
+    //    types short-circuits to []).
+    let promote = repo
+        .auto_promote_candidates(
+            "t1",
+            "00000000000000000099",
+            &[
+                CapabilityCapsuleType::Experience,
+                CapabilityCapsuleType::Episode,
+            ],
+            0.5,
+        )
+        .await
+        .unwrap();
+    let promote_empty = repo
+        .auto_promote_candidates("t1", "00000000000000000099", &[], 0.5)
+        .await
+        .unwrap();
+    check_or_write(
+        "auto_promote_candidates",
+        json!({
+            "ids": promote
+                .into_iter()
+                .map(|c| c.capability_capsule_id)
+                .collect::<Vec<_>>(),
+            "empty_types_len": promote_empty.len(),
+        }),
+    );
+
+    // ── final-batch: list_entities ── (kind filter + LIKE substring + a miss;
+    //    created_at DESC ordering, project STABLE shape not the UUIDv7 id)
+    let ents_all = repo.list_entities("t1", None, None, 50).await.unwrap();
+    let ents_kind = repo
+        .list_entities("t1", Some(mem::domain::EntityKind::Topic), None, 50)
+        .await
+        .unwrap();
+    let ents_like = repo
+        .list_entities("t1", None, Some("Rust"), 50)
+        .await
+        .unwrap();
+    let ents_miss = repo
+        .list_entities("t1", None, Some("zzz-no-match"), 50)
+        .await
+        .unwrap();
+    let proj = |es: Vec<mem::domain::Entity>| {
+        es.into_iter()
+            .map(|e| json!([e.canonical_name, serde_json::to_value(e.kind).unwrap()]))
+            .collect::<Vec<_>>()
+    };
+    check_or_write(
+        "list_entities",
+        json!({
+            "all": proj(ents_all),
+            "kind_topic": proj(ents_kind),
+            "like_rust": proj(ents_like),
+            "miss_len": ents_miss.len(),
+        }),
+    );
+
     // ── ann ──
     let ann = repo.ann_candidate_ids("t1", &q_vec, 5).await.unwrap();
     check_or_write("ann", ranked(ann));
@@ -926,6 +1049,112 @@ async fn duckdb_parity_golden() {
             .map(|m| m.message_block_id)
             .collect::<Vec<_>>()),
     );
+
+    // ── final-batch: get_conversation_messages_by_session ── (chronological
+    //    ASC; ordered ids load-bearing)
+    let by_session = repo
+        .get_conversation_messages_by_session("t1", "S1")
+        .await
+        .unwrap();
+    check_or_write(
+        "get_conversation_messages_by_session",
+        json!(by_session
+            .into_iter()
+            .map(|m| m.message_block_id)
+            .collect::<Vec<_>>()),
+    );
+
+    // ── final-batch: get_conversation_messages_by_session_paged ── (limit=2
+    //    forces a has_more page; then resume via the composite cursor)
+    let (paged_p1, paged_more) = repo
+        .get_conversation_messages_by_session_paged("t1", "S1", None, None, None, None, None, 2)
+        .await
+        .unwrap();
+    // Cursor = last row of page 1: (created_at, line_number, block_index).
+    let cursor = paged_p1.last().map(|m| {
+        (
+            m.created_at.clone(),
+            m.line_number as i64,
+            m.block_index as i64,
+        )
+    });
+    let (paged_p2, p2_more) = match &cursor {
+        Some((at, ln, bi)) => repo
+            .get_conversation_messages_by_session_paged(
+                "t1",
+                "S1",
+                None,
+                None,
+                None,
+                None,
+                Some((at.as_str(), *ln, *bi)),
+                2,
+            )
+            .await
+            .unwrap(),
+        None => (Vec::new(), false),
+    };
+    check_or_write(
+        "get_conversation_messages_by_session_paged",
+        json!({
+            "page1_ids": paged_p1.iter().map(|m| m.message_block_id.clone()).collect::<Vec<_>>(),
+            "page1_has_more": paged_more,
+            "page2_ids": paged_p2.iter().map(|m| m.message_block_id.clone()).collect::<Vec<_>>(),
+            "page2_has_more": p2_more,
+        }),
+    );
+
+    // ── final-batch: list_conversation_messages_in_range ── (cross-session
+    //    range; bounded window excludes the first block; limit=10)
+    let (range_all, range_more) = repo
+        .list_conversation_messages_in_range("t1", None, None, None, None, None, 10)
+        .await
+        .unwrap();
+    let (range_win, win_more) = repo
+        .list_conversation_messages_in_range(
+            "t1",
+            Some("00000000000000000021"),
+            None,
+            None,
+            None,
+            None,
+            10,
+        )
+        .await
+        .unwrap();
+    check_or_write(
+        "list_conversation_messages_in_range",
+        json!({
+            "all_ids": range_all.iter().map(|m| m.message_block_id.clone()).collect::<Vec<_>>(),
+            "all_has_more": range_more,
+            "windowed_ids": range_win.iter().map(|m| m.message_block_id.clone()).collect::<Vec<_>>(),
+            "windowed_has_more": win_more,
+        }),
+    );
+
+    // ── final-batch: anchor_session_candidates ── (most-recent embed_eligible
+    //    blocks in S1, capped; k=0 short-circuits)
+    let anchor = repo.anchor_session_candidates("t1", "S1", 2).await.unwrap();
+    let anchor_zero = repo.anchor_session_candidates("t1", "S1", 0).await.unwrap();
+    check_or_write(
+        "anchor_session_candidates",
+        json!({ "k2": anchor, "k0_len": anchor_zero.len() }),
+    );
+
+    // ── final-batch: context_window_for_block ── (mb_2 is the middle block;
+    //    1 before + 1 after; before/after returned chronological ASC)
+    let window = repo
+        .context_window_for_block("t1", "mb_2", 1, 1, true)
+        .await
+        .unwrap();
+    check_or_write(
+        "context_window_for_block",
+        json!({
+            "primary": window.primary.message_block_id,
+            "before": window.before.iter().map(|m| m.message_block_id.clone()).collect::<Vec<_>>(),
+            "after": window.after.iter().map(|m| m.message_block_id.clone()).collect::<Vec<_>>(),
+        }),
+    );
 }
 
 /// Phase-1 parity double-run: seed the same fixture, read each MIGRATED
@@ -1023,6 +1252,104 @@ async fn lance_parity_matches_golden() {
                 .map(|c| c.capability_capsule_id)
                 .collect::<Vec<_>>(),
             "has_more": scope_more,
+        }),
+    );
+
+    // ── final-batch: find_by_idempotency_or_hash ── (exact byte-match)
+    let idem_by_key = repo
+        .find_by_idempotency_or_hash("t1", &Some("idem-key-1".into()), "no-such-hash")
+        .await
+        .unwrap();
+    let idem_by_hash = repo
+        .find_by_idempotency_or_hash("t1", &None, "hash-cap_a")
+        .await
+        .unwrap();
+    let idem_miss = repo
+        .find_by_idempotency_or_hash("t1", &Some("nope".into()), "nope-hash")
+        .await
+        .unwrap();
+    assert_golden(
+        "find_by_idempotency_or_hash",
+        json!({
+            "by_key": idem_by_key.map(|c| c.capability_capsule_id),
+            "by_hash": idem_by_hash.map(|c| c.capability_capsule_id),
+            "miss": idem_miss.map(|c| c.capability_capsule_id),
+        }),
+    );
+
+    // ── final-batch: get_capability_capsule_for_tenant ── (exact byte-match)
+    let cap_hit = repo
+        .get_capability_capsule_for_tenant("t1", "cap_a")
+        .await
+        .unwrap();
+    let cap_miss = repo
+        .get_capability_capsule_for_tenant("t1", "does-not-exist")
+        .await
+        .unwrap();
+    assert_golden(
+        "get_capability_capsule_for_tenant",
+        json!({
+            "hit": cap_hit.map(|c| c.capability_capsule_id),
+            "miss_is_none": cap_miss.is_none(),
+        }),
+    );
+
+    // ── final-batch: auto_promote_candidates ── (created_at ASC; exact
+    //    byte-match; empty types → [])
+    let promote = repo
+        .auto_promote_candidates(
+            "t1",
+            "00000000000000000099",
+            &[
+                CapabilityCapsuleType::Experience,
+                CapabilityCapsuleType::Episode,
+            ],
+            0.5,
+        )
+        .await
+        .unwrap();
+    let promote_empty = repo
+        .auto_promote_candidates("t1", "00000000000000000099", &[], 0.5)
+        .await
+        .unwrap();
+    assert_golden(
+        "auto_promote_candidates",
+        json!({
+            "ids": promote
+                .into_iter()
+                .map(|c| c.capability_capsule_id)
+                .collect::<Vec<_>>(),
+            "empty_types_len": promote_empty.len(),
+        }),
+    );
+
+    // ── final-batch: list_entities ── (kind filter + LIKE substring + miss;
+    //    created_at DESC; exact byte-match on the stable projection)
+    let ents_all = repo.list_entities("t1", None, None, 50).await.unwrap();
+    let ents_kind = repo
+        .list_entities("t1", Some(mem::domain::EntityKind::Topic), None, 50)
+        .await
+        .unwrap();
+    let ents_like = repo
+        .list_entities("t1", None, Some("Rust"), 50)
+        .await
+        .unwrap();
+    let ents_miss = repo
+        .list_entities("t1", None, Some("zzz-no-match"), 50)
+        .await
+        .unwrap();
+    let proj = |es: Vec<mem::domain::Entity>| {
+        es.into_iter()
+            .map(|e| json!([e.canonical_name, serde_json::to_value(e.kind).unwrap()]))
+            .collect::<Vec<_>>()
+    };
+    assert_golden(
+        "list_entities",
+        json!({
+            "all": proj(ents_all),
+            "kind_topic": proj(ents_kind),
+            "like_rust": proj(ents_like),
+            "miss_len": ents_miss.len(),
         }),
     );
 
@@ -1279,5 +1606,106 @@ async fn lance_parity_matches_golden() {
             .into_iter()
             .map(|m| m.message_block_id)
             .collect::<Vec<_>>()),
+    );
+
+    // ── final-batch: get_conversation_messages_by_session ── (exact byte-match)
+    let by_session = repo
+        .get_conversation_messages_by_session("t1", "S1")
+        .await
+        .unwrap();
+    assert_golden(
+        "get_conversation_messages_by_session",
+        json!(by_session
+            .into_iter()
+            .map(|m| m.message_block_id)
+            .collect::<Vec<_>>()),
+    );
+
+    // ── final-batch: get_conversation_messages_by_session_paged ── (paged +
+    //    cursor resume; exact byte-match)
+    let (paged_p1, paged_more) = repo
+        .get_conversation_messages_by_session_paged("t1", "S1", None, None, None, None, None, 2)
+        .await
+        .unwrap();
+    let cursor = paged_p1.last().map(|m| {
+        (
+            m.created_at.clone(),
+            m.line_number as i64,
+            m.block_index as i64,
+        )
+    });
+    let (paged_p2, p2_more) = match &cursor {
+        Some((at, ln, bi)) => repo
+            .get_conversation_messages_by_session_paged(
+                "t1",
+                "S1",
+                None,
+                None,
+                None,
+                None,
+                Some((at.as_str(), *ln, *bi)),
+                2,
+            )
+            .await
+            .unwrap(),
+        None => (Vec::new(), false),
+    };
+    assert_golden(
+        "get_conversation_messages_by_session_paged",
+        json!({
+            "page1_ids": paged_p1.iter().map(|m| m.message_block_id.clone()).collect::<Vec<_>>(),
+            "page1_has_more": paged_more,
+            "page2_ids": paged_p2.iter().map(|m| m.message_block_id.clone()).collect::<Vec<_>>(),
+            "page2_has_more": p2_more,
+        }),
+    );
+
+    // ── final-batch: list_conversation_messages_in_range ── (exact byte-match)
+    let (range_all, range_more) = repo
+        .list_conversation_messages_in_range("t1", None, None, None, None, None, 10)
+        .await
+        .unwrap();
+    let (range_win, win_more) = repo
+        .list_conversation_messages_in_range(
+            "t1",
+            Some("00000000000000000021"),
+            None,
+            None,
+            None,
+            None,
+            10,
+        )
+        .await
+        .unwrap();
+    assert_golden(
+        "list_conversation_messages_in_range",
+        json!({
+            "all_ids": range_all.iter().map(|m| m.message_block_id.clone()).collect::<Vec<_>>(),
+            "all_has_more": range_more,
+            "windowed_ids": range_win.iter().map(|m| m.message_block_id.clone()).collect::<Vec<_>>(),
+            "windowed_has_more": win_more,
+        }),
+    );
+
+    // ── final-batch: anchor_session_candidates ── (exact byte-match; k0 → [])
+    let anchor = repo.anchor_session_candidates("t1", "S1", 2).await.unwrap();
+    let anchor_zero = repo.anchor_session_candidates("t1", "S1", 0).await.unwrap();
+    assert_golden(
+        "anchor_session_candidates",
+        json!({ "k2": anchor, "k0_len": anchor_zero.len() }),
+    );
+
+    // ── final-batch: context_window_for_block ── (exact byte-match)
+    let window = repo
+        .context_window_for_block("t1", "mb_2", 1, 1, true)
+        .await
+        .unwrap();
+    assert_golden(
+        "context_window_for_block",
+        json!({
+            "primary": window.primary.message_block_id,
+            "before": window.before.iter().map(|m| m.message_block_id.clone()).collect::<Vec<_>>(),
+            "after": window.after.iter().map(|m| m.message_block_id.clone()).collect::<Vec<_>>(),
+        }),
     );
 }

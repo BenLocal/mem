@@ -1,8 +1,8 @@
 {
   "has_more": true,
   "page1_ids": [
+    "cap_idem",
     "cap_f_archived",
-    "cap_e_pending",
-    "cap_d_v2"
+    "cap_e_pending"
   ]
 }

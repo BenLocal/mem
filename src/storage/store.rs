@@ -648,9 +648,18 @@ impl Store {
         tenant: &str,
         capability_capsule_id: &str,
     ) -> Result<Option<CapabilityCapsuleRecord>, StorageError> {
-        self.query
-            .get_capability_capsule_for_tenant(tenant, capability_capsule_id)
-            .await
+        match self.read_engine {
+            crate::config::ReadEngine::DuckDb => {
+                self.query
+                    .get_capability_capsule_for_tenant(tenant, capability_capsule_id)
+                    .await
+            }
+            crate::config::ReadEngine::Lance => {
+                self.lance
+                    .get_capability_capsule_for_tenant(tenant, capability_capsule_id)
+                    .await
+            }
+        }
     }
 
     pub async fn get_pending(
@@ -674,9 +683,18 @@ impl Store {
         idempotency_key: &Option<String>,
         content_hash: &str,
     ) -> Result<Option<CapabilityCapsuleRecord>, StorageError> {
-        self.query
-            .find_by_idempotency_or_hash(tenant, idempotency_key, content_hash)
-            .await
+        match self.read_engine {
+            crate::config::ReadEngine::DuckDb => {
+                self.query
+                    .find_by_idempotency_or_hash(tenant, idempotency_key, content_hash)
+                    .await
+            }
+            crate::config::ReadEngine::Lance => {
+                self.lance
+                    .find_by_idempotency_or_hash(tenant, idempotency_key, content_hash)
+                    .await
+            }
+        }
     }
 
     pub async fn list_pending_review(
@@ -701,9 +719,18 @@ impl Store {
         types: &[crate::domain::capability_capsule::CapabilityCapsuleType],
         max_decay_score: f32,
     ) -> Result<Vec<CapabilityCapsuleRecord>, StorageError> {
-        self.query
-            .auto_promote_candidates(tenant, cutoff_updated_at, types, max_decay_score)
-            .await
+        match self.read_engine {
+            crate::config::ReadEngine::DuckDb => {
+                self.query
+                    .auto_promote_candidates(tenant, cutoff_updated_at, types, max_decay_score)
+                    .await
+            }
+            crate::config::ReadEngine::Lance => {
+                self.lance
+                    .auto_promote_candidates(tenant, cutoff_updated_at, types, max_decay_score)
+                    .await
+            }
+        }
     }
 
     pub async fn search_candidates(
@@ -1370,9 +1397,18 @@ impl Store {
         tenant: &str,
         session_id: &str,
     ) -> Result<Vec<ConversationMessage>, StorageError> {
-        self.query
-            .get_conversation_messages_by_session(tenant, session_id)
-            .await
+        match self.read_engine {
+            crate::config::ReadEngine::DuckDb => {
+                self.query
+                    .get_conversation_messages_by_session(tenant, session_id)
+                    .await
+            }
+            crate::config::ReadEngine::Lance => {
+                self.lance
+                    .get_conversation_messages_by_session(tenant, session_id)
+                    .await
+            }
+        }
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1387,11 +1423,22 @@ impl Store {
         cursor: Option<(&str, i64, i64)>,
         limit: usize,
     ) -> Result<(Vec<ConversationMessage>, bool), StorageError> {
-        self.query
-            .get_conversation_messages_by_session_paged(
-                tenant, session_id, since, until, role, block_type, cursor, limit,
-            )
-            .await
+        match self.read_engine {
+            crate::config::ReadEngine::DuckDb => {
+                self.query
+                    .get_conversation_messages_by_session_paged(
+                        tenant, session_id, since, until, role, block_type, cursor, limit,
+                    )
+                    .await
+            }
+            crate::config::ReadEngine::Lance => {
+                self.lance
+                    .get_conversation_messages_by_session_paged(
+                        tenant, session_id, since, until, role, block_type, cursor, limit,
+                    )
+                    .await
+            }
+        }
     }
 
     pub async fn list_transcript_sessions(
@@ -1415,11 +1462,22 @@ impl Store {
         cursor: Option<(&str, i64, i64)>,
         limit: usize,
     ) -> Result<(Vec<ConversationMessage>, bool), StorageError> {
-        self.query
-            .list_conversation_messages_in_range(
-                tenant, time_from, time_to, role, block_type, cursor, limit,
-            )
-            .await
+        match self.read_engine {
+            crate::config::ReadEngine::DuckDb => {
+                self.query
+                    .list_conversation_messages_in_range(
+                        tenant, time_from, time_to, role, block_type, cursor, limit,
+                    )
+                    .await
+            }
+            crate::config::ReadEngine::Lance => {
+                self.lance
+                    .list_conversation_messages_in_range(
+                        tenant, time_from, time_to, role, block_type, cursor, limit,
+                    )
+                    .await
+            }
+        }
     }
 
     pub async fn fetch_conversation_messages_by_ids(
@@ -1449,9 +1507,30 @@ impl Store {
         k_after: usize,
         include_tool_blocks: bool,
     ) -> Result<ContextWindow, StorageError> {
-        self.query
-            .context_window_for_block(tenant, primary_id, k_before, k_after, include_tool_blocks)
-            .await
+        match self.read_engine {
+            crate::config::ReadEngine::DuckDb => {
+                self.query
+                    .context_window_for_block(
+                        tenant,
+                        primary_id,
+                        k_before,
+                        k_after,
+                        include_tool_blocks,
+                    )
+                    .await
+            }
+            crate::config::ReadEngine::Lance => {
+                self.lance
+                    .context_window_for_block(
+                        tenant,
+                        primary_id,
+                        k_before,
+                        k_after,
+                        include_tool_blocks,
+                    )
+                    .await
+            }
+        }
     }
 
     pub async fn anchor_session_candidates(
@@ -1460,9 +1539,18 @@ impl Store {
         session_id: &str,
         k: usize,
     ) -> Result<Vec<String>, StorageError> {
-        self.query
-            .anchor_session_candidates(tenant, session_id, k)
-            .await
+        match self.read_engine {
+            crate::config::ReadEngine::DuckDb => {
+                self.query
+                    .anchor_session_candidates(tenant, session_id, k)
+                    .await
+            }
+            crate::config::ReadEngine::Lance => {
+                self.lance
+                    .anchor_session_candidates(tenant, session_id, k)
+                    .await
+            }
+        }
     }
 
     pub async fn recent_conversation_messages(
@@ -1761,9 +1849,18 @@ impl Store {
         query: Option<&str>,
         limit: usize,
     ) -> Result<Vec<Entity>, StorageError> {
-        self.query
-            .list_entities(tenant, kind_filter, query, limit)
-            .await
+        match self.read_engine {
+            crate::config::ReadEngine::DuckDb => {
+                self.query
+                    .list_entities(tenant, kind_filter, query, limit)
+                    .await
+            }
+            crate::config::ReadEngine::Lance => {
+                self.lance
+                    .list_entities(tenant, kind_filter, query, limit)
+                    .await
+            }
+        }
     }
 }
 
