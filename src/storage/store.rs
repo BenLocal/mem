@@ -543,7 +543,10 @@ impl Store {
     }
 
     pub async fn list_wings(&self, tenant: &str) -> Result<Vec<String>, StorageError> {
-        self.query.list_wings(tenant).await
+        match self.read_engine {
+            crate::config::ReadEngine::DuckDb => self.query.list_wings(tenant).await,
+            crate::config::ReadEngine::Lance => self.lance.list_wings(tenant).await,
+        }
     }
 
     pub async fn capsule_stats(
@@ -579,19 +582,38 @@ impl Store {
         cursor: Option<(&str, &str)>,
         limit: usize,
     ) -> Result<(Vec<CapabilityCapsuleRecord>, bool), StorageError> {
-        self.query
-            .list_capability_capsules_in_scope(
-                tenant,
-                project,
-                repo,
-                module,
-                capsule_type,
-                status,
-                source_agent,
-                cursor,
-                limit,
-            )
-            .await
+        match self.read_engine {
+            crate::config::ReadEngine::DuckDb => {
+                self.query
+                    .list_capability_capsules_in_scope(
+                        tenant,
+                        project,
+                        repo,
+                        module,
+                        capsule_type,
+                        status,
+                        source_agent,
+                        cursor,
+                        limit,
+                    )
+                    .await
+            }
+            crate::config::ReadEngine::Lance => {
+                self.lance
+                    .list_capability_capsules_in_scope(
+                        tenant,
+                        project,
+                        repo,
+                        module,
+                        capsule_type,
+                        status,
+                        source_agent,
+                        cursor,
+                        limit,
+                    )
+                    .await
+            }
+        }
     }
 
     pub async fn get_capability_capsule_for_tenant(
@@ -609,7 +631,14 @@ impl Store {
         tenant: &str,
         capability_capsule_id: &str,
     ) -> Result<Option<CapabilityCapsuleRecord>, StorageError> {
-        self.query.get_pending(tenant, capability_capsule_id).await
+        match self.read_engine {
+            crate::config::ReadEngine::DuckDb => {
+                self.query.get_pending(tenant, capability_capsule_id).await
+            }
+            crate::config::ReadEngine::Lance => {
+                self.lance.get_pending(tenant, capability_capsule_id).await
+            }
+        }
     }
 
     pub async fn find_by_idempotency_or_hash(
@@ -627,7 +656,10 @@ impl Store {
         &self,
         tenant: &str,
     ) -> Result<Vec<CapabilityCapsuleRecord>, StorageError> {
-        self.query.list_pending_review(tenant).await
+        match self.read_engine {
+            crate::config::ReadEngine::DuckDb => self.query.list_pending_review(tenant).await,
+            crate::config::ReadEngine::Lance => self.lance.list_pending_review(tenant).await,
+        }
     }
 
     /// Auto-promote candidate set. Returns rows that match the
@@ -662,9 +694,18 @@ impl Store {
         tenant: &str,
         limit: usize,
     ) -> Result<Vec<CapabilityCapsuleRecord>, StorageError> {
-        self.query
-            .recent_active_capability_capsules(tenant, limit)
-            .await
+        match self.read_engine {
+            crate::config::ReadEngine::DuckDb => {
+                self.query
+                    .recent_active_capability_capsules(tenant, limit)
+                    .await
+            }
+            crate::config::ReadEngine::Lance => {
+                self.lance
+                    .recent_active_capability_capsules(tenant, limit)
+                    .await
+            }
+        }
     }
 
     pub async fn fetch_capability_capsules_by_ids(
@@ -690,9 +731,18 @@ impl Store {
         &self,
         tenant: &str,
     ) -> Result<Vec<String>, StorageError> {
-        self.query
-            .list_capability_capsule_ids_for_tenant(tenant)
-            .await
+        match self.read_engine {
+            crate::config::ReadEngine::DuckDb => {
+                self.query
+                    .list_capability_capsule_ids_for_tenant(tenant)
+                    .await
+            }
+            crate::config::ReadEngine::Lance => {
+                self.lance
+                    .list_capability_capsule_ids_for_tenant(tenant)
+                    .await
+            }
+        }
     }
 
     pub async fn list_capability_capsule_versions_for_tenant(

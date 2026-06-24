@@ -516,6 +516,79 @@ async fn duckdb_parity_golden() {
         sorted_ids(listed.into_iter().map(|c| c.capability_capsule_id)),
     );
 
+    // ── batch-A: list_wings ── (distinct projects, alpha order; set-stable)
+    let wings = repo.list_wings("t1").await.unwrap();
+    check_or_write("list_wings", sorted_ids(wings));
+
+    // ── batch-A: get_pending ── (the one PendingConfirmation row, + a miss)
+    let pending = repo.get_pending("t1", "cap_e_pending").await.unwrap();
+    let pending_miss = repo.get_pending("t1", "cap_a").await.unwrap();
+    check_or_write(
+        "get_pending",
+        json!({
+            "hit": pending.map(|c| c.capability_capsule_id),
+            "miss_active": pending_miss.map(|c| c.capability_capsule_id),
+        }),
+    );
+
+    // ── batch-A: list_pending_review ── (created_at DESC; ordered ids)
+    let pending_review = repo.list_pending_review("t1").await.unwrap();
+    check_or_write(
+        "list_pending_review",
+        json!(pending_review
+            .into_iter()
+            .map(|c| c.capability_capsule_id)
+            .collect::<Vec<_>>()),
+    );
+
+    // ── batch-A: recent_active ── (updated_at DESC, version DESC, id ASC;
+    //    excludes rejected/archived + diary; ORDER is load-bearing → ordered)
+    let recent = repo
+        .recent_active_capability_capsules("t1", 10)
+        .await
+        .unwrap();
+    check_or_write(
+        "recent_active",
+        json!(recent
+            .into_iter()
+            .map(|c| c.capability_capsule_id)
+            .collect::<Vec<_>>()),
+    );
+
+    // ── batch-A: list_ids ── (updated_at DESC; ALL statuses; ordered ids)
+    let ids = repo
+        .list_capability_capsule_ids_for_tenant("t1")
+        .await
+        .unwrap();
+    check_or_write("list_ids", json!(ids));
+
+    // ── batch-A: list_in_scope ── (project=mem, repo=mem; limit=3 forces a
+    //    has_more=true page; ORDER updated_at DESC, id ASC is load-bearing)
+    let (scope_p1, scope_more) = repo
+        .list_capability_capsules_in_scope(
+            "t1",
+            Some("mem"),
+            Some("mem"),
+            None,
+            None,
+            None,
+            None,
+            None,
+            3,
+        )
+        .await
+        .unwrap();
+    check_or_write(
+        "list_in_scope",
+        json!({
+            "page1_ids": scope_p1
+                .into_iter()
+                .map(|c| c.capability_capsule_id)
+                .collect::<Vec<_>>(),
+            "has_more": scope_more,
+        }),
+    );
+
     // ── ann ──
     let ann = repo.ann_candidate_ids("t1", &q_vec, 5).await.unwrap();
     check_or_write("ann", ranked(ann));
@@ -648,6 +721,78 @@ async fn lance_parity_matches_golden() {
     assert_golden(
         "filter",
         sorted_ids(listed.into_iter().map(|c| c.capability_capsule_id)),
+    );
+
+    // ── batch-A: list_wings ── (non-FTS → exact byte-match)
+    let wings = repo.list_wings("t1").await.unwrap();
+    assert_golden("list_wings", sorted_ids(wings));
+
+    // ── batch-A: get_pending ── (exact byte-match)
+    let pending = repo.get_pending("t1", "cap_e_pending").await.unwrap();
+    let pending_miss = repo.get_pending("t1", "cap_a").await.unwrap();
+    assert_golden(
+        "get_pending",
+        json!({
+            "hit": pending.map(|c| c.capability_capsule_id),
+            "miss_active": pending_miss.map(|c| c.capability_capsule_id),
+        }),
+    );
+
+    // ── batch-A: list_pending_review ── (created_at DESC; exact byte-match)
+    let pending_review = repo.list_pending_review("t1").await.unwrap();
+    assert_golden(
+        "list_pending_review",
+        json!(pending_review
+            .into_iter()
+            .map(|c| c.capability_capsule_id)
+            .collect::<Vec<_>>()),
+    );
+
+    // ── batch-A: recent_active ── (updated_at DESC, version DESC, id ASC;
+    //    exact byte-match — order is load-bearing)
+    let recent = repo
+        .recent_active_capability_capsules("t1", 10)
+        .await
+        .unwrap();
+    assert_golden(
+        "recent_active",
+        json!(recent
+            .into_iter()
+            .map(|c| c.capability_capsule_id)
+            .collect::<Vec<_>>()),
+    );
+
+    // ── batch-A: list_ids ── (updated_at DESC; exact byte-match)
+    let ids = repo
+        .list_capability_capsule_ids_for_tenant("t1")
+        .await
+        .unwrap();
+    assert_golden("list_ids", json!(ids));
+
+    // ── batch-A: list_in_scope ── (limit=3 → has_more page; exact byte-match)
+    let (scope_p1, scope_more) = repo
+        .list_capability_capsules_in_scope(
+            "t1",
+            Some("mem"),
+            Some("mem"),
+            None,
+            None,
+            None,
+            None,
+            None,
+            3,
+        )
+        .await
+        .unwrap();
+    assert_golden(
+        "list_in_scope",
+        json!({
+            "page1_ids": scope_p1
+                .into_iter()
+                .map(|c| c.capability_capsule_id)
+                .collect::<Vec<_>>(),
+            "has_more": scope_more,
+        }),
     );
 
     // ── ann ── (postfilter parity: top-k across tenants, then filter t1)

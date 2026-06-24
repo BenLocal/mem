@@ -151,6 +151,213 @@ impl LanceStore {
         .await
     }
 
+    /// Route-B batch-A bucket "list_wings": native lancedb-Rust equivalent
+    /// of `DuckDbQuery::list_wings` — DISTINCT `project` for `tenant` where
+    /// `project IS NOT NULL`, ordered alphabetically.
+    ///
+    /// The DuckDB SQL is `SELECT DISTINCT project ... WHERE tenant = ? AND
+    /// project IS NOT NULL ORDER BY project`. Diary capsules participate in
+    /// the project space too (no type exclusion). Here we fetch the tenant's
+    /// rows, collect each `Some(project)` into a `BTreeSet` (dedups AND sorts
+    /// in one shot, matching `ORDER BY project`), and return the names.
+    /// Parity-gated by `tests/parity_golden.rs`.
+    pub async fn list_wings(&self, tenant: &str) -> Result<Vec<String>, StorageError> {
+        let rows = self
+            .query_capability_capsules(format!("tenant = {}", sql_quote(tenant)), None)
+            .await?;
+        let projects: std::collections::BTreeSet<String> =
+            rows.into_iter().filter_map(|r| r.project).collect();
+        Ok(projects.into_iter().collect())
+    }
+
+    /// Route-B batch-A bucket "get_pending": native lancedb-Rust equivalent
+    /// of `DuckDbQuery::get_pending` — a single row matching `(tenant,
+    /// capability_capsule_id)` whose status is `PendingConfirmation`.
+    /// Returns `Ok(None)` when the row is absent or has already moved off
+    /// `pending_confirmation` (accepted/rejected) — the DuckDB query's
+    /// `AND status = 'pending_confirmation'` predicate. Parity-gated by
+    /// `tests/parity_golden.rs`.
+    pub async fn get_pending(
+        &self,
+        tenant: &str,
+        capability_capsule_id: &str,
+    ) -> Result<Option<CapabilityCapsuleRecord>, StorageError> {
+        let status = enum_to_str(&CapabilityCapsuleStatus::PendingConfirmation)?;
+        let rows = self
+            .query_capability_capsules(
+                format!(
+                    "tenant = {} AND capability_capsule_id = {} AND status = {}",
+                    sql_quote(tenant),
+                    sql_quote(capability_capsule_id),
+                    sql_quote(&status),
+                ),
+                Some(1),
+            )
+            .await?;
+        Ok(rows.into_iter().next())
+    }
+
+    /// Route-B batch-A bucket "list_pending_review": native lancedb-Rust
+    /// equivalent of `DuckDbQuery::list_pending_review` — every
+    /// `PendingConfirmation` row under `tenant`, ordered `created_at DESC`
+    /// (newest arrivals first). LanceDB doesn't sort, so we re-sort in Rust
+    /// to match the DuckDB `ORDER BY`. Parity-gated by
+    /// `tests/parity_golden.rs`.
+    pub async fn list_pending_review(
+        &self,
+        tenant: &str,
+    ) -> Result<Vec<CapabilityCapsuleRecord>, StorageError> {
+        let status = enum_to_str(&CapabilityCapsuleStatus::PendingConfirmation)?;
+        let mut rows = self
+            .query_capability_capsules(
+                format!(
+                    "tenant = {} AND status = {}",
+                    sql_quote(tenant),
+                    sql_quote(&status),
+                ),
+                None,
+            )
+            .await?;
+        // ORDER BY created_at DESC.
+        rows.sort_by(|a, b| b.created_at.cmp(&a.created_at));
+        Ok(rows)
+    }
+
+    /// Route-B batch-A bucket "recent_active": native lancedb-Rust
+    /// equivalent of `DuckDbQuery::recent_active_capability_capsules` — the
+    /// most-recent non-rejected, non-archived, non-diary rows under
+    /// `tenant`, ordered `(updated_at DESC, version DESC,
+    /// capability_capsule_id ASC)`, limited to `clamp(limit, 1, 1024)`.
+    ///
+    /// `PendingConfirmation` / `Provisional` / `Active` all pass — the
+    /// DuckDB SQL only excludes the two terminal statuses (rejected /
+    /// archived) and `diary` type. LanceDB doesn't ORDER BY / LIMIT
+    /// deterministically with the right tie-break, so we sort + truncate in
+    /// Rust. Parity-gated by `tests/parity_golden.rs`.
+    pub async fn recent_active_capability_capsules(
+        &self,
+        tenant: &str,
+        limit: usize,
+    ) -> Result<Vec<CapabilityCapsuleRecord>, StorageError> {
+        use crate::domain::capability_capsule::{
+            CapabilityCapsuleStatus as S, CapabilityCapsuleType as T,
+        };
+        let lim = limit.clamp(1, 1024);
+        let mut rows = self
+            .query_capability_capsules(format!("tenant = {}", sql_quote(tenant)), None)
+            .await?;
+        rows.retain(|r| {
+            !matches!(r.status, S::Rejected | S::Archived)
+                && !matches!(r.capability_capsule_type, T::Diary)
+        });
+        // ORDER BY updated_at DESC, version DESC, capability_capsule_id ASC.
+        rows.sort_by(|a, b| {
+            b.updated_at
+                .cmp(&a.updated_at)
+                .then_with(|| b.version.cmp(&a.version))
+                .then_with(|| a.capability_capsule_id.cmp(&b.capability_capsule_id))
+        });
+        rows.truncate(lim);
+        Ok(rows)
+    }
+
+    /// Route-B batch-A bucket "list_ids": native lancedb-Rust equivalent of
+    /// `DuckDbQuery::list_capability_capsule_ids_for_tenant` — just the
+    /// `capability_capsule_id` column for `tenant`, **all statuses**, ordered
+    /// `updated_at DESC`. No status / type filter (admin read wants every
+    /// row). LanceDB doesn't sort, so we sort in Rust to match the DuckDB
+    /// `ORDER BY`. Parity-gated by `tests/parity_golden.rs`.
+    pub async fn list_capability_capsule_ids_for_tenant(
+        &self,
+        tenant: &str,
+    ) -> Result<Vec<String>, StorageError> {
+        let mut rows = self
+            .query_capability_capsules(format!("tenant = {}", sql_quote(tenant)), None)
+            .await?;
+        // ORDER BY updated_at DESC. The DuckDB query has no secondary
+        // tie-break key, but the parity fixture's timestamps are distinct,
+        // so the order is deterministic either way.
+        rows.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
+        Ok(rows.into_iter().map(|r| r.capability_capsule_id).collect())
+    }
+
+    /// Route-B batch-A bucket "list_in_scope": native lancedb-Rust
+    /// equivalent of `DuckDbQuery::list_capability_capsules_in_scope` — the
+    /// embedding-free scope browse path. Each of `(project, repo, module,
+    /// capsule_type, status, source_agent)` is an optional equality filter
+    /// (a `None` is a no-op); results are ordered `(updated_at DESC,
+    /// capability_capsule_id ASC)` and paginated by the composite cursor
+    /// `(updated_at, id)`.
+    ///
+    /// The DuckDB query pushes each filter into the `WHERE`, applies the
+    /// composite-cursor resume condition (`updated_at < cur OR (updated_at =
+    /// cur AND id > cur_id)`), orders, and fetches `LIMIT clamp(limit,
+    /// 1, 200) + 1` to report `has_more` via the standard N+1 trick. We
+    /// replicate exactly: equality filters in the lance `only_if`
+    /// predicate; the cursor + ordering + N+1 slice in Rust (LanceDB has no
+    /// ORDER BY). `enum`-shaped filters (`capsule_type`, `status`) are
+    /// matched as the raw snake_case strings the caller passes, identical to
+    /// the DuckDB `= ?` bind. Parity-gated by `tests/parity_golden.rs`.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn list_capability_capsules_in_scope(
+        &self,
+        tenant: &str,
+        project: Option<&str>,
+        repo: Option<&str>,
+        module: Option<&str>,
+        capsule_type: Option<&str>,
+        status: Option<&str>,
+        source_agent: Option<&str>,
+        cursor: Option<(&str, &str)>,
+        limit: usize,
+    ) -> Result<(Vec<CapabilityCapsuleRecord>, bool), StorageError> {
+        let lim = limit.clamp(1, 200);
+        let mut clauses = vec![format!("tenant = {}", sql_quote(tenant))];
+        if let Some(v) = project {
+            clauses.push(format!("project = {}", sql_quote(v)));
+        }
+        if let Some(v) = repo {
+            clauses.push(format!("repo = {}", sql_quote(v)));
+        }
+        if let Some(v) = module {
+            clauses.push(format!("module = {}", sql_quote(v)));
+        }
+        if let Some(v) = capsule_type {
+            clauses.push(format!("capability_capsule_type = {}", sql_quote(v)));
+        }
+        if let Some(v) = status {
+            clauses.push(format!("status = {}", sql_quote(v)));
+        }
+        if let Some(v) = source_agent {
+            clauses.push(format!("source_agent = {}", sql_quote(v)));
+        }
+        let filter = clauses.join(" AND ");
+        let mut rows = self.query_capability_capsules(filter, None).await?;
+
+        // Composite cursor: strictly after (updated_at, id) under the
+        // ORDER BY (updated_at DESC, id ASC). Resume condition mirrors the
+        // DuckDB SQL: updated_at < cur OR (updated_at = cur AND id > cur_id).
+        if let Some((cur_updated, cur_id)) = cursor {
+            rows.retain(|r| {
+                r.updated_at.as_str() < cur_updated
+                    || (r.updated_at.as_str() == cur_updated
+                        && r.capability_capsule_id.as_str() > cur_id)
+            });
+        }
+
+        // ORDER BY updated_at DESC, capability_capsule_id ASC.
+        rows.sort_by(|a, b| {
+            b.updated_at
+                .cmp(&a.updated_at)
+                .then_with(|| a.capability_capsule_id.cmp(&b.capability_capsule_id))
+        });
+
+        // N+1 trick: fetch lim+1, has_more if we overshot, then trim.
+        let has_more = rows.len() > lim;
+        rows.truncate(lim);
+        Ok((rows, has_more))
+    }
+
     /// Route-B bucket "ann": native lancedb-Rust equivalent of
     /// `DuckDbQuery::ann_candidate_ids`.
     ///
