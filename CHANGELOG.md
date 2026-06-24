@@ -8,6 +8,51 @@ are organized by feature wave (merge commit ranges on `master`).
 
 ## [Unreleased]
 
+## 2026-06-24 — `0.1.9`
+
+Route-B release. **The DuckDB read engine is removed** — `mem` is now
+lance-native only: Lance datasets on disk + lancedb-Rust native reads +
+a Tantivy BM25 full-text subsystem. ~8200 lines deleted; the `duckdb`
+dependency is gone.
+
+### Changed
+
+- **Reads are lancedb-Rust native.** All Store read methods that went
+  through the in-process DuckDB lance-extension (`SELECT … FROM ns.main.*`)
+  were reimplemented on the LanceDB Rust query API: `only_if` SQL filters,
+  `nearest_to` ANN, `fetch_*_by_ids` hydration, with ranking / aggregation /
+  RRF compose done Rust-side (`pipeline/retrieve.rs`). Read freshness comes
+  from opening the read connection with `read_consistency_interval(0)`
+  (Strong), replacing the old `refresh` / `mark_dirty` / `ensure_fresh`
+  connection-rebuild machinery (also removed).
+- **Full-text search is a self-built Tantivy index** (`src/storage/fts.rs`,
+  jieba tokenizer), replacing the DuckDB `lance_fts(...)` path that hit the
+  upstream `lance scanner.rs` ragged-batch bug. In-RAM, full-rebuilt at
+  startup + each maintenance sweep (cheap: ~1s at the real ~31k-doc scale).
+  CJK queries are term-split before search.
+- **Decay writes moved to lancedb Rust `table.update()`** (Phase 2,
+  irreversible gate): `apply_time_decay` + `bump_last_used_at` no longer
+  write through the DuckDB extension. The old dual-writer commit race is
+  gone (single Rust-API writer); lance's native `execute_with_retry` handles
+  optimistic-concurrency conflicts. Decay output is verified bit-identical
+  to the old path.
+
+### Removed
+
+- The `duckdb` crate dependency; `src/storage/duckdb_query/` (~6000 lines);
+  the `ReadEngine` / `MEM_READ_ENGINE` read-engine switch; `MEM_DUCKDB_THREADS`
+  and the r2d2 DuckDB read pool (`MEM_RW_POOL_DISABLED`); `StorageError::DuckDb`;
+  the DuckDB-ATTACH snapshot-visibility probe + the two duckdb PoC examples.
+
+### Notes
+
+- The on-disk dataset directory keeps its legacy name `mem.duckdb` for
+  path compatibility — it holds Lance datasets, not a DuckDB file.
+- FTS parity is **soft** (overlap@10 ≥ 0.8) by design — Tantivy BM25 is a
+  different engine than the old `lance_fts`; non-FTS read parity is exact,
+  asserted against frozen DuckDB-generated goldens (`tests/golden/`).
+- Design + execution record: `docs/remove-duckdb-keep-lance.md`.
+
 ## 2026-06-22 — `0.1.8`
 
 Memory-footprint release. Swaps the Rust global allocator from glibc malloc
