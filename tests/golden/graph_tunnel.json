@@ -1,0 +1,155 @@
+{
+  "find_tunnels_any": [
+    {
+      "from_node_id": "capability_capsule:cap_a",
+      "relation": "user_tunnel:link_ab",
+      "to_node_id": "capability_capsule:cap_b",
+      "valid_from": "00000000000000000050",
+      "valid_to": null
+    },
+    {
+      "from_node_id": "capability_capsule:cap_b",
+      "relation": "user_tunnel:topic_bridge",
+      "to_node_id": "entity:proj-mem",
+      "valid_from": "00000000000000000051",
+      "valid_to": null
+    }
+  ],
+  "find_tunnels_caps": [
+    {
+      "from_node_id": "capability_capsule:cap_a",
+      "relation": "user_tunnel:link_ab",
+      "to_node_id": "capability_capsule:cap_b",
+      "valid_from": "00000000000000000050",
+      "valid_to": null
+    }
+  ],
+  "follow_tunnels_cap_b": [
+    {
+      "from_node_id": "capability_capsule:cap_a",
+      "relation": "user_tunnel:link_ab",
+      "to_node_id": "capability_capsule:cap_b",
+      "valid_from": "00000000000000000050",
+      "valid_to": null
+    },
+    {
+      "from_node_id": "capability_capsule:cap_b",
+      "relation": "user_tunnel:topic_bridge",
+      "to_node_id": "entity:proj-mem",
+      "valid_from": "00000000000000000051",
+      "valid_to": null
+    }
+  ],
+  "incident_edges_proj_mem": [
+    [
+      "capability_capsule:cap_a",
+      "entity:proj-mem"
+    ],
+    [
+      "capability_capsule:cap_b",
+      "entity:proj-mem"
+    ],
+    [
+      "capability_capsule:cap_b",
+      "entity:proj-mem"
+    ],
+    [
+      "entity:proj-mem",
+      "entity:org-x"
+    ]
+  ],
+  "kg_timeline_cap_a": [
+    {
+      "from_node_id": "capability_capsule:cap_a",
+      "relation": "user_tunnel:link_ab",
+      "to_node_id": "capability_capsule:cap_b",
+      "valid_from": "00000000000000000050",
+      "valid_to": null
+    },
+    {
+      "from_node_id": "capability_capsule:cap_a",
+      "relation": "user_tunnel:archived",
+      "to_node_id": "entity:org-x",
+      "valid_from": "00000000000000000052",
+      "valid_to": "00000000000000000060"
+    },
+    {
+      "from_node_id": "capability_capsule:cap_a",
+      "relation": "mentions",
+      "to_node_id": "entity:proj-mem",
+      "valid_from": "00000000000000000001",
+      "valid_to": null
+    }
+  ],
+  "list_user_tunnels": [
+    {
+      "from_node_id": "capability_capsule:cap_a",
+      "relation": "user_tunnel:link_ab",
+      "to_node_id": "capability_capsule:cap_b",
+      "valid_from": "00000000000000000050",
+      "valid_to": null
+    },
+    {
+      "from_node_id": "capability_capsule:cap_b",
+      "relation": "user_tunnel:topic_bridge",
+      "to_node_id": "entity:proj-mem",
+      "valid_from": "00000000000000000051",
+      "valid_to": null
+    }
+  ],
+  "neighbors_1hop": [
+    {
+      "from_node_id": "capability_capsule:cap_a",
+      "relation": "mentions",
+      "to_node_id": "entity:proj-mem",
+      "valid_from": "00000000000000000001",
+      "valid_to": null
+    },
+    {
+      "from_node_id": "capability_capsule:cap_b",
+      "relation": "mentions",
+      "to_node_id": "entity:proj-mem",
+      "valid_from": "00000000000000000002",
+      "valid_to": null
+    },
+    {
+      "from_node_id": "capability_capsule:cap_b",
+      "relation": "user_tunnel:topic_bridge",
+      "to_node_id": "entity:proj-mem",
+      "valid_from": "00000000000000000051",
+      "valid_to": null
+    },
+    {
+      "from_node_id": "entity:proj-mem",
+      "relation": "part_of",
+      "to_node_id": "entity:org-x",
+      "valid_from": "00000000000000000003",
+      "valid_to": null
+    }
+  ],
+  "query_predicate_mentions": [
+    {
+      "from_node_id": "capability_capsule:cap_a",
+      "relation": "mentions",
+      "to_node_id": "entity:proj-mem",
+      "valid_from": "00000000000000000001",
+      "valid_to": null
+    },
+    {
+      "from_node_id": "capability_capsule:cap_b",
+      "relation": "mentions",
+      "to_node_id": "entity:proj-mem",
+      "valid_from": "00000000000000000002",
+      "valid_to": null
+    }
+  ],
+  "query_predicate_mentions_as_of": [
+    {
+      "from_node_id": "capability_capsule:cap_a",
+      "relation": "mentions",
+      "to_node_id": "entity:proj-mem",
+      "valid_from": "00000000000000000001",
+      "valid_to": null
+    }
+  ]
+}

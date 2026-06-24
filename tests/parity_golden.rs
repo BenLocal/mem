@@ -136,6 +136,17 @@ fn edge(from: &str, to: &str, rel: &str, valid_from: &str) -> GraphEdge {
     }
 }
 
+/// Like [`edge`] but pre-closed at `valid_to` — exercises the
+/// closed/historical path for `kg_timeline` (which surfaces closed
+/// edges) vs `neighbors` / `list_user_tunnels` / `find_tunnels` /
+/// `follow_tunnels` (active-only).
+fn closed_edge(from: &str, to: &str, rel: &str, valid_from: &str, valid_to: &str) -> GraphEdge {
+    GraphEdge {
+        valid_to: Some(valid_to.into()),
+        ..edge(from, to, rel, valid_from)
+    }
+}
+
 /// Build the fixed deterministic corpus on a fresh tempdir store, embeddings
 /// and FTS/ANN indexes included. Same inputs every run.
 async fn seed(repo: &Store) {
@@ -321,6 +332,31 @@ async fn seed(repo: &Store) {
             "entity:org-x",
             "part_of",
             "00000000000000000003",
+        ),
+        // ── batch-C graph-tunnel reads need more edge variety: ──
+        // Two ACTIVE user-tunnel edges (caller-curated bridges) for
+        // list_user_tunnels / find_tunnels / follow_tunnels. The
+        // `user_tunnel:` relation prefix is what those reads filter on.
+        edge(
+            "capability_capsule:cap_a",
+            "capability_capsule:cap_b",
+            "user_tunnel:link_ab",
+            "00000000000000000050",
+        ),
+        edge(
+            "capability_capsule:cap_b",
+            "entity:proj-mem",
+            "user_tunnel:topic_bridge",
+            "00000000000000000051",
+        ),
+        // A CLOSED user-tunnel edge — must be excluded by the active-only
+        // tunnel listings but surface in cap_a's kg_timeline (history).
+        closed_edge(
+            "capability_capsule:cap_a",
+            "entity:org-x",
+            "user_tunnel:archived",
+            "00000000000000000052",
+            "00000000000000000060",
         ),
     ] {
         repo.add_edge_direct(&e).await.unwrap();
@@ -510,6 +546,34 @@ fn sorted_ids<I: IntoIterator<Item = String>>(ids: I) -> serde_json::Value {
     let mut v: Vec<String> = ids.into_iter().collect();
     v.sort();
     json!(v)
+}
+
+/// Project a `Vec<GraphEdge>` to a stable JSON value, sorting by
+/// `(from, to, relation, valid_from)` so non-load-bearing scan order
+/// can't drift the golden. The engine-side ordering is asserted
+/// separately by the unit tests in `duckdb_query/graph.rs`; here we
+/// only need a deterministic set projection for cross-engine parity.
+fn graph_edges_json(mut edges: Vec<GraphEdge>) -> serde_json::Value {
+    edges.sort_by(|a, b| {
+        (&a.from_node_id, &a.to_node_id, &a.relation, &a.valid_from).cmp(&(
+            &b.from_node_id,
+            &b.to_node_id,
+            &b.relation,
+            &b.valid_from,
+        ))
+    });
+    serde_json::to_value(&edges).unwrap()
+}
+
+/// Project `Vec<(String, String)>` endpoint pairs to a stable JSON
+/// value (sorted) — `incident_edges_for_nodes` has no load-bearing
+/// order, so we sort the pairs deterministically.
+fn sorted_pairs(mut pairs: Vec<(String, String)>) -> serde_json::Value {
+    pairs.sort();
+    json!(pairs
+        .into_iter()
+        .map(|(a, b)| json!([a, b]))
+        .collect::<Vec<_>>())
 }
 
 /// `Vec<(id, rank)>` in engine order (ranking is semantic; ties broken by id
@@ -708,6 +772,54 @@ async fn duckdb_parity_golden() {
             "neighbors_within_2hops": serde_json::to_value(&neighbors).unwrap(),
             "related_capsule_ids": json!(related),
             "graph_stats": serde_json::to_value(gstats).unwrap(),
+        }),
+    );
+
+    // ── batch-C graph-tunnel reads ──
+    // neighbors (1-hop active, on the shared entity node)
+    let neighbors_1hop = repo.neighbors("entity:proj-mem").await.unwrap();
+    // kg_timeline (cap_a is on a mentions edge + a closed user_tunnel) —
+    // closed edges MUST surface here.
+    let timeline = repo.kg_timeline("capability_capsule:cap_a").await.unwrap();
+    // query_predicate: every `mentions` assertion (active + closed), and a
+    // point-in-time as_of probe that excludes future-dated edges.
+    let predicate_all = repo.query_predicate("mentions", None).await.unwrap();
+    let predicate_as_of = repo
+        .query_predicate("mentions", Some("00000000000000000001"))
+        .await
+        .unwrap();
+    // list_user_tunnels: the two ACTIVE user-tunnel edges (closed excluded).
+    let user_tunnels = repo.list_user_tunnels(100).await.unwrap();
+    // find_tunnels: active user-tunnels between capability_capsule:* nodes
+    // (both prefixes equal → dedup path exercised) and a broad any↔any scan.
+    let tunnels_caps = repo
+        .find_tunnels("capability_capsule:", "capability_capsule:", 100)
+        .await
+        .unwrap();
+    let tunnels_any = repo.find_tunnels("", "", 100).await.unwrap();
+    // follow_tunnels: BFS from cap_b following only user-tunnel edges.
+    let followed = repo
+        .follow_tunnels("capability_capsule:cap_b", 3)
+        .await
+        .unwrap();
+    // incident_edges_for_nodes: active 1-hop endpoint pairs around the
+    // shared entity (no load-bearing order → sorted).
+    let incident = repo
+        .incident_edges_for_nodes(&["entity:proj-mem".to_string()])
+        .await
+        .unwrap();
+    check_or_write(
+        "graph_tunnel",
+        json!({
+            "neighbors_1hop": graph_edges_json(neighbors_1hop),
+            "kg_timeline_cap_a": graph_edges_json(timeline),
+            "query_predicate_mentions": graph_edges_json(predicate_all),
+            "query_predicate_mentions_as_of": graph_edges_json(predicate_as_of),
+            "list_user_tunnels": graph_edges_json(user_tunnels),
+            "find_tunnels_caps": graph_edges_json(tunnels_caps),
+            "find_tunnels_any": graph_edges_json(tunnels_any),
+            "follow_tunnels_cap_b": graph_edges_json(followed),
+            "incident_edges_proj_mem": sorted_pairs(incident),
         }),
     );
 
@@ -967,6 +1079,46 @@ async fn lance_parity_matches_golden() {
             "neighbors_within_2hops": serde_json::to_value(&neighbors).unwrap(),
             "related_capsule_ids": json!(related),
             "graph_stats": serde_json::to_value(gstats).unwrap(),
+        }),
+    );
+
+    // ── batch-C graph-tunnel reads ── (mirrors the duckdb block verbatim:
+    //    neighbors / kg_timeline / query_predicate / list_user_tunnels /
+    //    find_tunnels / follow_tunnels / incident_edges_for_nodes — all
+    //    exact byte-match against the DuckDb-owned golden)
+    let neighbors_1hop = repo.neighbors("entity:proj-mem").await.unwrap();
+    let timeline = repo.kg_timeline("capability_capsule:cap_a").await.unwrap();
+    let predicate_all = repo.query_predicate("mentions", None).await.unwrap();
+    let predicate_as_of = repo
+        .query_predicate("mentions", Some("00000000000000000001"))
+        .await
+        .unwrap();
+    let user_tunnels = repo.list_user_tunnels(100).await.unwrap();
+    let tunnels_caps = repo
+        .find_tunnels("capability_capsule:", "capability_capsule:", 100)
+        .await
+        .unwrap();
+    let tunnels_any = repo.find_tunnels("", "", 100).await.unwrap();
+    let followed = repo
+        .follow_tunnels("capability_capsule:cap_b", 3)
+        .await
+        .unwrap();
+    let incident = repo
+        .incident_edges_for_nodes(&["entity:proj-mem".to_string()])
+        .await
+        .unwrap();
+    assert_golden(
+        "graph_tunnel",
+        json!({
+            "neighbors_1hop": graph_edges_json(neighbors_1hop),
+            "kg_timeline_cap_a": graph_edges_json(timeline),
+            "query_predicate_mentions": graph_edges_json(predicate_all),
+            "query_predicate_mentions_as_of": graph_edges_json(predicate_as_of),
+            "list_user_tunnels": graph_edges_json(user_tunnels),
+            "find_tunnels_caps": graph_edges_json(tunnels_caps),
+            "find_tunnels_any": graph_edges_json(tunnels_any),
+            "follow_tunnels_cap_b": graph_edges_json(followed),
+            "incident_edges_proj_mem": sorted_pairs(incident),
         }),
     );
 

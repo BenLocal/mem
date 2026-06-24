@@ -1,13 +1,14 @@
 //! Graph edges (`graph_edges` table). LanceStore-side WRITE methods —
 //! `sync_memory_edges`, `add_edge_direct`, `invalidate_edge`,
-//! `close_edges_for_capability_capsule` — plus the Route-B "graph"
-//! bucket NATIVE READS: `neighbors_within` (iterative BFS),
-//! `related_capability_capsule_ids`, and `graph_stats`. These three
-//! mirror the DuckDB backend (`DuckDbQuery::*`) field-for-field and are
-//! parity-gated by `tests/parity_golden.rs`; `Store` routes between the
-//! two engines on `read_engine`. The remaining graph reads (neighbors,
-//! kg_timeline, query_predicate, tunnels) still live solely on
-//! `DuckDbQuery` until their own buckets migrate.
+//! `close_edges_for_capability_capsule` — plus the Route-B graph NATIVE
+//! READS. The "graph" bucket: `neighbors_within` (iterative BFS),
+//! `related_capability_capsule_ids`, `graph_stats`. The "graph-tunnel"
+//! bucket (batch C): `neighbors`, `get_active_edge`, `kg_timeline`,
+//! `query_predicate`, `list_user_tunnels`, `find_tunnels`,
+//! `follow_tunnels`, `incident_edges_for_nodes`. All mirror the DuckDB
+//! backend (`DuckDbQuery::*`) field-for-field and are parity-gated by
+//! `tests/parity_golden.rs`; `Store` routes between the two engines on
+//! `read_engine`. With batch C every graph read has a lance-native arm.
 
 use arrow_array::{Array, Float32Array, Int64Array, RecordBatch, StringArray};
 use futures::TryStreamExt;
@@ -529,6 +530,269 @@ impl LanceStore {
             closed_edges,
             top_relations,
         })
+    }
+
+    /// Route-B bucket "graph-tunnel": native lancedb-Rust equivalent of
+    /// `DuckDbQuery::neighbors`. Active edges (`valid_to IS NULL`)
+    /// incident on `node_id` (either endpoint), 1-hop, no dedup/limit.
+    /// Output sorted `(relation, from_node_id, to_node_id)` — mirrors the
+    /// DuckDB `ORDER BY relation, from_node_id, to_node_id`. Parity-gated
+    /// by `tests/parity_golden.rs`.
+    pub async fn neighbors(&self, node_id: &str) -> Result<Vec<GraphEdge>, GraphError> {
+        let filter = format!(
+            "(from_node_id = {node} OR to_node_id = {node}) AND valid_to IS NULL",
+            node = sql_quote(node_id),
+        );
+        let mut out = self.query_graph_edges(filter).await?;
+        out.sort_by(|a, b| {
+            a.relation
+                .cmp(&b.relation)
+                .then_with(|| a.from_node_id.cmp(&b.from_node_id))
+                .then_with(|| a.to_node_id.cmp(&b.to_node_id))
+        });
+        Ok(out)
+    }
+
+    /// Route-B bucket "graph-tunnel": native lancedb-Rust equivalent of
+    /// `DuckDbQuery::get_active_edge`. The single active edge identified
+    /// by `(from, to, relation)` with its full K9 dynamics, or `None`.
+    /// Used by the potentiation worker's read-modify-write. Mirrors the
+    /// DuckDB `WHERE … AND valid_to IS NULL LIMIT 1`. Parity-gated by
+    /// `tests/parity_golden.rs`.
+    pub async fn get_active_edge(
+        &self,
+        from_node_id: &str,
+        to_node_id: &str,
+        relation: &str,
+    ) -> Result<Option<GraphEdge>, GraphError> {
+        let filter = format!(
+            "from_node_id = {} AND to_node_id = {} AND relation = {} AND valid_to IS NULL",
+            sql_quote(from_node_id),
+            sql_quote(to_node_id),
+            sql_quote(relation),
+        );
+        let edges = self.query_graph_edges(filter).await?;
+        Ok(edges.into_iter().next())
+    }
+
+    /// Route-B bucket "graph-tunnel": native lancedb-Rust equivalent of
+    /// `DuckDbQuery::kg_timeline`. ALL edges (incl. closed/historical)
+    /// involving `node_id` (either endpoint), ordered
+    /// `(valid_from ASC, relation ASC, from_node_id ASC, to_node_id ASC)`.
+    /// Unlike [`Self::neighbors`], closed edges are surfaced — the whole
+    /// point of a timeline. Parity-gated by `tests/parity_golden.rs`.
+    pub async fn kg_timeline(&self, node_id: &str) -> Result<Vec<GraphEdge>, GraphError> {
+        let filter = format!(
+            "from_node_id = {node} OR to_node_id = {node}",
+            node = sql_quote(node_id),
+        );
+        let mut out = self.query_graph_edges(filter).await?;
+        out.sort_by(|a, b| {
+            a.valid_from
+                .cmp(&b.valid_from)
+                .then_with(|| a.relation.cmp(&b.relation))
+                .then_with(|| a.from_node_id.cmp(&b.from_node_id))
+                .then_with(|| a.to_node_id.cmp(&b.to_node_id))
+        });
+        Ok(out)
+    }
+
+    /// Route-B bucket "graph-tunnel": native lancedb-Rust equivalent of
+    /// `DuckDbQuery::query_predicate`. All edges with `relation =
+    /// predicate`, optionally restricted to those active at `as_of`
+    /// (`valid_from <= as_of AND (valid_to IS NULL OR valid_to > as_of)`).
+    /// When `as_of` is `None`, includes both active and closed edges.
+    /// Ordered `(valid_from ASC, from_node_id ASC, to_node_id ASC)`.
+    /// Parity-gated by `tests/parity_golden.rs`.
+    pub async fn query_predicate(
+        &self,
+        predicate: &str,
+        as_of: Option<&str>,
+    ) -> Result<Vec<GraphEdge>, GraphError> {
+        let filter = match as_of {
+            Some(ts) => format!(
+                "relation = {rel} AND valid_from <= {ts} AND (valid_to IS NULL OR valid_to > {ts})",
+                rel = sql_quote(predicate),
+                ts = sql_quote(ts),
+            ),
+            None => format!("relation = {}", sql_quote(predicate)),
+        };
+        let mut out = self.query_graph_edges(filter).await?;
+        out.sort_by(|a, b| {
+            a.valid_from
+                .cmp(&b.valid_from)
+                .then_with(|| a.from_node_id.cmp(&b.from_node_id))
+                .then_with(|| a.to_node_id.cmp(&b.to_node_id))
+        });
+        Ok(out)
+    }
+
+    /// Route-B bucket "graph-tunnel": native lancedb-Rust equivalent of
+    /// `DuckDbQuery::list_user_tunnels`. Caller-curated active edges
+    /// (`relation LIKE 'user_tunnel:%' AND valid_to IS NULL`), ordered
+    /// `(relation, from_node_id, to_node_id)`, capped at `limit` (clamped
+    /// 1..200, matching DuckDB). The LIMIT is applied AFTER the sort — a
+    /// LanceDB scan has no ORDER BY, so the cap is taken in Rust on the
+    /// sorted vec. Parity-gated by `tests/parity_golden.rs`.
+    pub async fn list_user_tunnels(&self, limit: usize) -> Result<Vec<GraphEdge>, GraphError> {
+        let lim = limit.clamp(1, 200);
+        let filter = "relation LIKE 'user_tunnel:%' AND valid_to IS NULL".to_string();
+        let mut out = self.query_graph_edges(filter).await?;
+        out.sort_by(|a, b| {
+            a.relation
+                .cmp(&b.relation)
+                .then_with(|| a.from_node_id.cmp(&b.from_node_id))
+                .then_with(|| a.to_node_id.cmp(&b.to_node_id))
+        });
+        out.truncate(lim);
+        Ok(out)
+    }
+
+    /// Route-B bucket "graph-tunnel": native lancedb-Rust equivalent of
+    /// `DuckDbQuery::find_tunnels`. Active user-tunnel edges
+    /// (`relation LIKE 'user_tunnel:%' AND valid_to IS NULL`) where the
+    /// endpoints match `prefix_a`/`prefix_b` in EITHER direction:
+    /// `(from LIKE A% AND to LIKE B%) OR (from LIKE B% AND to LIKE A%)`.
+    /// Dedup on `(from, to, relation, valid_from)` (matters when
+    /// `prefix_a == prefix_b`), ordered `(relation, from, to)`, capped at
+    /// `limit` (clamped 1..200). LIMIT after sort+dedup in Rust.
+    /// Parity-gated by `tests/parity_golden.rs`.
+    pub async fn find_tunnels(
+        &self,
+        prefix_a: &str,
+        prefix_b: &str,
+        limit: usize,
+    ) -> Result<Vec<GraphEdge>, GraphError> {
+        let lim = limit.clamp(1, 200);
+        // LIKE-escape is unnecessary here: callers pass node-id prefixes
+        // (no `%`/`_` of their own); we append the wildcard ourselves. The
+        // pattern literal is sql_quote'd so an embedded quote can't break
+        // out of the string.
+        let pat_a = sql_quote(&format!("{prefix_a}%"));
+        let pat_b = sql_quote(&format!("{prefix_b}%"));
+        let filter = format!(
+            "relation LIKE 'user_tunnel:%' AND valid_to IS NULL \
+             AND ((from_node_id LIKE {pat_a} AND to_node_id LIKE {pat_b}) \
+               OR (from_node_id LIKE {pat_b} AND to_node_id LIKE {pat_a}))"
+        );
+        let edges = self.query_graph_edges(filter).await?;
+        let mut seen: std::collections::HashSet<(String, String, String, String)> =
+            std::collections::HashSet::new();
+        let mut out = Vec::new();
+        for e in edges {
+            let key = (
+                e.from_node_id.clone(),
+                e.to_node_id.clone(),
+                e.relation.clone(),
+                e.valid_from.clone(),
+            );
+            if seen.insert(key) {
+                out.push(e);
+            }
+        }
+        out.sort_by(|a, b| {
+            a.relation
+                .cmp(&b.relation)
+                .then_with(|| a.from_node_id.cmp(&b.from_node_id))
+                .then_with(|| a.to_node_id.cmp(&b.to_node_id))
+        });
+        out.truncate(lim);
+        Ok(out)
+    }
+
+    /// Route-B bucket "graph-tunnel": native lancedb-Rust equivalent of
+    /// `DuckDbQuery::follow_tunnels`. BFS from `node_id` following ONLY
+    /// active user-tunnel edges (`relation LIKE 'user_tunnel:%' AND
+    /// valid_to IS NULL`), up to `max_hops` (clamped to `MAX_HOPS_CAP =
+    /// 3`). Edge-set dedup on `(from, to, relation, valid_from)`; output
+    /// sorted `(relation, from, to)`. Distinct from
+    /// [`Self::neighbors_within`] (which walks all active edges) — here
+    /// only user-curated bridges are traversed. Parity-gated by
+    /// `tests/parity_golden.rs`.
+    pub async fn follow_tunnels(
+        &self,
+        node_id: &str,
+        max_hops: u32,
+    ) -> Result<Vec<GraphEdge>, GraphError> {
+        let hops = max_hops.clamp(1, MAX_HOPS_CAP);
+
+        let mut visited: std::collections::HashSet<String> =
+            std::collections::HashSet::from([node_id.to_string()]);
+        let mut frontier: Vec<String> = vec![node_id.to_string()];
+        let mut edges: std::collections::HashMap<(String, String, String, String), GraphEdge> =
+            std::collections::HashMap::new();
+
+        for _ in 0..hops {
+            if frontier.is_empty() {
+                break;
+            }
+            let mut next_frontier: Vec<String> = Vec::new();
+            for node in frontier.drain(..) {
+                let filter = format!(
+                    "(from_node_id = {node} OR to_node_id = {node}) \
+                     AND relation LIKE 'user_tunnel:%' AND valid_to IS NULL",
+                    node = sql_quote(&node),
+                );
+                let incident = self.query_graph_edges(filter).await?;
+                for edge in incident {
+                    let key = (
+                        edge.from_node_id.clone(),
+                        edge.to_node_id.clone(),
+                        edge.relation.clone(),
+                        edge.valid_from.clone(),
+                    );
+                    edges.entry(key).or_insert_with(|| edge.clone());
+                    for endpoint in [&edge.from_node_id, &edge.to_node_id] {
+                        if !visited.contains(endpoint.as_str()) {
+                            if visited.len() >= NEIGHBORS_VISITED_CAP {
+                                continue;
+                            }
+                            visited.insert(endpoint.clone());
+                            next_frontier.push(endpoint.clone());
+                        }
+                    }
+                }
+            }
+            frontier = next_frontier;
+        }
+
+        let mut out: Vec<GraphEdge> = edges.into_values().collect();
+        out.sort_by(|a, b| {
+            a.relation
+                .cmp(&b.relation)
+                .then_with(|| a.from_node_id.cmp(&b.from_node_id))
+                .then_with(|| a.to_node_id.cmp(&b.to_node_id))
+        });
+        Ok(out)
+    }
+
+    /// Route-B bucket "graph-tunnel": native lancedb-Rust equivalent of
+    /// `DuckDbQuery::incident_edges_for_nodes`. Every active 1-hop edge
+    /// (`valid_to IS NULL`) incident to any node in `node_ids`, as raw
+    /// `(from_node_id, to_node_id)` pairs. The DuckDB query has no ORDER
+    /// BY, so the pair order is not load-bearing — callers (and the
+    /// golden) sort deterministically. Empty input short-circuits.
+    /// Parity-gated by `tests/parity_golden.rs`.
+    pub async fn incident_edges_for_nodes(
+        &self,
+        node_ids: &[String],
+    ) -> Result<Vec<(String, String)>, GraphError> {
+        if node_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let in_list = node_ids
+            .iter()
+            .map(|n| sql_quote(n))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let filter = format!(
+            "(from_node_id IN ({in_list}) OR to_node_id IN ({in_list})) AND valid_to IS NULL"
+        );
+        let edges = self.query_graph_edges(filter).await?;
+        Ok(edges
+            .into_iter()
+            .map(|e| (e.from_node_id, e.to_node_id))
+            .collect())
     }
 }
 

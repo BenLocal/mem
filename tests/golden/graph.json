@@ -1,7 +1,7 @@
 {
   "graph_stats": {
-    "active_edges": 3,
-    "closed_edges": 0,
+    "active_edges": 5,
+    "closed_edges": 1,
     "node_count": 4,
     "top_relations": [
       [
@@ -11,11 +11,30 @@
       [
         "part_of",
         1
+      ],
+      [
+        "user_tunnel:archived",
+        1
+      ],
+      [
+        "user_tunnel:link_ab",
+        1
+      ],
+      [
+        "user_tunnel:topic_bridge",
+        1
       ]
     ],
-    "total_edges": 3
+    "total_edges": 6
   },
   "neighbors_within_2hops": [
+    {
+      "from_node_id": "capability_capsule:cap_a",
+      "relation": "user_tunnel:link_ab",
+      "to_node_id": "capability_capsule:cap_b",
+      "valid_from": "00000000000000000050",
+      "valid_to": null
+    },
     {
       "from_node_id": "capability_capsule:cap_a",
       "relation": "mentions",
@@ -28,6 +47,13 @@
       "relation": "mentions",
       "to_node_id": "entity:proj-mem",
       "valid_from": "00000000000000000002",
+      "valid_to": null
+    },
+    {
+      "from_node_id": "capability_capsule:cap_b",
+      "relation": "user_tunnel:topic_bridge",
+      "to_node_id": "entity:proj-mem",
+      "valid_from": "00000000000000000051",
       "valid_to": null
     },
     {

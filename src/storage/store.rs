@@ -1510,10 +1510,13 @@ impl Store {
     }
 }
 
-// ── Graph (writes → LanceStore, reads → DuckDbQuery) ────────────────
+// ── Graph (writes → LanceStore, reads → engine-routed by `read_engine`) ──
 impl Store {
     pub async fn neighbors(&self, node_id: &str) -> Result<Vec<GraphEdge>, GraphError> {
-        self.query.neighbors(node_id).await
+        match self.read_engine {
+            crate::config::ReadEngine::DuckDb => self.query.neighbors(node_id).await,
+            crate::config::ReadEngine::Lance => self.lance.neighbors(node_id).await,
+        }
     }
 
     pub async fn neighbors_within(
@@ -1533,7 +1536,10 @@ impl Store {
     }
 
     pub async fn kg_timeline(&self, node_id: &str) -> Result<Vec<GraphEdge>, GraphError> {
-        self.query.kg_timeline(node_id).await
+        match self.read_engine {
+            crate::config::ReadEngine::DuckDb => self.query.kg_timeline(node_id).await,
+            crate::config::ReadEngine::Lance => self.lance.kg_timeline(node_id).await,
+        }
     }
 
     pub async fn query_predicate(
@@ -1541,11 +1547,17 @@ impl Store {
         predicate: &str,
         as_of: Option<&str>,
     ) -> Result<Vec<GraphEdge>, GraphError> {
-        self.query.query_predicate(predicate, as_of).await
+        match self.read_engine {
+            crate::config::ReadEngine::DuckDb => self.query.query_predicate(predicate, as_of).await,
+            crate::config::ReadEngine::Lance => self.lance.query_predicate(predicate, as_of).await,
+        }
     }
 
     pub async fn list_user_tunnels(&self, limit: usize) -> Result<Vec<GraphEdge>, GraphError> {
-        self.query.list_user_tunnels(limit).await
+        match self.read_engine {
+            crate::config::ReadEngine::DuckDb => self.query.list_user_tunnels(limit).await,
+            crate::config::ReadEngine::Lance => self.lance.list_user_tunnels(limit).await,
+        }
     }
 
     pub async fn find_tunnels(
@@ -1554,7 +1566,14 @@ impl Store {
         prefix_b: &str,
         limit: usize,
     ) -> Result<Vec<GraphEdge>, GraphError> {
-        self.query.find_tunnels(prefix_a, prefix_b, limit).await
+        match self.read_engine {
+            crate::config::ReadEngine::DuckDb => {
+                self.query.find_tunnels(prefix_a, prefix_b, limit).await
+            }
+            crate::config::ReadEngine::Lance => {
+                self.lance.find_tunnels(prefix_a, prefix_b, limit).await
+            }
+        }
     }
 
     pub async fn follow_tunnels(
@@ -1562,7 +1581,10 @@ impl Store {
         node_id: &str,
         max_hops: u32,
     ) -> Result<Vec<GraphEdge>, GraphError> {
-        self.query.follow_tunnels(node_id, max_hops).await
+        match self.read_engine {
+            crate::config::ReadEngine::DuckDb => self.query.follow_tunnels(node_id, max_hops).await,
+            crate::config::ReadEngine::Lance => self.lance.follow_tunnels(node_id, max_hops).await,
+        }
     }
 
     pub async fn graph_stats(
@@ -1592,7 +1614,12 @@ impl Store {
         &self,
         node_ids: &[String],
     ) -> Result<Vec<(String, String)>, GraphError> {
-        self.query.incident_edges_for_nodes(node_ids).await
+        match self.read_engine {
+            crate::config::ReadEngine::DuckDb => {
+                self.query.incident_edges_for_nodes(node_ids).await
+            }
+            crate::config::ReadEngine::Lance => self.lance.incident_edges_for_nodes(node_ids).await,
+        }
     }
 
     pub async fn sync_memory_edges(
@@ -1629,11 +1656,19 @@ impl Store {
         relation: &str,
         now: &str,
     ) -> Result<bool, GraphError> {
-        let Some(mut edge) = self
-            .query
-            .get_active_edge(from_node_id, to_node_id, relation)
-            .await?
-        else {
+        let active = match self.read_engine {
+            crate::config::ReadEngine::DuckDb => {
+                self.query
+                    .get_active_edge(from_node_id, to_node_id, relation)
+                    .await?
+            }
+            crate::config::ReadEngine::Lance => {
+                self.lance
+                    .get_active_edge(from_node_id, to_node_id, relation)
+                    .await?
+            }
+        };
+        let Some(mut edge) = active else {
             return Ok(false);
         };
         crate::domain::edge_dynamics::potentiate(&mut edge, now);
