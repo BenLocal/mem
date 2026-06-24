@@ -732,9 +732,28 @@ impl Store {
         query_embedding: &[f32],
         k: usize,
     ) -> Result<Vec<(CapabilityCapsuleRecord, f32)>, StorageError> {
-        self.query
-            .hybrid_candidates(tenant, query_text, query_embedding, k)
-            .await
+        match self.read_engine {
+            crate::config::ReadEngine::DuckDb => {
+                self.query
+                    .hybrid_candidates(tenant, query_text, query_embedding, k)
+                    .await
+            }
+            // Route-B: the fused-SQL fast path needs `lance_fts(...)` +
+            // `lance_vector_search(...)` (the DuckDB extension). On the lance
+            // engine we drop it for the portable compose
+            // (`hybrid_candidates_compose`: Tantivy BM25 + lance ANN + Rust
+            // RRF). Compose does NOT version-chain-dedup like the fused SQL —
+            // that dedup is redundant downstream (the `search_candidates`
+            // recall pool already excludes superseded rows), so the lance
+            // hybrid output matches `hybrid_compose.json`, not the fused
+            // `hybrid.json`. The QW-1 bench measured compose 14–29% slower
+            // than fused; that is the accepted route-B tradeoff.
+            // See docs/remove-duckdb-keep-lance.md §3.
+            crate::config::ReadEngine::Lance => {
+                self.hybrid_candidates_compose(tenant, query_text, query_embedding, k)
+                    .await
+            }
+        }
     }
 
     /// Backend-portable compose form of [`Self::hybrid_candidates`]:

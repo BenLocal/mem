@@ -750,4 +750,35 @@ async fn lance_parity_matches_golden() {
             .map(|m| m.message_block_id)
             .collect::<Vec<_>>(),
     );
+
+    // ── hybrid ── On the lance engine the fused-SQL fast path is dropped for
+    //    the portable compose (Tantivy BM25 + lance ANN + Rust RRF), so BOTH
+    //    `hybrid_candidates` and `hybrid_candidates_compose` soft-match the
+    //    COMPOSE golden (`hybrid_compose.json`). The fused `hybrid.json`
+    //    (version-chain-deduped) is intentionally NOT reproduced — that dedup
+    //    is redundant downstream (the `search_candidates` recall pool already
+    //    excludes superseded rows). See docs/remove-duckdb-keep-lance.md §3.
+    let q_vec_h = deterministic_embedding("new decay formula anchors on last_used_at", DIM);
+    let lance_hybrid = repo
+        .hybrid_candidates("t1", "decay formula", &q_vec_h, 5)
+        .await
+        .unwrap();
+    assert_golden_soft(
+        "hybrid_compose",
+        lance_hybrid
+            .into_iter()
+            .map(|(r, _)| (r.capability_capsule_id, 0_i64))
+            .collect(),
+    );
+    let lance_compose = repo
+        .hybrid_candidates_compose("t1", "decay formula", &q_vec_h, 5)
+        .await
+        .unwrap();
+    assert_golden_soft(
+        "hybrid_compose",
+        lance_compose
+            .into_iter()
+            .map(|(r, _)| (r.capability_capsule_id, 0_i64))
+            .collect(),
+    );
 }
