@@ -1,0 +1,11 @@
+{
+  "aliases": [
+    "rust async",
+    "tokio"
+  ],
+  "canonical_name": "Rust Async",
+  "id_matches_lookup": true,
+  "kind": "topic",
+  "miss_is_none": true,
+  "tenant": "t1"
+}

@@ -326,6 +326,47 @@ async fn seed(repo: &Store) {
         repo.add_edge_direct(&e).await.unwrap();
     }
 
+    // ── Entity registry (batch-B): one entity with two aliases. ──
+    // `resolve_or_create` mints a UUIDv7 entity_id (non-deterministic), so
+    // golden projections must NOT embed the raw id — they project canonical
+    // name / kind / aliases and id-consistency flags instead.
+    let entity_id = repo
+        .resolve_or_create(
+            "t1",
+            "Rust Async",
+            mem::domain::EntityKind::Topic,
+            "00000000000000000040",
+        )
+        .await
+        .unwrap();
+    repo.add_alias("t1", &entity_id, "Tokio", "00000000000000000041")
+        .await
+        .unwrap();
+
+    // ── Embedding jobs (batch-B): one capsule-side + one transcript-side,
+    //    each with a FIXED job_id so the status reads are deterministic. ──
+    repo.try_enqueue_embedding_job(mem::storage::types::EmbeddingJobInsert {
+        job_id: "job_cap_b".into(),
+        tenant: "t1".into(),
+        capability_capsule_id: "cap_a".into(),
+        target_content_hash: "hash-cap_a".into(),
+        provider: "fake".into(),
+        available_at: "00000000000000000042".into(),
+        created_at: "00000000000000000042".into(),
+        updated_at: "00000000000000000042".into(),
+    })
+    .await
+    .unwrap();
+    repo.try_enqueue_transcript_embedding_job(
+        "job_tr_b".into(),
+        "t1".into(),
+        "mb_1".into(),
+        "fake".into(),
+        "00000000000000000043".into(),
+    )
+    .await
+    .unwrap();
+
     // Force-build FTS + (where eligible) ANN indexes over all seeded rows so
     // the bm25 buckets see a fully-covering index (deterministic).
     repo.rebuild_query_indexes().await.unwrap();
@@ -695,6 +736,84 @@ async fn duckdb_parity_golden() {
             .map(|(m, _)| m.message_block_id)
             .collect::<Vec<_>>()),
     );
+
+    // ── batch-B: get_embedding_job_status ── (hit = seeded job, miss = gone)
+    let job_hit = repo.get_embedding_job_status("job_cap_b").await.unwrap();
+    let job_miss = repo.get_embedding_job_status("nope").await.unwrap();
+    check_or_write(
+        "embedding_job_status",
+        json!({ "hit": job_hit, "miss": job_miss }),
+    );
+
+    // ── batch-B: get_transcript_embedding_job_status ── (hit + miss)
+    let tjob_hit = repo
+        .get_transcript_embedding_job_status("job_tr_b")
+        .await
+        .unwrap();
+    let tjob_miss = repo
+        .get_transcript_embedding_job_status("nope")
+        .await
+        .unwrap();
+    check_or_write(
+        "transcript_embedding_job_status",
+        json!({ "hit": tjob_hit, "miss": tjob_miss }),
+    );
+
+    // ── batch-B: get_entity ── (entity_id is a non-deterministic UUIDv7, so
+    //    project a STABLE shape: canonical name / kind / ordered aliases +
+    //    whether the fetched id matches the alias lookup, never the raw id)
+    let looked_up = repo.lookup_alias("t1", "rust async").await.unwrap();
+    let entity = repo
+        .get_entity("t1", looked_up.as_deref().unwrap())
+        .await
+        .unwrap()
+        .expect("seeded entity exists");
+    let entity_miss = repo.get_entity("t1", "does-not-exist").await.unwrap();
+    check_or_write(
+        "get_entity",
+        json!({
+            "canonical_name": entity.entity.canonical_name,
+            "tenant": entity.entity.tenant,
+            "kind": serde_json::to_value(entity.entity.kind).unwrap(),
+            "aliases": entity.aliases,
+            "id_matches_lookup": Some(&entity.entity.entity_id) == looked_up.as_ref(),
+            "miss_is_none": entity_miss.is_none(),
+        }),
+    );
+
+    // ── batch-B: lookup_alias ── (id is a UUIDv7 → project consistency, not
+    //    the raw id: both aliases resolve to the SAME entity; miss is None)
+    let look_a = repo.lookup_alias("t1", "rust async").await.unwrap();
+    let look_b = repo.lookup_alias("t1", "Tokio").await.unwrap();
+    let look_ws = repo.lookup_alias("t1", "  RUST   ASYNC  ").await.unwrap();
+    let look_miss = repo.lookup_alias("t1", "unknown").await.unwrap();
+    check_or_write(
+        "lookup_alias",
+        json!({
+            "both_aliases_same_entity": look_a.is_some() && look_a == look_b,
+            "normalized_ws_same_entity": look_a == look_ws,
+            "miss_is_none": look_miss.is_none(),
+        }),
+    );
+
+    // ── batch-B: list_transcript_sessions ── (per-session aggregate;
+    //    last_at DESC; fully deterministic values)
+    let sessions = repo.list_transcript_sessions("t1").await.unwrap();
+    check_or_write(
+        "list_transcript_sessions",
+        serde_json::to_value(&sessions).unwrap(),
+    );
+
+    // ── batch-B: recent_conversation_messages ── (created_at DESC,
+    //    line_number DESC, block_index DESC; ordered ids are load-bearing)
+    let recent_msgs = repo.recent_conversation_messages("t1", 10).await.unwrap();
+    check_or_write(
+        "recent_conversation_messages",
+        json!(recent_msgs
+            .into_iter()
+            .map(|m| m.message_block_id)
+            .collect::<Vec<_>>()),
+    );
 }
 
 /// Phase-1 parity double-run: seed the same fixture, read each MIGRATED
@@ -933,5 +1052,80 @@ async fn lance_parity_matches_golden() {
             .into_iter()
             .map(|(r, _)| (r.capability_capsule_id, 0_i64))
             .collect(),
+    );
+
+    // ── batch-B: get_embedding_job_status ── (exact byte-match)
+    let job_hit = repo.get_embedding_job_status("job_cap_b").await.unwrap();
+    let job_miss = repo.get_embedding_job_status("nope").await.unwrap();
+    assert_golden(
+        "embedding_job_status",
+        json!({ "hit": job_hit, "miss": job_miss }),
+    );
+
+    // ── batch-B: get_transcript_embedding_job_status ── (exact byte-match)
+    let tjob_hit = repo
+        .get_transcript_embedding_job_status("job_tr_b")
+        .await
+        .unwrap();
+    let tjob_miss = repo
+        .get_transcript_embedding_job_status("nope")
+        .await
+        .unwrap();
+    assert_golden(
+        "transcript_embedding_job_status",
+        json!({ "hit": tjob_hit, "miss": tjob_miss }),
+    );
+
+    // ── batch-B: get_entity ── (stable shape, mirrors the duckdb block)
+    let looked_up = repo.lookup_alias("t1", "rust async").await.unwrap();
+    let entity = repo
+        .get_entity("t1", looked_up.as_deref().unwrap())
+        .await
+        .unwrap()
+        .expect("seeded entity exists");
+    let entity_miss = repo.get_entity("t1", "does-not-exist").await.unwrap();
+    assert_golden(
+        "get_entity",
+        json!({
+            "canonical_name": entity.entity.canonical_name,
+            "tenant": entity.entity.tenant,
+            "kind": serde_json::to_value(entity.entity.kind).unwrap(),
+            "aliases": entity.aliases,
+            "id_matches_lookup": Some(&entity.entity.entity_id) == looked_up.as_ref(),
+            "miss_is_none": entity_miss.is_none(),
+        }),
+    );
+
+    // ── batch-B: lookup_alias ── (consistency shape, mirrors the duckdb block)
+    let look_a = repo.lookup_alias("t1", "rust async").await.unwrap();
+    let look_b = repo.lookup_alias("t1", "Tokio").await.unwrap();
+    let look_ws = repo.lookup_alias("t1", "  RUST   ASYNC  ").await.unwrap();
+    let look_miss = repo.lookup_alias("t1", "unknown").await.unwrap();
+    assert_golden(
+        "lookup_alias",
+        json!({
+            "both_aliases_same_entity": look_a.is_some() && look_a == look_b,
+            "normalized_ws_same_entity": look_a == look_ws,
+            "miss_is_none": look_miss.is_none(),
+        }),
+    );
+
+    // ── batch-B: list_transcript_sessions ── (per-session aggregate;
+    //    last_at DESC; exact byte-match)
+    let sessions = repo.list_transcript_sessions("t1").await.unwrap();
+    assert_golden(
+        "list_transcript_sessions",
+        serde_json::to_value(&sessions).unwrap(),
+    );
+
+    // ── batch-B: recent_conversation_messages ── (created_at DESC,
+    //    line_number DESC, block_index DESC; exact byte-match on ordered ids)
+    let recent_msgs = repo.recent_conversation_messages("t1", 10).await.unwrap();
+    assert_golden(
+        "recent_conversation_messages",
+        json!(recent_msgs
+            .into_iter()
+            .map(|m| m.message_block_id)
+            .collect::<Vec<_>>()),
     );
 }

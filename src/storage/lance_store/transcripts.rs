@@ -16,7 +16,9 @@ use super::{
 };
 use crate::domain::ConversationMessage;
 use crate::embedding::wire::decode_f32_blob;
-use crate::storage::types::{ClaimedTranscriptEmbeddingJob, StorageError};
+use crate::storage::types::{
+    ClaimedTranscriptEmbeddingJob, StorageError, TranscriptSessionSummary,
+};
 use crate::storage::{timestamp_sub_ms, EMBEDDING_JOB_LEASE_MS};
 
 /// `query_transcript_embedding_jobs` was a helper inside the
@@ -48,6 +50,21 @@ impl LanceStore {
             out.extend(record_batch_to_transcript_embedding_job_rows(b)?);
         }
         Ok(out)
+    }
+
+    /// Route-B native equivalent of
+    /// `DuckDbQuery::get_transcript_embedding_job_status`: read the
+    /// `status` column of a `transcript_embedding_jobs` row by `job_id`,
+    /// or `None` when the row is gone. Same shape as the memories-side
+    /// `LanceStore::get_embedding_job_status`.
+    pub async fn get_transcript_embedding_job_status(
+        &self,
+        job_id: &str,
+    ) -> Result<Option<String>, StorageError> {
+        let rows = self
+            .query_transcript_embedding_jobs(format!("job_id = {}", sql_quote(job_id)))
+            .await?;
+        Ok(rows.into_iter().next().map(|r| r.status))
     }
 }
 
@@ -498,6 +515,112 @@ impl LanceStore {
             }
         }
         Ok(out)
+    }
+
+    /// Route-B native equivalent of `DuckDbQuery::list_transcript_sessions`:
+    /// per-session aggregate over `conversation_messages` for `tenant`.
+    ///
+    /// DuckDB does this with one `GROUP BY session_id` —
+    /// `count(*)`, `min(created_at)`, `max(created_at)`,
+    /// `max(caller_agent)`, filtered `tenant = ? AND session_id IS NOT
+    /// NULL`, ordered `last_at DESC`. LanceDB has no GROUP BY, so we scan
+    /// the rows and aggregate in Rust (the `capsule_stats` / `graph_stats`
+    /// pattern). `max(caller_agent)` is the lexicographic max of the
+    /// string column (DuckDB semantics). The `ORDER BY last_at DESC` is
+    /// reproduced with a stable secondary `session_id ASC` tie-break so
+    /// the output is deterministic (DuckDB's bare ORDER BY would be
+    /// arbitrary on a `last_at` tie).
+    pub async fn list_transcript_sessions(
+        &self,
+        tenant: &str,
+    ) -> Result<Vec<TranscriptSessionSummary>, StorageError> {
+        let rows = self
+            .query_conversation_messages(format!(
+                "tenant = {} AND session_id IS NOT NULL",
+                sql_quote(tenant),
+            ))
+            .await?;
+
+        // session_id → (block_count, first_at, last_at, max_caller_agent)
+        let mut groups: std::collections::HashMap<String, (i64, String, String, String)> =
+            std::collections::HashMap::new();
+        for m in rows {
+            let Some(session_id) = m.session_id else {
+                continue; // belt-and-braces: the filter already drops these
+            };
+            let caller = m.caller_agent;
+            let created = m.created_at;
+            groups
+                .entry(session_id)
+                .and_modify(|(count, first_at, last_at, caller_max)| {
+                    *count += 1;
+                    if created < *first_at {
+                        *first_at = created.clone();
+                    }
+                    if created > *last_at {
+                        *last_at = created.clone();
+                    }
+                    if caller > *caller_max {
+                        *caller_max = caller.clone();
+                    }
+                })
+                .or_insert_with(|| (1, created.clone(), created.clone(), caller.clone()));
+        }
+
+        let mut out: Vec<TranscriptSessionSummary> = groups
+            .into_iter()
+            .map(
+                |(session_id, (block_count, first_at, last_at, caller_agent))| {
+                    TranscriptSessionSummary {
+                        session_id,
+                        block_count,
+                        first_at,
+                        last_at,
+                        // DuckDB stores caller_agent NOT NULL, so `max()` is
+                        // always Some here; the type is Option for the legacy
+                        // `row.get(4).ok()` shape.
+                        caller_agent: Some(caller_agent),
+                    }
+                },
+            )
+            .collect();
+        // last_at DESC, then session_id ASC (deterministic tie-break).
+        out.sort_by(|a, b| {
+            b.last_at
+                .cmp(&a.last_at)
+                .then_with(|| a.session_id.cmp(&b.session_id))
+        });
+        Ok(out)
+    }
+
+    /// Route-B native equivalent of
+    /// `DuckDbQuery::recent_conversation_messages`: most-recent
+    /// embed_eligible blocks for `tenant`, newest first
+    /// (`created_at DESC, line_number DESC, block_index DESC`), capped at
+    /// `limit` (clamped to `1..=1024`, matching the DuckDB impl). LanceDB
+    /// has no ORDER BY / LIMIT-with-sort, so we scan then sort + slice in
+    /// Rust to reproduce the DuckDB tie-break exactly.
+    pub async fn recent_conversation_messages(
+        &self,
+        tenant: &str,
+        limit: usize,
+    ) -> Result<Vec<ConversationMessage>, StorageError> {
+        let lim = i64::try_from(limit).unwrap_or(64).clamp(1, 1024) as usize;
+        let mut rows = self
+            .query_conversation_messages(format!(
+                "tenant = {} AND embed_eligible = true",
+                sql_quote(tenant),
+            ))
+            .await?;
+        // created_at DESC, line_number DESC, block_index DESC.
+        rows.sort_by(|a, b| {
+            b.created_at
+                .cmp(&a.created_at)
+                .then_with(|| b.line_number.cmp(&a.line_number))
+                .then_with(|| b.block_index.cmp(&a.block_index))
+        });
+        rows.truncate(lim);
+        Ok(rows)
     }
 }
 

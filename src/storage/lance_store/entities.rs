@@ -8,9 +8,10 @@ use futures::TryStreamExt;
 use lancedb::query::{ExecutableQuery, QueryBase};
 
 use super::{
-    entity_alias_to_record_batch, entity_to_record_batch, lancedb_err, sql_quote, LanceStore,
+    entity_alias_to_record_batch, entity_to_record_batch, lancedb_err, parse_col, sql_quote,
+    LanceStore,
 };
-use crate::domain::{AddAliasOutcome, Entity, EntityKind};
+use crate::domain::{AddAliasOutcome, Entity, EntityKind, EntityWithAliases};
 use crate::storage::types::StorageError;
 
 impl LanceStore {
@@ -148,6 +149,114 @@ impl LanceStore {
             return Ok(Some(entity_id.value(0).to_string()));
         }
         Ok(None)
+    }
+
+    /// Route-B native equivalent of `DuckDbQuery::get_entity`: fetch the
+    /// `entities` row for `(tenant, entity_id)` plus its `entity_aliases`
+    /// list ordered `created_at ASC, alias_text ASC`. Returns `Ok(None)`
+    /// when no entity row matches.
+    ///
+    /// Two scans (like the DuckDB impl): one for the entity row, one for
+    /// its aliases. LanceDB has no ORDER BY, so the alias ordering is
+    /// applied in Rust to match the DuckDB tie-break exactly.
+    pub async fn get_entity(
+        &self,
+        tenant: &str,
+        entity_id: &str,
+    ) -> Result<Option<EntityWithAliases>, StorageError> {
+        const ENTITIES: &str = "entities";
+        const ALIASES: &str = "entity_aliases";
+
+        // ── entity row ──────────────────────────────────────────
+        let entities_table = self
+            .conn
+            .open_table(ENTITIES)
+            .execute()
+            .await
+            .map_err(lancedb_err)?;
+        let stream = entities_table
+            .query()
+            .only_if(format!(
+                "tenant = {} AND entity_id = {}",
+                sql_quote(tenant),
+                sql_quote(entity_id),
+            ))
+            .limit(1)
+            .execute()
+            .await
+            .map_err(lancedb_err)?;
+        let batches: Vec<RecordBatch> = stream
+            .try_collect()
+            .await
+            .map_err(|e| StorageError::InvalidInput(format!("lancedb stream: {e}")))?;
+        let mut entity: Option<Entity> = None;
+        for b in &batches {
+            if b.num_rows() == 0 {
+                continue;
+            }
+            let entity_id_col = parse_col::<StringArray>(b, ENTITIES, "entity_id")?;
+            let tenant_col = parse_col::<StringArray>(b, ENTITIES, "tenant")?;
+            let canonical_name = parse_col::<StringArray>(b, ENTITIES, "canonical_name")?;
+            let kind = parse_col::<StringArray>(b, ENTITIES, "kind")?;
+            let created_at = parse_col::<StringArray>(b, ENTITIES, "created_at")?;
+            let kind_str = kind.value(0);
+            let parsed_kind = EntityKind::from_db_str(kind_str).ok_or_else(|| {
+                StorageError::InvalidInput(format!("invalid entity kind {kind_str:?}"))
+            })?;
+            entity = Some(Entity {
+                entity_id: entity_id_col.value(0).to_string(),
+                tenant: tenant_col.value(0).to_string(),
+                canonical_name: canonical_name.value(0).to_string(),
+                kind: parsed_kind,
+                created_at: created_at.value(0).to_string(),
+            });
+            break;
+        }
+        let Some(entity) = entity else {
+            return Ok(None);
+        };
+
+        // ── alias rows (ordered created_at ASC, alias_text ASC) ──
+        let aliases_table = self
+            .conn
+            .open_table(ALIASES)
+            .execute()
+            .await
+            .map_err(lancedb_err)?;
+        let stream = aliases_table
+            .query()
+            .only_if(format!(
+                "tenant = {} AND entity_id = {}",
+                sql_quote(tenant),
+                sql_quote(entity_id),
+            ))
+            .execute()
+            .await
+            .map_err(lancedb_err)?;
+        let batches: Vec<RecordBatch> = stream
+            .try_collect()
+            .await
+            .map_err(|e| StorageError::InvalidInput(format!("lancedb stream: {e}")))?;
+        // (created_at, alias_text) tuples so the Rust sort reproduces the
+        // DuckDB `ORDER BY created_at ASC, alias_text ASC`.
+        let mut rows: Vec<(String, String)> = Vec::new();
+        for b in &batches {
+            if b.num_rows() == 0 {
+                continue;
+            }
+            let alias_text = parse_col::<StringArray>(b, ALIASES, "alias_text")?;
+            let created_at = parse_col::<StringArray>(b, ALIASES, "created_at")?;
+            for i in 0..b.num_rows() {
+                rows.push((
+                    created_at.value(i).to_string(),
+                    alias_text.value(i).to_string(),
+                ));
+            }
+        }
+        rows.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
+        let aliases = rows.into_iter().map(|(_, alias)| alias).collect();
+
+        Ok(Some(EntityWithAliases { entity, aliases }))
     }
 }
 

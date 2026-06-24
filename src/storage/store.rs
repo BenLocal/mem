@@ -267,6 +267,33 @@ impl Store {
             .await
     }
 
+    /// Enqueue a `pending` row in `transcript_embedding_jobs` with a
+    /// caller-supplied `job_id`. Mirrors [`Self::try_enqueue_embedding_job`]
+    /// for the transcript-side queue; `create_conversation_message` already
+    /// auto-enqueues with a generated id, so this explicit form is for
+    /// callers that need a known job_id (e.g. parity fixtures / tooling).
+    pub async fn try_enqueue_transcript_embedding_job(
+        &self,
+        job_id: String,
+        tenant: String,
+        message_block_id: String,
+        provider: String,
+        now: String,
+    ) -> Result<(), StorageError> {
+        self.commit_lance_write(
+            self.lance
+                .try_enqueue_transcript_embedding_job(
+                    job_id,
+                    tenant,
+                    message_block_id,
+                    provider,
+                    now,
+                )
+                .await,
+        )
+        .await
+    }
+
     /// **LANCE-SPECIFIC**: claim is an `update().only_if(...)` whose
     /// `rows_updated == 0` branch is what we read as "another worker
     /// got there first." Portable equivalent is Postgres `SELECT FOR
@@ -988,7 +1015,10 @@ impl Store {
         &self,
         job_id: &str,
     ) -> Result<Option<String>, StorageError> {
-        self.query.get_embedding_job_status(job_id).await
+        match self.read_engine {
+            crate::config::ReadEngine::DuckDb => self.query.get_embedding_job_status(job_id).await,
+            crate::config::ReadEngine::Lance => self.lance.get_embedding_job_status(job_id).await,
+        }
     }
 
     /// Same shape as [`Self::get_embedding_job_status`] for the
@@ -997,7 +1027,14 @@ impl Store {
         &self,
         job_id: &str,
     ) -> Result<Option<String>, StorageError> {
-        self.query.get_transcript_embedding_job_status(job_id).await
+        match self.read_engine {
+            crate::config::ReadEngine::DuckDb => {
+                self.query.get_transcript_embedding_job_status(job_id).await
+            }
+            crate::config::ReadEngine::Lance => {
+                self.lance.get_transcript_embedding_job_status(job_id).await
+            }
+        }
     }
 
     /// Prune Lance version manifests older than `older_than_days`
@@ -1361,7 +1398,10 @@ impl Store {
         &self,
         tenant: &str,
     ) -> Result<Vec<TranscriptSessionSummary>, StorageError> {
-        self.query.list_transcript_sessions(tenant).await
+        match self.read_engine {
+            crate::config::ReadEngine::DuckDb => self.query.list_transcript_sessions(tenant).await,
+            crate::config::ReadEngine::Lance => self.lance.list_transcript_sessions(tenant).await,
+        }
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1430,7 +1470,14 @@ impl Store {
         tenant: &str,
         limit: usize,
     ) -> Result<Vec<ConversationMessage>, StorageError> {
-        self.query.recent_conversation_messages(tenant, limit).await
+        match self.read_engine {
+            crate::config::ReadEngine::DuckDb => {
+                self.query.recent_conversation_messages(tenant, limit).await
+            }
+            crate::config::ReadEngine::Lance => {
+                self.lance.recent_conversation_messages(tenant, limit).await
+            }
+        }
     }
 
     /// Route-B bucket "transcript_fts": BM25 lexical recall over
@@ -1655,7 +1702,10 @@ impl Store {
         tenant: &str,
         entity_id: &str,
     ) -> Result<Option<EntityWithAliases>, StorageError> {
-        self.query.get_entity(tenant, entity_id).await
+        match self.read_engine {
+            crate::config::ReadEngine::DuckDb => self.query.get_entity(tenant, entity_id).await,
+            crate::config::ReadEngine::Lance => self.lance.get_entity(tenant, entity_id).await,
+        }
     }
 
     pub async fn lookup_alias(
@@ -1663,7 +1713,10 @@ impl Store {
         tenant: &str,
         alias: &str,
     ) -> Result<Option<String>, StorageError> {
-        self.query.lookup_alias(tenant, alias).await
+        match self.read_engine {
+            crate::config::ReadEngine::DuckDb => self.query.lookup_alias(tenant, alias).await,
+            crate::config::ReadEngine::Lance => self.lance.lookup_alias(tenant, alias).await,
+        }
     }
 
     pub async fn list_entities(

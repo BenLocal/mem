@@ -844,6 +844,20 @@ impl LanceStore {
         }
         Ok(out)
     }
+
+    /// Route-B native equivalent of `DuckDbQuery::get_embedding_job_status`:
+    /// read the `status` column of an `embedding_jobs` row by `job_id`,
+    /// or `None` when the row is gone. `job_id` is the table's "PK"
+    /// (one row per id), so the filtered scan yields at most one row.
+    pub async fn get_embedding_job_status(
+        &self,
+        job_id: &str,
+    ) -> Result<Option<String>, StorageError> {
+        let rows = self
+            .query_embedding_jobs(format!("job_id = {}", sql_quote(job_id)))
+            .await?;
+        Ok(rows.into_iter().next().map(|r| r.status))
+    }
 }
 
 /// Memory CRUD + filter + embedding-job + feedback methods —

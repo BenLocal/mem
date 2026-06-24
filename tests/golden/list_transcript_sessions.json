@@ -1,0 +1,9 @@
+[
+  {
+    "block_count": 3,
+    "caller_agent": "claude-code",
+    "first_at": "00000000000000000020",
+    "last_at": "00000000000000000022",
+    "session_id": "S1"
+  }
+]
