@@ -834,17 +834,27 @@ impl Store {
         Ok(out)
     }
 
-    /// **LANCE-SPECIFIC** (see `DuckDbQuery::bm25_candidate_ids`).
-    /// Backend-portable callers shouldn't reach for this directly —
-    /// they should use [`Self::hybrid_candidates`] which composes
-    /// BM25 + ANN behind a backend-agnostic shell.
+    /// BM25 candidate ids. Routes on the `MEM_READ_ENGINE` switch: the
+    /// DuckDb arm goes through the lance `lance_fts(...)` table function
+    /// (LANCE-SPECIFIC, see `DuckDbQuery::bm25_candidate_ids`); the Lance
+    /// arm goes through the route-B Tantivy index (`LanceStore::bm25_candidate_ids`).
+    /// Backend-portable callers shouldn't reach for this directly — they
+    /// should use [`Self::hybrid_candidates`] which composes BM25 + ANN
+    /// behind a backend-agnostic shell.
     pub async fn bm25_candidate_ids(
         &self,
         tenant: &str,
         query_text: &str,
         k: usize,
     ) -> Result<Vec<(String, i64)>, StorageError> {
-        self.query.bm25_candidate_ids(tenant, query_text, k).await
+        match self.read_engine {
+            crate::config::ReadEngine::DuckDb => {
+                self.query.bm25_candidate_ids(tenant, query_text, k).await
+            }
+            crate::config::ReadEngine::Lance => {
+                self.lance.bm25_candidate_ids(tenant, query_text, k).await
+            }
+        }
     }
 
     /// **LANCE-SPECIFIC** (see `DuckDbQuery::ann_candidate_ids`).

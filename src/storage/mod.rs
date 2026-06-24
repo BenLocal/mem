@@ -30,6 +30,10 @@ pub mod embedding_job_store;
 pub mod embedding_vector_store;
 pub mod entity_registry;
 pub mod evolution_candidate_store;
+// Route-B Tantivy full-text (BM25) subsystem replacing the DuckDB
+// `lance_fts` read path for capsule search. See
+// `docs/remove-duckdb-keep-lance.md` §4.
+pub(crate) mod fts;
 pub mod graph_store;
 pub(crate) mod lance_store;
 pub mod maintenance_store;

@@ -368,6 +368,57 @@ fn assert_golden(name: &str, value: serde_json::Value) {
     );
 }
 
+/// SOFT parity assertion for a different-engine ranked result (§7): a
+/// migrated bucket whose engine is NOT byte-compatible with DuckDB (a
+/// different BM25 implementation won't reproduce the exact scores /
+/// rank order). The golden is read for its ordered id list, and the
+/// lance result is asserted "acceptably close" on two axes — lenient on
+/// exact rank order, strict on which docs come back:
+///
+/// 1. `overlap@10 ≥ 0.8` (overlap of the top-10 id sets:
+///    `|intersection| / |golden top-10|`), AND
+/// 2. the lance id set is equal-or-superset of the golden id set within
+///    that tolerance — every golden id must appear in the lance result.
+///
+/// A wrong-docs result fails #1; a superset that still contains all
+/// golden docs passes — a stricter engine returning a few extra true
+/// matches is fine, dropping a golden doc is not.
+fn assert_golden_soft(name: &str, lance_ranked: Vec<(String, i64)>) {
+    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/golden")
+        .join(format!("{name}.json"));
+    let raw = fs::read_to_string(&path)
+        .unwrap_or_else(|_| panic!("golden {name}.json missing — generate it via the DuckDB test"));
+    // Golden shape is `[[id, rank], …]` in rank order.
+    let golden: Vec<(String, i64)> = serde_json::from_str::<Vec<(String, i64)>>(&raw)
+        .unwrap_or_else(|e| panic!("golden {name}.json not a [[id,rank],…] array: {e}"));
+
+    let golden_ids: Vec<&str> = golden.iter().map(|(id, _)| id.as_str()).collect();
+    let lance_ids: Vec<&str> = lance_ranked.iter().map(|(id, _)| id.as_str()).collect();
+    let golden_set: std::collections::HashSet<&str> = golden_ids.iter().copied().collect();
+    let lance_set: std::collections::HashSet<&str> = lance_ids.iter().copied().collect();
+
+    // overlap@10: |golden_top10 ∩ lance_top10| / |golden_top10|.
+    let g10: std::collections::HashSet<&str> = golden_ids.iter().take(10).copied().collect();
+    let l10: std::collections::HashSet<&str> = lance_ids.iter().take(10).copied().collect();
+    let inter = g10.intersection(&l10).count();
+    let overlap = if g10.is_empty() {
+        1.0
+    } else {
+        inter as f64 / g10.len() as f64
+    };
+    assert!(
+        overlap >= 0.8,
+        "soft parity `{name}`: overlap@10 = {overlap:.3} < 0.8\n  golden={golden_ids:?}\n  lance ={lance_ids:?}"
+    );
+    // Equal-or-superset: every golden id must be present in the lance set.
+    let missing: Vec<&str> = golden_set.difference(&lance_set).copied().collect();
+    assert!(
+        missing.is_empty(),
+        "soft parity `{name}`: lance result is not a superset of golden — missing {missing:?}\n  golden={golden_ids:?}\n  lance ={lance_ids:?}"
+    );
+}
+
 fn sorted_ids<I: IntoIterator<Item = String>>(ids: I) -> serde_json::Value {
     let mut v: Vec<String> = ids.into_iter().collect();
     v.sort();
@@ -549,6 +600,17 @@ async fn lance_parity_matches_golden() {
     let q_vec = deterministic_embedding("new decay formula anchors on last_used_at", DIM);
     let ann = repo.ann_candidate_ids("t1", &q_vec, 5).await.unwrap();
     assert_golden("ann", ranked(ann));
+
+    // ── fts ── SOFT parity: Tantivy is a different BM25 engine than
+    //    DuckDB's lance_fts, so it won't byte-match the golden's exact
+    //    score-derived ranks. We assert overlap@10 ≥ 0.8 + superset of the
+    //    golden id set (§7). The fixture's golden set is {cap_d_v1,
+    //    cap_d_v2} — Tantivy must return both.
+    let fts = repo
+        .bm25_candidate_ids("t1", "decay formula", 5)
+        .await
+        .unwrap();
+    assert_golden_soft("fts", fts);
 
     // ── stats ──
     let stats = repo.capsule_stats("t1").await.unwrap();

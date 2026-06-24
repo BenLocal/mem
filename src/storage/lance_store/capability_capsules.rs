@@ -205,6 +205,87 @@ impl LanceStore {
             .collect())
     }
 
+    /// Rebuild the Tantivy capsule FTS index from the current
+    /// `capability_capsules` corpus. Scans every row across all tenants
+    /// (the index is tenant-tagged and filters at query time), excluding
+    /// the rows the DuckDB `lance_fts` query excludes — archived /
+    /// rejected status and `diary` type — so BM25 parity holds (the
+    /// DuckDB SQL carries `status NOT IN (rejected, archived) AND
+    /// capability_capsule_type != 'diary'`). A full rebuild, matching the
+    /// route-B "startup full-rebuild" strategy (see `crate::storage::fts`).
+    ///
+    /// Marks the index built so the lazy path in
+    /// [`Self::bm25_candidate_ids`] doesn't redundantly rebuild.
+    pub async fn rebuild_capsule_fts(&self) -> Result<(), StorageError> {
+        use crate::domain::capability_capsule::{
+            CapabilityCapsuleStatus as S, CapabilityCapsuleType as T,
+        };
+        // Scan all tenants — the FTS index is tenant-tagged and filters
+        // tenant at query time (POSTFILTER, same posture as the rest of
+        // route-B). No `WHERE` clause beyond "everything", then drop the
+        // excluded rows in Rust to mirror the DuckDB BM25 filter.
+        let rows = self
+            .query_capability_capsules("true".to_string(), None)
+            .await?;
+        let docs: Vec<crate::storage::fts::FtsDoc> = rows
+            .into_iter()
+            .filter(|r| {
+                !matches!(r.status, S::Archived | S::Rejected)
+                    && !matches!(r.capability_capsule_type, T::Diary)
+            })
+            .map(|r| crate::storage::fts::FtsDoc {
+                capability_capsule_id: r.capability_capsule_id,
+                tenant: r.tenant,
+                content: r.content,
+            })
+            .collect();
+        // Tantivy writes are synchronous + CPU-bound; run them off the
+        // async reactor.
+        let fts = self.fts.clone();
+        tokio::task::spawn_blocking(move || fts.rebuild_from_capsules(&docs))
+            .await
+            .map_err(|e| StorageError::InvalidInput(format!("fts rebuild join: {e}")))??;
+        self.fts_built
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        Ok(())
+    }
+
+    /// Route-B bucket "fts": native (Tantivy) equivalent of
+    /// `DuckDbQuery::bm25_candidate_ids`. Returns
+    /// `(capability_capsule_id, rank_lex)` 1-based, ordered by
+    /// `(score DESC, capability_capsule_id ASC)`.
+    ///
+    /// The Tantivy index ([`crate::storage::fts::FtsIndex`]) is built from
+    /// the capsule corpus via [`Self::rebuild_capsule_fts`] — eagerly by
+    /// `rebuild_query_indexes`, or lazily here on first use if it was
+    /// never built (so the route-B read engine works standalone). The
+    /// query is term-split through the jieba tokenizer so unspaced CJK
+    /// runs match (the load-bearing CJK fix — see `fts` module docs).
+    ///
+    /// Empty / whitespace `query_text` or `k == 0` → `Ok(vec![])`.
+    pub async fn bm25_candidate_ids(
+        &self,
+        tenant: &str,
+        query_text: &str,
+        k: usize,
+    ) -> Result<Vec<(String, i64)>, StorageError> {
+        if query_text.trim().is_empty() || k == 0 {
+            return Ok(Vec::new());
+        }
+        // Lazy build: a route-B store that never ran rebuild_query_indexes
+        // still needs a populated index. Idempotent — the eager path flips
+        // `fts_built` so this only fires once.
+        if !self.fts_built.load(std::sync::atomic::Ordering::SeqCst) {
+            self.rebuild_capsule_fts().await?;
+        }
+        let fts = self.fts.clone();
+        let tenant = tenant.to_string();
+        let query_text = query_text.to_string();
+        tokio::task::spawn_blocking(move || fts.bm25(&tenant, &query_text, k))
+            .await
+            .map_err(|e| StorageError::InvalidInput(format!("fts query join: {e}")))?
+    }
+
     /// Route-B bucket "stats": native lancedb-Rust equivalent of
     /// `DuckDbQuery::capsule_stats` — the DuckDB `GROUP BY status`
     /// aggregation folded into the discrete fields on [`CapsuleStats`].

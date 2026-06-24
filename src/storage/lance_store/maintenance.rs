@@ -382,6 +382,16 @@ impl LanceStore {
                 IndexAction::Skip => unreachable!("skip handled above"),
             }
         }
+        // Route-B: rebuild the Tantivy capsule BM25 index from the live
+        // corpus (startup full-rebuild strategy — see `crate::storage::fts`).
+        // Unlike the lance IVF/FTS indexes there's no per-table delta
+        // tracking — the rebuild is cheap (<1s at real scale) and a full
+        // rebuild is the whole design, so we always run it here. This is
+        // what makes the existing "seed → rebuild_query_indexes → query"
+        // test flow cover the route-B FTS bucket. Counts as one rebuilt
+        // index in the stats.
+        self.rebuild_capsule_fts().await?;
+        agg.indexes_rebuilt += 1;
         Ok(agg)
     }
 }

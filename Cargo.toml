@@ -85,6 +85,18 @@ fs4 = "0.8"
 # capped separately via MALLOC_ARENA_MAX.
 tikv-jemallocator = "0.6"
 tikv-jemalloc-ctl = "0.6"
+# Tantivy is the route-B full-text (BM25) subsystem replacing the
+# DuckDB `lance_fts` path (see `docs/remove-duckdb-keep-lance.md` §4).
+# A pure-Rust embedded inverted index — no external service, fits the
+# local-first single-binary constraint. `tantivy-jieba` is the Chinese
+# segmenter (jieba precision mode) registered on the `content` field;
+# `jieba-rs` is pulled directly so the query layer can term-split CJK
+# runs into BM25 terms (Tantivy's QueryParser treats an unspaced CJK
+# run as a phrase query → 0 hits, so the query MUST be tokenized into a
+# should/OR boolean of terms — see `FtsIndex::bm25`).
+tantivy = "0.26"
+tantivy-jieba = "0.20"
+jieba-rs = "0.9"
 
 [dev-dependencies]
 rand = "0.10"

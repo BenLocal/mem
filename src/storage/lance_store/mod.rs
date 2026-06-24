@@ -91,6 +91,16 @@ pub struct LanceStore {
     /// errors loudly rather than silently substituting a default
     /// that may diverge from the configured provider.
     transcript_job_provider: Arc<std::sync::RwLock<Option<String>>>,
+    /// Route-B Tantivy BM25 index over capsule `content`. Built empty at
+    /// open, populated via [`Self::rebuild_capsule_fts`] (called from
+    /// `rebuild_query_indexes` and lazily on first `bm25_candidate_ids`).
+    /// See `crate::storage::fts`.
+    fts: Arc<crate::storage::fts::FtsIndex>,
+    /// Whether the FTS index has been populated from the capsule corpus
+    /// at least once. The first `bm25_candidate_ids` call builds it
+    /// lazily (so the route-B read engine works even if
+    /// `rebuild_query_indexes` was never called).
+    fts_built: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl LanceStore {
@@ -176,6 +186,8 @@ impl LanceStore {
         Ok(Self {
             conn: Arc::new(conn),
             transcript_job_provider: Arc::new(std::sync::RwLock::new(None)),
+            fts: Arc::new(crate::storage::fts::FtsIndex::new()?),
+            fts_built: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         })
     }
 
