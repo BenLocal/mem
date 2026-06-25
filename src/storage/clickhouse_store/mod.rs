@@ -7,15 +7,18 @@
 //! insert + `FINAL` reads over a `ReplacingMergeTree`); **P2** adds the
 //! other 10 sub-traits as `unimplemented!()` stubs ([`stubs`]) so the
 //! blanket `impl<T> Backend for T` applies and [`ClickHouseBackend`] can
-//! erase to `Arc<dyn Backend>` — wired into `app::from_config`. The stub
-//! bodies are filled in P3 (vectors) / P4 (search) / P5 (the rest). The
-//! whole module sits behind `#[cfg(feature = "clickhouse")]`, so the
-//! default build pulls neither the `clickhouse` crate nor this code.
+//! erase to `Arc<dyn Backend>` — wired into `app::from_config`. **P3** fills
+//! [`EmbeddingVectorStore`] for real ([`embedding`]); P4 (search) / P5 (the
+//! rest) remain `unimplemented!()` stubs. The whole module sits behind
+//! `#[cfg(feature = "clickhouse")]`, so the default build pulls neither the
+//! `clickhouse` crate nor this code.
 //!
 //! [`CapsuleStore`]: crate::storage::capsule_store::CapsuleStore
+//! [`EmbeddingVectorStore`]: crate::storage::embedding_vector_store::EmbeddingVectorStore
 
 mod backend;
 mod capsule_store;
+mod embedding;
 mod stubs;
 
 pub use backend::ClickHouseBackend;

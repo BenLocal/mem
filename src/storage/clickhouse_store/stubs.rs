@@ -7,7 +7,8 @@
 //! `unimplemented!()` placeholders; the real implementations land per the
 //! `docs/clickhouse-backend.md` §9 milestone table:
 //!
-//! - [`EmbeddingVectorStore`] → **P3** (Array(Float32) + cosineDistance)
+//! ([`EmbeddingVectorStore`] is **done** in P3 — see `embedding.rs`.)
+//!
 //! - [`CapsuleSearchStore`] → **P4** (lexical + vector + Rust-side RRF)
 //! - [`GraphStore`] / [`TranscriptStore`] / [`EmbeddingJobStore`] /
 //!   [`EntityRegistry`] / [`SessionStore`] / [`MaintenanceStore`] /
@@ -37,9 +38,9 @@ use crate::storage::types::{
     GraphError, StorageError, TranscriptSessionSummary,
 };
 use crate::storage::{
-    CapsuleSearchStore, EmbeddingJobStore, EmbeddingVectorStore, EntityRegistry,
-    EvolutionCandidate, EvolutionCandidateStore, GraphStore, MaintenanceStore, MineCursor,
-    MineCursorStore, SessionStore, TranscriptStore,
+    CapsuleSearchStore, EmbeddingJobStore, EntityRegistry, EvolutionCandidate,
+    EvolutionCandidateStore, GraphStore, MaintenanceStore, MineCursor, MineCursorStore,
+    SessionStore, TranscriptStore,
 };
 
 // ─────────────────────────── CapsuleSearchStore (P4) ───────────────────────
@@ -300,114 +301,6 @@ impl EmbeddingJobStore for ClickHouseBackend {
     ) -> Result<Option<String>, StorageError> {
         unimplemented!(
             "clickhouse-backend P5: EmbeddingJobStore::get_transcript_embedding_job_status"
-        )
-    }
-}
-
-// ─────────────────────────── EmbeddingVectorStore (P3) ─────────────────────
-#[async_trait]
-impl EmbeddingVectorStore for ClickHouseBackend {
-    #[allow(clippy::too_many_arguments)]
-    async fn upsert_capability_capsule_embedding(
-        &self,
-        _capability_capsule_id: &str,
-        _tenant: &str,
-        _embedding_model: &str,
-        _embedding_dim: i64,
-        _embedding_blob: &[u8],
-        _content_hash: &str,
-        _source_updated_at: &str,
-        _now: &str,
-    ) -> Result<(), StorageError> {
-        unimplemented!(
-            "clickhouse-backend P3: EmbeddingVectorStore::upsert_capability_capsule_embedding"
-        )
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    async fn upsert_capability_capsule_embedding_chunks(
-        &self,
-        _capability_capsule_id: &str,
-        _tenant: &str,
-        _embedding_model: &str,
-        _embedding_dim: i64,
-        _vectors: &[Vec<f32>],
-        _content_hash: &str,
-        _source_updated_at: &str,
-        _now: &str,
-    ) -> Result<(), StorageError> {
-        unimplemented!(
-            "clickhouse-backend P3: EmbeddingVectorStore::upsert_capability_capsule_embedding_chunks"
-        )
-    }
-
-    async fn delete_capability_capsule_embedding(
-        &self,
-        _capability_capsule_id: &str,
-    ) -> Result<(), StorageError> {
-        unimplemented!(
-            "clickhouse-backend P3: EmbeddingVectorStore::delete_capability_capsule_embedding"
-        )
-    }
-
-    async fn get_capability_capsule_embedding_row(
-        &self,
-        _capability_capsule_id: &str,
-    ) -> Result<Option<(String, String, String)>, StorageError> {
-        unimplemented!(
-            "clickhouse-backend P3: EmbeddingVectorStore::get_capability_capsule_embedding_row"
-        )
-    }
-
-    async fn get_capability_capsule_embedding_vector(
-        &self,
-        _capability_capsule_id: &str,
-    ) -> Result<Option<Vec<f32>>, StorageError> {
-        unimplemented!(
-            "clickhouse-backend P3: EmbeddingVectorStore::get_capability_capsule_embedding_vector"
-        )
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    async fn upsert_conversation_message_embedding(
-        &self,
-        _message_block_id: &str,
-        _tenant: &str,
-        _embedding_model: &str,
-        _embedding_dim: i64,
-        _embedding_blob: &[u8],
-        _content_hash: &str,
-        _source_updated_at: &str,
-        _now: &str,
-    ) -> Result<(), StorageError> {
-        unimplemented!(
-            "clickhouse-backend P3: EmbeddingVectorStore::upsert_conversation_message_embedding"
-        )
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    async fn upsert_conversation_message_embedding_chunks(
-        &self,
-        _message_block_id: &str,
-        _tenant: &str,
-        _embedding_model: &str,
-        _embedding_dim: i64,
-        _vectors: &[Vec<f32>],
-        _content_hash: &str,
-        _source_updated_at: &str,
-        _now: &str,
-    ) -> Result<(), StorageError> {
-        unimplemented!(
-            "clickhouse-backend P3: EmbeddingVectorStore::upsert_conversation_message_embedding_chunks"
-        )
-    }
-
-    async fn delete_conversation_message_embedding(
-        &self,
-        _message_block_id: &str,
-    ) -> Result<(), StorageError> {
-        unimplemented!(
-            "clickhouse-backend P3: EmbeddingVectorStore::delete_conversation_message_embedding"
         )
     }
 }

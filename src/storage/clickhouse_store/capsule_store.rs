@@ -30,7 +30,7 @@ use crate::storage::types::{FeedbackEvent, StorageError};
 // ── helpers ────────────────────────────────────────────────────────────
 
 /// Map a clickhouse-rs error into the shared [`StorageError`].
-fn ch_err(e: clickhouse::error::Error) -> StorageError {
+pub(super) fn ch_err(e: clickhouse::error::Error) -> StorageError {
     StorageError::InvalidInput(format!("clickhouse: {e}"))
 }
 
@@ -48,7 +48,7 @@ fn opt(s: String) -> Option<String> {
 /// Wall-clock ms; two writes inside the same ms collide (a known scaffold
 /// caveat — see the pain inventory; a per-process `AtomicU64` would harden
 /// it). Never run, so the collision window is theoretical here.
-fn now_version() -> u64 {
+pub(super) fn now_version() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_millis() as u64)

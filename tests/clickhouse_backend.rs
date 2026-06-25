@@ -22,7 +22,9 @@ mod ch {
     use mem::domain::capability_capsule::{
         CapabilityCapsuleRecord, CapabilityCapsuleStatus, CapabilityCapsuleType, Scope, Visibility,
     };
-    use mem::storage::{current_timestamp, CapsuleStore, ClickHouseBackend, FeedbackEvent};
+    use mem::storage::{
+        current_timestamp, CapsuleStore, ClickHouseBackend, EmbeddingVectorStore, FeedbackEvent,
+    };
 
     fn fixture(id: &str, status: CapabilityCapsuleStatus) -> CapabilityCapsuleRecord {
         CapabilityCapsuleRecord {
@@ -117,6 +119,89 @@ mod ch {
             found.map(|r| r.capability_capsule_id),
             Some("ch_hash".to_string())
         );
+    }
+
+    /// Concrete backend (impls every sub-trait) so a test can reach methods
+    /// off `CapsuleStore` — e.g. `EmbeddingVectorStore` (P3). `None` to skip.
+    async fn ch_backend() -> Option<ClickHouseBackend> {
+        let url = std::env::var("MEM_TEST_CLICKHOUSE_URL")
+            .ok()
+            .filter(|s| !s.trim().is_empty());
+        let Some(url) = url else {
+            eprintln!("MEM_TEST_CLICKHOUSE_URL unset — skipping ClickHouse embedding parity");
+            return None;
+        };
+        let backend = ClickHouseBackend::connect(&url)
+            .await
+            .expect("clickhouse connect");
+        backend
+            .apply_migrations()
+            .await
+            .expect("clickhouse migrate");
+        Some(backend)
+    }
+
+    /// P3: a capsule embedding upserts and round-trips its vector + metadata,
+    /// and `delete` clears it.
+    #[tokio::test]
+    async fn embedding_vector_round_trip_and_delete() {
+        let Some(be) = ch_backend().await else { return };
+        let v = vec![0.1_f32, 0.2, 0.3, 0.4];
+        be.upsert_capability_capsule_embedding_chunks(
+            "ch_emb",
+            "t",
+            "test-model",
+            4,
+            std::slice::from_ref(&v),
+            "hash_emb",
+            &current_timestamp(),
+            &current_timestamp(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            be.get_capability_capsule_embedding_vector("ch_emb")
+                .await
+                .unwrap(),
+            Some(v)
+        );
+        assert_eq!(
+            be.get_capability_capsule_embedding_row("ch_emb")
+                .await
+                .unwrap()
+                .map(|(m, h, _)| (m, h)),
+            Some(("test-model".to_string(), "hash_emb".to_string()))
+        );
+        be.delete_capability_capsule_embedding("ch_emb")
+            .await
+            .unwrap();
+        // Mutations are async in ClickHouse; the delete is best-effort here —
+        // we only assert it doesn't error. (A post-delete absence check would
+        // need to wait out the mutation; deferred to the validation pass.)
+    }
+
+    /// P3: a 2-chunk conversation embedding upserts without error (the
+    /// chunk_index discriminator lets both rows coexist under
+    /// ReplacingMergeTree; the full chunk-set read is P5's search).
+    #[tokio::test]
+    async fn conversation_chunks_upsert_ok() {
+        let Some(be) = ch_backend().await else { return };
+        let vs = vec![vec![1.0_f32, 0.0], vec![0.0_f32, 1.0]];
+        be.upsert_conversation_message_embedding_chunks(
+            "msg_x",
+            "t",
+            "test-model",
+            2,
+            &vs,
+            "hash_msg",
+            &current_timestamp(),
+            &current_timestamp(),
+        )
+        .await
+        .unwrap();
+        be.delete_conversation_message_embedding("msg_x")
+            .await
+            .unwrap();
     }
 
     #[tokio::test]

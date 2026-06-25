@@ -372,3 +372,20 @@ P2 让 `ClickHouseBackend` impl 全 11 子 trait → blanket `impl<T> Backend fo
 11. **`MaintenanceStore` 的 3 个默认方法**(`vacuum_old_versions` / `ensure_query_indexes` / `rebuild_query_indexes`)**不要 stub** —— 它们的 trait 默认就是 non-Lance 的零-stats no-op(正确行为),stub 成 `unimplemented!()` 反而会让 vacuum worker panic。只 stub 3 个必需方法。
 12. **`unimplemented!()` stub 是编译期完整、运行期会 panic** —— P2 交付的是「能 erase 成 Backend、`mem serve` 能启」,**不是**运行可用;CapsuleStore 外任何操作 abort。这是 scaffold 的预期状态(无真实 CH)。
 13. **`from_config` 走到 connect 分支无法静态测** —— `apply_migrations` 需要活 CH;只能单测 `parse_backend`(`MEM_BACKEND=clickhouse`/`ch` + `MEM_CLICKHOUSE_URL` → `(Clickhouse, None, Some(url))`,缺 URL 报错,全词与 `ch` 别名都覆盖)。connect-分支的端到端验证留给 P6 的 `MEM_TEST_CLICKHOUSE_URL` 门控测试。
+
+### P3(2026-06-25):EmbeddingVectorStore 实现 + migration 0002
+
+P3 把 `EmbeddingVectorStore`(8 方法)从 stub 升为真实现(`src/storage/clickhouse_store/embedding.rs`),建嵌入表(`migrations/clickhouse/0002_embeddings.sql`)。stubs.rs 降到 9 个 trait(P4 search + P5 其余 8)。门禁:默认 fmt+clippy+test 绿 + `--features clickhouse` build/clippy 绿。仍 **UNVALIDATED**。
+
+**关键设计决策:**
+- **`chunk_index UInt32` 判别列**:一条 message 可有 N 个 chunk 向量(多行同 id)。`ORDER BY (tenant, id, chunk_index)` 让 N 行在 `ReplacingMergeTree` 下**不被折叠**成一行(否则同 `(tenant,id)` 键只剩一行)。一次 upsert 的 N 行共享一个 `row_version`(= 一代)。
+- **blob↔Vec<f32>**:单条 upsert 收 `embedding_blob: &[u8]`(native-endian f32,见 `crate::embedding::wire`),用 `decode_f32_blob(blob, dim)` 解成 `Vec<f32>`;chunks 变体直接收 `&[Vec<f32>]`。CH 行结构 `embedding: Vec<f32>` ⇄ `Array(Float32)`(`clickhouse` 0.15 的 `Vec<T>`⇄`Array(T)` 映射,与 `ChCapsuleRow` 的 `Vec<String>`⇄`Array(String)` 同理,已验证编译)。
+- **读取**:`get_*_vector`/`get_*_row` 走 `ORDER BY row_version DESC LIMIT 1`(胶囊侧单行)。chunk-set 的完整读(GROUP BY id 取 min 距离)是 P5 search 的事。
+- **delete**:`ALTER TABLE … DELETE WHERE id = ?`(异步 mutation)。嵌入是派生数据、delete 罕见(胶囊硬删/重嵌),所以这里用 mutation 可接受——与热路径的生命周期写(版本化 insert,§4a)区别对待。
+- **`embedding_dim` 用 `Int64`**(非 §6 草案的 `Int32`)对齐 trait 的 `i64` 参数 + lance schema 的 `Int64`。
+
+**P3 新 pain:**
+14. **`apply_migrations` 的注释跳过 bug(已修)**:原实现 `split(';')` 后 `trimmed.starts_with("--")` 整条跳过——但带前导 `--` 注释的语句,trimmed 以注释开头 → **整个 CREATE 被跳过**。gates 不跑 migration(无 CH)故没暴露。改成**逐行剥 `--` 注释行**再判空,并把 0001/0002 排进有序 `include_str!` 列表。
+15. **「delete-once-then-insert」语义在 append 模型下的偏差**:lance 的 chunks upsert 是「先删该 id 所有行,再插 N 行」。CH 走纯 append(不在 upsert 路径上 mutation),代价:(a) 空 `vectors` upsert **不清旧行**(trait 说空=no-op,可接受);(b) chunk 数缩小(N<M)时旧的 M-N 行**物理残留**,靠读时 `row_version DESC LIMIT 1` / 后续 `OPTIMIZE`/TTL 清。记为 scaffold caveat,validation 阶段定夺是否要 per-upsert 的 `ALTER DELETE`。
+16. **delete 是异步 mutation → 测试不能断言「删后立即不存在」**:`delete_*_embedding` 测试只断言不报错;删后缺失检查要等 mutation 落地,留给 validation。
+17. **trait 不对称**:胶囊侧有 `get_row`/`get_vector`,conversation 侧只有 upsert+delete(无 get)。conversation chunk 测试只能验「upsert/delete 不报错」,完整 chunk-survival 验证靠 P5 search parity。
