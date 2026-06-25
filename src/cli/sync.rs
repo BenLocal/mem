@@ -291,6 +291,71 @@ pub async fn copy_transcripts_for_test(
     copy_transcripts(src, dst, tenant, batch_size, false, false).await
 }
 
+/// Copy all successful episodes from `src` to `dst` for one `tenant`.
+/// Already-present episode ids (by id) are skipped so re-runs are idempotent.
+/// Returns a per-tenant tally.
+#[allow(dead_code)] // wired in Task 8
+async fn copy_episodes(
+    src: &dyn Backend,
+    dst: &dyn Backend,
+    tenant: &str,
+    _batch_size: usize,
+    dry_run: bool,
+    verbose: bool,
+) -> DomainReport {
+    let mut report = DomainReport::default();
+    let eps = match src.list_successful_episodes_for_tenant(tenant).await {
+        Ok(e) => e,
+        Err(e) => {
+            eprintln!("episodes[{tenant}]: list failed: {e}");
+            report.failed += 1;
+            return report;
+        }
+    };
+    let present: std::collections::HashSet<String> = dst
+        .list_successful_episodes_for_tenant(tenant)
+        .await
+        .unwrap_or_default()
+        .into_iter()
+        .map(|e| e.episode_id)
+        .collect();
+    for ep in eps {
+        if present.contains(&ep.episode_id) {
+            report.skipped += 1;
+            continue;
+        }
+        if dry_run {
+            report.copied += 1;
+            continue;
+        }
+        match dst.insert_episode(ep).await {
+            Ok(_) => report.copied += 1,
+            Err(e) => {
+                eprintln!("episodes[{tenant}]: insert failed: {e}");
+                report.failed += 1;
+            }
+        }
+    }
+    if verbose {
+        println!(
+            "  episodes[{tenant}]: +{} (skip {})",
+            report.copied, report.skipped
+        );
+    }
+    report
+}
+
+/// Test seam: integration tests call the episode copier directly.
+#[doc(hidden)]
+pub async fn copy_episodes_for_test(
+    src: &dyn Backend,
+    dst: &dyn Backend,
+    tenant: &str,
+    batch_size: usize,
+) -> DomainReport {
+    copy_episodes(src, dst, tenant, batch_size, false, false).await
+}
+
 /// Entry point. Returns process exit code (`0` clean, `1` if any batch failed
 /// or setup errored).
 pub async fn run(args: SyncArgs) -> i32 {

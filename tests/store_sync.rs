@@ -3,9 +3,10 @@ use std::sync::Arc;
 use mem::domain::capability_capsule::{
     CapabilityCapsuleRecord, CapabilityCapsuleStatus, CapabilityCapsuleType, Scope, Visibility,
 };
+use mem::domain::episode::EpisodeRecord;
 use mem::domain::{BlockType, ConversationMessage, MessageRole};
 use mem::embedding::FakeEmbeddingProvider;
-use mem::storage::Store;
+use mem::storage::{SessionStore, Store};
 use tempfile::TempDir;
 
 async fn temp_lance() -> (TempDir, Store) {
@@ -106,4 +107,50 @@ async fn syncs_transcripts_lance_to_lance() {
         .await
         .unwrap();
     assert_eq!(got.len(), 1);
+}
+
+fn episode_fixture(id: &str, tenant: &str) -> EpisodeRecord {
+    EpisodeRecord {
+        episode_id: id.to_string(),
+        tenant: tenant.to_string(),
+        goal: format!("goal-{id}"),
+        steps: vec![format!("step-{id}")],
+        outcome: "success".to_string(),
+        evidence: vec![],
+        scope: Scope::Workspace,
+        visibility: Visibility::Private,
+        project: None,
+        repo: None,
+        module: None,
+        tags: vec![],
+        source_agent: "test".to_string(),
+        idempotency_key: None,
+        created_at: "00000000000000000000".to_string(),
+        updated_at: "00000000000000000000".to_string(),
+        workflow_candidate: None,
+    }
+}
+
+#[tokio::test]
+async fn syncs_episodes_lance_to_lance() {
+    let (_sd, src) = temp_lance().await;
+    let (_td, dst) = temp_lance().await;
+    src.insert_episode(episode_fixture("e1", "local"))
+        .await
+        .unwrap();
+
+    let report = mem::cli::sync::copy_episodes_for_test(&src, &dst, "local", 100).await;
+    assert_eq!(report.copied, 1);
+    assert_eq!(
+        dst.list_successful_episodes_for_tenant("local")
+            .await
+            .unwrap()
+            .len(),
+        1
+    );
+
+    // Idempotent re-run.
+    let again = mem::cli::sync::copy_episodes_for_test(&src, &dst, "local", 100).await;
+    assert_eq!(again.copied, 0);
+    assert_eq!(again.skipped, 1);
 }
