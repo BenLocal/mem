@@ -8,6 +8,65 @@ are organized by feature wave (merge commit ranges on `master`).
 
 ## [Unreleased]
 
+## 2026-06-25 — `0.2.0`
+
+Backend-expansion release. Adds a third storage backend (ClickHouse) and two
+new CLI subcommands (`mem import`, `mem sync`); makes the Postgres + ClickHouse
+backends **default dependencies** (always compiled, selected at runtime).
+
+### Added
+
+- **ClickHouse storage backend** (`MEM_BACKEND=clickhouse` + `MEM_CLICKHOUSE_URL`).
+  A `ClickHouseBackend` (clickhouse-rs client) implements all 11 storage
+  sub-traits, so the blanket `Backend` impl makes it a runtime-selectable peer
+  to Lance (default) and Postgres. ANN via `Array(Float32)` + `cosineDistance`,
+  lexical via substring/token candidates, RRF fused Rust-side; the update-heavy
+  lifecycle (decay / status / supersede) is modeled as versioned re-inserts into
+  `ReplacingMergeTree`. Built P1–P6 and **e2e-validated against ClickHouse 26.5**
+  (all parity scenarios pass). See `docs/clickhouse-backend.md`.
+- **`mem import` CLI** — bulk **archive-only** transcript import, extensible per
+  source agent (`mem import claude-code` walks `~/.claude/projects/**/*.jsonl`).
+  Reuses the `mine` parser's block half (no memory extraction), idempotent via
+  the server-side `(transcript_path, line_number, block_index)` dedup. The
+  rebuild path for the verbatim transcript archive.
+- **`mem sync` CLI** — verbatim **any → any** store-to-store migration across
+  Lance / Postgres / ClickHouse (`--from <kind>:<locator> --to … --tenant …`).
+  Copies capsules (+ version chains), transcripts, entities, episodes, and
+  active graph edges through existing trait reads/writes — original ids /
+  timestamps / lifecycle state preserved, not re-ingested. Idempotent
+  (re-run = resume), embeddings rebuilt on the target, `--domains` subset +
+  `--dry-run`. See README «Migrating between backends».
+
+### Changed
+
+- **Postgres + ClickHouse are now default dependencies** — the `postgres` /
+  `clickhouse` cargo features were **removed**. Both backends are compiled into
+  every build and selected purely at runtime via `MEM_BACKEND` +
+  `MEM_POSTGRES_URL` / `MEM_CLICKHOUSE_URL`; `sqlx` / `pgvector` / `clickhouse`
+  are always in the dep graph. The feature-gated parity suites now self-skip
+  without `MEM_TEST_{POSTGRES,CLICKHOUSE}_URL`, so a plain `cargo test` compiles
+  and runs them.
+
+### Fixed
+
+- **Transcript import/mine `413 Payload Too Large`** on tool-result-heavy
+  sessions — replaced fixed 100-block batching with **size-aware batching**
+  (bounded by both block count and a 1.5 MiB serialized-byte budget) so a heavy
+  session's large blocks no longer overflow the server's 2 MiB request limit.
+- **Docker release build** — `COPY migrations ./migrations` into the builder.
+  With postgres/clickhouse always compiled, their stores `include_str!` the
+  migration SQL at compile time; the image lacked the files.
+- **`make install`** — `cargo install --path . --locked`. Without `--locked`,
+  `cargo install` re-resolves and pulls pgvector's sqlx onto sqlx-core 0.9.0
+  while our `sqlx = 0.8` stays 0.8.6 → two sqlx-core versions → `pgvector::Vector`
+  fails its sqlx bounds. The locked resolution unifies on 0.8.6.
+
+### Docs
+
+- Route-B documentation sweep (DuckDB → lance-native) across README,
+  `docs/api-data-flow.md`, and src comments; README «Storage backends» reworked
+  for three default-compiled backends + `mem import` / `mem sync` usage.
+
 ## 2026-06-24 — `0.1.9`
 
 Route-B release. **The DuckDB read engine is removed** — `mem` is now
