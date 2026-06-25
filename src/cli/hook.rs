@@ -211,7 +211,13 @@ fn format_error_recall(resp: &Value) -> Value {
         false,
         RecallStyle::Snippet,
     );
-    hook_envelope("PostToolUseFailure", &lines.join("\n"))
+    let mut env = hook_envelope("PostToolUseFailure", &lines.join("\n"));
+    // User-visible headline (the recall itself is model-only additionalContext).
+    if env.get("hookSpecificOutput").is_some() {
+        let n = dir.len() + facts.len() + pat.len();
+        env["systemMessage"] = json!(format!("🧠 mem · {n} incident hit(s) for the last failure"));
+    }
+    env
 }
 
 // ---------------------------------------------------------------------------
@@ -359,7 +365,29 @@ pub(crate) fn format_prompt_recall_styled(cap: &Value, tr: &Value, style: Recall
             lines.push(format_window(w, window_cap));
         }
     }
-    hook_envelope("UserPromptSubmit", &lines.join("\n"))
+    let mut env = hook_envelope("UserPromptSubmit", &lines.join("\n"));
+    // Surface a one-line, user-VISIBLE headline. The recall banner above is
+    // emitted as `additionalContext` — Claude Code injects it into the model's
+    // prompt but never renders it to the user, so without this the user never
+    // sees that recall fired. `systemMessage` IS rendered to the user. The
+    // `additionalContext` payload is unchanged (its format is parsed back by
+    // `cli/feedback.rs::scan_transcript` — do not touch it).
+    if env.get("hookSpecificOutput").is_some() {
+        env["systemMessage"] = json!(recall_headline(
+            dir.len(),
+            facts.len(),
+            pat.len(),
+            windows.len()
+        ));
+    }
+    env
+}
+
+/// One-line, user-visible recall headline (emitted as `systemMessage`).
+/// Summarizes how many hits auto-recall surfaced this turn, by section.
+fn recall_headline(directives: usize, facts: usize, patterns: usize, windows: usize) -> String {
+    let total = directives + facts + patterns + windows;
+    format!("🧠 mem · recalled {total} ({directives}d {facts}f {patterns}p {windows}w)")
 }
 
 /// One transcript window → one bullet: `- [sid8] yyyy-mm-dd: <primary block text>`.
@@ -411,7 +439,15 @@ fn commit_nudge(p: &Value) -> Value {
     if is_routine_commit(&subject) {
         return skip();
     }
-    hook_envelope("PostToolUse", &commit_nudge_text(&subject))
+    let mut env = hook_envelope("PostToolUse", &commit_nudge_text(&subject));
+    // User-visible headline (the nudge itself is model-only additionalContext).
+    if env.get("hookSpecificOutput").is_some() {
+        env["systemMessage"] = json!(format!(
+            "💡 mem · committed `{}` — consider propose_experience",
+            clean_to(&subject, 50)
+        ));
+    }
+    env
 }
 
 fn contains_git_commit(cmd: &str) -> bool {
@@ -776,6 +812,12 @@ mod tests {
             v["hookSpecificOutput"]["hookEventName"].as_str(),
             Some("PostToolUseFailure")
         );
+        // User-visible headline present.
+        let sys = v["systemMessage"].as_str().unwrap();
+        assert!(
+            sys.starts_with("🧠 mem ·") && sys.contains("incident"),
+            "got {sys}"
+        );
     }
 
     #[test]
@@ -815,6 +857,44 @@ mod tests {
         assert!(ctx.contains("[abcdef12]"));
         assert!(ctx.contains("2026-06-04"));
         assert!(ctx.contains("we fixed the hook"));
+    }
+
+    #[test]
+    fn recall_headline_counts_by_section() {
+        assert_eq!(
+            recall_headline(1, 3, 2, 2),
+            "🧠 mem · recalled 8 (1d 3f 2p 2w)"
+        );
+        assert_eq!(
+            recall_headline(0, 1, 0, 0),
+            "🧠 mem · recalled 1 (0d 1f 0p 0w)"
+        );
+    }
+
+    #[test]
+    fn format_prompt_recall_emits_visible_system_message() {
+        // Recall must surface a user-visible `systemMessage` headline (the
+        // banner itself is model-only `additionalContext`).
+        let cap = json!({
+            "relevant_facts": [
+                {"text": "fact one", "capability_capsule_id": "mem_a"},
+                {"text": "fact two", "capability_capsule_id": "mem_b"}
+            ]
+        });
+        let v = format_prompt_recall(&cap, &json!({}));
+        let sys = v["systemMessage"].as_str().unwrap();
+        assert!(sys.starts_with("🧠 mem · recalled"), "got {sys}");
+        assert!(sys.contains("2f"), "two facts → 2f; got {sys}");
+        // additionalContext is still present + unchanged in shape.
+        assert!(v["hookSpecificOutput"]["additionalContext"].is_string());
+    }
+
+    #[test]
+    fn format_prompt_recall_skip_has_no_system_message() {
+        // Nothing recalled → `{}` skip envelope, no headline.
+        let v = format_prompt_recall(&json!({}), &json!({}));
+        assert!(v.get("systemMessage").is_none());
+        assert!(v.get("hookSpecificOutput").is_none());
     }
 
     #[test]

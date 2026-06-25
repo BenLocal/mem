@@ -51,6 +51,9 @@ pub fn session_start_envelope(body: &str) -> serde_json::Value {
         return serde_json::Value::Object(Default::default());
     }
     serde_json::json!({
+        // User-visible headline (the injected memories are model-only
+        // additionalContext; this one line renders to the user).
+        "systemMessage": "🧠 mem · session-start memories loaded",
         "hookSpecificOutput": {
             "hookEventName": "SessionStart",
             "additionalContext": body,
@@ -201,5 +204,10 @@ mod tests {
                 .unwrap(),
             body
         );
+        // User-visible headline present on non-empty injection.
+        assert!(v["systemMessage"]
+            .as_str()
+            .unwrap()
+            .starts_with("🧠 mem · session-start"));
     }
 }

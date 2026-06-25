@@ -8,6 +8,19 @@ are organized by feature wave (merge commit ranges on `master`).
 
 ## [Unreleased]
 
+### Added
+
+- **Visible hook headlines.** Every `mem` hook that previously injected only
+  model-facing `additionalContext` (invisible to the user) now ALSO emits a
+  one-line user-visible `systemMessage` headline, so you can see when mem fires:
+  - UserPromptSubmit recall → `🧠 mem · recalled N (Nd Nf Np Nw)`
+  - PostToolUseFailure recall → `🧠 mem · N incident hit(s) for the last failure`
+  - PostToolUse commit-nudge → `💡 mem · committed \`<subject>\` — consider propose_experience`
+  - SessionStart wake-up → `🧠 mem · session-start memories loaded`
+
+  The `additionalContext` payloads are unchanged (their format is still parsed
+  back by `cli/feedback.rs::scan_transcript`).
+
 ## 2026-06-25 — `0.2.0`
 
 Backend-expansion release. Adds a third storage backend (ClickHouse) and two
