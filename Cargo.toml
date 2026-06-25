@@ -7,30 +7,19 @@ default-run = "mem"
 [lib]
 doctest = false
 
-[features]
-default = []
-# Phase 4 (backend-coupling §6.5) Postgres spike — opt-in. Adds sqlx
-# + PostgresCapsuleStore behind `cargo build --features postgres`.
-# Default build is unaffected; no sqlx pulled into the dep graph
-# unless the feature is on. See `docs/backend-coupling.md` §6.5.
-postgres = ["dep:sqlx", "dep:pgvector"]
-# ClickHouse spike (clickhouse-backend.md) — opt-in third backend. Adds the
-# `clickhouse` crate + ClickHouseBackend behind `cargo build --features
-# clickhouse`. Default build is unaffected; the crate is not pulled into the
-# dep graph unless the feature is on. UNVALIDATED scaffold (P1).
-clickhouse = ["dep:clickhouse"]
-
 [dependencies]
-# Optional: Phase 4 Postgres spike. Gated behind the `postgres`
-# feature so the default build doesn't pull sqlx + libpq machinery.
-sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "tls-rustls", "postgres", "uuid"], optional = true }
-# Optional: ClickHouse spike. Gated behind the `clickhouse` feature so the
-# default build doesn't pull the clickhouse-rs HTTP client / lz4 machinery.
-clickhouse = { version = "0.15", default-features = false, features = ["lz4"], optional = true }
-# Optional: pgvector binding for the Postgres EmbeddingVectorStore (P3).
-# `pgvector::Vector` implements sqlx Encode/Decode for the PG `vector`
-# type. Only pulled in under the `postgres` feature.
-pgvector = { version = "0.4", default-features = false, features = ["sqlx"], optional = true }
+# Postgres backend (backend-coupling §6.5). A default dependency: the
+# `postgres`/`clickhouse` backends are always compiled in and selected at
+# runtime via `MEM_BACKEND` + `MEM_POSTGRES_URL`/`MEM_CLICKHOUSE_URL`, so
+# there is no longer a cargo feature gating them. sqlx + libpq machinery is
+# always in the dep graph.
+sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "tls-rustls", "postgres", "uuid"] }
+# ClickHouse backend — default dependency (see the sqlx note above). Pulls the
+# clickhouse-rs HTTP client + lz4 into every build.
+clickhouse = { version = "0.15", default-features = false, features = ["lz4"] }
+# pgvector binding for the Postgres EmbeddingVectorStore. `pgvector::Vector`
+# implements sqlx Encode/Decode for the PG `vector` type.
+pgvector = { version = "0.4", default-features = false, features = ["sqlx"] }
 # LanceDB is the storage backend (on-disk Lance datasets) for both
 # reads and writes — reads go through the lancedb Rust API natively
 # (read_consistency_interval(0)). Single, unconditional storage path.

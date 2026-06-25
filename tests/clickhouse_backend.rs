@@ -1,13 +1,11 @@
 //! ClickHouse backend parity smoke — **UNVALIDATED scaffold**
 //! (clickhouse-backend P1).
 //!
-//! Gated twice over:
-//! - It only does real work under `--features clickhouse` (the default
-//!   build compiles a no-op stub so the test binary still exists).
-//! - Even with the feature, it requires `MEM_TEST_CLICKHOUSE_URL`
-//!   (e.g. `http://localhost:8123`); when unset every case prints a skip
-//!   line and returns `Ok` — there is no local ClickHouse in CI/dev, so
-//!   the suite must never fail merely for being un-runnable.
+//! The backend is a default dependency (always compiled), but the suite
+//! requires `MEM_TEST_CLICKHOUSE_URL` (e.g. `http://localhost:8123`): when
+//! unset every case prints a skip line and returns `Ok` — there is no local
+//! ClickHouse in CI/dev, so a plain `cargo test` must never fail merely for
+//! being un-runnable.
 //!
 //! When a real ClickHouse is reachable it applies
 //! `migrations/clickhouse/0001_capsule_store.sql` and runs a representative
@@ -15,7 +13,6 @@
 //! `ClickHouseBackend` (full reuse of that crate's scenarios needs a shared
 //! test-helper module — a P-later cleanup).
 
-#[cfg(feature = "clickhouse")]
 mod ch {
     use std::sync::Arc;
 
@@ -369,19 +366,6 @@ mod ch {
         assert_eq!(
             be.get_embedding_job_status("j1").await.unwrap(),
             Some("completed".to_string())
-        );
-    }
-}
-
-/// Default build (no `clickhouse` feature): keep a test binary present so
-/// `cargo test` lists the file, and explain how to run the real suite.
-#[cfg(not(feature = "clickhouse"))]
-#[test]
-fn clickhouse_parity_requires_feature() {
-    if std::env::var("MEM_TEST_CLICKHOUSE_URL").is_ok() {
-        eprintln!(
-            "MEM_TEST_CLICKHOUSE_URL is set but mem was built without --features clickhouse — \
-             skipping ClickHouse parity (rebuild with the feature to run it)"
         );
     }
 }

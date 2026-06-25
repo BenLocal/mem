@@ -14,9 +14,9 @@
 //! ([`graph`], [`transcript`], [`jobs`], [`entity`], [`session`],
 //! [`maintenance`], [`cursor`], [`evolution`]) — so all 11 sub-traits are
 //! now real and `ClickHouseBackend` is a fully-wired (still UNVALIDATED)
-//! [`Backend`]. The whole module sits behind
-//! `#[cfg(feature = "clickhouse")]`, so the default build pulls neither the
-//! `clickhouse` crate nor this code.
+//! [`Backend`]. Compiled into every build (a default dependency — no cargo
+//! feature gates it); the backend is selected at runtime via
+//! `MEM_BACKEND=clickhouse` + `MEM_CLICKHOUSE_URL`.
 //!
 //! [`CapsuleStore`]: crate::storage::capsule_store::CapsuleStore
 //! [`EmbeddingVectorStore`]: crate::storage::embedding_vector_store::EmbeddingVectorStore

@@ -133,80 +133,62 @@ impl AppState {
                 (store, edge_access_tx, capsule_used_tx)
             }
             crate::config::BackendKind::Postgres => {
-                #[cfg(feature = "postgres")]
-                {
-                    // Connect + idempotently migrate. The Store-glue
-                    // workers (last_used / potentiation) are skipped: they
-                    // are optimizations, not correctness, and call
-                    // Store-level compositions absent on the Postgres
-                    // backend. The transcript embedding-job provider IS
-                    // configured (P5 wired the transcript fan-out). The
-                    // capsule service still gets a live `capsule_used_tx`;
-                    // its receiver is dropped, so the events it emits are
-                    // silently discarded (acceptable until the PG last-used
-                    // worker lands).
-                    let url = config
-                        .postgres_url
-                        .as_deref()
-                        .expect("postgres_url present when backend=Postgres");
-                    let pg_concrete = crate::storage::PostgresCapsuleStore::connect(url)
-                        .await
-                        .map_err(|e| anyhow::anyhow!("postgres connect: {e}"))?;
-                    // Stamp the transcript embedding-job provider so
-                    // embed-eligible transcript inserts can enqueue jobs
-                    // (P5: TranscriptStore::create_conversation_message
-                    // fans out into transcript_embedding_jobs).
-                    pg_concrete.set_transcript_job_provider(config.embedding.job_provider_id());
-                    let pg = Arc::new(pg_concrete);
-                    info!(backend = "postgres", "storage initialized");
-                    let store: Arc<dyn Backend> = pg;
-                    let (capsule_used_tx, _rx) = tokio::sync::mpsc::unbounded_channel();
-                    (store, None, capsule_used_tx)
-                }
-                #[cfg(not(feature = "postgres"))]
-                {
-                    return Err(anyhow::anyhow!(
-                        "MEM_BACKEND=postgres requires building mem with --features postgres"
-                    ));
-                }
+                // Connect + idempotently migrate. The Store-glue
+                // workers (last_used / potentiation) are skipped: they
+                // are optimizations, not correctness, and call
+                // Store-level compositions absent on the Postgres
+                // backend. The transcript embedding-job provider IS
+                // configured (P5 wired the transcript fan-out). The
+                // capsule service still gets a live `capsule_used_tx`;
+                // its receiver is dropped, so the events it emits are
+                // silently discarded (acceptable until the PG last-used
+                // worker lands).
+                let url = config
+                    .postgres_url
+                    .as_deref()
+                    .expect("postgres_url present when backend=Postgres");
+                let pg_concrete = crate::storage::PostgresCapsuleStore::connect(url)
+                    .await
+                    .map_err(|e| anyhow::anyhow!("postgres connect: {e}"))?;
+                // Stamp the transcript embedding-job provider so
+                // embed-eligible transcript inserts can enqueue jobs
+                // (P5: TranscriptStore::create_conversation_message
+                // fans out into transcript_embedding_jobs).
+                pg_concrete.set_transcript_job_provider(config.embedding.job_provider_id());
+                let pg = Arc::new(pg_concrete);
+                info!(backend = "postgres", "storage initialized");
+                let store: Arc<dyn Backend> = pg;
+                let (capsule_used_tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+                (store, None, capsule_used_tx)
             }
             crate::config::BackendKind::Clickhouse => {
-                #[cfg(feature = "clickhouse")]
-                {
-                    // P2: `ClickHouseBackend` now impls all 11 sub-traits (the
-                    // 10 beyond `CapsuleStore` are `unimplemented!()` stubs,
-                    // filled in P3-P5), so the blanket impl makes it a
-                    // `Backend`. Same assembly shape as the Postgres arm:
-                    // connect + idempotently migrate, upcast to
-                    // `Arc<dyn Backend>`, skip the lance-Store-level glue
-                    // workers (potentiation / last_used — optimizations, not
-                    // correctness). `set_transcript_job_provider` is DEFERRED
-                    // to P5 (transcript writes are stubbed until then). The
-                    // capsule service still gets a live `capsule_used_tx` whose
-                    // receiver is dropped. UNVALIDATED — never run against a
-                    // real ClickHouse; any read/write outside CapsuleStore
-                    // panics until P3-P5.
-                    let url = config
-                        .clickhouse_url
-                        .as_deref()
-                        .expect("clickhouse_url present when backend=Clickhouse");
-                    let ch = crate::storage::ClickHouseBackend::connect(url)
-                        .await
-                        .map_err(|e| anyhow::anyhow!("clickhouse connect: {e}"))?;
-                    ch.apply_migrations()
-                        .await
-                        .map_err(|e| anyhow::anyhow!("clickhouse migrate: {e}"))?;
-                    info!(backend = "clickhouse", "storage initialized");
-                    let store: Arc<dyn Backend> = Arc::new(ch);
-                    let (capsule_used_tx, _rx) = tokio::sync::mpsc::unbounded_channel();
-                    (store, None, capsule_used_tx)
-                }
-                #[cfg(not(feature = "clickhouse"))]
-                {
-                    return Err(anyhow::anyhow!(
-                        "MEM_BACKEND=clickhouse requires building mem with --features clickhouse"
-                    ));
-                }
+                // P2: `ClickHouseBackend` now impls all 11 sub-traits (the
+                // 10 beyond `CapsuleStore` are `unimplemented!()` stubs,
+                // filled in P3-P5), so the blanket impl makes it a
+                // `Backend`. Same assembly shape as the Postgres arm:
+                // connect + idempotently migrate, upcast to
+                // `Arc<dyn Backend>`, skip the lance-Store-level glue
+                // workers (potentiation / last_used — optimizations, not
+                // correctness). `set_transcript_job_provider` is DEFERRED
+                // to P5 (transcript writes are stubbed until then). The
+                // capsule service still gets a live `capsule_used_tx` whose
+                // receiver is dropped. UNVALIDATED — never run against a
+                // real ClickHouse; any read/write outside CapsuleStore
+                // panics until P3-P5.
+                let url = config
+                    .clickhouse_url
+                    .as_deref()
+                    .expect("clickhouse_url present when backend=Clickhouse");
+                let ch = crate::storage::ClickHouseBackend::connect(url)
+                    .await
+                    .map_err(|e| anyhow::anyhow!("clickhouse connect: {e}"))?;
+                ch.apply_migrations()
+                    .await
+                    .map_err(|e| anyhow::anyhow!("clickhouse migrate: {e}"))?;
+                info!(backend = "clickhouse", "storage initialized");
+                let store: Arc<dyn Backend> = Arc::new(ch);
+                let (capsule_used_tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+                (store, None, capsule_used_tx)
             }
         };
 

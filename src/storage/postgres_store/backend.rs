@@ -13,9 +13,9 @@
 //! `ensure_query_indexes` no-ops are deliberate (no Lance-manifest analog
 //! on Postgres).
 //!
-//! Behind the `postgres` cargo feature (this whole module is only
-//! `mod`'d under `#[cfg(feature = "postgres")]`), so the default build
-//! never pulls it in.
+//! Compiled into every build (a default dependency — no cargo feature
+//! gates it). The backend is selected at runtime via `MEM_BACKEND=postgres`
+//! + `MEM_POSTGRES_URL`.
 
 use async_trait::async_trait;
 

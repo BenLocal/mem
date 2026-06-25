@@ -37,14 +37,14 @@ The MCP server forwards 20 tools to the HTTP service over `MEM_BASE_URL` (defaul
 | Backend | Select with | Storage | Notes |
 |---------|-------------|---------|-------|
 | **Lance** (default) | `MEM_BACKEND=lance` (or unset) | On-disk Lance datasets at `MEM_DB_PATH`, read natively via the lancedb Rust API — vector ANN via lance `nearest_to`, BM25 via an in-RAM Tantivy index, hybrid fused with RRF in Rust | Zero external services. The standard single-node deployment. |
-| **Postgres** | `MEM_BACKEND=postgres` + `MEM_POSTGRES_URL=…` | A Postgres database with the [`pgvector`](https://github.com/pgvector/pgvector) extension | ANN via pgvector, BM25 via `tsvector`/GIN, hybrid recall fused with RRF. Build with `--features postgres`. |
-| **ClickHouse** | `MEM_BACKEND=clickhouse` + `MEM_CLICKHOUSE_URL=…` (creds in the URL) | A ClickHouse server (columnar / OLAP) | ANN via `cosineDistance` over `Array(Float32)`, lexical via substring/token candidates, hybrid fused with RRF in Rust; the update-heavy lifecycle (decay / status / supersede) is modeled as versioned re-inserts into `ReplacingMergeTree`. Build with `--features clickhouse`. Opt-in spike — see [`docs/clickhouse-backend.md`](docs/clickhouse-backend.md). |
+| **Postgres** | `MEM_BACKEND=postgres` + `MEM_POSTGRES_URL=…` | A Postgres database with the [`pgvector`](https://github.com/pgvector/pgvector) extension | ANN via pgvector, BM25 via `tsvector`/GIN, hybrid recall fused with RRF. |
+| **ClickHouse** | `MEM_BACKEND=clickhouse` + `MEM_CLICKHOUSE_URL=…` (creds in the URL) | A ClickHouse server (columnar / OLAP) | ANN via `cosineDistance` over `Array(Float32)`, lexical via substring/token candidates, hybrid fused with RRF in Rust; the update-heavy lifecycle (decay / status / supersede) is modeled as versioned re-inserts into `ReplacingMergeTree`. See [`docs/clickhouse-backend.md`](docs/clickhouse-backend.md). |
 
-The Postgres backend is gated behind the `postgres` cargo feature, so the default build does not pull `sqlx`/`pgvector` into the dependency graph:
+All three backends are compiled into every build (default dependencies — no cargo feature flags), so selecting one is purely a runtime choice:
 
 ```bash
-# Build + run with the Postgres backend.
-cargo build --features postgres
+# Run with the Postgres backend — no special build flags.
+cargo build
 MEM_BACKEND=postgres \
 MEM_POSTGRES_URL='postgres://user:pass@localhost:5432/mem' \
   ./target/debug/mem serve     # or target/release/mem after a release build
@@ -52,7 +52,7 @@ MEM_POSTGRES_URL='postgres://user:pass@localhost:5432/mem' \
 
 - The database must have `pgvector` available (`CREATE EXTENSION vector;` — the image [`pgvector/pgvector:pg16`](https://hub.docker.com/r/pgvector/pgvector) ships it). Schema migrations (`migrations/postgres/0001`–`0004`) are applied idempotently on connect; no manual setup needed.
 - Embedding dimension is provider-dependent (default 1024). The pgvector embedding tables are lazy-created on first upsert with the running provider's dim — changing the embedding provider/dim means recreating those tables.
-- Selecting `MEM_BACKEND=postgres` (or `clickhouse`) without the matching `--features` is a startup error; with the default build, `MEM_BACKEND` is ignored and Lance is always used.
+- Selecting `MEM_BACKEND=postgres` (or `clickhouse`) without its `MEM_*_URL` set is a startup error; with `MEM_BACKEND` unset (or `lance`), Lance is always used.
 
 ## Cross-compile server (Linux binary)
 

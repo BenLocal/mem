@@ -1,22 +1,20 @@
 //! Postgres backend integration tests (postgres-backend.md P1).
 //!
-//! Gated on the `postgres` cargo feature AND a reachable test database:
-//! every test reads `MEM_TEST_POSTGRES_URL` and **skips** (prints +
-//! returns) when it is unset, so the default `cargo test` (no feature,
-//! no DB) stays green and CI's `rust` job is unaffected. To run:
+//! Gated on a reachable test database (the backend itself is a default
+//! dependency, always compiled): every test reads `MEM_TEST_POSTGRES_URL`
+//! and **skips** (prints + returns) when it is unset, so a plain
+//! `cargo test` with no DB stays green and CI's `rust` job is unaffected.
+//! To run:
 //!
 //! ```bash
 //! docker run -d --name mem-pg -e POSTGRES_PASSWORD=mem -e POSTGRES_DB=mem \
 //!   -p 5433:5432 pgvector/pgvector:pg16
 //! MEM_TEST_POSTGRES_URL=postgres://postgres:mem@127.0.0.1:5433/mem \
-//!   cargo test --features postgres --test postgres_backend
+//!   cargo test --test postgres_backend
 //! ```
 //!
-//! P1 validates the existing `PostgresCapsuleStore` scaffold (the
-//! `CapsuleStore` trait) against a real Postgres — the Phase-4 spike
-//! validation that the doc said "needs Docker + testcontainers" and
-//! never ran. Cases mirror `capsule_store_parity.rs`.
-#![cfg(feature = "postgres")]
+//! Validates the `PostgresCapsuleStore` against a real Postgres. Cases
+//! mirror `capsule_store_parity.rs`.
 
 use std::sync::Arc;
 

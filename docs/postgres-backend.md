@@ -2,9 +2,11 @@
 
 > **For agentic workers:** phased plan, repo design-doc convention (cf. `evolution-worker.md`). Each phase is TDD, three-gate-green, committed with `… (closes postgres-backend P#)`. Default backend stays Lance (lance-native); Postgres is opt-in.
 
+> **Update (2026-06-25):** the `postgres` cargo feature was **removed** — the backend is now a **default dependency**, compiled into every build and selected purely at runtime via `MEM_BACKEND=postgres` + `MEM_POSTGRES_URL`. The `--features postgres` flags throughout the P1-P6 log below are **historical**; build/run/test with no feature flag (`cargo build`, `cargo test --test postgres_backend`).
+
 **Goal:** Make `mem serve` able to run entirely on a single Postgres instance — a real peer to the Lance backend, not a degraded one — selected at runtime, with Lance remaining the default.
 
-**Architecture:** A concrete `PostgresBackend` (an `sqlx::PgPool` wrapper) implements all 11 storage sub-traits, so the existing blanket `impl<T> Backend for T` applies unchanged. `app::AppState::from_config` chooses between `Store` (Lance, lance-native) and `PostgresBackend` by `MEM_BACKEND`, upcasting either to `Arc<dyn Backend>` — the rest of the service/worker layer is backend-agnostic already. Semantic search uses **pgvector** (`<=>` cosine + HNSW index); lexical search uses Postgres `tsvector`/GIN; the two fuse with the same RRF the Lance path uses. The whole module is behind the `postgres` cargo feature so the default build never pulls `sqlx`.
+**Architecture:** A concrete `PostgresBackend` (an `sqlx::PgPool` wrapper) implements all 11 storage sub-traits, so the existing blanket `impl<T> Backend for T` applies unchanged. `app::AppState::from_config` chooses between `Store` (Lance, lance-native) and `PostgresBackend` by `MEM_BACKEND`, upcasting either to `Arc<dyn Backend>` — the rest of the service/worker layer is backend-agnostic already. Semantic search uses **pgvector** (`<=>` cosine + HNSW index); lexical search uses Postgres `tsvector`/GIN; the two fuse with the same RRF the Lance path uses. (Originally behind a `postgres` cargo feature; as of 2026-06-25 it is a default dependency — `sqlx` is always in the dep graph.)
 
 **Tech Stack:** Rust, `sqlx` 0.8 (runtime-tokio, tls-rustls, postgres, uuid), **pgvector** Postgres extension, Docker Postgres for integration tests.
 

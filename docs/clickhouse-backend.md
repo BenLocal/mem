@@ -1,6 +1,8 @@
 # ClickHouse Backend Design Plan
 
-> **For agentic workers:** phased plan, repo design-doc convention (cf. `postgres-backend.md` / `evolution-worker.md`). Each phase is TDD, three-gate-green, committed with `… (closes clickhouse-backend P#)`. **Default backend stays Lance (lance-native); ClickHouse is opt-in, behind the `clickhouse` cargo feature.** Default build pulls **zero** new deps and behaves identically.
+> **For agentic workers:** phased plan, repo design-doc convention (cf. `postgres-backend.md` / `evolution-worker.md`). Each phase is TDD, three-gate-green, committed with `… (closes clickhouse-backend P#)`. **Default backend stays Lance (lance-native); ClickHouse is selected at runtime via `MEM_BACKEND=clickhouse`.**
+
+> **Update (2026-06-25):** the `clickhouse` cargo feature was **removed** — the backend is now a **default dependency**, compiled into every build (the `clickhouse` crate + lz4 are always in the dep graph) and selected purely at runtime via `MEM_BACKEND=clickhouse` + `MEM_CLICKHOUSE_URL`. The `--features clickhouse` / `#[cfg(feature="clickhouse")]` references throughout the P1-P6 log below are **historical**; build/run/test with no feature flag (`cargo build`, `cargo test --test clickhouse_backend`).
 
 **Goal:** Let `mem serve` run entirely on a ClickHouse instance — selected at runtime via `MEM_BACKEND=clickhouse` — as a third peer to Lance (default) and Postgres (opt-in). This is a **spike** in the same posture as the Postgres backend: scaffold the full 11-sub-trait surface, feature-gate it, and inventory the pains — *not* a production-blessed backend on day one. **Status (P6, 2026-06-25): the gated test suite has been run against ClickHouse 26.5 — all 10 scenarios pass (see §10 P6).** The per-module "scaffold" labels remain because the gated tests cover the core round-trips, not every method / edge case; production-hardening is still future work.
 

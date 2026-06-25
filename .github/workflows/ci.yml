@@ -46,11 +46,10 @@ jobs:
       - run: cargo clippy --all-targets -- -D warnings
       - run: cargo test
 
-  # Opt-in Postgres backend (the `postgres` cargo feature). Spins up a
-  # pgvector-enabled Postgres service container and runs the
-  # feature-gated parity suite (tests/postgres_backend.rs) + clippy over
-  # the feature-gated code. The default `rust` job above covers
-  # everything else; this only gates the Postgres backend.
+  # Postgres backend parity. The backend is a default dependency now, so the
+  # `rust` job above already compiles + clippy-lints it; this job adds the one
+  # thing that job can't — running tests/postgres_backend.rs against a live
+  # pgvector Postgres (the parity suite self-skips without MEM_TEST_POSTGRES_URL).
   postgres:
     runs-on: ubuntu-latest
     env:
@@ -77,22 +76,20 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           shared-key: rust-postgres
-      # `--features postgres` is additive — it still compiles lance, whose
-      # build script needs a recent protoc (see the `rust` job).
+      # lance's build script needs a recent protoc (see the `rust` job).
       - uses: arduino/setup-protoc@v3
         with:
           version: "27.x"
           repo-token: ${{ secrets.GITHUB_TOKEN }}
-      - run: cargo clippy --features postgres --all-targets -- -D warnings
-      - run: cargo test --features postgres --test postgres_backend
+      # Clippy over this code runs in the `rust` job (default dependency).
+      - run: cargo test --test postgres_backend
         env:
           MEM_TEST_POSTGRES_URL: postgres://postgres:mem@localhost:5432/mem
 
-  # Opt-in ClickHouse backend (the `clickhouse` cargo feature). Spins up a
-  # ClickHouse service container and runs the feature-gated parity suite
-  # (tests/clickhouse_backend.rs) + clippy over the feature-gated code. Like
-  # the postgres job, this only gates the ClickHouse backend; the default
-  # `rust` job covers everything else.
+  # ClickHouse backend parity. Like the postgres job: the backend is a default
+  # dependency (compiled + linted by `rust`), so this job only runs
+  # tests/clickhouse_backend.rs against a live ClickHouse (the suite self-skips
+  # without MEM_TEST_CLICKHOUSE_URL).
   clickhouse:
     runs-on: ubuntu-latest
     env:
@@ -123,14 +120,13 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           shared-key: rust-clickhouse
-      # `--features clickhouse` still compiles lance, whose build script needs
-      # a recent protoc (see the `rust` job).
+      # lance's build script needs a recent protoc (see the `rust` job).
       - uses: arduino/setup-protoc@v3
         with:
           version: "27.x"
           repo-token: ${{ secrets.GITHUB_TOKEN }}
-      - run: cargo clippy --features clickhouse --all-targets -- -D warnings
-      - run: cargo test --features clickhouse --test clickhouse_backend
+      # Clippy over this code runs in the `rust` job (default dependency).
+      - run: cargo test --test clickhouse_backend
         env:
           MEM_TEST_CLICKHOUSE_URL: http://mem:mem@localhost:8123
 
