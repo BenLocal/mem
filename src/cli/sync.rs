@@ -7,7 +7,10 @@ use clap::Args;
 
 use crate::config::{BackendKind, Config};
 use crate::embedding::{arc_embedding_provider, EmbeddingProvider};
-use crate::storage::{Backend, ClickHouseBackend, PostgresCapsuleStore, Store};
+use crate::storage::types::EmbeddingJobInsert;
+use crate::storage::{
+    current_timestamp, Backend, CapsuleStore, ClickHouseBackend, PostgresCapsuleStore, Store,
+};
 
 /// One data domain copied independently, in this dependency order.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
@@ -100,6 +103,121 @@ async fn open_backend(
             Ok(Arc::new(ch))
         }
     }
+}
+
+/// Copy all capsules (every status, all version links) from `src` to `dst`
+/// for one `tenant`. Already-present ids are skipped (idempotent). Enqueues
+/// embedding jobs on the target so the destination `mem serve`'s worker can
+/// rebuild vectors. Returns a per-tenant tally.
+async fn copy_capsules(
+    src: &dyn Backend,
+    dst: &dyn Backend,
+    tenant: &str,
+    batch_size: usize,
+    dry_run: bool,
+    verbose: bool,
+) -> DomainReport {
+    let mut report = DomainReport::default();
+
+    let head_ids = match src.list_capability_capsule_ids_for_tenant(tenant).await {
+        Ok(ids) => ids,
+        Err(e) => {
+            eprintln!("capsules[{tenant}]: list ids failed: {e}");
+            report.failed += 1;
+            return report;
+        }
+    };
+
+    // Collect EVERY version id (all statuses), not just active heads.
+    let mut all_ids: Vec<String> = Vec::new();
+    for head in &head_ids {
+        match src
+            .list_capability_capsule_versions_for_tenant(tenant, head)
+            .await
+        {
+            Ok(links) => all_ids.extend(links.into_iter().map(|l| l.capability_capsule_id)),
+            Err(_) => all_ids.push(head.clone()),
+        }
+    }
+    all_ids.sort();
+    all_ids.dedup();
+    let total = all_ids.len();
+
+    let present: std::collections::HashSet<String> = dst
+        .list_capability_capsule_ids_for_tenant(tenant)
+        .await
+        .unwrap_or_default()
+        .into_iter()
+        .collect();
+    let todo: Vec<String> = all_ids
+        .into_iter()
+        .filter(|id| !present.contains(id))
+        .collect();
+    report.skipped = (total - todo.len()) as u64;
+
+    let now = current_timestamp();
+    let provider_id = crate::config::Config::from_env()
+        .map(|c| c.embedding.job_provider_id().to_string())
+        .unwrap_or_else(|_| "fake".to_string());
+
+    for chunk in todo.chunks(batch_size) {
+        let id_refs: Vec<&str> = chunk.iter().map(|s| s.as_str()).collect();
+        let rows = match CapsuleStore::fetch_capability_capsules_by_ids(src, tenant, &id_refs).await
+        {
+            Ok(r) => r,
+            Err(e) => {
+                eprintln!("capsules[{tenant}]: fetch failed: {e}");
+                report.failed += chunk.len() as u64;
+                continue;
+            }
+        };
+        if dry_run {
+            report.copied += rows.len() as u64;
+            continue;
+        }
+        if let Err(e) = dst.insert_capability_capsules(&rows).await {
+            eprintln!("capsules[{tenant}]: insert failed: {e}");
+            report.failed += rows.len() as u64;
+            continue;
+        }
+        let jobs: Vec<EmbeddingJobInsert> = rows
+            .iter()
+            .map(|r| EmbeddingJobInsert {
+                job_id: uuid::Uuid::now_v7().to_string(),
+                tenant: tenant.to_string(),
+                capability_capsule_id: r.capability_capsule_id.clone(),
+                target_content_hash: r.content_hash.clone(),
+                provider: provider_id.clone(),
+                available_at: now.clone(),
+                created_at: now.clone(),
+                updated_at: now.clone(),
+            })
+            .collect();
+        if let Err(e) = dst.enqueue_embedding_jobs(&jobs).await {
+            eprintln!("capsules[{tenant}]: enqueue embed jobs failed: {e}");
+            // Rows landed; vectors just won't rebuild for this batch. Not a row failure.
+        }
+        report.copied += rows.len() as u64;
+        if verbose {
+            println!(
+                "  capsules[{tenant}]: +{} (total {})",
+                rows.len(),
+                report.copied
+            );
+        }
+    }
+    report
+}
+
+/// Test seam: integration tests call the capsule copier directly.
+#[doc(hidden)]
+pub async fn copy_capsules_for_test(
+    src: &dyn Backend,
+    dst: &dyn Backend,
+    tenant: &str,
+    batch_size: usize,
+) -> DomainReport {
+    copy_capsules(src, dst, tenant, batch_size, false, false).await
 }
 
 /// Entry point. Returns process exit code (`0` clean, `1` if any batch failed
