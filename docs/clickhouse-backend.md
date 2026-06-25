@@ -329,3 +329,19 @@ CREATE TABLE evolution_candidates (
 | P4 | 混合 CapsuleSearchStore(词法候选 + 向量 + Rust RRF)| 召回软 parity(overlap@10≥0.8)绿 |
 | P5 | 其余 8 trait(graph Rust-BFS / transcript / jobs / entity / session / maint / cursor / evolution)| 各自 parity 绿,逐 trait commit |
 | P6 | 端到端 mem serve on CH + CI + 文档 | e2e 全链路绿;Lance 回归绿;pain inventory 落 backend-coupling.md |
+
+---
+
+## 10. P1 实测 pain inventory(scaffold landed 2026-06-25)
+
+P1(CapsuleStore + 测试基建)已落地:`cargo build` / `clippy --all-targets` 默认绿 + `--features clickhouse` build/clippy 绿 + 默认 `cargo test` 回归绿(36 binary / 0 失败);CapsuleStore 全 impl(`accept_pending`/`reject_pending` 走 trait 默认实现,故 18 个非默认方法体);仍 **UNVALIDATED**(无真实 ClickHouse)。实测撞到的 pain:
+
+1. **RowBinary enum 映射**:`clickhouse` 0.15 的 RowBinary 把 serde enum 映射成与 `LowCardinality(String)` 不符的 repr → 每个枚举列改存 `String`,经 `serde_json` 转换(多一层;`enum_to_str` / `enum_from_str` helper)。
+2. **无 `Nullable`(§6 设计)**:`Some("")` 与 `None` 不可区分 → 约定空串 = `None`(`opt()` helper),`''` round-trip 读成 `None`。坐实未决点 #2。
+3. **Pain #4 原子性**:`apply_feedback` / `replace_pending_with_successor` 是两次独立 insert,CH 无事务 → 契约保持「NOT atomic」,**无需改 trait**(CH 是这条契约「必须最弱」的第三实证)。
+4. **Pain #3(COALESCE / 动态 SET)**:被 §4(a)「读-改-整行版本化重插」消解——根本没有部分 `SET` 要表达。
+5. **`row_version` = 墙钟 ms**:同一 ms 内两次写在 ReplacingMergeTree 下会 tie(per-process `AtomicU64` 可加固;未跑过,理论风险)。
+6. **`parse_backend` 元组扩容**(2→3,加 `clickhouse_url`)波及 5 处调用含 4 个测试——小,但「config 形状即契约」。
+7. **app.rs 无法 erase 成 `Arc<dyn Backend>`**(P1 只 impl 了 CapsuleStore)→ Clickhouse arm 两个 cfg 都 `return Err`;具体坐实伞 trait 的「全 11 或全无」耦合(完整装配 = P2)。
+8. **删除级联 P1 只覆盖 2 表**(`capability_capsules` + `feedback_events`);embedding/job 卫星表的级联待其 schema 落地(P3)。
+9. **读形态用 `FINAL`(非 argMax)**:P1 为简单正确统一用 `… FINAL`;`argMax(…) GROUP BY pk` 热路径优化注明留后(validation 测出 FINAL 太慢再切)。

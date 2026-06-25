@@ -22,6 +22,8 @@ pub mod capsule_store;
 // callers go through `Backend` (umbrella) or one of the 9 sub-traits —
 // never the concrete type. `pub(crate)` blocks cross-crate access;
 // intra-storage modules still see it.
+#[cfg(feature = "clickhouse")]
+pub mod clickhouse_store;
 pub mod embedding_job_store;
 pub mod embedding_vector_store;
 pub mod entity_registry;
@@ -46,6 +48,8 @@ pub mod types;
 pub use backend::Backend;
 pub use capsule_search_store::CapsuleSearchStore;
 pub use capsule_store::{CapsuleStore, InMemoryCapsuleStore};
+#[cfg(feature = "clickhouse")]
+pub use clickhouse_store::ClickHouseBackend;
 pub use embedding_job_store::EmbeddingJobStore;
 pub use embedding_vector_store::EmbeddingVectorStore;
 pub use entity_registry::EntityRegistry;

@@ -385,6 +385,9 @@ pub struct Config {
     /// Connection string for the Postgres backend (`MEM_POSTGRES_URL`).
     /// `None` for the Lance backend.
     pub postgres_url: Option<String>,
+    /// Connection string for the ClickHouse backend (`MEM_CLICKHOUSE_URL`,
+    /// e.g. `http://localhost:8123`). `None` unless `backend = Clickhouse`.
+    pub clickhouse_url: Option<String>,
 }
 
 /// Storage backend selector (`MEM_BACKEND`).
@@ -395,31 +398,43 @@ pub enum BackendKind {
     Lance,
     /// Postgres (+ pgvector). Requires the `postgres` cargo feature.
     Postgres,
+    /// ClickHouse. Requires the `clickhouse` cargo feature. UNVALIDATED
+    /// scaffold (clickhouse-backend P1).
+    Clickhouse,
 }
 
-/// Parse `MEM_BACKEND` (`lance` default | `postgres`) + `MEM_POSTGRES_URL`.
-/// `postgres` without a URL is a loud error, not a silent fallback to
-/// Lance — selecting a backend you can't reach should fail at startup.
+/// Parse `MEM_BACKEND` (`lance` default | `postgres` | `clickhouse`) plus the
+/// selected backend's connection URL (`MEM_POSTGRES_URL` / `MEM_CLICKHOUSE_URL`).
+/// Returns `(kind, postgres_url, clickhouse_url)`. Selecting a non-Lance
+/// backend without its URL is a loud error, not a silent fallback to Lance —
+/// a backend you can't reach should fail at startup.
 pub fn parse_backend(
     get: impl Fn(&str) -> Option<String>,
-) -> Result<(BackendKind, Option<String>), ConfigError> {
+) -> Result<(BackendKind, Option<String>, Option<String>), ConfigError> {
     let kind = match get("MEM_BACKEND").map(|s| s.trim().to_ascii_lowercase()) {
         None => BackendKind::Lance,
         Some(s) if s == "lance" || s.is_empty() => BackendKind::Lance,
         Some(s) if s == "postgres" || s == "postgresql" || s == "pg" => BackendKind::Postgres,
+        Some(s) if s == "clickhouse" || s == "ch" => BackendKind::Clickhouse,
         Some(other) => {
             return Err(ConfigError::InvalidBackend(format!(
-                "{other} (expected lance or postgres)"
+                "{other} (expected lance, postgres, or clickhouse)"
             )))
         }
     };
-    let url = get("MEM_POSTGRES_URL").filter(|s| !s.trim().is_empty());
-    if kind == BackendKind::Postgres && url.is_none() {
+    let postgres_url = get("MEM_POSTGRES_URL").filter(|s| !s.trim().is_empty());
+    let clickhouse_url = get("MEM_CLICKHOUSE_URL").filter(|s| !s.trim().is_empty());
+    if kind == BackendKind::Postgres && postgres_url.is_none() {
         return Err(ConfigError::InvalidBackend(
             "MEM_BACKEND=postgres requires MEM_POSTGRES_URL".to_string(),
         ));
     }
-    Ok((kind, url))
+    if kind == BackendKind::Clickhouse && clickhouse_url.is_none() {
+        return Err(ConfigError::InvalidBackend(
+            "MEM_BACKEND=clickhouse requires MEM_CLICKHOUSE_URL".to_string(),
+        ));
+    }
+    Ok((kind, postgres_url, clickhouse_url))
 }
 
 #[derive(Debug, Error)]
@@ -1259,12 +1274,13 @@ impl Config {
             evolution: EvolutionSettings::development_defaults(),
             backend: BackendKind::Lance,
             postgres_url: None,
+            clickhouse_url: None,
         }
     }
 
     pub fn from_env() -> Result<Self, ConfigError> {
         let bind_addr = std::env::var("BIND_ADDR").unwrap_or_else(|_| "127.0.0.1:3000".to_string());
-        let (backend, postgres_url) = parse_backend(|k| std::env::var(k).ok())?;
+        let (backend, postgres_url, clickhouse_url) = parse_backend(|k| std::env::var(k).ok())?;
         Ok(Self {
             bind_addr,
             db_path: default_db_path(),
@@ -1280,6 +1296,7 @@ impl Config {
             evolution: EvolutionSettings::from_env_vars(|k| std::env::var(k).ok())?,
             backend,
             postgres_url,
+            clickhouse_url,
         })
     }
 }
@@ -1628,9 +1645,10 @@ mod tests {
 
     #[test]
     fn backend_defaults_to_lance() {
-        let (kind, url) = parse_backend(|_| None).unwrap();
+        let (kind, pg, ch) = parse_backend(|_| None).unwrap();
         assert_eq!(kind, BackendKind::Lance);
-        assert_eq!(url, None);
+        assert_eq!(pg, None);
+        assert_eq!(ch, None);
     }
 
     #[test]
@@ -1644,13 +1662,36 @@ mod tests {
 
     #[test]
     fn backend_postgres_with_url_ok() {
-        let (kind, url) = parse_backend(env(&[
+        let (kind, pg, ch) = parse_backend(env(&[
             ("MEM_BACKEND", "postgres"),
             ("MEM_POSTGRES_URL", "postgres://localhost/mem"),
         ]))
         .unwrap();
         assert_eq!(kind, BackendKind::Postgres);
-        assert_eq!(url.as_deref(), Some("postgres://localhost/mem"));
+        assert_eq!(pg.as_deref(), Some("postgres://localhost/mem"));
+        assert_eq!(ch, None);
+    }
+
+    #[test]
+    fn backend_clickhouse_requires_url() {
+        // clickhouse selected but no URL → loud error (mirrors postgres).
+        let err = parse_backend(env(&[("MEM_BACKEND", "clickhouse")])).unwrap_err();
+        assert!(
+            matches!(err, ConfigError::InvalidBackend(ref s) if s.contains("MEM_CLICKHOUSE_URL"))
+        );
+    }
+
+    #[test]
+    fn backend_clickhouse_with_url_ok() {
+        // The `ch` alias also resolves to the ClickHouse backend.
+        let (kind, pg, ch) = parse_backend(env(&[
+            ("MEM_BACKEND", "ch"),
+            ("MEM_CLICKHOUSE_URL", "http://localhost:8123"),
+        ]))
+        .unwrap();
+        assert_eq!(kind, BackendKind::Clickhouse);
+        assert_eq!(pg, None);
+        assert_eq!(ch.as_deref(), Some("http://localhost:8123"));
     }
 
     #[test]

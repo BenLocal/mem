@@ -170,6 +170,29 @@ impl AppState {
                     ));
                 }
             }
+            crate::config::BackendKind::Clickhouse => {
+                // clickhouse-backend P1 is a scaffold: `ClickHouseBackend`
+                // implements `CapsuleStore` only, so it can't yet be erased
+                // to `Arc<dyn Backend>`. Both arms return — wiring it as a
+                // full backend lands in P2 (the other 10 sub-traits).
+                #[cfg(feature = "clickhouse")]
+                {
+                    let _url = config
+                        .clickhouse_url
+                        .as_deref()
+                        .expect("clickhouse_url present when backend=Clickhouse");
+                    return Err(anyhow::anyhow!(
+                        "clickhouse backend is a P1 scaffold (CapsuleStore only) — not yet a \
+                         complete Backend; tracked in clickhouse-backend P2"
+                    ));
+                }
+                #[cfg(not(feature = "clickhouse"))]
+                {
+                    return Err(anyhow::anyhow!(
+                        "MEM_BACKEND=clickhouse requires building mem with --features clickhouse"
+                    ));
+                }
+            }
         };
 
         // ── Workers ─────────────────────────────────────────────

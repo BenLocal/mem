@@ -14,11 +14,19 @@ default = []
 # Default build is unaffected; no sqlx pulled into the dep graph
 # unless the feature is on. See `docs/backend-coupling.md` §6.5.
 postgres = ["dep:sqlx", "dep:pgvector"]
+# ClickHouse spike (clickhouse-backend.md) — opt-in third backend. Adds the
+# `clickhouse` crate + ClickHouseBackend behind `cargo build --features
+# clickhouse`. Default build is unaffected; the crate is not pulled into the
+# dep graph unless the feature is on. UNVALIDATED scaffold (P1).
+clickhouse = ["dep:clickhouse"]
 
 [dependencies]
 # Optional: Phase 4 Postgres spike. Gated behind the `postgres`
 # feature so the default build doesn't pull sqlx + libpq machinery.
 sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "tls-rustls", "postgres", "uuid"], optional = true }
+# Optional: ClickHouse spike. Gated behind the `clickhouse` feature so the
+# default build doesn't pull the clickhouse-rs HTTP client / lz4 machinery.
+clickhouse = { version = "0.15", default-features = false, features = ["lz4"], optional = true }
 # Optional: pgvector binding for the Postgres EmbeddingVectorStore (P3).
 # `pgvector::Vector` implements sqlx Encode/Decode for the PG `vector`
 # type. Only pulled in under the `postgres` feature.
