@@ -21,7 +21,12 @@ release: ## Release build
 	$(CARGO) build --release
 
 install: release ## Install to ~/.cargo/bin
-	$(CARGO) install --path .
+	# --locked: `cargo install` otherwise IGNORES Cargo.lock and re-resolves,
+	# which pulls pgvector's sqlx onto sqlx-core 0.9.0 while our sqlx stays
+	# 0.8.6 → two sqlx-core versions → pgvector::Vector fails its sqlx
+	# Encode/Decode/Type bounds. Now that postgres/clickhouse are default deps
+	# (always compiled), the install MUST use the tested locked resolution.
+	$(CARGO) install --path . --locked
 
 # ==== Run (matches the subcommands listed in AGENTS.md) ====
 
