@@ -54,6 +54,30 @@ MEM_POSTGRES_URL='postgres://user:pass@localhost:5432/mem' \
 - Embedding dimension is provider-dependent (default 1024). The pgvector embedding tables are lazy-created on first upsert with the running provider's dim — changing the embedding provider/dim means recreating those tables.
 - Selecting `MEM_BACKEND=postgres` (or `clickhouse`) without its `MEM_*_URL` set is a startup error; with `MEM_BACKEND` unset (or `lance`), Lance is always used.
 
+### Migrating between backends (`mem sync`)
+
+`mem sync` copies all data **verbatim** from one backend to another — any → any across Lance / Postgres / ClickHouse — so you can migrate a local Lance store into Postgres or ClickHouse (or roll back):
+
+```bash
+# Dry-run first (reads + counts, writes nothing):
+mem sync --from lance:/root/.mem/mem.lance \
+         --to clickhouse:http://mem:mem@localhost:8123 \
+         --tenant local --dry-run --verbose
+
+# Then for real:
+mem sync --from lance:/root/.mem/mem.lance \
+         --to clickhouse:http://mem:mem@localhost:8123 \
+         --tenant local
+```
+
+- **`--from` / `--to`** are `<kind>:<locator>` specs: `lance:<dir>`, `postgres:<url>`, `clickhouse:<url>`.
+- **`--tenant`** is required and repeatable — there is no tenant-enumeration read, so name each tenant explicitly.
+- **`--domains`** copies a subset (default: all five, in dependency order): `entities,capsules,episodes,transcripts,graph`.
+- Rows are copied **verbatim** (original ids / timestamps / lifecycle state preserved), not re-ingested, and the copy is **idempotent** — re-running skips rows already present in the target, so it resumes after an interruption.
+- **Embeddings are rebuilt on the target:** sync copies rows + enqueues embedding jobs; the target's `mem serve` embedding worker fills the vectors (source and target may use different embedding providers/dims).
+
+**Known v1 limitations** (all from using only existing read methods): tenants must be named explicitly; entity-table rows are best-effort — `resolve_or_create` remints `entity_id`, so migrated entities won't link to the copied edges (the graph edges themselves are copied verbatim); only active graph edges are reconstructed; operational tables (embedding jobs, mine cursors, raw sessions) are skipped. Opening a Lance **source** holds an advisory single-writer lock, so stop any `mem serve` running on the source dir during migration.
+
 ## Cross-compile server (Linux binary)
 
 The config file is **`Cross.toml`** at the repo root (the `cross` CLI always reads that exact filename; set the `CROSS_CONFIG` environment variable to use a different path).
