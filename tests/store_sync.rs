@@ -56,6 +56,13 @@ async fn syncs_capsules_lance_to_lance() {
     assert_eq!(ids.len(), 2);
     assert!(ids.contains(&"c1".to_string()));
 
+    // Verbatim-content round-trip: fetching c1 from dst preserves content_hash.
+    let rows = mem::storage::CapsuleStore::fetch_capability_capsules_by_ids(&dst, "local", &["c1"])
+        .await
+        .unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].content_hash, "hash-c1");
+
     // Re-run is idempotent.
     let again = mem::cli::sync::copy_capsules_for_test(&src, &dst, "local", 100).await;
     assert_eq!(again.copied, 0);

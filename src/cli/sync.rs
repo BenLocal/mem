@@ -116,6 +116,7 @@ async fn copy_capsules(
     batch_size: usize,
     dry_run: bool,
     verbose: bool,
+    provider_id: &str,
 ) -> DomainReport {
     let mut report = DomainReport::default();
 
@@ -136,7 +137,12 @@ async fn copy_capsules(
             .await
         {
             Ok(links) => all_ids.extend(links.into_iter().map(|l| l.capability_capsule_id)),
-            Err(_) => all_ids.push(head.clone()),
+            Err(e) => {
+                eprintln!(
+                    "capsules[{tenant}]: version-walk failed for {head}: {e} (copying head only)"
+                );
+                all_ids.push(head.clone());
+            }
         }
     }
     all_ids.sort();
@@ -149,18 +155,15 @@ async fn copy_capsules(
         .unwrap_or_default()
         .into_iter()
         .collect();
-    let todo: Vec<String> = all_ids
+    let to_copy: Vec<String> = all_ids
         .into_iter()
         .filter(|id| !present.contains(id))
         .collect();
-    report.skipped = (total - todo.len()) as u64;
+    report.skipped = (total - to_copy.len()) as u64;
 
     let now = current_timestamp();
-    let provider_id = crate::config::Config::from_env()
-        .map(|c| c.embedding.job_provider_id().to_string())
-        .unwrap_or_else(|_| "fake".to_string());
 
-    for chunk in todo.chunks(batch_size) {
+    for chunk in to_copy.chunks(batch_size) {
         let id_refs: Vec<&str> = chunk.iter().map(|s| s.as_str()).collect();
         let rows = match CapsuleStore::fetch_capability_capsules_by_ids(src, tenant, &id_refs).await
         {
@@ -187,7 +190,7 @@ async fn copy_capsules(
                 tenant: tenant.to_string(),
                 capability_capsule_id: r.capability_capsule_id.clone(),
                 target_content_hash: r.content_hash.clone(),
-                provider: provider_id.clone(),
+                provider: provider_id.to_string(),
                 available_at: now.clone(),
                 created_at: now.clone(),
                 updated_at: now.clone(),
@@ -217,7 +220,7 @@ pub async fn copy_capsules_for_test(
     tenant: &str,
     batch_size: usize,
 ) -> DomainReport {
-    copy_capsules(src, dst, tenant, batch_size, false, false).await
+    copy_capsules(src, dst, tenant, batch_size, false, false, "fake").await
 }
 
 /// Entry point. Returns process exit code (`0` clean, `1` if any batch failed
