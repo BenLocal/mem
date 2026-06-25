@@ -31,6 +31,12 @@ COPY src ./src
 # even with `--bin mem`. Copying examples too is cheaper than dropping
 # the declarations.
 COPY examples ./examples
+# The postgres + clickhouse backends are default dependencies (since
+# 2026-06-25 — no longer feature-gated), so the default `cargo build`
+# compiles their stores, which `include_str!("../../../migrations/…")` the
+# schema SQL at COMPILE time. The migration files must be in the build
+# context or the build fails with "No such file or directory".
+COPY migrations ./migrations
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/build/target \
     cargo build --release --bin mem && \
