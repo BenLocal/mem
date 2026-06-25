@@ -6,4 +6,5 @@ pub mod init;
 pub mod mcp;
 pub mod mine;
 pub mod serve;
+pub mod sync;
 pub mod wake_up;
