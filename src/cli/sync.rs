@@ -541,65 +541,66 @@ async fn run_inner(args: SyncArgs) -> anyhow::Result<i32> {
     };
 
     let provider_id = config.embedding.job_provider_id();
+    let grand = run_domains(
+        src.as_ref(),
+        dst.as_ref(),
+        &args.tenants,
+        &domains,
+        args.batch_size,
+        args.dry_run,
+        args.verbose,
+        provider_id,
+    )
+    .await;
+    println!(
+        "sync done{}: copied={} skipped={} failed={}",
+        if args.dry_run { " (dry-run)" } else { "" },
+        grand.copied,
+        grand.skipped,
+        grand.failed
+    );
+    Ok(if grand.failed > 0 { 1 } else { 0 })
+}
+
+/// Run the per-`(tenant, domain)` copy loop over two already-opened backends.
+/// Extracted from [`run_inner`] so the orchestration — domain-subset selection,
+/// tenant×domain iteration, per-domain dispatch, and grand tally — is testable
+/// without `Config::from_env` or backend opening. The Capsules arm gets the
+/// extra `provider_id` (for the embedding-job rows it enqueues); the other four
+/// share the uniform copier shape. Returns the summed `DomainReport`.
+///
+/// `#[doc(hidden)] pub` is the test seam (integration tests drive this directly
+/// with two fake-provider temp Lance stores).
+#[doc(hidden)]
+#[allow(clippy::too_many_arguments)] // mirrors the CLI knob set; bundling into a struct buys nothing for one call site
+pub async fn run_domains(
+    src: &dyn Backend,
+    dst: &dyn Backend,
+    tenants: &[String],
+    domains: &[Domain],
+    batch_size: usize,
+    dry_run: bool,
+    verbose: bool,
+    provider_id: &str,
+) -> DomainReport {
     let mut grand = DomainReport::default();
-    for tenant in &args.tenants {
-        for domain in &domains {
+    for tenant in tenants {
+        for domain in domains {
             let r = match domain {
                 Domain::Entities => {
-                    copy_entities(
-                        src.as_ref(),
-                        dst.as_ref(),
-                        tenant,
-                        args.batch_size,
-                        args.dry_run,
-                        args.verbose,
-                    )
-                    .await
+                    copy_entities(src, dst, tenant, batch_size, dry_run, verbose).await
                 }
                 Domain::Capsules => {
-                    copy_capsules(
-                        src.as_ref(),
-                        dst.as_ref(),
-                        tenant,
-                        args.batch_size,
-                        args.dry_run,
-                        args.verbose,
-                        provider_id,
-                    )
-                    .await
+                    copy_capsules(src, dst, tenant, batch_size, dry_run, verbose, provider_id).await
                 }
                 Domain::Episodes => {
-                    copy_episodes(
-                        src.as_ref(),
-                        dst.as_ref(),
-                        tenant,
-                        args.batch_size,
-                        args.dry_run,
-                        args.verbose,
-                    )
-                    .await
+                    copy_episodes(src, dst, tenant, batch_size, dry_run, verbose).await
                 }
                 Domain::Transcripts => {
-                    copy_transcripts(
-                        src.as_ref(),
-                        dst.as_ref(),
-                        tenant,
-                        args.batch_size,
-                        args.dry_run,
-                        args.verbose,
-                    )
-                    .await
+                    copy_transcripts(src, dst, tenant, batch_size, dry_run, verbose).await
                 }
                 Domain::Graph => {
-                    copy_graph_edges(
-                        src.as_ref(),
-                        dst.as_ref(),
-                        tenant,
-                        args.batch_size,
-                        args.dry_run,
-                        args.verbose,
-                    )
-                    .await
+                    copy_graph_edges(src, dst, tenant, batch_size, dry_run, verbose).await
                 }
             };
             println!(
@@ -611,14 +612,7 @@ async fn run_inner(args: SyncArgs) -> anyhow::Result<i32> {
             grand.failed += r.failed;
         }
     }
-    println!(
-        "sync done{}: copied={} skipped={} failed={}",
-        if args.dry_run { " (dry-run)" } else { "" },
-        grand.copied,
-        grand.skipped,
-        grand.failed
-    );
-    Ok(if grand.failed > 0 { 1 } else { 0 })
+    grand
 }
 
 /// Parse a `--from` / `--to` spec of the form `<kind>:<locator>` into a

@@ -282,3 +282,72 @@ async fn syncs_capsules_lance_to_postgres() {
     assert_eq!(report.failed, 0);
     assert!(report.copied >= 1);
 }
+
+/// Orchestration layer (`run_domains`): `--domains` subset selection only runs
+/// the chosen domains, the grand tally sums across them, and `--dry-run`
+/// counts without writing. Drives two fake-provider temp Lance stores directly,
+/// bypassing `Config::from_env` / backend opening.
+#[tokio::test]
+async fn orchestration_honors_domain_subset_and_dry_run() {
+    let (_sd, src) = temp_lance().await;
+    src.insert_capability_capsules(&[sample_capsule("c1", "local")])
+        .await
+        .unwrap();
+    src.resolve_or_create("local", "Svc", EntityKind::Module, "20260625T000000000")
+        .await
+        .unwrap();
+
+    // Subset = only Capsules → the Entities domain must NOT run.
+    let (_td, dst) = temp_lance().await;
+    let grand = mem::cli::sync::run_domains(
+        &src,
+        &dst,
+        &["local".to_string()],
+        &[mem::cli::sync::Domain::Capsules],
+        100,
+        false, // dry_run
+        false, // verbose
+        "fake",
+    )
+    .await;
+    assert_eq!(grand.copied, 1, "only the capsule should be copied");
+    assert_eq!(grand.failed, 0);
+    assert_eq!(
+        dst.list_capability_capsule_ids_for_tenant("local")
+            .await
+            .unwrap()
+            .len(),
+        1
+    );
+    assert_eq!(
+        dst.list_entities("local", None, None, 100)
+            .await
+            .unwrap()
+            .len(),
+        0,
+        "entities domain was excluded by the subset"
+    );
+
+    // Dry-run: tallies what it would copy but writes nothing.
+    let (_td2, dst2) = temp_lance().await;
+    let dry = mem::cli::sync::run_domains(
+        &src,
+        &dst2,
+        &["local".to_string()],
+        &[mem::cli::sync::Domain::Capsules],
+        100,
+        true, // dry_run
+        false,
+        "fake",
+    )
+    .await;
+    assert_eq!(dry.copied, 1);
+    assert_eq!(
+        dst2.list_capability_capsule_ids_for_tenant("local")
+            .await
+            .unwrap()
+            .len(),
+        0,
+        "dry-run must not write to the target"
+    );
+}
