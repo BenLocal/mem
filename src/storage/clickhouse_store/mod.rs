@@ -10,8 +10,11 @@
 //! erase to `Arc<dyn Backend>` — wired into `app::from_config`. **P3** fills
 //! [`EmbeddingVectorStore`] for real ([`embedding`]); **P4** fills
 //! [`CapsuleSearchStore`] ([`search`] — hybrid recall: lexical candidate +
-//! `cosineDistance` ANN + Rust-side RRF); P5 (the rest) remain
-//! `unimplemented!()` stubs. The whole module sits behind
+//! `cosineDistance` ANN + Rust-side RRF); **P5** fills the remaining 8
+//! ([`graph`], [`transcript`], [`jobs`], [`entity`], [`session`],
+//! [`maintenance`], [`cursor`], [`evolution`]) — so all 11 sub-traits are
+//! now real and `ClickHouseBackend` is a fully-wired (still UNVALIDATED)
+//! [`Backend`]. The whole module sits behind
 //! `#[cfg(feature = "clickhouse")]`, so the default build pulls neither the
 //! `clickhouse` crate nor this code.
 //!
@@ -20,8 +23,15 @@
 
 mod backend;
 mod capsule_store;
+mod cursor;
 mod embedding;
+mod entity;
+mod evolution;
+mod graph;
+mod jobs;
+mod maintenance;
 mod search;
-mod stubs;
+mod session;
+mod transcript;
 
 pub use backend::ClickHouseBackend;

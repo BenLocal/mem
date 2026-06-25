@@ -36,7 +36,7 @@ pub(super) fn ch_err(e: clickhouse::error::Error) -> StorageError {
 
 /// `''` ⇒ `None`, else `Some(s)` — the empty-string-as-absent convention
 /// the §6 DDL uses (CH `String` columns, not `Nullable`).
-fn opt(s: String) -> Option<String> {
+pub(super) fn opt(s: String) -> Option<String> {
     if s.is_empty() {
         None
     } else {
@@ -56,7 +56,7 @@ pub(super) fn now_version() -> u64 {
 }
 
 /// Serialize a snake_case serde enum to its string form for a CH column.
-fn enum_to_str<T: Serialize>(v: &T) -> String {
+pub(super) fn enum_to_str<T: Serialize>(v: &T) -> String {
     serde_json::to_value(v)
         .ok()
         .and_then(|j| j.as_str().map(str::to_owned))
@@ -65,7 +65,7 @@ fn enum_to_str<T: Serialize>(v: &T) -> String {
 
 /// Parse a CH enum string back to a serde enum (falls back to `Default`
 /// on an unrecognised value — forward-compat with future variants).
-fn enum_from_str<T: serde::de::DeserializeOwned + Default>(s: &str) -> T {
+pub(super) fn enum_from_str<T: serde::de::DeserializeOwned + Default>(s: &str) -> T {
     serde_json::from_value(serde_json::Value::String(s.to_owned())).unwrap_or_default()
 }
 

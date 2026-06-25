@@ -405,3 +405,25 @@ P4 把 `CapsuleSearchStore`(9 方法)从 stub 升为真实现(`src/storage/click
 19. **ANN 距离度量:CH `cosineDistance` vs lance `_distance`(L2)**:lance ANN 默认返 L2 距离(transcript 侧用 `1 - L²/2` 反推 cosine,即向量是**归一化**的)。归一化向量下 L2 与 cosine **排序一致**,故 ranking parity 成立;若未来出现未归一化向量两者会分叉——记为已知前提。
 20. **pool/version 读是「load 全租户 + Rust 过滤」**:与 lance 同策略(高 parity),但每次 O(租户行数) 全量拉取;超大租户下是全扫描。下推 `WHERE`/`LIMIT` 可优化,但会偏离 lance 的 Rust 逻辑、增加 parity 风险——scaffold 阶段选择忠实复刻。
 21. **`fetch_capability_capsules_by_ids` 双 trait 同名**:`CapsuleStore` 与 `CapsuleSearchStore` 都声明它,`ClickHouseBackend` 两边都 impl;search 版直接 `CapsuleStore::fetch_capability_capsules_by_ids(self, …)` 委托,零重复。
+
+### P5(2026-06-25):其余 8 个 trait —— ClickHouseBackend 成为完整 Backend
+
+P5 把剩余 8 个 sub-trait 从 stub 升为真实现,`stubs.rs` 删除——**ClickHouseBackend 现已 impl 全 11 个 trait,是一个完整(仍 UNVALIDATED)的 Backend**。新增 migration `0003`(graph_edges / conversation_messages / embedding_jobs / transcript_embedding_jobs)+ `0004`(entities / entity_aliases / sessions / episodes / mine_cursors / evolution_candidates);`apply_migrations` 现按序跑 0001-0004。一文件一 trait:`graph.rs` / `transcript.rs` / `jobs.rs` / `entity.rs` / `session.rs` / `maintenance.rs` / `cursor.rs` / `evolution.rs`。门禁:默认 fmt+clippy 绿 + `--features clickhouse` build/clippy 绿。
+
+| 子 trait | 关键实现 |
+|---|---|
+| `GraphStore` | `graph_edges` ReplacingMergeTree;`valid_to=''`=active;多跳 `neighbors_within`/`follow_tunnels`/`related_*` = 一次读活动边 + Rust 迭代 BFS(MAX_HOPS_CAP=3);边关闭 = `ALTER … UPDATE valid_to`(mutation) |
+| `TranscriptStore` | `conversation_messages` 追加;`semantic_search_transcripts` = cosineDistance + GROUP BY message_block_id chunk-collapse + 水合;`bm25_transcript_candidates` = substring 候选;embed-eligible 写时入队 `transcript_embedding_jobs` |
+| `EmbeddingJobStore` | 两条队列;状态变更 = 读改整行版本化重插;`claim_next_n` = best-effort claim(见下) |
+| `EntityRegistry` | `entities`+`entity_aliases`;alias normalize 复用 `pipeline::entity_normalize`;新实体 `uuid::Uuid::now_v7()` |
+| `SessionStore` | session touch/close = 读改重插;episode 追加;`workflow_candidate` 存 JSON 串 |
+| `MaintenanceStore` | 只 impl 3 个必需;decay = `ALTER UPDATE`(worst-case mutation);vacuum = `OPTIMIZE TABLE … FINAL`(语义≠Lance manifest);auto_promote = 只读 SELECT |
+| `MineCursorStore` / `EvolutionCandidateStore` | 直版本化 insert + FINAL 读 |
+
+**P5 决策:** graph `valid_to=''`=active(落地未决点 #2 的 ''-as-absent 方向);**EmbeddingJobStore non-atomic claim**(CH 无 `FOR UPDATE SKIP LOCKED`/事务,`claim_next_n` 只能 best-effort,两 worker 可能抢同一 job;mem 嵌入 worker 实际单例,可接受——坐实 §2/§4 队列原语弱于 Postgres);decay/边关闭/批量 stale 用 `ALTER … UPDATE/DELETE` 异步 mutation(scaffold 接受,validation 阶段考虑全版本化重插或 TTL);transcript 嵌入 provider 推迟(入队 job `provider=''`)。
+
+**P5 新 pain:**
+22. 多跳 BFS 读全量活动边(边集大时全表扫;`as_of` 点时查询未实现,只查当前活动集)。
+23. `*_paged`/`*_in_range` 的 `since`/`until`/`role`/`block_type`/`cursor` 参数当前被忽略(只返回前 `limit+1` 行)——validation 补谓词下推。
+24. mutation 不返回 affected-count(`invalidate_edge`/`close_edges_*`/`delete_*` 统一返回占位 1/0)。
+25. GraphEdge 数值 Option 列(confidence/strength/stability/access_count)存非 Nullable,读回一律 `Some(value)`,0/None 不可分(pain #2 同类)。

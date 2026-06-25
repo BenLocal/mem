@@ -19,11 +19,15 @@
 mod ch {
     use std::sync::Arc;
 
+    use mem::domain::capability_capsule::GraphEdge;
     use mem::domain::capability_capsule::{
         CapabilityCapsuleRecord, CapabilityCapsuleStatus, CapabilityCapsuleType, Scope, Visibility,
     };
+    use mem::domain::EntityKind;
+    use mem::storage::types::EmbeddingJobInsert;
     use mem::storage::{
-        current_timestamp, CapsuleStore, ClickHouseBackend, EmbeddingVectorStore, FeedbackEvent,
+        current_timestamp, CapsuleStore, ClickHouseBackend, EmbeddingJobStore,
+        EmbeddingVectorStore, EntityRegistry, FeedbackEvent, GraphStore,
     };
 
     fn fixture(id: &str, status: CapabilityCapsuleStatus) -> CapabilityCapsuleRecord {
@@ -289,6 +293,83 @@ mod ch {
         let summary = store.feedback_summary("ch_fb").await.unwrap();
         assert_eq!(summary.useful, 1);
         assert_eq!(summary.total, 1);
+    }
+
+    fn edge(from: &str, to: &str, rel: &str) -> GraphEdge {
+        GraphEdge {
+            from_node_id: from.into(),
+            to_node_id: to.into(),
+            relation: rel.into(),
+            valid_from: current_timestamp(),
+            valid_to: None,
+            confidence: Some(1.0),
+            extractor: Some("test".into()),
+            strength: None,
+            stability: None,
+            last_activated: None,
+            access_count: None,
+        }
+    }
+
+    /// P5 GraphStore: sync edges, then `neighbors` finds the incident active edge.
+    #[tokio::test]
+    async fn graph_sync_and_neighbors() {
+        let Some(be) = ch_backend().await else { return };
+        let now = current_timestamp();
+        be.sync_memory_edges(&[edge("a", "b", "rel:x")], &now)
+            .await
+            .unwrap();
+        let n = be.neighbors("a").await.unwrap();
+        assert!(n
+            .iter()
+            .any(|e| e.to_node_id == "b" && e.relation == "rel:x"));
+    }
+
+    /// P5 EntityRegistry: resolve creates an entity; a second resolve of the
+    /// same alias returns the same id; get_entity surfaces it.
+    #[tokio::test]
+    async fn entity_resolve_is_idempotent() {
+        let Some(be) = ch_backend().await else { return };
+        let now = current_timestamp();
+        let id1 = be
+            .resolve_or_create("t", "Rust", EntityKind::Topic, &now)
+            .await
+            .unwrap();
+        let id2 = be
+            .resolve_or_create("t", "rust", EntityKind::Topic, &now)
+            .await
+            .unwrap();
+        assert_eq!(id1, id2);
+        let got = be.get_entity("t", &id1).await.unwrap().unwrap();
+        assert_eq!(got.entity.canonical_name, "Rust");
+    }
+
+    /// P5 EmbeddingJobStore: enqueue → claim → complete moves the status.
+    #[tokio::test]
+    async fn embedding_job_enqueue_claim_complete() {
+        let Some(be) = ch_backend().await else { return };
+        let now = current_timestamp();
+        let ok = be
+            .try_enqueue_embedding_job(EmbeddingJobInsert {
+                job_id: "j1".into(),
+                tenant: "t".into(),
+                capability_capsule_id: "cap1".into(),
+                target_content_hash: "h1".into(),
+                provider: "fake".into(),
+                available_at: now.clone(),
+                created_at: now.clone(),
+                updated_at: now.clone(),
+            })
+            .await
+            .unwrap();
+        assert!(ok);
+        let claimed = be.claim_next_n_embedding_jobs(&now, 3, 10).await.unwrap();
+        assert!(claimed.iter().any(|c| c.job_id == "j1"));
+        be.complete_embedding_job("j1", &now).await.unwrap();
+        assert_eq!(
+            be.get_embedding_job_status("j1").await.unwrap(),
+            Some("completed".to_string())
+        );
     }
 }
 

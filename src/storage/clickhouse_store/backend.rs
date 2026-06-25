@@ -42,6 +42,8 @@ impl ClickHouseBackend {
         const MIGRATIONS: &[&str] = &[
             include_str!("../../../migrations/clickhouse/0001_capsule_store.sql"),
             include_str!("../../../migrations/clickhouse/0002_embeddings.sql"),
+            include_str!("../../../migrations/clickhouse/0003_graph_transcript_jobs.sql"),
+            include_str!("../../../migrations/clickhouse/0004_registry_session_misc.sql"),
         ];
         for sql in MIGRATIONS {
             for stmt in sql.split(';') {
