@@ -359,8 +359,11 @@ Hooks run automatically:
 Manual commands:
 
 ```bash
-# Mine a transcript
+# Mine a transcript (extract memories + archive blocks)
 mem mine ~/.claude/projects/.../session.jsonl
+
+# Bulk archive-only import of the whole transcript store (see Transcript Archive)
+mem import claude-code
 
 # Get wake-up context
 mem wake-up --token-budget 800
@@ -369,6 +372,22 @@ mem wake-up --token-budget 800
 ## Transcript Archive (conversation_messages)
 
 A second pipeline, fully isolated from `memories`, archives every Claude Code transcript block verbatim and exposes semantic search + ordered replay over those blocks. It exists alongside `memories` so the existing ranking / lifecycle / verbatim-guard surface is **untouched**: separate table (`conversation_messages`), separate embedding queue (`transcript_embedding_jobs`), and a separate Lance-native embedding table (`conversation_message_embeddings`). `mem mine` is now **dual-sink** — one transcript scan writes both extracted memories (existing path) and every block (text / tool_use / tool_result / thinking) to the archive.
+
+**Bulk import (`mem import`)** — `mem mine` handles **one** transcript at a time (and also extracts memories). To back-fill the archive from an agent's entire transcript store in one pass — **archive-only**, no memory extraction, no `<mem-save>` parsing — use `mem import`:
+
+```bash
+# Archive every Claude Code transcript under ~/.claude/projects/**/*.jsonl.
+mem import claude-code
+
+# Scope to one project directory, or a single .jsonl file.
+mem import claude-code --path ~/.claude/projects/-home-me-myrepo
+mem import claude-code --path ~/.claude/projects/foo/abc.jsonl
+
+# Parse + count only, without POSTing anything (sanity check).
+mem import claude-code --dry-run --verbose
+```
+
+It POSTs to the service at `--base-url` (default `http://127.0.0.1:3000`), so `mem serve` must be running. **Idempotent**: the batch endpoint dedups server-side by `(transcript_path, line_number, block_index)`, so re-running over an already-imported store re-sends without double-inserting — safe to run repeatedly to pick up new blocks. The importer is **per-agent extensible** (`mem import <agent>`); `claude-code` is the first source.
 
 ```bash
 # Ingest a single block (internal — `mem mine` POSTs these for you).
