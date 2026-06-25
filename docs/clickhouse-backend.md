@@ -389,3 +389,19 @@ P3 把 `EmbeddingVectorStore`(8 方法)从 stub 升为真实现(`src/storage/cli
 15. **「delete-once-then-insert」语义在 append 模型下的偏差**:lance 的 chunks upsert 是「先删该 id 所有行,再插 N 行」。CH 走纯 append(不在 upsert 路径上 mutation),代价:(a) 空 `vectors` upsert **不清旧行**(trait 说空=no-op,可接受);(b) chunk 数缩小(N<M)时旧的 M-N 行**物理残留**,靠读时 `row_version DESC LIMIT 1` / 后续 `OPTIMIZE`/TTL 清。记为 scaffold caveat,validation 阶段定夺是否要 per-upsert 的 `ALTER DELETE`。
 16. **delete 是异步 mutation → 测试不能断言「删后立即不存在」**:`delete_*_embedding` 测试只断言不报错;删后缺失检查要等 mutation 落地,留给 validation。
 17. **trait 不对称**:胶囊侧有 `get_row`/`get_vector`,conversation 侧只有 upsert+delete(无 get)。conversation chunk 测试只能验「upsert/delete 不报错」,完整 chunk-survival 验证靠 P5 search parity。
+
+### P4(2026-06-25):`CapsuleSearchStore` 混合召回
+
+P4 把 `CapsuleSearchStore`(9 方法)从 stub 升为真实现(`src/storage/clickhouse_store/search.rs`)。stubs.rs 降到 8 个 trait(全 P5)。门禁:默认 fmt+clippy+test 绿 + `--features clickhouse` build/clippy 绿。仍 **UNVALIDATED**。
+
+**关键设计决策:**
+- **`ann_candidate_ids`**:暴力 `cosineDistance(embedding, :q)`,**子查询取全租户 top-k → 外层过滤 tenant → `GROUP BY capability_capsule_id` 取 `min(dist)`**(chunk-collapse)。这复刻 lance `nearest_to` 的 **POSTFILTER** 语义(外租户向量占 top-k 槽 → 本租户结果可 <k)。rank = 返回位置(RRF 按 rank 融合,不需真距离值,故 `ORDER BY min(d)` 不 SELECT d)。query 向量经 `.bind(Vec<f32>)` → `Array(Float32)`(已验证编译)。experimental `vector_similarity` HNSW 索引是 scale 优化,非 P4。
+- **`bm25_candidate_ids`**:CH 无 BM25,这里是**粗粒度词法候选通道**——`positionCaseInsensitiveUTF8(content, :q) > 0` 整串子串匹配 + live 过滤(status NOT archived/rejected、type != diary,同 lance),rank = 返回位置。**parity 只能软验**(overlap@10),CJK/分词召回弱、语义侧兜底(§4e)。tokenbf_v1 skip-index + 逐 token 匹配留作后续。
+- **pool/recent/version 读**:`search_candidates`/`recent_active`/`list_versions` 都 **load 本租户全部 `capability_capsules`(`FINAL`)→ Rust 侧复刻 lance 的过滤/排序逐字**(生命周期池的 status+diary+active-supersede 去重、`MEM_RECALL_POOL_LIMIT` 近期 cap + guidance 豁免、版本链双向 BFS)。高 parity。
+- **`hybrid_candidates_compose`**:Rust 形状与 `Store::hybrid_candidates_compose` 完全一致(oversample k×2 → `rrf_merge` → 取 3k 水合 → status/diary 后过滤 → 排序 rrf DESC/updated_at DESC/id ASC → 截 k),复用 `pipeline::ranking::rrf_merge`。`hybrid_candidates` 委托给 compose。`fetch_capability_capsules_by_ids` 直接调 P1 的 `CapsuleStore` 版(两 trait 同名,不重复逻辑)。
+
+**P4 新 pain:**
+18. **bm25 是整串子串、非 tokenized BM25**:`positionCaseInsensitiveUTF8` 只判「整个 query 是否为 content 子串」,比 Tantivy 的 jieba-token BM25 粗得多——多 token query 不拆分、无词频排序。够当 RRF 词法候选通道,但 parity 只能软验,CJK 尤其弱。改进:tokenbf_v1 skip-index + 多 token OR(需查询拼接转义)。
+19. **ANN 距离度量:CH `cosineDistance` vs lance `_distance`(L2)**:lance ANN 默认返 L2 距离(transcript 侧用 `1 - L²/2` 反推 cosine,即向量是**归一化**的)。归一化向量下 L2 与 cosine **排序一致**,故 ranking parity 成立;若未来出现未归一化向量两者会分叉——记为已知前提。
+20. **pool/version 读是「load 全租户 + Rust 过滤」**:与 lance 同策略(高 parity),但每次 O(租户行数) 全量拉取;超大租户下是全扫描。下推 `WHERE`/`LIMIT` 可优化,但会偏离 lance 的 Rust 逻辑、增加 parity 风险——scaffold 阶段选择忠实复刻。
+21. **`fetch_capability_capsules_by_ids` 双 trait 同名**:`CapsuleStore` 与 `CapsuleSearchStore` 都声明它,`ClickHouseBackend` 两边都 impl;search 版直接 `CapsuleStore::fetch_capability_capsules_by_ids(self, …)` 委托,零重复。

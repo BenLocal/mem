@@ -204,6 +204,70 @@ mod ch {
             .unwrap();
     }
 
+    /// P4: seed 2 capsules + embeddings → `ann_candidate_ids` ranks by the
+    /// query vector (chunk-collapse + tenant postfilter), `bm25_candidate_ids`
+    /// substring-matches the coarse lexical channel, and
+    /// `hybrid_candidates_compose` fuses both via Rust RRF.
+    #[tokio::test]
+    async fn hybrid_search_ann_bm25_compose() {
+        use mem::storage::CapsuleSearchStore;
+        let Some(be) = ch_backend().await else { return };
+
+        let mut a = fixture("ch_s_a", CapabilityCapsuleStatus::Active);
+        a.content = "alpha vector database".into();
+        let mut b = fixture("ch_s_b", CapabilityCapsuleStatus::Active);
+        b.content = "beta graph store".into();
+        be.insert_capability_capsule(a).await.unwrap();
+        be.insert_capability_capsule(b).await.unwrap();
+
+        let va = vec![1.0_f32, 0.0, 0.0];
+        let vb = vec![0.0_f32, 1.0, 0.0];
+        be.upsert_capability_capsule_embedding_chunks(
+            "ch_s_a",
+            "t",
+            "m",
+            3,
+            std::slice::from_ref(&va),
+            "ha",
+            &current_timestamp(),
+            &current_timestamp(),
+        )
+        .await
+        .unwrap();
+        be.upsert_capability_capsule_embedding_chunks(
+            "ch_s_b",
+            "t",
+            "m",
+            3,
+            std::slice::from_ref(&vb),
+            "hb",
+            &current_timestamp(),
+            &current_timestamp(),
+        )
+        .await
+        .unwrap();
+
+        // ANN: query near `va` → ch_s_a ranks first.
+        let ann = be.ann_candidate_ids("t", &va, 5).await.unwrap();
+        assert_eq!(ann.first().map(|(id, _)| id.as_str()), Some("ch_s_a"));
+
+        // BM25 (coarse substring): "graph" → ch_s_b is a candidate.
+        let bm25 = be.bm25_candidate_ids("t", "graph", 5).await.unwrap();
+        assert!(bm25.iter().any(|(id, _)| id == "ch_s_b"));
+
+        // Hybrid compose: text + vec → non-empty fused result, ch_s_a on top.
+        let hybrid = be
+            .hybrid_candidates_compose("t", "vector", &va, 5)
+            .await
+            .unwrap();
+        assert_eq!(
+            hybrid
+                .first()
+                .map(|(r, _)| r.capability_capsule_id.as_str()),
+            Some("ch_s_a")
+        );
+    }
+
     #[tokio::test]
     async fn feedback_summary_counts_kinds() {
         let Some(store) = store().await else { return };

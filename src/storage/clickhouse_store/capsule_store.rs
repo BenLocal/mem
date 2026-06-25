@@ -81,7 +81,7 @@ fn parse_feedback_kind(s: &str) -> Option<FeedbackKind> {
 /// list). Enums are stored as their snake_case strings; optional domain
 /// fields collapse `None` → `""`.
 #[derive(Debug, Row, Serialize, Deserialize)]
-struct ChCapsuleRow {
+pub(super) struct ChCapsuleRow {
     capability_capsule_id: String,
     tenant: String,
     capability_capsule_type: String,
@@ -155,7 +155,7 @@ impl ChCapsuleRow {
         }
     }
 
-    fn into_record(self) -> CapabilityCapsuleRecord {
+    pub(super) fn into_record(self) -> CapabilityCapsuleRecord {
         CapabilityCapsuleRecord {
             capability_capsule_id: self.capability_capsule_id,
             tenant: self.tenant,

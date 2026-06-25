@@ -8,8 +8,10 @@
 //! other 10 sub-traits as `unimplemented!()` stubs ([`stubs`]) so the
 //! blanket `impl<T> Backend for T` applies and [`ClickHouseBackend`] can
 //! erase to `Arc<dyn Backend>` — wired into `app::from_config`. **P3** fills
-//! [`EmbeddingVectorStore`] for real ([`embedding`]); P4 (search) / P5 (the
-//! rest) remain `unimplemented!()` stubs. The whole module sits behind
+//! [`EmbeddingVectorStore`] for real ([`embedding`]); **P4** fills
+//! [`CapsuleSearchStore`] ([`search`] — hybrid recall: lexical candidate +
+//! `cosineDistance` ANN + Rust-side RRF); P5 (the rest) remain
+//! `unimplemented!()` stubs. The whole module sits behind
 //! `#[cfg(feature = "clickhouse")]`, so the default build pulls neither the
 //! `clickhouse` crate nor this code.
 //!
@@ -19,6 +21,7 @@
 mod backend;
 mod capsule_store;
 mod embedding;
+mod search;
 mod stubs;
 
 pub use backend::ClickHouseBackend;

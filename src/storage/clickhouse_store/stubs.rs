@@ -7,9 +7,9 @@
 //! `unimplemented!()` placeholders; the real implementations land per the
 //! `docs/clickhouse-backend.md` §9 milestone table:
 //!
-//! ([`EmbeddingVectorStore`] is **done** in P3 — see `embedding.rs`.)
+//! ([`EmbeddingVectorStore`] is **done** in P3 — see `embedding.rs`;
+//! [`CapsuleSearchStore`] is **done** in P4 — see `search.rs`.)
 //!
-//! - [`CapsuleSearchStore`] → **P4** (lexical + vector + Rust-side RRF)
 //! - [`GraphStore`] / [`TranscriptStore`] / [`EmbeddingJobStore`] /
 //!   [`EntityRegistry`] / [`SessionStore`] / [`MaintenanceStore`] /
 //!   [`MineCursorStore`] / [`EvolutionCandidateStore`] → **P5**
@@ -25,8 +25,7 @@ use async_trait::async_trait;
 
 use super::backend::ClickHouseBackend;
 use crate::domain::capability_capsule::{
-    CapabilityCapsuleRecord, CapabilityCapsuleType, CapabilityCapsuleVersionLink, GraphEdge,
-    GraphStats,
+    CapabilityCapsuleRecord, CapabilityCapsuleType, GraphEdge, GraphStats,
 };
 use crate::domain::embeddings::EmbeddingJobInfo;
 use crate::domain::episode::EpisodeRecord;
@@ -38,98 +37,9 @@ use crate::storage::types::{
     GraphError, StorageError, TranscriptSessionSummary,
 };
 use crate::storage::{
-    CapsuleSearchStore, EmbeddingJobStore, EntityRegistry, EvolutionCandidate,
-    EvolutionCandidateStore, GraphStore, MaintenanceStore, MineCursor, MineCursorStore,
-    SessionStore, TranscriptStore,
+    EmbeddingJobStore, EntityRegistry, EvolutionCandidate, EvolutionCandidateStore, GraphStore,
+    MaintenanceStore, MineCursor, MineCursorStore, SessionStore, TranscriptStore,
 };
-
-// ─────────────────────────── CapsuleSearchStore (P4) ───────────────────────
-#[async_trait]
-impl CapsuleSearchStore for ClickHouseBackend {
-    async fn search_candidates(
-        &self,
-        _tenant: &str,
-    ) -> Result<Vec<CapabilityCapsuleRecord>, StorageError> {
-        unimplemented!("clickhouse-backend P4: CapsuleSearchStore::search_candidates")
-    }
-
-    async fn recent_active_capability_capsules(
-        &self,
-        _tenant: &str,
-        _limit: usize,
-    ) -> Result<Vec<CapabilityCapsuleRecord>, StorageError> {
-        unimplemented!(
-            "clickhouse-backend P4: CapsuleSearchStore::recent_active_capability_capsules"
-        )
-    }
-
-    async fn fetch_capability_capsules_by_ids(
-        &self,
-        _tenant: &str,
-        _ids: &[&str],
-    ) -> Result<Vec<CapabilityCapsuleRecord>, StorageError> {
-        unimplemented!(
-            "clickhouse-backend P4: CapsuleSearchStore::fetch_capability_capsules_by_ids"
-        )
-    }
-
-    async fn list_capability_capsule_ids_for_tenant(
-        &self,
-        _tenant: &str,
-    ) -> Result<Vec<String>, StorageError> {
-        unimplemented!(
-            "clickhouse-backend P4: CapsuleSearchStore::list_capability_capsule_ids_for_tenant"
-        )
-    }
-
-    async fn list_capability_capsule_versions_for_tenant(
-        &self,
-        _tenant: &str,
-        _capability_capsule_id: &str,
-    ) -> Result<Vec<CapabilityCapsuleVersionLink>, StorageError> {
-        unimplemented!(
-            "clickhouse-backend P4: CapsuleSearchStore::list_capability_capsule_versions_for_tenant"
-        )
-    }
-
-    async fn hybrid_candidates(
-        &self,
-        _tenant: &str,
-        _query_text: &str,
-        _query_embedding: &[f32],
-        _k: usize,
-    ) -> Result<Vec<(CapabilityCapsuleRecord, f32)>, StorageError> {
-        unimplemented!("clickhouse-backend P4: CapsuleSearchStore::hybrid_candidates")
-    }
-
-    async fn hybrid_candidates_compose(
-        &self,
-        _tenant: &str,
-        _query_text: &str,
-        _query_embedding: &[f32],
-        _k: usize,
-    ) -> Result<Vec<(CapabilityCapsuleRecord, f32)>, StorageError> {
-        unimplemented!("clickhouse-backend P4: CapsuleSearchStore::hybrid_candidates_compose")
-    }
-
-    async fn bm25_candidate_ids(
-        &self,
-        _tenant: &str,
-        _query_text: &str,
-        _k: usize,
-    ) -> Result<Vec<(String, i64)>, StorageError> {
-        unimplemented!("clickhouse-backend P4: CapsuleSearchStore::bm25_candidate_ids")
-    }
-
-    async fn ann_candidate_ids(
-        &self,
-        _tenant: &str,
-        _query_embedding: &[f32],
-        _k: usize,
-    ) -> Result<Vec<(String, i64)>, StorageError> {
-        unimplemented!("clickhouse-backend P4: CapsuleSearchStore::ann_candidate_ids")
-    }
-}
 
 // ─────────────────────────── EmbeddingJobStore (P5) ────────────────────────
 #[async_trait]
