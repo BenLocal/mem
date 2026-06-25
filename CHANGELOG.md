@@ -8,6 +8,8 @@ are organized by feature wave (merge commit ranges on `master`).
 
 ## [Unreleased]
 
+## 2026-06-25 — `0.2.1`
+
 ### Added
 
 - **Visible hook headlines.** Every `mem` hook that previously injected only
