@@ -88,6 +88,52 @@ jobs:
         env:
           MEM_TEST_POSTGRES_URL: postgres://postgres:mem@localhost:5432/mem
 
+  # Opt-in ClickHouse backend (the `clickhouse` cargo feature). Spins up a
+  # ClickHouse service container and runs the feature-gated parity suite
+  # (tests/clickhouse_backend.rs) + clippy over the feature-gated code. Like
+  # the postgres job, this only gates the ClickHouse backend; the default
+  # `rust` job covers everything else.
+  clickhouse:
+    runs-on: ubuntu-latest
+    env:
+      CARGO_PROFILE_TEST_DEBUG: "0"
+    services:
+      clickhouse:
+        image: clickhouse/clickhouse-server:26.5
+        # CLICKHOUSE_USER creates an open (non-localhost-restricted) user;
+        # recent images restrict the bare `default` user to localhost, so the
+        # job (connecting via the mapped port from outside the container)
+        # needs an explicit user. The test URL carries the creds.
+        env:
+          CLICKHOUSE_USER: mem
+          CLICKHOUSE_PASSWORD: mem
+          CLICKHOUSE_DEFAULT_ACCESS_MANAGEMENT: "1"
+        ports:
+          - 8123:8123
+        options: >-
+          --health-cmd "clickhouse-client --user mem --password mem --query 'SELECT 1' || exit 1"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 10
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: rust-clickhouse
+      # `--features clickhouse` still compiles lance, whose build script needs
+      # a recent protoc (see the `rust` job).
+      - uses: arduino/setup-protoc@v3
+        with:
+          version: "27.x"
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+      - run: cargo clippy --features clickhouse --all-targets -- -D warnings
+      - run: cargo test --features clickhouse --test clickhouse_backend
+        env:
+          MEM_TEST_CLICKHOUSE_URL: http://mem:mem@localhost:8123
+
   rust-cross:
     runs-on: ubuntu-latest
     steps:

@@ -23,12 +23,25 @@ impl ClickHouseBackend {
     /// construction. Kept `async` to mirror `PostgresCapsuleStore::connect`
     /// and leave room for an eager ping in P2.
     pub async fn connect(url: &str) -> Result<Self, StorageError> {
-        if url.trim().is_empty() {
+        let url = url.trim();
+        if url.is_empty() {
             return Err(StorageError::InvalidInput(
                 "MEM_CLICKHOUSE_URL is empty".to_owned(),
             ));
         }
-        let client = Client::default().with_url(url);
+        // Pull optional `user:password@` userinfo out of the URL (real
+        // ClickHouse requires auth; the `clickhouse` crate takes the
+        // endpoint via `with_url` and creds via `with_user`/`with_password`
+        // separately, so split them here — same shape as the Postgres
+        // backend's `MEM_POSTGRES_URL`).
+        let (endpoint, user, password) = split_userinfo(url);
+        let mut client = Client::default().with_url(endpoint);
+        if let Some(u) = user {
+            client = client.with_user(u);
+        }
+        if let Some(p) = password {
+            client = client.with_password(p);
+        }
         Ok(Self { client })
     }
 
@@ -46,17 +59,19 @@ impl ClickHouseBackend {
             include_str!("../../../migrations/clickhouse/0004_registry_session_misc.sql"),
         ];
         for sql in MIGRATIONS {
-            for stmt in sql.split(';') {
-                // Strip `--` line comments before checking emptiness: splitting
-                // on ';' keeps a statement's leading comment lines attached to
-                // it, so a naive `starts_with("--")` would skip the whole
-                // CREATE. Filter comment lines out, run what's left.
-                let cleaned: String = stmt
-                    .lines()
-                    .filter(|l| !l.trim_start().starts_with("--"))
-                    .collect::<Vec<_>>()
-                    .join("\n");
-                let trimmed = cleaned.trim();
+            // Strip `--` line comments from the WHOLE file FIRST, then split on
+            // ';'. Order matters: a comment line may itself contain a ';' (e.g.
+            // "the trait's `&str` surface; lexicographic compare ..."), so
+            // splitting first would chop the comment mid-line and leak its tail
+            // (no longer `--`-prefixed) onto the next statement — a stray
+            // "...)" then trips CH's parser with "Unmatched parentheses".
+            let no_comments: String = sql
+                .lines()
+                .filter(|l| !l.trim_start().starts_with("--"))
+                .collect::<Vec<_>>()
+                .join("\n");
+            for stmt in no_comments.split(';') {
+                let trimmed = stmt.trim();
                 if trimmed.is_empty() {
                     continue;
                 }
@@ -66,5 +81,53 @@ impl ClickHouseBackend {
             }
         }
         Ok(())
+    }
+}
+
+/// Split `scheme://[user[:password]@]host…` into (endpoint-without-userinfo,
+/// user, password). Returns the URL unchanged with `None`s when there is no
+/// `@` userinfo. The `clickhouse` crate wants the endpoint and creds
+/// separately, so we peel the userinfo off `MEM_CLICKHOUSE_URL` here.
+fn split_userinfo(url: &str) -> (String, Option<String>, Option<String>) {
+    let Some(scheme_end) = url.find("://") else {
+        return (url.to_owned(), None, None);
+    };
+    let rest = &url[scheme_end + 3..];
+    let Some(at) = rest.find('@') else {
+        return (url.to_owned(), None, None);
+    };
+    let userinfo = &rest[..at];
+    let host = &rest[at + 1..];
+    let (user, password) = match userinfo.split_once(':') {
+        Some((u, p)) => (u, Some(p.to_owned())),
+        None => (userinfo, None),
+    };
+    let user = if user.is_empty() {
+        None
+    } else {
+        Some(user.to_owned())
+    };
+    (format!("{}{host}", &url[..scheme_end + 3]), user, password)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::split_userinfo;
+
+    #[test]
+    fn split_userinfo_handles_creds_and_bare_url() {
+        let (e, u, p) = split_userinfo("http://localhost:8123");
+        assert_eq!(e, "http://localhost:8123");
+        assert!(u.is_none() && p.is_none());
+
+        let (e, u, p) = split_userinfo("http://mem:secret@ch.example:8123");
+        assert_eq!(e, "http://ch.example:8123");
+        assert_eq!(u.as_deref(), Some("mem"));
+        assert_eq!(p.as_deref(), Some("secret"));
+
+        let (e, u, p) = split_userinfo("http://default@localhost:8123");
+        assert_eq!(e, "http://localhost:8123");
+        assert_eq!(u.as_deref(), Some("default"));
+        assert!(p.is_none());
     }
 }

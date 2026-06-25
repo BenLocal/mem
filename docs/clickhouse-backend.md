@@ -2,7 +2,7 @@
 
 > **For agentic workers:** phased plan, repo design-doc convention (cf. `postgres-backend.md` / `evolution-worker.md`). Each phase is TDD, three-gate-green, committed with `… (closes clickhouse-backend P#)`. **Default backend stays Lance (lance-native); ClickHouse is opt-in, behind the `clickhouse` cargo feature.** Default build pulls **zero** new deps and behaves identically.
 
-**Goal:** Let `mem serve` run entirely on a ClickHouse instance — selected at runtime via `MEM_BACKEND=clickhouse` — as a third peer to Lance (default) and Postgres (opt-in). This is a **spike** in the same posture as the Postgres backend: scaffold the full 11-sub-trait surface, feature-gate it, mark it **UNVALIDATED until run against a real ClickHouse**, and inventory the pains — *not* a production-blessed backend on day one.
+**Goal:** Let `mem serve` run entirely on a ClickHouse instance — selected at runtime via `MEM_BACKEND=clickhouse` — as a third peer to Lance (default) and Postgres (opt-in). This is a **spike** in the same posture as the Postgres backend: scaffold the full 11-sub-trait surface, feature-gate it, and inventory the pains — *not* a production-blessed backend on day one. **Status (P6, 2026-06-25): the gated test suite has been run against ClickHouse 26.5 — all 10 scenarios pass (see §10 P6).** The per-module "scaffold" labels remain because the gated tests cover the core round-trips, not every method / edge case; production-hardening is still future work.
 
 **Architecture:** A concrete `ClickHouseBackend` (a `clickhouse::Client` wrapper) implements all 11 storage sub-traits, so the existing blanket `impl<T> Backend for T where T: <11 sub-traits>` (`src/storage/backend.rs`) applies unchanged. `app::AppState::from_config` chooses between `Store` (Lance), `PostgresBackend` (opt-in) and `ClickHouseBackend` (opt-in) by `MEM_BACKEND`, upcasting any of them to `Arc<dyn Backend>` — the service/worker layer is already backend-agnostic. Semantic recall uses `Array(Float32)` columns + `cosineDistance()` (brute force baseline; experimental `vector_similarity` HNSW index for scale); lexical recall uses a token/ngram data-skipping or experimental inverted index as a *candidate* channel; the two fuse with the **same Rust-side RRF** the Lance path uses (`pipeline::ranking::rrf_merge`). Graph BFS reuses the same Rust iterative hop-by-hop walk.
 
@@ -427,3 +427,19 @@ P5 把剩余 8 个 sub-trait 从 stub 升为真实现,`stubs.rs` 删除——**C
 23. `*_paged`/`*_in_range` 的 `since`/`until`/`role`/`block_type`/`cursor` 参数当前被忽略(只返回前 `limit+1` 行)——validation 补谓词下推。
 24. mutation 不返回 affected-count(`invalidate_edge`/`close_edges_*`/`delete_*` 统一返回占位 1/0)。
 25. GraphEdge 数值 Option 列(confidence/strength/stability/access_count)存非 Nullable,读回一律 `Some(value)`,0/None 不可分(pain #2 同类)。
+
+### P6(2026-06-25):真实 ClickHouse e2e 验证 ✅
+
+把 P1–P5 的 scaffold **真的对一个 ClickHouse 26.5 实例跑了一遍**(Docker `clickhouse/clickhouse-server:26.5`,`MEM_TEST_CLICKHOUSE_URL` 门控的 `tests/clickhouse_backend.rs`,10 个场景:capsule CRUD/idempotency/accept、feedback_summary、embedding 向量+chunk、hybrid ann/bm25/compose、graph sync+neighbors、entity resolve、job enqueue→claim→complete)。**结果:10/10 通过**——forks 写的 ~120 个方法的核心读写路径在真实 CH 上正确。两处真 bug 被 e2e 当场抓出并修掉:
+
+- **bug A — migration split**:`apply_migrations` 先 `split(';')` 再 strip `--` 注释,但**某条注释里含分号**(`` `&str` surface; lexicographic … ``)→ 注释被从中间劈开、其尾巴(不再以 `--` 开头)黏到 CREATE TABLE 前 → CH 报 `Unmatched parentheses: )`,**全 10 测试在第一条迁移就挂**。修:**先 strip 注释、再 split**(顺序反了)。
+- **bug B — connect 无 auth**:`connect()` 只 `Client::default().with_url(url)`,不带 user/password;但真实 CH(及 CI service container,默认 `default` 用户限本机)都要认证。修:`connect` 解析 `MEM_CLICKHOUSE_URL` 里的 `user:password@`(新增 `split_userinfo` + 单测),再 `.with_user()/.with_password()`——同 Postgres 的 `MEM_POSTGRES_URL` 形。验证:CH 带 `mem:mem` + `http://mem:mem@localhost:8123` → 10/10 通过、无密码连接被拒。
+
+**CI:** 新增 `.github/workflows/ci.yml` 的 `clickhouse` job(镜像 postgres job:`clickhouse/clickhouse-server` service + `CLICKHOUSE_USER/PASSWORD=mem` + `MEM_TEST_CLICKHOUSE_URL=http://mem:mem@localhost:8123` + `clippy --features clickhouse`)。README「Storage backends」表加第三列。
+
+**P6 新 pain:**
+26. **migration split**(bug A,已修):注释含分号 → 先 strip 再 split。
+27. **connect 无 auth**(bug B,已修):`split_userinfo` 解析 URL creds。
+28. **gated 测试非 hermetic**:共用 CH `default` 库 + 固定 id,**重复对同一 CH 跑会因数据残留让 count 类断言(如 `feedback_summary_counts_kinds`)失败**;全新 CH(`DROP` 后 / CI 的全新 service container)10/10 绿。CI 不受影响(每跑全新容器);本地连跑前需 `DROP` 表或重建容器。后续可加「per-run 唯一 id 前缀(tenant + capsule_id)」让测试 hermetic。
+
+**仍未验证的部分**(scaffold 范围外,validation-后续):性能(FINAL/argMax 读成本、mutation 延迟)、FTS CJK parity、`vector_similarity` HNSW 索引、未走到的 method/edge case、`*_paged`/`*_in_range` 谓词下推、生产化。
