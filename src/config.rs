@@ -1695,6 +1695,20 @@ mod tests {
     }
 
     #[test]
+    fn backend_clickhouse_full_word_with_url_ok() {
+        // The full `clickhouse` literal resolves identically to the `ch`
+        // alias and carries MEM_CLICKHOUSE_URL into the third tuple slot.
+        let (kind, pg, ch) = parse_backend(env(&[
+            ("MEM_BACKEND", "clickhouse"),
+            ("MEM_CLICKHOUSE_URL", "http://ch.local:8123"),
+        ]))
+        .unwrap();
+        assert_eq!(kind, BackendKind::Clickhouse);
+        assert_eq!(pg, None);
+        assert_eq!(ch.as_deref(), Some("http://ch.local:8123"));
+    }
+
+    #[test]
     fn backend_unknown_value_rejected() {
         let err = parse_backend(env(&[("MEM_BACKEND", "mysql")])).unwrap_err();
         assert!(matches!(err, ConfigError::InvalidBackend(_)));

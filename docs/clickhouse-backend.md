@@ -345,3 +345,30 @@ P1(CapsuleStore + 测试基建)已落地:`cargo build` / `clippy --all-targets` 
 7. **app.rs 无法 erase 成 `Arc<dyn Backend>`**(P1 只 impl 了 CapsuleStore)→ Clickhouse arm 两个 cfg 都 `return Err`;具体坐实伞 trait 的「全 11 或全无」耦合(完整装配 = P2)。
 8. **删除级联 P1 只覆盖 2 表**(`capability_capsules` + `feedback_events`);embedding/job 卫星表的级联待其 schema 落地(P3)。
 9. **读形态用 `FINAL`(非 argMax)**:P1 为简单正确统一用 `… FINAL`;`argMax(…) GROUP BY pk` 热路径优化注明留后(validation 测出 FINAL 太慢再切)。
+
+### P2(2026-06-25):完整 Backend 装配 + 10 trait stub
+
+P2 让 `ClickHouseBackend` impl 全 11 子 trait → blanket `impl<T> Backend for T` 成立 → 能 erase 成 `Arc<dyn Backend>`,`app::from_config` 真正 connect + `apply_migrations` + 装配。其余 10 trait 的方法体先 `unimplemented!("clickhouse-backend P#")` 占位(`src/storage/clickhouse_store/stubs.rs`,79 个必需方法)。门禁:默认 fmt+clippy+test 绿 + `--features clickhouse` build/clippy 绿。**仍 UNVALIDATED**:`mem serve` 能启到 CH、CapsuleStore 路径外的读写会 panic,直到 P3-P5 填实。
+
+**10 个 stub 的 phase 标注:**
+
+| 子 trait | 方法数(stub)| 真正实现 phase |
+|---|---|---|
+| `EmbeddingVectorStore` | 8 | **P3**(Array(Float32) + cosineDistance)|
+| `CapsuleSearchStore` | 9 | **P4**(lexical + 向量 + Rust RRF)|
+| `GraphStore` | 14 | **P5** |
+| `TranscriptStore` | 12 | **P5** |
+| `EmbeddingJobStore` | 18 | **P5** |
+| `EntityRegistry` | 5 | **P5** |
+| `SessionStore` | 6 | **P5** |
+| `MaintenanceStore` | 3(必需)| **P5** |
+| `MineCursorStore` | 2 | **P5** |
+| `EvolutionCandidateStore` | 2 | **P5** |
+
+**胶水方法处理(决策):** 沿用 Postgres arm 的「装配处按 backend 能力分支」模式,不提升为 trait 方法。CH arm **跳过** potentiation / last_used 两个 worker(它们调 `Store::potentiate_edge`/`bump_last_used_at`,是 lance-Store 级优化、非正确性);`set_transcript_job_provider` **推迟到 P5**(transcript 写本身是 stub,现在调它无意义,故不为它造 inherent stub);capsule 服务仍拿一个 `capsule_used_tx`、其 receiver 立即 drop(事件静默丢弃,同 Postgres)。
+
+**P2 新 pain:**
+10. **stub 必须精确匹配 trait 签名** —— 79 个方法逐字抄签名(含 `#[allow(clippy::too_many_arguments)]` 的 6 个宽参方法、`GraphError` vs `StorageError` 两种错误面);幸而一次编过(`unimplemented!()` 返 `!`,return type 不约束 body)。
+11. **`MaintenanceStore` 的 3 个默认方法**(`vacuum_old_versions` / `ensure_query_indexes` / `rebuild_query_indexes`)**不要 stub** —— 它们的 trait 默认就是 non-Lance 的零-stats no-op(正确行为),stub 成 `unimplemented!()` 反而会让 vacuum worker panic。只 stub 3 个必需方法。
+12. **`unimplemented!()` stub 是编译期完整、运行期会 panic** —— P2 交付的是「能 erase 成 Backend、`mem serve` 能启」,**不是**运行可用;CapsuleStore 外任何操作 abort。这是 scaffold 的预期状态(无真实 CH)。
+13. **`from_config` 走到 connect 分支无法静态测** —— `apply_migrations` 需要活 CH;只能单测 `parse_backend`(`MEM_BACKEND=clickhouse`/`ch` + `MEM_CLICKHOUSE_URL` → `(Clickhouse, None, Some(url))`,缺 URL 报错,全词与 `ch` 别名都覆盖)。connect-分支的端到端验证留给 P6 的 `MEM_TEST_CLICKHOUSE_URL` 门控测试。

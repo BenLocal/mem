@@ -171,20 +171,35 @@ impl AppState {
                 }
             }
             crate::config::BackendKind::Clickhouse => {
-                // clickhouse-backend P1 is a scaffold: `ClickHouseBackend`
-                // implements `CapsuleStore` only, so it can't yet be erased
-                // to `Arc<dyn Backend>`. Both arms return — wiring it as a
-                // full backend lands in P2 (the other 10 sub-traits).
                 #[cfg(feature = "clickhouse")]
                 {
-                    let _url = config
+                    // P2: `ClickHouseBackend` now impls all 11 sub-traits (the
+                    // 10 beyond `CapsuleStore` are `unimplemented!()` stubs,
+                    // filled in P3-P5), so the blanket impl makes it a
+                    // `Backend`. Same assembly shape as the Postgres arm:
+                    // connect + idempotently migrate, upcast to
+                    // `Arc<dyn Backend>`, skip the lance-Store-level glue
+                    // workers (potentiation / last_used — optimizations, not
+                    // correctness). `set_transcript_job_provider` is DEFERRED
+                    // to P5 (transcript writes are stubbed until then). The
+                    // capsule service still gets a live `capsule_used_tx` whose
+                    // receiver is dropped. UNVALIDATED — never run against a
+                    // real ClickHouse; any read/write outside CapsuleStore
+                    // panics until P3-P5.
+                    let url = config
                         .clickhouse_url
                         .as_deref()
                         .expect("clickhouse_url present when backend=Clickhouse");
-                    return Err(anyhow::anyhow!(
-                        "clickhouse backend is a P1 scaffold (CapsuleStore only) — not yet a \
-                         complete Backend; tracked in clickhouse-backend P2"
-                    ));
+                    let ch = crate::storage::ClickHouseBackend::connect(url)
+                        .await
+                        .map_err(|e| anyhow::anyhow!("clickhouse connect: {e}"))?;
+                    ch.apply_migrations()
+                        .await
+                        .map_err(|e| anyhow::anyhow!("clickhouse migrate: {e}"))?;
+                    info!(backend = "clickhouse", "storage initialized");
+                    let store: Arc<dyn Backend> = Arc::new(ch);
+                    let (capsule_used_tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+                    (store, None, capsule_used_tx)
                 }
                 #[cfg(not(feature = "clickhouse"))]
                 {
