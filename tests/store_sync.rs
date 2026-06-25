@@ -1,7 +1,8 @@
 use std::sync::Arc;
 
 use mem::domain::capability_capsule::{
-    CapabilityCapsuleRecord, CapabilityCapsuleStatus, CapabilityCapsuleType, Scope, Visibility,
+    CapabilityCapsuleRecord, CapabilityCapsuleStatus, CapabilityCapsuleType, GraphEdge, Scope,
+    Visibility,
 };
 use mem::domain::entity::EntityKind;
 use mem::domain::episode::EpisodeRecord;
@@ -178,6 +179,43 @@ async fn syncs_entities_lance_to_lance() {
 
     // Idempotent re-run (skip by canonical_name).
     let again = mem::cli::sync::copy_entities_for_test(&src, &dst, "local", 100).await;
+    assert_eq!(again.copied, 0);
+    assert_eq!(again.skipped, 1);
+}
+
+#[tokio::test]
+async fn syncs_active_edges_lance_to_lance() {
+    let (_sd, src) = temp_lance().await;
+    let (_td, dst) = temp_lance().await;
+    // A capsule must exist so the walk enumerates its node id "mem:c1".
+    src.insert_capability_capsules(&[sample_capsule("c1", "local")])
+        .await
+        .unwrap();
+
+    // Seed one active edge rooted at the capsule node.
+    let edge = GraphEdge {
+        from_node_id: "mem:c1".into(),
+        to_node_id: "entity:abc".into(),
+        relation: "mentions".into(),
+        valid_from: "20260625T000000000000".into(),
+        valid_to: None,
+        confidence: Some(1.0),
+        extractor: Some("test".into()),
+        strength: None,
+        stability: None,
+        last_activated: None,
+        access_count: None,
+    };
+    src.sync_memory_edges(&[edge], "20260625T000000000000")
+        .await
+        .unwrap();
+
+    let report = mem::cli::sync::copy_edges_for_test(&src, &dst, "local", 100).await;
+    assert_eq!(report.copied, 1);
+    assert_eq!(dst.neighbors("mem:c1").await.unwrap().len(), 1);
+
+    // Idempotent re-run: the active edge already exists on the target.
+    let again = mem::cli::sync::copy_edges_for_test(&src, &dst, "local", 100).await;
     assert_eq!(again.copied, 0);
     assert_eq!(again.skipped, 1);
 }

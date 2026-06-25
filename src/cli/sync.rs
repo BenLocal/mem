@@ -430,6 +430,88 @@ pub async fn copy_entities_for_test(
     copy_entities(src, dst, tenant, batch_size, false, false).await
 }
 
+/// Copy active graph edges from `src` to `dst` for one `tenant`. Walks
+/// `neighbors("mem:<id>")` for every capsule in the tenant, dedupes by
+/// `(from, to, relation)`, and writes via `add_edge_direct` (preserves
+/// `valid_from`). ACTIVE edges only — closed (valid_to set) edges are not
+/// reconstructed. Edges with no capsule endpoint are not reached (memory
+/// edges are capsule-rooted). Idempotent: an active duplicate on the target
+/// returns `false` from `add_edge_direct` and is counted as skipped.
+#[allow(dead_code)] // wired in Task 8
+async fn copy_graph_edges(
+    src: &dyn Backend,
+    dst: &dyn Backend,
+    tenant: &str,
+    _batch_size: usize,
+    dry_run: bool,
+    verbose: bool,
+) -> DomainReport {
+    let mut report = DomainReport::default();
+    let capsule_ids = src
+        .list_capability_capsule_ids_for_tenant(tenant)
+        .await
+        .unwrap_or_default();
+
+    let mut seen: std::collections::HashSet<(String, String, String)> =
+        std::collections::HashSet::new();
+    let mut edges: Vec<crate::domain::capability_capsule::GraphEdge> = Vec::new();
+    for id in &capsule_ids {
+        let node = format!("mem:{id}");
+        match src.neighbors(&node).await {
+            Ok(es) => {
+                for e in es {
+                    let k = (
+                        e.from_node_id.clone(),
+                        e.to_node_id.clone(),
+                        e.relation.clone(),
+                    );
+                    if seen.insert(k) {
+                        edges.push(e);
+                    }
+                }
+            }
+            Err(e) => {
+                eprintln!("edges[{tenant}/{node}]: neighbors failed: {e}");
+                report.failed += 1;
+            }
+        }
+    }
+
+    if dry_run {
+        report.copied = edges.len() as u64;
+        return report;
+    }
+
+    for e in edges {
+        match dst.add_edge_direct(&e).await {
+            Ok(true) => report.copied += 1,
+            Ok(false) => report.skipped += 1,
+            Err(err) => {
+                eprintln!("edges[{tenant}]: add failed: {err}");
+                report.failed += 1;
+            }
+        }
+    }
+    if verbose {
+        println!(
+            "  edges[{tenant}]: +{} (skip {})",
+            report.copied, report.skipped
+        );
+    }
+    report
+}
+
+/// Test seam: integration tests call the graph edge copier directly.
+#[doc(hidden)]
+pub async fn copy_edges_for_test(
+    src: &dyn Backend,
+    dst: &dyn Backend,
+    tenant: &str,
+    batch_size: usize,
+) -> DomainReport {
+    copy_graph_edges(src, dst, tenant, batch_size, false, false).await
+}
+
 /// Entry point. Returns process exit code (`0` clean, `1` if any batch failed
 /// or setup errored).
 pub async fn run(args: SyncArgs) -> i32 {
