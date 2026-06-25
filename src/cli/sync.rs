@@ -227,7 +227,6 @@ pub async fn copy_capsules_for_test(
 /// Iterates sessions, reads messages per session, and bulk-inserts into dst.
 /// The dst backend deduplicates on `(transcript_path, line_number, block_index)`,
 /// so re-runs are safe. Returns a per-tenant tally.
-#[allow(dead_code)] // wired in Task 8
 async fn copy_transcripts(
     src: &dyn Backend,
     dst: &dyn Backend,
@@ -294,7 +293,6 @@ pub async fn copy_transcripts_for_test(
 /// Copy all successful episodes from `src` to `dst` for one `tenant`.
 /// Already-present episode ids (by id) are skipped so re-runs are idempotent.
 /// Returns a per-tenant tally.
-#[allow(dead_code)] // wired in Task 8
 async fn copy_episodes(
     src: &dyn Backend,
     dst: &dyn Backend,
@@ -364,7 +362,6 @@ pub async fn copy_episodes_for_test(
 /// refs and therefore won't link to these reminted rows — this is the accepted
 /// v1 limitation. Idempotent: entities already present on the target (matched
 /// by canonical_name) are skipped.
-#[allow(dead_code)] // wired in Task 8
 async fn copy_entities(
     src: &dyn Backend,
     dst: &dyn Backend,
@@ -437,7 +434,6 @@ pub async fn copy_entities_for_test(
 /// reconstructed. Edges with no capsule endpoint are not reached (memory
 /// edges are capsule-rooted). Idempotent: an active duplicate on the target
 /// returns `false` from `add_edge_direct` and is counted as skipped.
-#[allow(dead_code)] // wired in Task 8
 async fn copy_graph_edges(
     src: &dyn Backend,
     dst: &dyn Backend,
@@ -447,10 +443,14 @@ async fn copy_graph_edges(
     verbose: bool,
 ) -> DomainReport {
     let mut report = DomainReport::default();
-    let capsule_ids = src
-        .list_capability_capsule_ids_for_tenant(tenant)
-        .await
-        .unwrap_or_default();
+    let capsule_ids = match src.list_capability_capsule_ids_for_tenant(tenant).await {
+        Ok(ids) => ids,
+        Err(e) => {
+            eprintln!("edges[{tenant}]: list capsule ids failed: {e}");
+            report.failed += 1;
+            return report;
+        }
+    };
 
     let mut seen: std::collections::HashSet<(String, String, String)> =
         std::collections::HashSet::new();
@@ -540,13 +540,85 @@ async fn run_inner(args: SyncArgs) -> anyhow::Result<i32> {
         args.domains.clone()
     };
 
-    // Copiers land in Task 3-7; orchestration in Task 8.
-    let _ = (&src, &dst, &domains, &config);
+    let provider_id = config.embedding.job_provider_id();
+    let mut grand = DomainReport::default();
+    for tenant in &args.tenants {
+        for domain in &domains {
+            let r = match domain {
+                Domain::Entities => {
+                    copy_entities(
+                        src.as_ref(),
+                        dst.as_ref(),
+                        tenant,
+                        args.batch_size,
+                        args.dry_run,
+                        args.verbose,
+                    )
+                    .await
+                }
+                Domain::Capsules => {
+                    copy_capsules(
+                        src.as_ref(),
+                        dst.as_ref(),
+                        tenant,
+                        args.batch_size,
+                        args.dry_run,
+                        args.verbose,
+                        provider_id,
+                    )
+                    .await
+                }
+                Domain::Episodes => {
+                    copy_episodes(
+                        src.as_ref(),
+                        dst.as_ref(),
+                        tenant,
+                        args.batch_size,
+                        args.dry_run,
+                        args.verbose,
+                    )
+                    .await
+                }
+                Domain::Transcripts => {
+                    copy_transcripts(
+                        src.as_ref(),
+                        dst.as_ref(),
+                        tenant,
+                        args.batch_size,
+                        args.dry_run,
+                        args.verbose,
+                    )
+                    .await
+                }
+                Domain::Graph => {
+                    copy_graph_edges(
+                        src.as_ref(),
+                        dst.as_ref(),
+                        tenant,
+                        args.batch_size,
+                        args.dry_run,
+                        args.verbose,
+                    )
+                    .await
+                }
+            };
+            println!(
+                "{:?}[{tenant}]: copied={} skipped={} failed={}",
+                domain, r.copied, r.skipped, r.failed
+            );
+            grand.copied += r.copied;
+            grand.skipped += r.skipped;
+            grand.failed += r.failed;
+        }
+    }
     println!(
-        "sync: opened {} → {} (orchestration in Task 8)",
-        args.from, args.to
+        "sync done{}: copied={} skipped={} failed={}",
+        if args.dry_run { " (dry-run)" } else { "" },
+        grand.copied,
+        grand.skipped,
+        grand.failed
     );
-    Ok(0)
+    Ok(if grand.failed > 0 { 1 } else { 0 })
 }
 
 /// Parse a `--from` / `--to` spec of the form `<kind>:<locator>` into a

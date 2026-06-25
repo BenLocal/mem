@@ -219,3 +219,66 @@ async fn syncs_active_edges_lance_to_lance() {
     assert_eq!(again.copied, 0);
     assert_eq!(again.skipped, 1);
 }
+
+#[tokio::test]
+async fn full_roundtrip_lance_to_lance() {
+    let (_sd, src) = temp_lance().await;
+    let (_td, dst) = temp_lance().await;
+    src.insert_capability_capsules(&[sample_capsule("c1", "local")])
+        .await
+        .unwrap();
+
+    let caps = mem::cli::sync::copy_capsules_for_test(&src, &dst, "local", 100).await;
+    let ents = mem::cli::sync::copy_entities_for_test(&src, &dst, "local", 100).await;
+    assert_eq!(caps.copied, 1);
+    assert_eq!(caps.failed + ents.failed, 0);
+}
+
+#[tokio::test]
+async fn syncs_capsules_lance_to_clickhouse() {
+    let Ok(url) = std::env::var("MEM_TEST_CLICKHOUSE_URL") else {
+        eprintln!("MEM_TEST_CLICKHOUSE_URL unset — skipping lance→clickhouse");
+        return;
+    };
+    let (_sd, src) = temp_lance().await;
+    src.insert_capability_capsules(&[sample_capsule("c1", "local")])
+        .await
+        .unwrap();
+    let ch = mem::storage::ClickHouseBackend::connect(&url)
+        .await
+        .unwrap();
+    ch.apply_migrations().await.unwrap();
+    let report = mem::cli::sync::copy_capsules_for_test(
+        &src,
+        &ch as &dyn mem::storage::Backend,
+        "local",
+        100,
+    )
+    .await;
+    assert_eq!(report.failed, 0);
+    assert!(report.copied >= 1);
+}
+
+#[tokio::test]
+async fn syncs_capsules_lance_to_postgres() {
+    let Ok(url) = std::env::var("MEM_TEST_POSTGRES_URL") else {
+        eprintln!("MEM_TEST_POSTGRES_URL unset — skipping lance→postgres");
+        return;
+    };
+    let (_sd, src) = temp_lance().await;
+    src.insert_capability_capsules(&[sample_capsule("c1", "local")])
+        .await
+        .unwrap();
+    let pg = mem::storage::PostgresCapsuleStore::connect(&url)
+        .await
+        .unwrap();
+    let report = mem::cli::sync::copy_capsules_for_test(
+        &src,
+        &pg as &dyn mem::storage::Backend,
+        "local",
+        100,
+    )
+    .await;
+    assert_eq!(report.failed, 0);
+    assert!(report.copied >= 1);
+}
