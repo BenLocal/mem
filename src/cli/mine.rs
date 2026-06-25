@@ -152,39 +152,86 @@ pub fn block_to_payload(
     })
 }
 
-/// Chunked POST of transcript-block payloads to `/transcripts/messages/batch`,
-/// shared by `mine` and `import`. Returns `(ok, fail)` — the number of blocks
-/// the server accepted (HTTP 2xx) vs. rejected. Block-level idempotency is
-/// enforced server-side by the `(transcript_path, line_number, block_index)`
-/// triple, so re-sending already-present rows returns 2xx without
-/// double-inserting (counted as `ok`, mirroring the single-row endpoint).
+/// Soft cap on serialized JSON bytes per batch POST. `mem serve` caps request
+/// bodies at axum's 2 MiB default, so a fixed `MINE_BATCH_CHUNK`-block batch
+/// from a tool-result-heavy session can exceed it and 413. We bound each batch
+/// by BOTH the block count and this byte budget (whichever trips first), with
+/// headroom under 2 MiB. A single block larger than this is still sent alone
+/// (it only 413s if it alone exceeds the server's hard 2 MiB limit).
+const MINE_BATCH_MAX_BYTES: usize = 1_500_000;
+
+/// Partition payloads into batch index-ranges `[start, end)` bounded by both
+/// `max_count` blocks and `max_bytes` of serialized JSON, whichever trips
+/// first. Pure (no I/O) so the batching logic is unit-testable. `sizes[i]` is
+/// the serialized byte length of payload `i`. A single oversized payload lands
+/// alone in its own batch (never merged, never dropped).
+fn plan_block_batches(sizes: &[usize], max_count: usize, max_bytes: usize) -> Vec<(usize, usize)> {
+    let mut batches = Vec::new();
+    let mut start = 0usize;
+    let mut bytes = 0usize;
+    for (i, &sz) in sizes.iter().enumerate() {
+        if i > start && (i - start >= max_count || bytes + sz > max_bytes) {
+            batches.push((start, i));
+            start = i;
+            bytes = 0;
+        }
+        bytes += sz;
+    }
+    if start < sizes.len() {
+        batches.push((start, sizes.len()));
+    }
+    batches
+}
+
+/// Size-aware batched POST of transcript-block payloads to
+/// `/transcripts/messages/batch`, shared by `mine` and `import`. Returns
+/// `(ok, fail)` — the number of blocks the server accepted (HTTP 2xx) vs.
+/// rejected. Block-level idempotency is enforced server-side by the
+/// `(transcript_path, line_number, block_index)` triple, so re-sending
+/// already-present rows returns 2xx without double-inserting (counted as `ok`,
+/// mirroring the single-row endpoint). Batches are bounded by both
+/// `MINE_BATCH_CHUNK` blocks and `MINE_BATCH_MAX_BYTES` so a heavy session's
+/// large blocks don't overflow the server's request-body limit.
 pub async fn post_block_payloads(
     client: &reqwest::Client,
     base_url: &str,
     payloads: &[serde_json::Value],
 ) -> (u32, u32) {
+    let sizes: Vec<usize> = payloads
+        .iter()
+        .map(|p| serde_json::to_vec(p).map(|v| v.len()).unwrap_or(0))
+        .collect();
     let (mut ok, mut fail) = (0u32, 0u32);
-    for chunk in payloads.chunks(MINE_BATCH_CHUNK) {
-        match client
-            .post(format!("{}/transcripts/messages/batch", base_url))
-            .json(chunk)
-            .send()
-            .await
-        {
-            Ok(resp) if resp.status().is_success() => {
-                ok += chunk.len() as u32;
-            }
-            Ok(resp) => {
-                eprintln!("Failed to archive block batch: {}", resp.status());
-                fail += chunk.len() as u32;
-            }
-            Err(e) => {
-                eprintln!("Block batch request error: {}", e);
-                fail += chunk.len() as u32;
-            }
-        }
+    for (start, end) in plan_block_batches(&sizes, MINE_BATCH_CHUNK, MINE_BATCH_MAX_BYTES) {
+        let (o, f) = send_block_batch(client, base_url, &payloads[start..end]).await;
+        ok += o;
+        fail += f;
     }
     (ok, fail)
+}
+
+/// POST one batch of block payloads; returns `(ok, fail)` block counts for it.
+async fn send_block_batch(
+    client: &reqwest::Client,
+    base_url: &str,
+    batch: &[serde_json::Value],
+) -> (u32, u32) {
+    match client
+        .post(format!("{}/transcripts/messages/batch", base_url))
+        .json(batch)
+        .send()
+        .await
+    {
+        Ok(resp) if resp.status().is_success() => (batch.len() as u32, 0),
+        Ok(resp) => {
+            eprintln!("Failed to archive block batch: {}", resp.status());
+            (0, batch.len() as u32)
+        }
+        Err(e) => {
+            eprintln!("Block batch request error: {}", e);
+            (0, batch.len() as u32)
+        }
+    }
 }
 
 /// Backwards-compatible wrapper retained for the legacy unit tests in
@@ -826,6 +873,58 @@ pub async fn run_with_counts(args: MineArgs) -> anyhow::Result<MineCounts> {
 // `mod extract_tests` lives at file end so clippy::items_after_test_module
 // doesn't fire — the lint requires no real items appear after a test
 // module.
+#[cfg(test)]
+mod batch_tests {
+    use super::*;
+
+    #[test]
+    fn splits_on_count_cap() {
+        // 5 tiny payloads, count cap 2 → batches of 2,2,1.
+        let sizes = vec![10, 10, 10, 10, 10];
+        assert_eq!(
+            plan_block_batches(&sizes, 2, 1_000_000),
+            vec![(0, 2), (2, 4), (4, 5)]
+        );
+    }
+
+    #[test]
+    fn splits_on_byte_cap_before_count() {
+        // Byte cap 100 trips before the count cap of 100: 60 + 60 > 100, so
+        // each 60-byte payload starts a new batch.
+        let sizes = vec![60, 60, 60];
+        assert_eq!(
+            plan_block_batches(&sizes, 100, 100),
+            vec![(0, 1), (1, 2), (2, 3)]
+        );
+    }
+
+    #[test]
+    fn oversized_single_payload_lands_alone() {
+        // A payload bigger than the byte budget is never merged or dropped —
+        // it gets its own batch, flanked by normally-batched neighbors.
+        let sizes = vec![10, 5_000_000, 10];
+        assert_eq!(
+            plan_block_batches(&sizes, 100, 1_500_000),
+            vec![(0, 1), (1, 2), (2, 3)]
+        );
+    }
+
+    #[test]
+    fn packs_until_either_cap() {
+        // 40-byte payloads, byte cap 100 → 2 per batch (40+40=80 ok, +40=120 > 100).
+        let sizes = vec![40, 40, 40, 40, 40];
+        assert_eq!(
+            plan_block_batches(&sizes, 100, 100),
+            vec![(0, 2), (2, 4), (4, 5)]
+        );
+    }
+
+    #[test]
+    fn empty_input_yields_no_batches() {
+        assert!(plan_block_batches(&[], 100, 1_500_000).is_empty());
+    }
+}
+
 #[cfg(test)]
 mod extract_tests {
     use super::*;
