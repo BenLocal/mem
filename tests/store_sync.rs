@@ -3,6 +3,7 @@ use std::sync::Arc;
 use mem::domain::capability_capsule::{
     CapabilityCapsuleRecord, CapabilityCapsuleStatus, CapabilityCapsuleType, Scope, Visibility,
 };
+use mem::domain::entity::EntityKind;
 use mem::domain::episode::EpisodeRecord;
 use mem::domain::{BlockType, ConversationMessage, MessageRole};
 use mem::embedding::FakeEmbeddingProvider;
@@ -151,6 +152,32 @@ async fn syncs_episodes_lance_to_lance() {
 
     // Idempotent re-run.
     let again = mem::cli::sync::copy_episodes_for_test(&src, &dst, "local", 100).await;
+    assert_eq!(again.copied, 0);
+    assert_eq!(again.skipped, 1);
+}
+
+#[tokio::test]
+async fn syncs_entities_lance_to_lance() {
+    let (_sd, src) = temp_lance().await;
+    let (_td, dst) = temp_lance().await;
+
+    src.resolve_or_create(
+        "local",
+        "InvoiceService",
+        EntityKind::Module,
+        "20260625T000000000",
+    )
+    .await
+    .unwrap();
+
+    let report = mem::cli::sync::copy_entities_for_test(&src, &dst, "local", 100).await;
+    assert_eq!(report.copied, 1);
+    let got = dst.list_entities("local", None, None, 100).await.unwrap();
+    assert_eq!(got.len(), 1);
+    assert_eq!(got[0].canonical_name, "InvoiceService");
+
+    // Idempotent re-run (skip by canonical_name).
+    let again = mem::cli::sync::copy_entities_for_test(&src, &dst, "local", 100).await;
     assert_eq!(again.copied, 0);
     assert_eq!(again.skipped, 1);
 }

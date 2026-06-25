@@ -356,6 +356,80 @@ pub async fn copy_episodes_for_test(
     copy_episodes(src, dst, tenant, batch_size, false, false).await
 }
 
+/// Copy entities from `src` to `dst` for one `tenant`, best-effort.
+///
+/// Uses `resolve_or_create`, which REMINTS `entity_id` on the target (no
+/// insert-with-id path exists), so canonical names + kinds migrate but the
+/// original ids do NOT. Copied graph edges keep their verbatim `entity:<uuid>`
+/// refs and therefore won't link to these reminted rows — this is the accepted
+/// v1 limitation. Idempotent: entities already present on the target (matched
+/// by canonical_name) are skipped.
+#[allow(dead_code)] // wired in Task 8
+async fn copy_entities(
+    src: &dyn Backend,
+    dst: &dyn Backend,
+    tenant: &str,
+    _batch_size: usize,
+    dry_run: bool,
+    verbose: bool,
+) -> DomainReport {
+    let mut report = DomainReport::default();
+    let entities = match src.list_entities(tenant, None, None, 1_000_000).await {
+        Ok(e) => e,
+        Err(e) => {
+            eprintln!("entities[{tenant}]: list failed: {e}");
+            report.failed += 1;
+            return report;
+        }
+    };
+    let present: std::collections::HashSet<String> = dst
+        .list_entities(tenant, None, None, 1_000_000)
+        .await
+        .unwrap_or_default()
+        .into_iter()
+        .map(|e| e.canonical_name)
+        .collect();
+    let now = current_timestamp();
+    for ent in entities {
+        if present.contains(&ent.canonical_name) {
+            report.skipped += 1;
+            continue;
+        }
+        if dry_run {
+            report.copied += 1;
+            continue;
+        }
+        match dst
+            .resolve_or_create(tenant, &ent.canonical_name, ent.kind, &now)
+            .await
+        {
+            Ok(_) => report.copied += 1,
+            Err(e) => {
+                eprintln!("entities[{tenant}]: resolve_or_create failed: {e}");
+                report.failed += 1;
+            }
+        }
+    }
+    if verbose {
+        println!(
+            "  entities[{tenant}]: +{} (skip {}, ids reminted)",
+            report.copied, report.skipped
+        );
+    }
+    report
+}
+
+/// Test seam: integration tests call the entity copier directly.
+#[doc(hidden)]
+pub async fn copy_entities_for_test(
+    src: &dyn Backend,
+    dst: &dyn Backend,
+    tenant: &str,
+    batch_size: usize,
+) -> DomainReport {
+    copy_entities(src, dst, tenant, batch_size, false, false).await
+}
+
 /// Entry point. Returns process exit code (`0` clean, `1` if any batch failed
 /// or setup errored).
 pub async fn run(args: SyncArgs) -> i32 {
