@@ -3,6 +3,7 @@ use std::sync::Arc;
 use mem::domain::capability_capsule::{
     CapabilityCapsuleRecord, CapabilityCapsuleStatus, CapabilityCapsuleType, Scope, Visibility,
 };
+use mem::domain::{BlockType, ConversationMessage, MessageRole};
 use mem::embedding::FakeEmbeddingProvider;
 use mem::storage::Store;
 use tempfile::TempDir;
@@ -67,4 +68,42 @@ async fn syncs_capsules_lance_to_lance() {
     let again = mem::cli::sync::copy_capsules_for_test(&src, &dst, "local", 100).await;
     assert_eq!(again.copied, 0);
     assert_eq!(again.skipped, 2);
+}
+
+fn conversation_message_fixture(session_id: &str, tenant: &str) -> ConversationMessage {
+    ConversationMessage {
+        message_block_id: format!("mb-{session_id}-1"),
+        session_id: Some(session_id.to_string()),
+        tenant: tenant.to_string(),
+        caller_agent: "claude-code".to_string(),
+        transcript_path: format!("/tmp/transcript-{session_id}.jsonl"),
+        line_number: 1,
+        block_index: 0,
+        message_uuid: None,
+        role: MessageRole::Assistant,
+        block_type: BlockType::Text,
+        content: format!("hello from {session_id}"),
+        tool_name: None,
+        tool_use_id: None,
+        embed_eligible: false,
+        created_at: "00000001778000000000".to_string(),
+        meta_json: None,
+    }
+}
+
+#[tokio::test]
+async fn syncs_transcripts_lance_to_lance() {
+    let (_sd, src) = temp_lance().await;
+    let (_td, dst) = temp_lance().await;
+    // Build one ConversationMessage via the tests/clickhouse_backend.rs literal pattern.
+    let msg = conversation_message_fixture("sess1", "local");
+    src.create_conversation_messages(&[msg]).await.unwrap();
+
+    let report = mem::cli::sync::copy_transcripts_for_test(&src, &dst, "local", 100).await;
+    assert_eq!(report.copied, 1);
+    let got = dst
+        .get_conversation_messages_by_session("local", "sess1")
+        .await
+        .unwrap();
+    assert_eq!(got.len(), 1);
 }

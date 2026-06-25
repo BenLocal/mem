@@ -223,6 +223,74 @@ pub async fn copy_capsules_for_test(
     copy_capsules(src, dst, tenant, batch_size, false, false, "fake").await
 }
 
+/// Copy all transcript messages from `src` to `dst` for one `tenant`.
+/// Iterates sessions, reads messages per session, and bulk-inserts into dst.
+/// The dst backend deduplicates on `(transcript_path, line_number, block_index)`,
+/// so re-runs are safe. Returns a per-tenant tally.
+#[allow(dead_code)] // wired in Task 8
+async fn copy_transcripts(
+    src: &dyn Backend,
+    dst: &dyn Backend,
+    tenant: &str,
+    _batch_size: usize,
+    dry_run: bool,
+    verbose: bool,
+) -> DomainReport {
+    let mut report = DomainReport::default();
+    let sessions = match src.list_transcript_sessions(tenant).await {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("transcripts[{tenant}]: list sessions failed: {e}");
+            report.failed += 1;
+            return report;
+        }
+    };
+    for s in sessions {
+        let msgs = match src
+            .get_conversation_messages_by_session(tenant, &s.session_id)
+            .await
+        {
+            Ok(m) => m,
+            Err(e) => {
+                eprintln!("transcripts[{tenant}/{}]: read failed: {e}", s.session_id);
+                report.failed += 1;
+                continue;
+            }
+        };
+        if dry_run {
+            report.copied += msgs.len() as u64;
+            continue;
+        }
+        match dst.create_conversation_messages(&msgs).await {
+            Ok(n) => {
+                // `create_conversation_messages` returns the count of newly-inserted
+                // rows (input length minus dedup-skipped). Skipped = msgs.len() - n.
+                report.skipped += (msgs.len() - n) as u64;
+                report.copied += n as u64;
+                if verbose {
+                    println!("  transcripts[{tenant}/{}]: +{n}", s.session_id);
+                }
+            }
+            Err(e) => {
+                eprintln!("transcripts[{tenant}/{}]: write failed: {e}", s.session_id);
+                report.failed += msgs.len() as u64;
+            }
+        }
+    }
+    report
+}
+
+/// Test seam: integration tests call the transcript copier directly.
+#[doc(hidden)]
+pub async fn copy_transcripts_for_test(
+    src: &dyn Backend,
+    dst: &dyn Backend,
+    tenant: &str,
+    batch_size: usize,
+) -> DomainReport {
+    copy_transcripts(src, dst, tenant, batch_size, false, false).await
+}
+
 /// Entry point. Returns process exit code (`0` clean, `1` if any batch failed
 /// or setup errored).
 pub async fn run(args: SyncArgs) -> i32 {
