@@ -32,7 +32,7 @@ The MCP server forwards 20 tools to the HTTP service over `MEM_BASE_URL` (defaul
 
 ## Storage backends
 
-`mem` has two interchangeable storage backends behind one `Backend` trait. The default needs no setup; Postgres is opt-in for teams that already run Postgres and want a single shared store.
+`mem` has three interchangeable storage backends behind one `Backend` trait, all compiled in and selected at runtime via `MEM_BACKEND`. The default (Lance) needs no setup; Postgres and ClickHouse are for teams that already run them and want a single shared store. `mem sync` (below) migrates data between any two of them.
 
 | Backend | Select with | Storage | Notes |
 |---------|-------------|---------|-------|
