@@ -31,6 +31,11 @@ enum Command {
     Init(mem::cli::init::InitArgs),
     /// Mine memories from Claude Code transcript.
     Mine(mem::cli::mine::MineArgs),
+    /// Bulk-archive an agent's conversation records into the transcript
+    /// archive (archive-only; no memory extraction). Extensible per source
+    /// agent — `mem import claude-code` walks `~/.claude/projects`.
+    #[command(subcommand)]
+    Import(mem::cli::import::ImportSource),
     /// Claude Code hook entry points. Each subcommand reads the hook's
     /// JSON payload on stdin and prints the hook-output envelope (or `{}`).
     /// The shell hooks `exec mem hook <event>` instead of parsing payloads
@@ -86,6 +91,10 @@ async fn async_main() -> error::Result<()> {
         }
         Command::Mine(args) => {
             let code = mem::cli::mine::run(args).await;
+            std::process::exit(code);
+        }
+        Command::Import(source) => {
+            let code = mem::cli::import::run(source).await;
             std::process::exit(code);
         }
         Command::Hook(command) => {

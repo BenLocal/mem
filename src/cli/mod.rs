@@ -1,6 +1,7 @@
 pub mod common;
 pub mod feedback;
 pub mod hook;
+pub mod import;
 pub mod init;
 pub mod mcp;
 pub mod mine;

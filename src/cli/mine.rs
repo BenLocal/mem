@@ -117,6 +117,76 @@ pub struct ArchivedBlock {
     pub meta_json: Option<String>,
 }
 
+/// Build the `/transcripts/messages/batch` JSON payload for one archived
+/// block. The field shape mirrors `http::transcripts::IngestRequest` and is
+/// the **single source of truth** for that mapping, shared by `mem mine`
+/// (dual-sink: memories + archive) and `mem import` (archive-only). Change
+/// it here, not in two places.
+///
+/// `embed_eligible` follows mine's rule: only `text` / `thinking` blocks
+/// carry semantically useful prose; `tool_use` / `tool_result` are skipped
+/// so the transcript embedding worker doesn't burn cycles on tool JSON.
+pub fn block_to_payload(
+    b: &ArchivedBlock,
+    transcript_path: &str,
+    tenant: &str,
+    agent: &str,
+) -> serde_json::Value {
+    let embed_eligible = matches!(b.block_type.as_str(), "text" | "thinking");
+    serde_json::json!({
+        "session_id": b.session_id,
+        "tenant": tenant,
+        "caller_agent": agent,
+        "transcript_path": transcript_path,
+        "line_number": b.line_number,
+        "block_index": b.block_index,
+        "message_uuid": b.message_uuid,
+        "role": b.role,
+        "block_type": b.block_type,
+        "content": b.content,
+        "tool_name": b.tool_name,
+        "tool_use_id": b.tool_use_id,
+        "embed_eligible": embed_eligible,
+        "created_at": b.timestamp,
+        "meta_json": b.meta_json,
+    })
+}
+
+/// Chunked POST of transcript-block payloads to `/transcripts/messages/batch`,
+/// shared by `mine` and `import`. Returns `(ok, fail)` — the number of blocks
+/// the server accepted (HTTP 2xx) vs. rejected. Block-level idempotency is
+/// enforced server-side by the `(transcript_path, line_number, block_index)`
+/// triple, so re-sending already-present rows returns 2xx without
+/// double-inserting (counted as `ok`, mirroring the single-row endpoint).
+pub async fn post_block_payloads(
+    client: &reqwest::Client,
+    base_url: &str,
+    payloads: &[serde_json::Value],
+) -> (u32, u32) {
+    let (mut ok, mut fail) = (0u32, 0u32);
+    for chunk in payloads.chunks(MINE_BATCH_CHUNK) {
+        match client
+            .post(format!("{}/transcripts/messages/batch", base_url))
+            .json(chunk)
+            .send()
+            .await
+        {
+            Ok(resp) if resp.status().is_success() => {
+                ok += chunk.len() as u32;
+            }
+            Ok(resp) => {
+                eprintln!("Failed to archive block batch: {}", resp.status());
+                fail += chunk.len() as u32;
+            }
+            Err(e) => {
+                eprintln!("Block batch request error: {}", e);
+                fail += chunk.len() as u32;
+            }
+        }
+    }
+    (ok, fail)
+}
+
 /// Backwards-compatible wrapper retained for the legacy unit tests in
 /// `tests/cli_mine.rs`. New code should prefer [`parse_transcript_full`]
 /// which also returns the per-block archive payload.
@@ -708,52 +778,14 @@ pub async fn run_with_counts(args: MineArgs) -> anyhow::Result<MineCounts> {
     // sent (regardless of dedup status) as `block_ok` to mirror the
     // single-row endpoint's "2xx → ok" semantic.
     let block_payloads: Vec<serde_json::Value> = blocks
-        .into_iter()
-        .map(|b| {
-            let embed_eligible = matches!(b.block_type.as_str(), "text" | "thinking");
-            serde_json::json!({
-                "session_id": b.session_id,
-                "tenant": args.remote.tenant,
-                "caller_agent": args.agent,
-                "transcript_path": args.transcript_path.display().to_string(),
-                "line_number": b.line_number,
-                "block_index": b.block_index,
-                "message_uuid": b.message_uuid,
-                "role": b.role,
-                "block_type": b.block_type,
-                "content": b.content,
-                "tool_name": b.tool_name,
-                "tool_use_id": b.tool_use_id,
-                "embed_eligible": embed_eligible,
-                "created_at": b.timestamp,
-                "meta_json": b.meta_json,
-            })
-        })
+        .iter()
+        .map(|b| block_to_payload(b, &transcript_path_str, &args.remote.tenant, &args.agent))
         .collect();
 
-    for chunk in block_payloads.chunks(MINE_BATCH_CHUNK) {
-        match client
-            .post(format!(
-                "{}/transcripts/messages/batch",
-                args.remote.base_url
-            ))
-            .json(chunk)
-            .send()
-            .await
-        {
-            Ok(resp) if resp.status().is_success() => {
-                block_ok += chunk.len() as u32;
-            }
-            Ok(resp) => {
-                eprintln!("Failed to archive block batch: {}", resp.status());
-                block_fail += chunk.len() as u32;
-            }
-            Err(e) => {
-                eprintln!("Block batch request error: {}", e);
-                block_fail += chunk.len() as u32;
-            }
-        }
-    }
+    let (block_sent_ok, block_sent_fail) =
+        post_block_payloads(&client, &args.remote.base_url, &block_payloads).await;
+    block_ok += block_sent_ok;
+    block_fail += block_sent_fail;
 
     // Counts reflect what the CLI *sent* (HTTP 2xx), not what the server
     // actually inserted. The server deduplicates by (transcript_path,
