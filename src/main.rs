@@ -49,6 +49,10 @@ enum Command {
     /// blocks. Wired into the Stop / PreCompact hooks so the lifecycle
     /// signals close even when the agent forgets to call `capability_capsule_feedback`.
     FeedbackFromTranscript(mem::cli::feedback::FeedbackFromTranscriptArgs),
+    /// Verbatim-copy all data domains from one storage backend to another
+    /// (any → any across Lance / Postgres / ClickHouse). Rebuilds embeddings
+    /// on the target. See README «mem sync».
+    Sync(mem::cli::sync::SyncArgs),
 }
 
 fn main() -> error::Result<()> {
@@ -113,6 +117,10 @@ async fn async_main() -> error::Result<()> {
         },
         Command::FeedbackFromTranscript(args) => {
             let code = mem::cli::feedback::run(args).await;
+            std::process::exit(code);
+        }
+        Command::Sync(args) => {
+            let code = mem::cli::sync::run(args).await;
             std::process::exit(code);
         }
     }
