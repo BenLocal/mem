@@ -52,7 +52,7 @@
 
 ## OSS 对照路线（O 系列）
 
-> 来源 [`oss-memory-diff.md`](./oss-memory-diff.md)（④，2026-06-05）。参照 mem0 / agentmemory 沿 **write → recall → feedback** 主轴补审，每项论证 / 触点 / 风险见原文 §5。**O1 ✅（`808cb59`+`709c648`）/ O2 ✅（`b7b9528`+worker）/ O3 ✅（`retrieve.rs`）/ O4 ✅（`retrieve.rs`），O5 待办。** close 引用用 `closes oss-memory-diff O#`。
+> 来源 [`oss-memory-diff.md`](./oss-memory-diff.md)（④，2026-06-05）。参照 mem0 / agentmemory 沿 **write → recall → feedback** 主轴补审，每项论证 / 触点 / 风险见原文 §5。**O1 ✅（`808cb59`+`709c648`）/ O2 ✅（`b7b9528`+worker）/ O3 ✅（`retrieve.rs`）/ O4 ✅（`retrieve.rs`），O5 / O6 待办。** O6（召回质量 eval 框架）来自 2026-06-26 更广赛道扫描（Zep/Cognee/agentmemory parity 数），非原 mem0/agentmemory 基线。close 引用用 `closes oss-memory-diff O#`。
 
 | # | 层 | 项 | 价值 | 工作量 | 风险 | 触点 |
 |---|---|---|---|---|---|---|
@@ -61,6 +61,7 @@
 | O3 | 🔍 | ✅（P1，`retrieve.rs`）**capsule recall 多样化（per-source cap）**。落地：`finalize` floor 过滤后调 `diversify_by_source`——source=`session_id`（无则自身 id），每 source 在 head 至多 `cap`（默认 3），超额按原排名挪尾部不丢（软上限，compress 按 budget 仍纳）。同 supersede 链那路 `hybrid_candidates` SQL 早已版本链去重，故只治"同 session 批量霸占头部"。选轻量配额非 MMR。默认开 `MEM_RECALL_PER_SOURCE_CAP`（=0 关）。借 agentmemory `max 3 per session`。 | 🟡 头部去冗 | S | 低（软上限，不足回填） | `pipeline/retrieve.rs::finalize` |
 | O4 | 🔍 | ✅（P2，`retrieve.rs`）**graph boost 按 degree 衰减**。落地：`compute_graph_boosts` 加 `spread_decay(degree)=1/(1+0.001·(degree-1)²)`,`boost=round(GRAPH_BOOST·spread·strength)`,degree=锚 entity 的 capsule fanout。略多一处:dynamics-OFF 路从扁平批量 `related_capability_capsule_ids` 改成逐 anchor `neighbors_within`(才有 degree),local-first 规模下开销可忽略。degree≤1 不衰减。 | 🟡 抑制高扇出节点过度 boost | S | 极小 | `pipeline/retrieve.rs::compute_graph_boosts` |
 | O5 | 📦/⚙️ | ⬜（P2）**ingest secret 脱敏**。现状 transcript 整段 verbatim 存，verbatim 抬高密钥泄露面。改法（两层守 verbatim）：原文 access-control 下原样保留，仅在索引/输出层 redact 高置信密钥模式（`sk-`、AWS AKIA、私钥块、`<private>`）；不就地改写 `content`。借 agentmemory privacy filter。 | 🟡 降低泄露面 | M（先定密钥白名单边界） | 中（误 redact 风险，与 verbatim 边界强相关，落地前单独定调） | index/输出侧（`pipeline/compress.rs`、嵌入前文本），不动落盘 content |
+| O6 | 🔍/⚙️ | ⬜（P1）**召回质量 eval 框架（金标集 + CI 回归门 + parity）**。**收口扩展非新建**——`pipeline/eval_metrics.rs`（recall@k/ndcg/mrr/precision，全测）+ `tests/recall_bench.rs`（8-rung synthetic 消融）已在。三缺口：① 语料是 `bench::synthetic` 合成、无真实/中文金标，注释留坑的 `tests/mempalace_bench.rs` 未建；② bench `#[ignore]` 一次性、不进 CI 无回归门；③ 无对外可比公开数。改法（全测试侧增量、不动 `src/`）：O6a 建 `tests/golden_recall/`（脱敏 corpus + qrels，守 [[no-real-client-names-in-code]]）喂 `eval_metrics`；O6b 轻量非 ignored test + 版本化 `baseline.json` 进 `ci.yml` 当回归门；O6c 可选补 `tests/mempalace_bench.rs` 跑 LongMemEval-S 出公开数。来源：2026-06-26 更广赛道扫描（Zep LongMemEval 63.8% / agentmemory recall@5 / Cognee bench）。 | 🔴 全赛道入场券：把 O1–O4 及未来每个排序改动从「手感」变「可度量」并堵回归 | M（O6a S-M / O6b S / O6c M） | 低（纯测试侧，无 src 改动/新依赖；把关金标脱敏 + qrels 标注质量） | 新增 `tests/golden_recall/` + `tests/golden_recall.rs`（复用 `pipeline/eval_metrics.rs`+`tests/common`）、`.github/workflows/ci.yml`；可选 `tests/mempalace_bench.rs` |
 
 ---
 
