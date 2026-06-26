@@ -8,6 +8,19 @@ are organized by feature wave (merge commit ranges on `master`).
 
 ## [Unreleased]
 
+## 2026-06-26 — `0.2.2`
+
+CI-only patch — no binary or behavior change vs `0.2.1`.
+
+### Fixed
+
+- **CI runner disk exhaustion.** Now that postgres + clickhouse are default
+  dependencies, the `rust` job's `cargo test` compiles a much larger target tree
+  (sqlx / clickhouse / pgvector + lance) and exhausted the ~14 GB ubuntu-latest
+  disk → `No space left on device` while lance wrote test datasets (a marginal
+  flake — it failed `0.2.1`'s tag CI). The `rust` / `postgres` / `clickhouse`
+  jobs now reclaim ~25 GB via `jlumbroso/free-disk-space` as their first step.
+
 ## 2026-06-25 — `0.2.1`
 
 ### Added
