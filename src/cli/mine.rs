@@ -33,9 +33,9 @@ static TAG_RE: Lazy<Regex> = Lazy::new(|| Regex::new(r"<mem-save>(.*?)</mem-save
 pub enum HookFormat {
     /// Print a one-line `Mined: capsules sent=…` summary to stdout.
     Human,
-    /// Print a Stop-event envelope: `{"systemMessage":"✦ mem · …"}`.
+    /// Print a Stop-event envelope: `{"systemMessage":"🧠 mem · …"}`.
     HookStop,
-    /// Print a PreCompact-event envelope: `{"systemMessage":"✦ mem · pre-compact · …"}`.
+    /// Print a PreCompact-event envelope: `{"systemMessage":"🧠 mem · pre-compact · …"}`.
     HookPrecompact,
 }
 
@@ -593,7 +593,7 @@ pub async fn run(args: MineArgs) -> i32 {
     }
 }
 
-/// Build a `{"systemMessage": "✦ mem · …"}` envelope. Returns the
+/// Build a `{"systemMessage": "🧠 mem · …"}` envelope. Returns the
 /// skip-event sentinel `{}` when both capsules and blocks are zero
 /// (typical "transcript had nothing new" path on a re-run).
 fn render_hook_envelope(
@@ -605,9 +605,9 @@ fn render_hook_envelope(
         return Value::Object(Default::default());
     }
     let prefix = if is_precompact {
-        "✦ mem · pre-compact · "
+        "🧠 mem · pre-compact · "
     } else {
-        "✦ mem · "
+        "🧠 mem · "
     };
     let suffix = if is_precompact {
         " archived"
@@ -984,7 +984,7 @@ mod extract_tests {
         };
         let v = render_hook_envelope(&mine, None, false);
         let msg = v["systemMessage"].as_str().unwrap();
-        assert!(msg.starts_with("✦ mem · "), "got {msg}");
+        assert!(msg.starts_with("🧠 mem · "), "got {msg}");
         assert!(msg.contains("3/3 capsules + 12/12 blocks"));
         assert!(msg.contains("woven into the archive"));
     }
@@ -1037,7 +1037,7 @@ mod extract_tests {
         };
         let v = render_hook_envelope(&mine, None, true);
         let msg = v["systemMessage"].as_str().unwrap();
-        assert!(msg.starts_with("✦ mem · pre-compact · "), "got {msg}");
+        assert!(msg.starts_with("🧠 mem · pre-compact · "), "got {msg}");
         assert!(msg.ends_with("blocks archived"), "got {msg}");
     }
 
