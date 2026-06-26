@@ -127,6 +127,9 @@ async fn recall_error(p: &Value, remote: &RemoteArgs) -> Value {
         "resolve an error / find related incident",
         1000,
         30,
+        // No scope filter: an incident/fix is often cross-repo, so error
+        // recall stays global on purpose.
+        &[],
     )
     .await;
     format_error_recall(&resp)
@@ -239,12 +242,37 @@ async fn recall_prompt(p: &Value, remote: &RemoteArgs) -> Value {
     // recall-prompt could return `{}` even though capsule hits existed.
     // Sequential capsule-first keeps the capsule hits regardless of how
     // slow the transcript search is.
-    let cap = search_capsules(remote, &query, "", 1200, 35).await;
+    // Scope recall to the current repo/project (derived from the hook payload's
+    // `cwd`). This keeps narrowly-scoped guidance from leaking across projects
+    // — a `project:NVR-APP` preference no longer surfaces while working in
+    // `mem` — and floats in-scope facts/patterns up. Falls back to no scope
+    // (global, original behavior) when `cwd` is absent.
+    let scope = scope_filters_from_cwd(p);
+    let cap = search_capsules(remote, &query, "", 1200, 35, &scope).await;
     // Transcript windows are secondary and the transcript search is currently
     // slow; best-effort with a tight timeout so it never blocks the prompt for
     // long. It returns `{}` (no windows) on timeout — capsule hits still inject.
     let tr = search_transcripts(remote, &query).await;
     format_prompt_recall(&cap, &tr)
+}
+
+/// Derive `scope_filters` from a hook payload's `cwd` (the session's working
+/// directory). Returns `["project:<base>", "repo:<base>"]` where `<base>` is
+/// the cwd's last path segment (the repo dir name), matching how capsules carry
+/// `project` / `repo`. Empty when `cwd` is absent/blank → no scoping.
+fn scope_filters_from_cwd(p: &Value) -> Vec<String> {
+    let base = p["cwd"]
+        .as_str()
+        .unwrap_or("")
+        .trim_end_matches('/')
+        .rsplit('/')
+        .next()
+        .unwrap_or("");
+    if base.is_empty() {
+        Vec::new()
+    } else {
+        vec![format!("project:{base}"), format!("repo:{base}")]
+    }
 }
 
 /// Gate a user prompt: returns the search query (the prompt, capped) when
@@ -320,6 +348,17 @@ pub(crate) fn parse_recall_style(raw: Option<&str>) -> RecallStyle {
     }
 }
 
+/// Relevance floor for injected transcript windows. Reads
+/// `MEM_RECALL_TRANSCRIPT_MIN_SCORE` (default 20); invalid/negative → default.
+/// `0` admits everything (disables the floor).
+fn transcript_min_score() -> i64 {
+    std::env::var("MEM_RECALL_TRANSCRIPT_MIN_SCORE")
+        .ok()
+        .and_then(|v| v.trim().parse::<i64>().ok())
+        .filter(|&v| v >= 0)
+        .unwrap_or(20)
+}
+
 fn format_prompt_recall(cap: &Value, tr: &Value) -> Value {
     let style = parse_recall_style(std::env::var("MEM_RECALL_STYLE").ok().as_deref());
     format_prompt_recall_styled(cap, tr, style)
@@ -329,7 +368,15 @@ pub(crate) fn format_prompt_recall_styled(cap: &Value, tr: &Value, style: Recall
     let dir = section(cap, "directives");
     let facts = section(cap, "relevant_facts");
     let pat = section(cap, "reusable_patterns");
-    let windows = section(tr, "windows");
+    // Drop low-relevance transcript windows: the transcript search returns its
+    // top-N by RRF score, but the tail is often a loose semantic match (noise).
+    // A floor keeps only windows worth injecting. Tunable via
+    // MEM_RECALL_TRANSCRIPT_MIN_SCORE (default 20); `0` disables.
+    let tr_floor = transcript_min_score();
+    let windows: Vec<Value> = section(tr, "windows")
+        .into_iter()
+        .filter(|w| w["score"].as_i64().unwrap_or(0) >= tr_floor)
+        .collect();
     if dir.is_empty() && facts.is_empty() && pat.is_empty() && windows.is_empty() {
         return skip();
     }
@@ -632,11 +679,12 @@ async fn search_capsules(
     intent: &str,
     token_budget: u32,
     min_score: i64,
+    scope_filters: &[String],
 ) -> Value {
     let body = json!({
         "query": query,
         "intent": intent,
-        "scope_filters": [],
+        "scope_filters": scope_filters,
         "token_budget": token_budget,
         "caller_agent": "claude-code",
         "expand_graph": false,
@@ -844,7 +892,7 @@ mod tests {
         let cap = json!({});
         let tr = json!({
             "windows": [
-                {"session_id": "abcdef12-3456", "blocks": [
+                {"session_id": "abcdef12-3456", "score": 30, "blocks": [
                     {"is_primary": true, "created_at": "2026-06-04T01:00:00Z", "content": "we fixed the hook"}
                 ]}
             ]
@@ -857,6 +905,32 @@ mod tests {
         assert!(ctx.contains("[abcdef12]"));
         assert!(ctx.contains("2026-06-04"));
         assert!(ctx.contains("we fixed the hook"));
+    }
+
+    #[test]
+    fn transcript_floor_drops_low_score_windows() {
+        // Below the default floor (20) → dropped; above → kept. Drops the loose
+        // semantic-match noise that the user observed in the recall banner.
+        let tr = json!({
+            "windows": [
+                {"session_id": "good1234-5678", "score": 30, "blocks": [
+                    {"is_primary": true, "created_at": "2026-06-04T01:00:00Z", "content": "relevant hit"}]},
+                {"session_id": "noise999-0000", "score": 8, "blocks": [
+                    {"is_primary": true, "created_at": "2026-05-31T01:00:00Z", "content": "loose semantic noise"}]}
+            ]
+        });
+        let v = format_prompt_recall(&json!({}), &tr);
+        let ctx = v["hookSpecificOutput"]["additionalContext"]
+            .as_str()
+            .unwrap();
+        assert!(ctx.contains("[good1234]"), "high-score window kept");
+        assert!(!ctx.contains("[noise999]"), "low-score window dropped");
+        // Headline counts only the surviving window.
+        assert!(
+            v["systemMessage"].as_str().unwrap().contains("1w"),
+            "got {}",
+            v["systemMessage"]
+        );
     }
 
     #[test]
@@ -980,7 +1054,7 @@ mod tests {
     #[test]
     fn index_style_caps_transcript_windows() {
         let tr = json!({
-            "windows": [{"session_id": "abcdef12-3456", "blocks": [
+            "windows": [{"session_id": "abcdef12-3456", "score": 30, "blocks": [
                 {"is_primary": true, "created_at": "2026-06-04T01:00:00Z",
                  "content": format!("WINHEAD {} WINTAIL", "对话".repeat(120))}
             ]}]

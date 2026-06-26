@@ -88,14 +88,22 @@ fn is_expired(m: &CapabilityCapsuleRecord, now: &str) -> bool {
 /// background guidance / procedural defaults that should surface regardless
 /// of textual match with the current query. The relevance floor only gates
 /// the relevance-driven sections (Facts, Patterns).
-fn finalize(scored: Vec<ScoredMemory>, floor: i64) -> Vec<CapabilityCapsuleRecord> {
+fn finalize(
+    scored: Vec<ScoredMemory>,
+    floor: i64,
+    scope_filters: &[String],
+) -> Vec<CapabilityCapsuleRecord> {
     let filtered: Vec<CapabilityCapsuleRecord> = scored
         .into_iter()
         .filter(|entry| {
-            matches!(
+            if matches!(
                 entry.memory.capability_capsule_type,
                 CapabilityCapsuleType::Preference | CapabilityCapsuleType::Workflow
-            ) || entry.score > floor
+            ) {
+                guidance_in_scope(&entry.memory, scope_filters)
+            } else {
+                entry.score > floor
+            }
         })
         .map(|entry| entry.memory)
         .collect();
@@ -103,6 +111,23 @@ fn finalize(scored: Vec<ScoredMemory>, floor: i64) -> Vec<CapabilityCapsuleRecor
     // capsules can't dominate the top (and thus the token budget) of the
     // result.
     diversify_by_source(filtered, per_source_cap())
+}
+
+/// Whether a `Preference` / `Workflow` guidance row should pass `finalize`'s
+/// floor exemption, given the active `scope_filters`. Guidance surfaces
+/// regardless of textual match — BUT a **narrowly-scoped** (`Project` / `Repo`)
+/// guidance row must match the active scope, so e.g. a `project:NVR-APP`
+/// preference no longer leaks into a `project:mem` recall. **Broad**
+/// (`Global` / `Workspace`) guidance always surfaces, and an **empty** filter
+/// set (no scope requested — e.g. a raw MCP search) preserves the original
+/// always-surface behavior for every guidance row.
+fn guidance_in_scope(m: &CapabilityCapsuleRecord, scope_filters: &[String]) -> bool {
+    match m.scope {
+        Scope::Global | Scope::Workspace => true,
+        Scope::Project | Scope::Repo => {
+            scope_filters.is_empty() || matches_scope_filters(m, scope_filters)
+        }
+    }
 }
 
 /// O3 (closes oss-memory-diff O3) — per-source diversity cap. Walk the
@@ -201,6 +226,7 @@ pub async fn rank_with_hybrid_and_graph(
         return Ok(finalize(
             score_with_hybrid(candidates, query, &hybrid_scores, &empty_boosts),
             floor,
+            &query.scope_filters,
         ));
     }
 
@@ -210,13 +236,14 @@ pub async fn rank_with_hybrid_and_graph(
         score_with_hybrid(candidates.clone(), query, &hybrid_scores, &empty_boosts);
     let anchors = graph_anchor_nodes(&preliminary_scored);
     if anchors.is_empty() {
-        return Ok(finalize(preliminary_scored, floor));
+        return Ok(finalize(preliminary_scored, floor, &query.scope_filters));
     }
 
     let boost_by_id = compute_graph_boosts(graph, &anchors, dynamics).await?;
     Ok(finalize(
         score_with_hybrid(candidates, query, &hybrid_scores, &boost_by_id),
         floor,
+        &query.scope_filters,
     ))
 }
 
@@ -876,7 +903,7 @@ mod tests {
             },
         ];
         // A higher per-request floor (40) drops the 30-scorer.
-        let kept = finalize(scored, 40);
+        let kept = finalize(scored, 40, &[]);
         assert_eq!(kept.len(), 1);
         assert_eq!(kept[0].capability_capsule_id, "high");
     }
@@ -897,8 +924,55 @@ mod tests {
                 score: 0,
             },
         ];
-        // Always-applicable types survive even a floor far above their score.
-        let kept = finalize(scored, 999);
+        // Always-applicable types survive even a floor far above their score
+        // (empty scope filter = no scope requested, original behavior).
+        let kept = finalize(scored, 999, &[]);
+        assert_eq!(kept.len(), 2);
+    }
+
+    #[test]
+    fn finalize_scopes_narrow_guidance_to_active_scope() {
+        // A Project-scoped Preference must NOT leak across projects: with a
+        // non-matching scope filter it is dropped; with a matching one it
+        // surfaces; a Global preference always surfaces regardless.
+        let mut nvr = fixture_memory("nvr");
+        nvr.capability_capsule_type = CapabilityCapsuleType::Preference;
+        nvr.scope = Scope::Project;
+        nvr.project = Some("NVR-APP".to_string());
+        let mut global = fixture_memory("global");
+        global.capability_capsule_type = CapabilityCapsuleType::Preference;
+        global.scope = Scope::Global;
+        let scored = || {
+            vec![
+                ScoredMemory {
+                    memory: nvr.clone(),
+                    score: 0,
+                },
+                ScoredMemory {
+                    memory: global.clone(),
+                    score: 0,
+                },
+            ]
+        };
+
+        // Recall scoped to project:mem → NVR-APP preference dropped, global kept.
+        let kept = finalize(scored(), 999, &["project:mem".to_string()]);
+        let ids: Vec<&str> = kept
+            .iter()
+            .map(|m| m.capability_capsule_id.as_str())
+            .collect();
+        assert_eq!(
+            ids,
+            vec!["global"],
+            "narrow out-of-scope guidance must be dropped"
+        );
+
+        // Recall scoped to project:NVR-APP → both surface.
+        let kept = finalize(scored(), 999, &["project:NVR-APP".to_string()]);
+        assert_eq!(kept.len(), 2);
+
+        // No scope filter → original always-surface behavior preserved.
+        let kept = finalize(scored(), 999, &[]);
         assert_eq!(kept.len(), 2);
     }
 
