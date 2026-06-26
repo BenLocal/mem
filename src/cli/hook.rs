@@ -434,7 +434,24 @@ pub(crate) fn format_prompt_recall_styled(cap: &Value, tr: &Value, style: Recall
 /// Summarizes how many hits auto-recall surfaced this turn, by section.
 fn recall_headline(directives: usize, facts: usize, patterns: usize, windows: usize) -> String {
     let total = directives + facts + patterns + windows;
-    format!("🧠 mem · recalled {total} ({directives}d {facts}f {patterns}p {windows}w)")
+    // Spell the section counts out in full words (regular +s plural, singular
+    // when n == 1) instead of the d/f/p/w abbreviations — the headline is the
+    // only user-visible signal, so it should be self-explanatory. `windows` are
+    // the "Past conversations" transcript hits.
+    fn seg(n: usize, label: &str) -> String {
+        if n == 1 {
+            format!("{n} {label}")
+        } else {
+            format!("{n} {label}s")
+        }
+    }
+    format!(
+        "🧠 mem · recalled {total} ({}, {}, {}, {})",
+        seg(directives, "directive"),
+        seg(facts, "fact"),
+        seg(patterns, "pattern"),
+        seg(windows, "conversation"),
+    )
 }
 
 /// One transcript window → one bullet: `- [sid8] yyyy-mm-dd: <primary block text>`.
@@ -927,7 +944,10 @@ mod tests {
         assert!(!ctx.contains("[noise999]"), "low-score window dropped");
         // Headline counts only the surviving window.
         assert!(
-            v["systemMessage"].as_str().unwrap().contains("1w"),
+            v["systemMessage"]
+                .as_str()
+                .unwrap()
+                .contains("1 conversation"),
             "got {}",
             v["systemMessage"]
         );
@@ -937,11 +957,11 @@ mod tests {
     fn recall_headline_counts_by_section() {
         assert_eq!(
             recall_headline(1, 3, 2, 2),
-            "🧠 mem · recalled 8 (1d 3f 2p 2w)"
+            "🧠 mem · recalled 8 (1 directive, 3 facts, 2 patterns, 2 conversations)"
         );
         assert_eq!(
             recall_headline(0, 1, 0, 0),
-            "🧠 mem · recalled 1 (0d 1f 0p 0w)"
+            "🧠 mem · recalled 1 (0 directives, 1 fact, 0 patterns, 0 conversations)"
         );
     }
 
@@ -958,7 +978,7 @@ mod tests {
         let v = format_prompt_recall(&cap, &json!({}));
         let sys = v["systemMessage"].as_str().unwrap();
         assert!(sys.starts_with("🧠 mem · recalled"), "got {sys}");
-        assert!(sys.contains("2f"), "two facts → 2f; got {sys}");
+        assert!(sys.contains("2 facts"), "two facts → 2 facts; got {sys}");
         // additionalContext is still present + unchanged in shape.
         assert!(v["hookSpecificOutput"]["additionalContext"].is_string());
     }
