@@ -8,6 +8,24 @@ are organized by feature wave (merge commit ranges on `master`).
 
 ## [Unreleased]
 
+## 2026-06-26 — `0.2.3`
+
+### Fixed
+
+- **Auto-recall noise reduced** — two precision fixes for the UserPromptSubmit
+  recall banner:
+  - *Scoped guidance no longer leaks across projects.* `finalize`'s
+    Preference/Workflow floor-exemption is now scope-aware: `Global`/`Workspace`
+    guidance always surfaces, but `Project`/`Repo`-scoped guidance must match the
+    active `scope_filters` (an empty filter set preserves the original
+    always-surface behavior, so raw MCP searches are unchanged). The
+    `recall-prompt` hook now derives `scope_filters` from the payload `cwd`, so a
+    `project:NVR-APP` preference stops surfacing while working in another repo.
+    `error-recall` stays global on purpose (incidents are cross-repo).
+  - *Low-relevance transcript windows are dropped.* The banner floors injected
+    windows by RRF score via `MEM_RECALL_TRANSCRIPT_MIN_SCORE` (default 20),
+    cutting loose semantic-match noise.
+
 ## 2026-06-26 — `0.2.2`
 
 CI-only patch — no binary or behavior change vs `0.2.1`.
