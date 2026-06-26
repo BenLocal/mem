@@ -1,0 +1,10 @@
+[
+  { "id": "q-lance", "intent": "debugging", "query": "lance 的读怎么保证看到最新提交的版本", "relevant": ["lance-1", "lance-2", "lance-3"] },
+  { "id": "q-vacuum", "intent": "debugging", "query": "vacuum 为什么默认不开激进模式", "relevant": ["vacuum-1", "vacuum-2", "vacuum-3"] },
+  { "id": "q-embedding", "intent": "debugging", "query": "embedding worker 一个 tick 领取几个 job", "relevant": ["embedding-1", "embedding-2", "embedding-3"] },
+  { "id": "q-rrf", "intent": "debugging", "query": "RRF 融合是怎么打分的", "relevant": ["rrf-1", "rrf-2", "rrf-3"] },
+  { "id": "q-jieba", "intent": "debugging", "query": "为什么中文 BM25 要先用 jieba 分词", "relevant": ["jieba-1", "jieba-2", "jieba-3"] },
+  { "id": "q-decay", "intent": "debugging", "query": "decay 衰减的时钟锚在哪个字段", "relevant": ["decay-1", "decay-2", "decay-3"] },
+  { "id": "q-embedding-fail", "intent": "debugging", "query": "embedding 的 job 失败了会怎样", "relevant": ["embedding-3"] },
+  { "id": "q-vacuum-manifest", "intent": "debugging", "query": "vacuum 激进模式会删掉仍被引用的 manifest 吗", "relevant": ["vacuum-2"] }
+]

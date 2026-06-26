@@ -1,0 +1,25 @@
+[
+  { "id": "lance-1", "topic": "lance", "content": "lance 读连接用 read_consistency_interval(0) 打开，所以每次读都能透明看到最新提交的版本，不需要显式 refresh 调用。" },
+  { "id": "lance-2", "topic": "lance", "content": "route-B 之后读写都走 lance 原生 API，没有 SQL 引擎、没有 ATTACH、也没有进程内连接池。" },
+  { "id": "lance-3", "topic": "lance", "content": "lance 数据集本身既是存储也是读表面，过滤扫描用 only_if 谓词表达，向量近邻检索用 nearest_to。" },
+
+  { "id": "vacuum-1", "topic": "vacuum", "content": "vacuum worker 周期性修剪数据集的 manifest 历史，把过期的提交版本清理掉以回收磁盘。" },
+  { "id": "vacuum-2", "topic": "vacuum", "content": "默认 vacuum 不开激进模式，因为激进修剪会绕过在途提交的下限、删掉仍被引用的 manifest，导致服务崩溃。" },
+  { "id": "vacuum-3", "topic": "vacuum", "content": "vacuum 的间隔和保留天数都可以用环境变量配置，关闭开关则完全跳过修剪。" },
+
+  { "id": "embedding-1", "topic": "embedding", "content": "embedding worker 每个 tick 默认领取 8 个 job，用批量摊薄每次的读写与刷新开销。" },
+  { "id": "embedding-2", "topic": "embedding", "content": "embedding 的 job 在队列里有完整生命周期：pending、processing、completed、failed、stale。" },
+  { "id": "embedding-3", "topic": "embedding", "content": "embedding 失败不会阻塞写入，job 走重试和退避，成功后把向量写进检索表。" },
+
+  { "id": "rrf-1", "topic": "rrf", "content": "RRF 融合在 Rust 侧对两路候选的排名重新计算，常数 RRF_K 取 60。" },
+  { "id": "rrf-2", "topic": "rrf", "content": "混合检索先取 BM25 和 ANN 两路候选，再用 RRF 把两个排名列表合成一个融合排名。" },
+  { "id": "rrf-3", "topic": "rrf", "content": "rank-1 命中在单通道大约贡献 16 分，两通道都命中约 33 分，这是 RRF 的整数化打分。" },
+
+  { "id": "jieba-1", "topic": "jieba", "content": "jieba 精度模式分词器注册在 content 字段上，专门服务中文重的语料。" },
+  { "id": "jieba-2", "topic": "jieba", "content": "一段没有空格的中文连写如果直接交给 QueryParser 会被当成短语、零命中，所以必须先用 jieba 切成词。" },
+  { "id": "jieba-3", "topic": "jieba", "content": "FTS 是自带的 Tantivy 子系统，用 jieba 切词后构造一个 should 或布尔查询。" },
+
+  { "id": "decay-1", "topic": "decay", "content": "decay 衰减的时钟锚在 last_used_at，用过的胶囊比没人碰过的衰减得更慢。" },
+  { "id": "decay-2", "topic": "decay", "content": "如果一行从来没被用过，decay 就以 updated_at 为锚，所以 updated_at 退回成纯写入新鲜度信号。" },
+  { "id": "decay-3", "topic": "decay", "content": "decay worker 每天线性衰减 active 行，hard-expiry 之后再加两遍衰减扫描。" }
+]

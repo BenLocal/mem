@@ -1,0 +1,8 @@
+{
+  "_comment": "Locked recall-quality floor (O6b). Each metric is the query-averaged value the current ranker achieves on tests/golden_recall/{corpus,qrels}.json with deterministic geometry embeddings. The gate (tests/golden_recall.rs) asserts current >= these minus 1e-6. A value dropping below its baseline means a ranking REGRESSION — investigate before lowering it. ndcg@10/mrr/recall=1.0 lock 'every relevant capsule ranks above every distractor'; precision@5=0.5 is this corpus's oracle ceiling (6 three-relevant queries at 3/5 + 2 single-relevant at 1/5, averaged). To intentionally raise a floor after a quality win, run `cargo test --test golden_recall -- --nocapture` and copy the printed observed numbers here.",
+  "recall_at_5": 1.0,
+  "recall_at_10": 1.0,
+  "ndcg_at_10": 1.0,
+  "mrr": 1.0,
+  "precision_at_5": 0.5
+}

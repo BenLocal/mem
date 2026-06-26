@@ -55,6 +55,13 @@ jobs:
           repo-token: ${{ secrets.GITHUB_TOKEN }}
       - run: cargo fmt --all -- --check
       - run: cargo clippy --all-targets -- -D warnings
+      # Recall-quality regression gate (oss-memory-diff O6b). Runs the
+      # gold-set recall bench (tests/golden_recall.rs) as a named, fast
+      # tripwire BEFORE the full suite, so a ranking change that drops
+      # recall/ndcg/mrr/precision below tests/golden_recall/baseline.json
+      # goes red first with a self-explanatory step name.
+      - name: Recall regression gate
+        run: cargo test --test golden_recall -- --nocapture
       - run: cargo test
 
   # Postgres backend parity. The backend is a default dependency now, so the
