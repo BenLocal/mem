@@ -222,7 +222,7 @@ FEEDBACK  ── 隐式 / 自动 ──
 - O6c harness：`tests/mempalace_bench.rs`（`#[ignore]`）+ committed `subset.json`（6 条 format-faithful synthetic）+ `tests/mempalace_bench/.gitignore`（挡 277MB 真集）。bench 逻辑：每题 fresh `Store` → 每 haystack session 一条 capsule（真 Qwen3 batch 嵌入 + upsert）→ question 走真 hybrid `rank_with_hybrid_and_graph` → ranked capsule 映回 session id → `recall_any_at_k`/`recall_at_k`/`mrr` over `answer_session_ids`；type-stratified `LONGMEMEVAL_SAMPLE`（默认 50，0=全 500）。
 - **真集数（公开数）= 未产出**：本机 Qwen3-Embedding-0.6B（CPU、contended）嵌 LongMemEval ~48-session 长 haystack 太慢，**N=6 探测 1h40m 未完**；全 500 题 ~2.4 万 session 嵌入在本机不可行。需在 **GPU 或非 contended CPU** 机器上 drop-in 真集后复跑 `cargo test --test mempalace_bench --ignored` 才能得到可对外引用的 session-recall@k。在那之前 README **不写**任何 LongMemEval 数（避免拿 synthetic 子集示意数误导对比）。
 
-### O7 🔍 — 对标 Mem0 的自动抽取 + 冲突消解：零-额外-LLM 版（P1）(a)(b) ✅ · (c) ⬜ ★(a)(b) 零 LLM 可直接做，(c) 默认关
+### O7 🔍 — 对标 Mem0 的自动抽取 + 冲突消解：零-额外-LLM 版（P1）(a)(b)(c) ✅ ★(a)(b) 零 LLM，(c) opt-in 默认关 + fail-safe
 
 > **硬约束**：本部署**没有多余的生成式 LLM**（无可达网关，见 O6c 勘探）。所以这条对标 Mem0「写时 LLM 抽取 + ADD/UPDATE/DELETE 对账」的能力，**默认形态必须零生成式 LLM**——靠已有的 embedding + 启发式 + review 队列拿到 80% 价值；真要 mem0 级细腻抽取，做成**默认关**的 opt-in lane，没配 LLM 时静默退回现状，**永不强依赖**。这与 §6「不做 inline LLM 抽取」不矛盾：(a)(b) 不是 LLM 抽取（是嵌入去重 + 规则抽取，守 verbatim），(c) 才是那条被 §6 排除的路——所以把它关在 opt-in 后面。
 
@@ -240,7 +240,8 @@ FEEDBACK  ── 隐式 / 自动 ──
 - **(b) 【零 LLM】启发式抽取 lane ✅ 落地**：新模块 `cli/heuristic_extract.rs::heuristic_candidates`——对**未打 `<mem-save>`** 的 assistant 文本块抓高信号句（决策/因果/error→fix/含 `code_ref`/命中已知实体），每条作为 `ExtractedMemory{pending:true}` 由 miner 以 `write_mode:"propose"` → `PendingConfirmation` 落 review 队列（**绝不 Active**）。**纯正则/启发式 + `entity_normalize`,零 LLM、零新模型**。
   - **守住历史教训**：pre-2026-05-08 的散文 cue 抽取因「元提及」误造 **Active** 记忆被删除（见 `cli/mine.rs` 头注）；本次安全的关键 = **opt-in 默认关**（`MEM_MINE_HEURISTIC_EXTRACT=1`）+ 高精度 cue + 硬垃圾过滤（≥12 字/≤400/≥4 实词）+ 每条都 **review-gated**（PendingConfirmation，一次 reject 即弃）。
   - **落地细节**：分句正则 `[。！？\n]+|[.!?]\s+`（ASCII `.` 仅在后接空白才算句界，保住 `decay.rs` 等路径/版本号不被切碎）；每块至多 `MAX_PER_BLOCK=2` 候选 + 去重；idempotency key 加 `:h{sha8(content)}` 后缀避免与同行 `<mem-save>` 碰撞、且重跑幂等。entity cue 接口已留（接受 alias 切片），miner v1 传空（实体注入留作后续）。assistant 文本块限定（与既有抽取同范围,保守）。
-- **(c) 【opt-in，默认关】生成式 LLM lane**：真要 Mem0 级细腻抽取/对账才需生成式 LLM → 走内部网关，**default OFF**；**没配 LLM 时静默退回 (a)+(b)/现状**，永不强依赖、永不因缺 LLM 报错。
+- **(c) 【opt-in，默认关】生成式 LLM lane ✅ 落地**：新模块 `cli/llm_extract.rs`——`mem mine` 时对未打 `<mem-save>` 的 assistant 文本块调内部网关 `chat/completions` 抽原子事实 → `PendingConfirmation` 候选。**三层 fail-safe 保证永不强依赖**:① `MEM_MINE_LLM_EXTRACT` 默认关;② `LlmExtractConfig::from_env` 缺 `LLM_API_BASE`/`LLM_MODEL` 返回 `None`→lane 不活;③ `llm_candidates` 吞掉一切错误(网络/非 2xx/解析)返回空→静默退回 O7(a/b)/tag。**(c) 开启时 supersede (b)**(同块不双挖)。
+  - **落地细节**：reqwest client `.no_proxy()`(= httpx `trust_env=False`,否则内网网关 IP 走公网代理 502,见 `internal-llm-gateway` skill);空 `LLM_API_KEY`→不发 Authorization(内网边缘鉴权);`caller:"mem-mine-o7c"` 统计;每块 ≤5 候选 + 同款长度过滤;每 mine 最多 40 块封顶(防打爆网关);`parse_candidates` 纯函数(剥 code fence、切首个 `[...]`、JSON 解析、过滤),单测覆盖。pending 候选走与 (b) 同一 `write_mode:"propose"` + `:h{sha8}` 幂等路径。
 
 **验收**：
 - (a) ingest 一条语义近重复（cosine ≥ 阈值但非 exact-hash）→ 新 capsule 落 `PendingConfirmation` + 指向簇 canonical 的 `suspected_supersede` 边；原文 verbatim 不动；**全程不调 LLM**。
@@ -258,7 +259,7 @@ FEEDBACK  ── 隐式 / 自动 ──
 
 ## 6. 不做 / 本质形态差异
 
-- **inline LLM fact 抽取（write 时）** —— mem0/agentmemory 都在写时用 LLM 把对话压成结构化 fact；mem **故意不做**，把抽取放到 `mem mine` 离线管线，落盘 verbatim。这是哲学差异（保真 > 即时结构化），不是 gap，**不引入**。
+- **inline LLM fact 抽取（write 时 / 默认路径）** —— mem0/agentmemory 在写时用 LLM 把对话压成结构化 fact；mem 的**默认路径故意不做**，抽取放在 `mem mine` 离线管线、落盘 verbatim（保真 > 即时结构化）。**O7(c) 提供了一条 opt-in 逃生口**（`mem mine` 离线、非 write 路径、`MEM_MINE_LLM_EXTRACT` 默认关、缺 LLM 静默退回、产出仍是 review-gated 候选），所以默认哲学不变——LLM 抽取始终关在显式开关后，不是默认行为。
 - **只增不删（mem0 additive）** —— mem 用 supersede 链 + 状态机表达版本，比 mem0 纯堆积更可控，**不回退**。
 - **四层 consolidation（agentmemory）** —— mem 已有近似分层：transcript archive(生) ≈ Working、capsule ≈ Semantic、`workflow.rs` episode→workflow ≈ Procedural。Episodic（会话级摘要）是唯一缺口，但价值待测，**暂不立项**。
 
@@ -274,6 +275,6 @@ FEEDBACK  ── 隐式 / 自动 ──
 | P2 ✅ | O4 graph degree 衰减（`retrieve.rs`） | 🔍 | S | 抑制热门节点过度 boost（spread_decay，按锚 fanout 反比） |
 | P2 | O5 secret 脱敏 | 📦/⚙️ | M（两层设计，先定边界） | 降低 verbatim 带来的泄露面 |
 | **P1 ✅/⚠️** | O6 召回质量 eval 框架（金标集 + CI 门 + parity） | 🔍/⚙️ | M | 🔴 全赛道入场券。O6a/O6b ✅（`2e7a68f`，CI 全绿回归门）；O6c harness ✅、**真集公开数待快机**（本机 Qwen3-0.6B CPU N=6 跑 1h40m 未完，需 GPU/非 contended CPU drop-in 真集复跑） |
-| **P1 (a)(b)✅** | O7 Mem0 式自动抽取 + 冲突消解（零-额外-LLM 版） | 🔍 | (a) S-M ／ (b) M ／ (c) M | 🟠 对标 Mem0 写时抽取/对账，但默认零生成式 LLM。**(a) ✅**：簇级语义近重复→canonical supersede 提案（`flag_if_near_duplicate`+`pick_cluster_canonical`，`o7_neardup_cluster`）；**(b) ✅**：启发式高信号抽取→PendingConfirmation（`heuristic_extract.rs`，opt-in `MEM_MINE_HEURISTIC_EXTRACT`，review-gated）；(c) opt-in LLM lane 默认关、缺 LLM 退回 (a)+(b)（⬜）。 |
+| **P1 (a)(b)(c)✅** | O7 Mem0 式自动抽取 + 冲突消解（零-额外-LLM 版） | 🔍 | (a) S-M ／ (b) M ／ (c) M | 🟠 对标 Mem0 写时抽取/对账，但默认零生成式 LLM。**(a) ✅**：簇级语义近重复→canonical supersede 提案（`flag_if_near_duplicate`+`pick_cluster_canonical`，`o7_neardup_cluster`）；**(b) ✅**：启发式高信号抽取→PendingConfirmation（`heuristic_extract.rs`，opt-in `MEM_MINE_HEURISTIC_EXTRACT`）；**(c) ✅**：生成式 LLM lane（`llm_extract.rs`，opt-in `MEM_MINE_LLM_EXTRACT` 默认关 + 三层 fail-safe，缺 LLM 静默退回 (a)+(b)）。三条都 review-gated。 |
 
 > commit close 引用：O1 已落地 = `feat(schema): add last_used_at column` (`808cb59`) + `feat(lifecycle): retrieval reinforcement resets the decay clock via last_used_at` (`709c648`) + `docs(agents)` (`181fe67`)。

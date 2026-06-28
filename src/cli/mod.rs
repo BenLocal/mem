@@ -4,6 +4,7 @@ pub mod heuristic_extract;
 pub mod hook;
 pub mod import;
 pub mod init;
+pub mod llm_extract;
 pub mod mcp;
 pub mod mine;
 pub mod serve;

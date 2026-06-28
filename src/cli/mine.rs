@@ -728,12 +728,52 @@ where
 /// `mem_fail` / `block_fail`, not propagated.
 pub async fn run_with_counts(args: MineArgs) -> anyhow::Result<MineCounts> {
     // O7(b): opt-in zero-LLM heuristic extraction of untagged high-signal
-    // sentences (default OFF). Conservative like the other write-affecting
-    // features; everything it surfaces is review-gated PendingConfirmation.
+    // sentences (default OFF). O7(c): opt-in generative-LLM extraction (default
+    // OFF, fail-safe). Both surface review-gated PendingConfirmation candidates.
+    // When (c) is active it SUPERSEDES (b) for the untagged blocks (the LLM is
+    // the higher-quality extractor), so (b) runs only when (c) is off — never
+    // double-mine the same block.
     let heuristic = std::env::var("MEM_MINE_HEURISTIC_EXTRACT")
         .map(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes"))
         .unwrap_or(false);
-    let (memories, blocks) = parse_transcript_full(&args.transcript_path, heuristic)?;
+    let llm_cfg = if crate::cli::llm_extract::enabled() {
+        // `enabled` is on but a missing gateway config → None → lane inactive
+        // (silent fallback, never an error). Guard #2 of three.
+        crate::cli::llm_extract::LlmExtractConfig::from_env()
+    } else {
+        None
+    };
+    let (mut memories, blocks) =
+        parse_transcript_full(&args.transcript_path, heuristic && llm_cfg.is_none())?;
+
+    // O7(c): LLM extraction over untagged assistant text blocks. Fail-safe by
+    // construction (`llm_candidates` swallows every error → empty), so a dead
+    // gateway just yields no candidates and the mine proceeds.
+    if let Some(cfg) = &llm_cfg {
+        // Bound the per-mine gateway fan-out so a huge transcript can't hammer
+        // the gateway; the rest still mine via tags (and the next run resumes).
+        const MAX_LLM_BLOCKS: usize = 40;
+        let mut used = 0usize;
+        for b in &blocks {
+            if used >= MAX_LLM_BLOCKS {
+                eprintln!("O7(c): LLM extract capped at {MAX_LLM_BLOCKS} blocks this run");
+                break;
+            }
+            if b.role == "assistant" && b.block_type == "text" && !b.content.contains("<mem-save>")
+            {
+                used += 1;
+                for cand in crate::cli::llm_extract::llm_candidates(cfg, &b.content).await {
+                    memories.push(ExtractedMemory {
+                        content: cand,
+                        session_id: b.session_id.clone(),
+                        timestamp: b.timestamp.clone(),
+                        line_number: b.line_number,
+                        pending: true,
+                    });
+                }
+            }
+        }
+    }
 
     let client = reqwest::Client::new();
     let mut mem_ok: u32 = 0;
