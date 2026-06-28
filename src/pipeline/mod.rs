@@ -4,6 +4,7 @@ pub mod entity_normalize;
 pub mod eval_metrics;
 pub mod ingest;
 pub mod ranking;
+pub mod redact;
 pub mod retrieve;
 pub mod session;
 pub mod transcript_recall;

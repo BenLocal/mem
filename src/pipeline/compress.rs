@@ -217,6 +217,12 @@ fn tokenizer() -> &'static CoreBPE {
 }
 
 fn compress_text(text: &str, budget: usize) -> String {
+    // O5: redact high-confidence secrets at the output layer (single choke point
+    // for all compressed prose). Storage stays verbatim; only this derived text
+    // is masked. Redact BEFORE the token-budget trim so a masked key is what the
+    // budget shapes.
+    let redacted = crate::pipeline::redact::redact_secrets(text);
+    let text: &str = redacted.as_ref();
     let limit = budget.max(8);
     let bpe = tokenizer();
     let tokens = bpe.encode_with_special_tokens(text);
@@ -315,6 +321,20 @@ mod tests {
         let input = "Hello world";
         let result = compress_text(input, 100);
         assert_eq!(result, input);
+    }
+
+    #[test]
+    fn compress_text_redacts_secrets_o5() {
+        // O5: a high-confidence secret in output prose is masked at this choke
+        // point (default-on). Large budget → no truncation, so we test redaction
+        // in isolation.
+        let input = "we set the key sk-abcdEFGH1234ijklMNOP in the deploy config";
+        let result = compress_text(input, 1000);
+        assert!(
+            result.contains("[redacted:sk]"),
+            "secret not masked: {result}"
+        );
+        assert!(!result.contains("sk-abcdEFGH"), "secret leaked: {result}");
     }
 
     #[test]

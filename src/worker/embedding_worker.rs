@@ -491,6 +491,9 @@ async fn record_failure(
 /// unchanged (one embedding row, today's behaviour).
 fn embed_input_chunks(summary: &str, content: &str) -> Vec<String> {
     let combined = format!("{summary}\n{content}");
+    // O5: redact secrets before embedding so a leaked key in captured content
+    // never rides into the vector index. Storage is untouched (verbatim).
+    let combined = crate::pipeline::redact::redact_secrets(&combined).into_owned();
     crate::pipeline::chunk::chunk_text(
         &combined,
         crate::pipeline::chunk::DEFAULT_CHUNK_TOKENS,

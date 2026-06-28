@@ -181,16 +181,22 @@ FEEDBACK  ── 隐式 / 自动 ──
 
 **已落地**：`compute_graph_boosts` 加 `spread_decay(degree) = 1/(1+0.001·(degree-1)²)`，`boost = round(GRAPH_BOOST·spread·strength)`，max-over-anchors。`degree` = 锚 entity 的 **capsule fanout**（只数 capsule 端点，entity↔entity 的共现/tunnel 边不计）。比"一行式"略多一处结构改动：原 dynamics-OFF 路用扁平批量 `related_capability_capsule_ids`（丢了 per-anchor 归属），改成和 dynamics-ON 路一样**逐 anchor 走 `neighbors_within`**，才能拿到每个 anchor 的 degree——mem 是 local-first、图规模适中，N 个 anchor（top-5 capsule 的实体，有界）的额外 round-trip 可忽略。degree≤1 不衰减；现有 dynamics 测试 degree=2、spread≈0.999 四舍五入到原值，无回归。无 env 开关（公式固定）。
 
-### O5 📦/⚙️ — ingest secret 脱敏（P2）
+### O5 📦/⚙️ — ingest secret 脱敏（P2）✅ 落地
 
 **现状（code）**：mem 把 transcript 整段 verbatim 存（`conversation_messages`）。相比两家，**verbatim 反而抬高了密钥泄露面**。
 
 **借鉴**：agentmemory 存前 privacy filter（剥 API key / secret / `<private>`）。
 
-**改法（两层，守 verbatim）**：原文在 access-control 下原样保留；只在**索引 / 输出层** redact 高置信密钥模式（`sk-...`、AWS AKIA、私钥块、`<private>…</private>`）。不在存储层就地改写 content（那会破 verbatim 原则）。
+**改法（两层，守 verbatim）**：原文在 access-control 下原样保留；只在**索引 / 输出层** redact 高置信密钥模式。不在存储层就地改写 content（那会破 verbatim 原则）。
 
-**触点**：index/输出侧（`pipeline/compress.rs` 输出过滤 + 嵌入前文本），不动 `memories.content` / transcript `content` 落盘。
-**风险**：中。要先定"哪些算密钥"白名单，避免误 redact 正常内容；与 §6「verbatim 不破」边界强相关，落地前需单独定调。
+**已落地（以代码为权威）**：新模块 `pipeline/redact.rs`——`redact_secrets`(默认开,opt-out `MEM_REDACT_SECRETS_DISABLED=1`;无命中走 `Cow::Borrowed` 零分配快路)。**两个 seam**(用户拍板的覆盖面=嵌入前 + 答案 + 横幅,不含 transcript):
+- **答案 + 横幅**:redact 接在 `compress::compress_text`——所有压缩输出 prose(directive/fact/pattern body + source_summary + workflow goal/steps/signals)的**唯一 choke point**,一处即覆盖 MCP/HTTP search response;recall 横幅渲染的就是该 response,**transitively 覆盖横幅**,无需动 `hook.rs`。
+- **嵌入前**:redact 接在 `worker/embedding_worker.rs::embed_input_chunks`,密钥不进向量索引。
+- **白名单**(高置信,token 模式带 `\b` 防 `ask-`→`sk-` 误命中):OpenAI/通用 `sk-`、AWS `AKIA`、私钥块 `-----BEGIN…PRIVATE KEY-----`、`<private>…</private>`、GitHub `gh[posru]_`、JWT、`Bearer`。替换成 `[redacted:<kind>]`。
+- **不动**:`capability_capsule_get`(显式 verbatim-fetch、access-controlled)+ 落盘 `content`/transcript content 保持原样。
+
+**触点**：`pipeline/redact.rs`(新)、`pipeline/compress.rs::compress_text`、`worker/embedding_worker.rs::embed_input_chunks`。**不动** `memories.content` / transcript `content` 落盘。
+**风险**：中→低。误 redact 风险用「高置信模式 + `\b` 边界 + 仅输出层(存储 verbatim 不破)」收口;默认开是因为纯输出层 mask 不碰存储。
 
 ### O6 🔍/⚙️ — 召回质量 eval 框架：金标集 + parity bench + CI 回归门（P1）✅ O6a/O6b 落地（`2e7a68f`）· O6c harness 就绪、真集数待快机 ★最高杠杆的质量基础设施
 
@@ -273,7 +279,7 @@ FEEDBACK  ── 隐式 / 自动 ──
 | P1 ✅ | O2 write 近邻去重/矛盾（`b7b9528`+worker） | 🔍 | M | 预防膨胀与矛盾并存（异步 worker，落 PendingConfirmation + suspected_supersede 边，守 verbatim） |
 | P1 ✅ | O3 capsule 多样化（`retrieve.rs`） | 🔍 | S | 消除头部近似条目霸占（per-source 软配额，默认 3，session 为 key） |
 | P2 ✅ | O4 graph degree 衰减（`retrieve.rs`） | 🔍 | S | 抑制热门节点过度 boost（spread_decay，按锚 fanout 反比） |
-| P2 | O5 secret 脱敏 | 📦/⚙️ | M（两层设计，先定边界） | 降低 verbatim 带来的泄露面 |
+| **P2 ✅** | O5 secret 脱敏 | 📦/⚙️ | M | 降低 verbatim 泄露面。**✅ 落地**：`pipeline/redact.rs`(默认开,opt-out `MEM_REDACT_SECRETS_DISABLED`)接在 `compress_text`(覆盖答案+横幅)+ `embed_input_chunks`(嵌入前);白名单 sk-/AKIA/私钥块/`<private>`/GitHub/JWT/Bearer,带 `\b` 防误命中;存储 verbatim 不动、`capability_capsule_get` 不 redact |
 | **P1 ✅/⚠️** | O6 召回质量 eval 框架（金标集 + CI 门 + parity） | 🔍/⚙️ | M | 🔴 全赛道入场券。O6a/O6b ✅（`2e7a68f`，CI 全绿回归门）；O6c harness ✅、**真集公开数待快机**（本机 Qwen3-0.6B CPU N=6 跑 1h40m 未完，需 GPU/非 contended CPU drop-in 真集复跑） |
 | **P1 (a)(b)(c)✅** | O7 Mem0 式自动抽取 + 冲突消解（零-额外-LLM 版） | 🔍 | (a) S-M ／ (b) M ／ (c) M | 🟠 对标 Mem0 写时抽取/对账，但默认零生成式 LLM。**(a) ✅**：簇级语义近重复→canonical supersede 提案（`flag_if_near_duplicate`+`pick_cluster_canonical`，`o7_neardup_cluster`）；**(b) ✅**：启发式高信号抽取→PendingConfirmation（`heuristic_extract.rs`，opt-in `MEM_MINE_HEURISTIC_EXTRACT`）；**(c) ✅**：生成式 LLM lane（`llm_extract.rs`，opt-in `MEM_MINE_LLM_EXTRACT` 默认关 + 三层 fail-safe，缺 LLM 静默退回 (a)+(b)）。三条都 review-gated。 |
 
