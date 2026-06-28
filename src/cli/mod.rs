@@ -1,5 +1,6 @@
 pub mod common;
 pub mod feedback;
+pub mod heuristic_extract;
 pub mod hook;
 pub mod import;
 pub mod init;

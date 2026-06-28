@@ -127,8 +127,9 @@ async fn run_claude_code(args: ClaudeCodeArgs) -> i32 {
     let mut total_failed: u64 = 0;
 
     for file in &files {
-        // Archive-only: keep the block half, drop the extracted-memory half.
-        let blocks = match parse_transcript_full(file) {
+        // Archive-only: keep the block half, drop the extracted-memory half
+        // (heuristic extraction off — import does not mine memories).
+        let blocks = match parse_transcript_full(file, false) {
             Ok((_memories, blocks)) => blocks,
             Err(e) => {
                 eprintln!("import: skip {} (parse error: {})", file.display(), e);

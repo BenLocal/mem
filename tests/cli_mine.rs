@@ -48,3 +48,56 @@ fn test_mem_save_tag_wins_over_inline_prose_cue() {
     assert_eq!(memories.len(), 1);
     assert_eq!(memories[0].content, "this is the canonical memory tag");
 }
+
+#[test]
+fn heuristic_extract_off_by_default_on_via_flag() {
+    // O7(b): an untagged assistant block with a high-signal decision + code-ref
+    // sentence. Off → nothing (legacy <mem-save>-only). On → one pending
+    // (review-gated) candidate.
+    let transcript = r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"我们最终决定采用 Lance 作为本地存储后端，retry 放在 src/storage/decay.rs 里"}]},"sessionId":"h","timestamp":"2026-04-29T10:00:00Z"}
+"#;
+    let file = NamedTempFile::new().unwrap();
+    fs::write(file.path(), transcript).unwrap();
+
+    let (off, _) = mem::cli::mine::parse_transcript_full(file.path(), false).unwrap();
+    assert!(
+        off.is_empty(),
+        "heuristic off → no candidates, got {:?}",
+        off.iter().map(|m| &m.content).collect::<Vec<_>>(),
+    );
+
+    let (on, _) = mem::cli::mine::parse_transcript_full(file.path(), true).unwrap();
+    assert_eq!(
+        on.len(),
+        1,
+        "heuristic on → 1 candidate, got {:?}",
+        on.iter().map(|m| &m.content).collect::<Vec<_>>(),
+    );
+    assert!(
+        on[0].pending,
+        "heuristic candidate must be pending (→ PendingConfirmation)",
+    );
+    assert!(on[0].content.contains("决定采用 Lance"));
+}
+
+#[test]
+fn tagged_block_is_not_double_mined_under_heuristic() {
+    // A block WITH a <mem-save> tag: under heuristic=true it must still yield
+    // exactly the tagged memory (pending=false), not an extra heuristic copy.
+    let transcript = r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"我们决定采用 Lance <mem-save>use Lance as the local store</mem-save>"}]},"sessionId":"h2","timestamp":"2026-04-29T10:00:00Z"}
+"#;
+    let file = NamedTempFile::new().unwrap();
+    fs::write(file.path(), transcript).unwrap();
+
+    let (mems, _) = mem::cli::mine::parse_transcript_full(file.path(), true).unwrap();
+    assert_eq!(
+        mems.len(),
+        1,
+        "tagged block → only the tag, got {:?}",
+        mems.iter()
+            .map(|m| (&m.content, m.pending))
+            .collect::<Vec<_>>(),
+    );
+    assert!(!mems[0].pending);
+    assert_eq!(mems[0].content, "use Lance as the local store");
+}

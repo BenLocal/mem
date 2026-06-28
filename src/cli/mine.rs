@@ -21,6 +21,12 @@ use super::feedback::{self, FeedbackCounts, FeedbackFromTranscriptArgs};
 // text as a memory (`mem_019e061e-...`, archived). Agents that want to
 // persist a fact must use `<mem-save>...</mem-save>` (or call
 // `capability_capsule_ingest` directly via MCP).
+//
+// O7(b) adds an OPT-IN heuristic lane (`MEM_MINE_HEURISTIC_EXTRACT=1`, default
+// off) on top of this: untagged high-signal sentences become
+// `PendingConfirmation` candidates (review-gated, never `Active`) — the review
+// gate is what makes reintroducing prose-cue extraction safe this time. See
+// `cli/heuristic_extract.rs`.
 static TAG_RE: Lazy<Regex> = Lazy::new(|| Regex::new(r"<mem-save>(.*?)</mem-save>").unwrap());
 
 /// Output shape for `mem mine`. `human` is the legacy stdout summary
@@ -87,6 +93,10 @@ pub struct ExtractedMemory {
     pub session_id: String,
     pub timestamp: String,
     pub line_number: usize,
+    /// O7(b): `true` for a zero-LLM heuristic candidate (untagged high-signal
+    /// sentence). These ingest as `PendingConfirmation` (review-gated) — the
+    /// tagged `<mem-save>` path keeps `pending = false` (→ `Active`).
+    pub pending: bool,
 }
 
 /// One transcript block destined for `/transcripts/messages`.
@@ -238,7 +248,9 @@ async fn send_block_batch(
 /// `tests/cli_mine.rs`. New code should prefer [`parse_transcript_full`]
 /// which also returns the per-block archive payload.
 pub fn parse_transcript(path: &Path) -> Result<Vec<ExtractedMemory>> {
-    parse_transcript_full(path).map(|(mems, _blocks)| mems)
+    // Legacy callers (and their tests) expect ONLY `<mem-save>` matches —
+    // heuristic extraction (O7 b) is off here.
+    parse_transcript_full(path, false).map(|(mems, _blocks)| mems)
 }
 
 /// Parses a Claude Code JSONL transcript into both extracted memories
@@ -249,7 +261,17 @@ pub fn parse_transcript(path: &Path) -> Result<Vec<ExtractedMemory>> {
 /// preserves the pre-existing extraction behavior. Every block of every
 /// message (user / assistant / system, all four block types) is added
 /// to the archive output.
-pub fn parse_transcript_full(path: &Path) -> Result<(Vec<ExtractedMemory>, Vec<ArchivedBlock>)> {
+///
+/// When `heuristic` is true (O7 b), assistant text blocks that did NOT yield a
+/// `<mem-save>` extraction are additionally scanned for high-signal sentences
+/// (`heuristic_extract::heuristic_candidates`); each becomes an
+/// `ExtractedMemory { pending: true, .. }` that the miner ingests as
+/// `PendingConfirmation` (review-gated). Off by default — the legacy
+/// `<mem-save>`-only behaviour is unchanged when `heuristic = false`.
+pub fn parse_transcript_full(
+    path: &Path,
+    heuristic: bool,
+) -> Result<(Vec<ExtractedMemory>, Vec<ArchivedBlock>)> {
     let file = File::open(path)?;
     let reader = BufReader::new(file);
     let mut memories = Vec::new();
@@ -335,7 +357,21 @@ pub fn parse_transcript_full(path: &Path) -> Result<(Vec<ExtractedMemory>, Vec<A
                             session_id: session_id.clone(),
                             timestamp: timestamp.clone(),
                             line_number,
+                            pending: false,
                         });
+                    } else if heuristic {
+                        // O7(b): no `<mem-save>` tag on this block — scan it for
+                        // high-signal sentences. Each lands as a review-gated
+                        // PendingConfirmation candidate (never Active).
+                        for cand in crate::cli::heuristic_extract::heuristic_candidates(text, &[]) {
+                            memories.push(ExtractedMemory {
+                                content: cand,
+                                session_id: session_id.clone(),
+                                timestamp: timestamp.clone(),
+                                line_number,
+                                pending: true,
+                            });
+                        }
                     }
                 }
             }
@@ -498,6 +534,16 @@ fn looks_like_real_memory(s: &str) -> bool {
     }
     let substantive = s.chars().filter(|c| c.is_alphanumeric()).count();
     substantive >= MIN_SUBSTANTIVE
+}
+
+/// Short, stable content-derived suffix for an O7(b) heuristic candidate's
+/// idempotency key — keeps a re-run from duplicating it, and two candidates
+/// mined off the same transcript line distinct. First 4 bytes of sha256 as
+/// hex (deterministic across runs/platforms).
+fn content_key_suffix(content: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let d = Sha256::digest(content.as_bytes());
+    format!("{:02x}{:02x}{:02x}{:02x}", d[0], d[1], d[2], d[3])
 }
 
 /// Typed result of a mine pass. Fields are wire-counted (HTTP 2xx) — the
@@ -681,7 +727,13 @@ where
 /// (transcript parse). Per-row HTTP failures are counted in
 /// `mem_fail` / `block_fail`, not propagated.
 pub async fn run_with_counts(args: MineArgs) -> anyhow::Result<MineCounts> {
-    let (memories, blocks) = parse_transcript_full(&args.transcript_path)?;
+    // O7(b): opt-in zero-LLM heuristic extraction of untagged high-signal
+    // sentences (default OFF). Conservative like the other write-affecting
+    // features; everything it surfaces is review-gated PendingConfirmation.
+    let heuristic = std::env::var("MEM_MINE_HEURISTIC_EXTRACT")
+        .map(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes"))
+        .unwrap_or(false);
+    let (memories, blocks) = parse_transcript_full(&args.transcript_path, heuristic)?;
 
     let client = reqwest::Client::new();
     let mut mem_ok: u32 = 0;
@@ -749,8 +801,26 @@ pub async fn run_with_counts(args: MineArgs) -> anyhow::Result<MineCounts> {
     let capsule_payloads: Vec<serde_json::Value> = memories
         .into_iter()
         .map(|memory| {
-            let idempotency_key =
-                format!("{}:{}", args.transcript_path.display(), memory.line_number);
+            // O7(b): heuristic candidates go in as `propose` → PendingConfirmation
+            // (review-gated), tagged distinctly so they never collide with a
+            // `<mem-save>` capsule mined off the same line. The content-hash
+            // suffix keeps the key stable across re-runs (idempotent).
+            let (write_mode, idempotency_key) = if memory.pending {
+                (
+                    "propose",
+                    format!(
+                        "{}:{}:h{}",
+                        args.transcript_path.display(),
+                        memory.line_number,
+                        content_key_suffix(&memory.content),
+                    ),
+                )
+            } else {
+                (
+                    "auto",
+                    format!("{}:{}", args.transcript_path.display(), memory.line_number),
+                )
+            };
             serde_json::json!({
                 "tenant": args.remote.tenant,
                 "capability_capsule_type": "experience",
@@ -758,7 +828,7 @@ pub async fn run_with_counts(args: MineArgs) -> anyhow::Result<MineCounts> {
                 "scope": "global",
                 "source_agent": args.agent,
                 "idempotency_key": idempotency_key,
-                "write_mode": "auto",
+                "write_mode": write_mode,
             })
         })
         .collect();
