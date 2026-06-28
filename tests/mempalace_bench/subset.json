@@ -1,0 +1,92 @@
+[
+  {
+    "question_id": "sub_single_session_user_1",
+    "question_type": "single-session-user",
+    "question": "我之前提到过想用哪个向量数据库来做本地检索？",
+    "answer": "Lance",
+    "question_date": "2026-06-01",
+    "haystack_session_ids": ["s1", "s2", "s3", "s4", "s5"],
+    "answer_session_ids": ["s2"],
+    "haystack_sessions": [
+      [{"role": "user", "content": "今天天气不错，想出去跑步。"}, {"role": "assistant", "content": "注意补水和热身。"}],
+      [{"role": "user", "content": "我打算用 Lance 这个嵌入式向量数据库来做本地的语义检索，不想依赖外部服务。", "has_answer": true}, {"role": "assistant", "content": "Lance 适合本地优先场景，读写都在进程内。"}],
+      [{"role": "user", "content": "帮我写一个 Python 的快速排序。"}, {"role": "assistant", "content": "好的，这是实现。"}],
+      [{"role": "user", "content": "推荐一部科幻电影。"}, {"role": "assistant", "content": "可以看《降临》。"}],
+      [{"role": "user", "content": "明天提醒我交报告。"}, {"role": "assistant", "content": "已记下。"}]
+    ]
+  },
+  {
+    "question_id": "sub_multi_session_1",
+    "question_type": "multi-session",
+    "question": "结合我说过的预算和人数，团建一共大概要花多少钱？",
+    "answer": "约 8000 元",
+    "question_date": "2026-06-02",
+    "haystack_session_ids": ["m1", "m2", "m3", "m4", "m5"],
+    "answer_session_ids": ["m2", "m4"],
+    "haystack_sessions": [
+      [{"role": "user", "content": "周末看了一场篮球赛。"}, {"role": "assistant", "content": "听起来很精彩。"}],
+      [{"role": "user", "content": "公司团建的人均预算是 400 元。", "has_answer": true}, {"role": "assistant", "content": "好的，人均 400。"}],
+      [{"role": "user", "content": "顺便问下怎么腌牛排。"}, {"role": "assistant", "content": "先用盐和黑胡椒。"}],
+      [{"role": "user", "content": "这次团建一共有 20 个人参加。", "has_answer": true}, {"role": "assistant", "content": "记下了，20 人。"}],
+      [{"role": "user", "content": "推荐一首轻音乐。"}, {"role": "assistant", "content": "试试久石让的曲子。"}]
+    ]
+  },
+  {
+    "question_id": "sub_knowledge_update_1",
+    "question_type": "knowledge-update",
+    "question": "我现在用的笔记本是什么型号？",
+    "answer": "MacBook Pro M4",
+    "question_date": "2026-06-03",
+    "haystack_session_ids": ["k1", "k2", "k3", "k4"],
+    "answer_session_ids": ["k3"],
+    "haystack_sessions": [
+      [{"role": "user", "content": "我之前一直用一台旧的 ThinkPad 写代码。"}, {"role": "assistant", "content": "经典机型。"}],
+      [{"role": "user", "content": "帮我订一张去上海的高铁票。"}, {"role": "assistant", "content": "好的。"}],
+      [{"role": "user", "content": "我刚换了新电脑，现在用的是 MacBook Pro M4。", "has_answer": true}, {"role": "assistant", "content": "M4 性能很强，恭喜。"}],
+      [{"role": "user", "content": "今晚吃什么好。"}, {"role": "assistant", "content": "来点清淡的。"}]
+    ]
+  },
+  {
+    "question_id": "sub_temporal_reasoning_1",
+    "question_type": "temporal-reasoning",
+    "question": "我是先去的杭州还是先去的成都？",
+    "answer": "先去杭州",
+    "question_date": "2026-06-04",
+    "haystack_session_ids": ["t1", "t2", "t3", "t4"],
+    "answer_session_ids": ["t2", "t3"],
+    "haystack_sessions": [
+      [{"role": "user", "content": "最近在学吉他。"}, {"role": "assistant", "content": "坚持练习很重要。"}],
+      [{"role": "user", "content": "我三月份去了杭州出差。", "has_answer": true}, {"role": "assistant", "content": "杭州春天很美。"}],
+      [{"role": "user", "content": "五月份我又去了一趟成都。", "has_answer": true}, {"role": "assistant", "content": "成都美食多。"}],
+      [{"role": "user", "content": "推荐一本书。"}, {"role": "assistant", "content": "《人类简史》。"}]
+    ]
+  },
+  {
+    "question_id": "sub_single_session_preference_1",
+    "question_type": "single-session-preference",
+    "question": "根据我说过的偏好，帮我点咖啡应该点什么？",
+    "answer": "不加糖的燕麦拿铁",
+    "question_date": "2026-06-05",
+    "haystack_session_ids": ["p1", "p2", "p3"],
+    "answer_session_ids": ["p2"],
+    "haystack_sessions": [
+      [{"role": "user", "content": "周末想去爬山。"}, {"role": "assistant", "content": "记得带足够的水。"}],
+      [{"role": "user", "content": "我喝咖啡从不加糖，而且乳糖不耐受，一般点燕麦拿铁。", "has_answer": true}, {"role": "assistant", "content": "了解，燕麦奶不加糖。"}],
+      [{"role": "user", "content": "帮我查下汇率。"}, {"role": "assistant", "content": "好的。"}]
+    ]
+  },
+  {
+    "question_id": "sub_single_session_assistant_1",
+    "question_type": "single-session-assistant",
+    "question": "上次你建议我用什么方式备份数据库？",
+    "answer": "定时快照 + 异地副本",
+    "question_date": "2026-06-06",
+    "haystack_session_ids": ["a1", "a2", "a3"],
+    "answer_session_ids": ["a2"],
+    "haystack_sessions": [
+      [{"role": "user", "content": "聊聊养猫的注意事项。"}, {"role": "assistant", "content": "定期驱虫和体检。"}],
+      [{"role": "user", "content": "数据库怎么备份比较稳妥？"}, {"role": "assistant", "content": "建议用定时快照加异地副本，既能回滚也能容灾。", "has_answer": true}],
+      [{"role": "user", "content": "推荐个键盘。"}, {"role": "assistant", "content": "看你喜欢的轴体。"}]
+    ]
+  }
+]

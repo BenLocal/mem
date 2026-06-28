@@ -192,7 +192,7 @@ FEEDBACK  ── 隐式 / 自动 ──
 **触点**：index/输出侧（`pipeline/compress.rs` 输出过滤 + 嵌入前文本），不动 `memories.content` / transcript `content` 落盘。
 **风险**：中。要先定"哪些算密钥"白名单，避免误 redact 正常内容；与 §6「verbatim 不破」边界强相关，落地前需单独定调。
 
-### O6 🔍/⚙️ — 召回质量 eval 框架：金标集 + parity bench + CI 回归门（P1）⬜ ★最高杠杆的质量基础设施
+### O6 🔍/⚙️ — 召回质量 eval 框架：金标集 + parity bench + CI 回归门（P1）✅ O6a/O6b 落地（`2e7a68f`）· O6c harness 就绪、真集数待快机 ★最高杠杆的质量基础设施
 
 > **来源与 O1–O5 不同**：O1–O5 参照 mem0/agentmemory；O6 来自 2026-06-26 的更广赛道扫描（Zep/Graphiti 报 LongMemEval 63.8%、agentmemory 报 recall@5 95.2%、Cognee 自带 bench）——全赛道都用**可复现的准确率数**自证，而 mem 对外拿不出一个「召回有多准」的数。
 
@@ -208,14 +208,19 @@ FEEDBACK  ── 隐式 / 自动 ──
 **借鉴**：Zep 的 LongMemEval parity（同一公开任务跑自家 pipeline 出可比数）；agentmemory 的 recall@5 自报口径；mem 自家 bench-driven 文化（QW-1 拆 RRF 先 bench 再落地）。
 
 **改法（三小步，全增量、不碰主架构）**：
-- **O6a 真实/中文金标集**：建 `tests/golden_recall/`（区别于已有的 `tests/golden/` SQL 快照）—— 一个 `corpus.jsonl`（N 条真实形态 capsule，**脱敏 + 通用占位名**守 [[no-real-client-names-in-code]]）+ `qrels.jsonl`（query → relevant capsule_id 集 + intent/scope）。复用现成 `ingest` + `search` 入口灌+查，喂 `eval_metrics.rs` 出 recall@k/ndcg/mrr。中文 query 占比对齐线上语料。
-- **O6b CI 回归门**：把金标集 bench 做成**非 `--ignored`** 的轻量 test（小语料、`EMBEDDING_PROVIDER=fake` 或固定向量，秒级），断言每指标 ≥ 基线（基线写进版本化 `tests/golden_recall/baseline.json`，即「锁住当前质量」）。进 `ci.yml` 的 rust job。改排序的 PR 要么不掉、要么显式更新 baseline——把「改了 ranking 有没有变差」变成 reviewable diff。
-- **O6c LongMemEval parity bench（可选/后置）**：补上注释里留坑的 `tests/mempalace_bench.rs`，跑 LongMemEval-S（或其子集）出对外可比数。`#[ignore]` 一次性即可，不进 CI（外部数据集、跑得慢）。这是「拿出公开数」那一格，价值高但工作量也最大，排 O6 末位。
+- **O6a 真实/中文金标集 ✅（`2e7a68f`）**：建 `tests/golden_recall/`（区别于已有的 `tests/golden/` SQL 快照）—— `corpus.json`（18 条 mem 自身技术 capsule，6 主题、锚词互斥，**脱敏 + 通用占位名**守 [[no-real-client-names-in-code]]）+ `qrels.json`（8 query → relevant id 集）+ `baseline.json`。确定性 `GeometryProvider` 向量 + 真 jieba BM25，喂 `eval_metrics.rs` 出 recall@k/ndcg/mrr。
+- **O6b CI 回归门 ✅（`2e7a68f`）**：金标集 bench 做成**非 `--ignored`** 的 hermetic test（确定性向量、~8s），断言每指标 ≥ 版本化 `tests/golden_recall/baseline.json`，进 `ci.yml` 命名步骤「Recall regression gate」。对抗验证过(不可达 baseline → 红)。改排序的 PR 要么不掉、要么显式更新 baseline。
+- **O6c LongMemEval parity bench ✅ harness 就绪 / ⚠️ 真集数待快机（`tests/mempalace_bench.rs`）**：补上注释里留坑的 `tests/mempalace_bench.rs`，`#[ignore]` 一次性、不进 CI。指标口径 = **session 级 memory recall@k（命中 `answer_session_ids`,LongMemEval 官方指标之一）**,复用 `eval_metrics::recall_any_at_k`;**显式区别于端到端 QA accuracy**(Zep 63.8% 那种,需 QA 模型 + LLM judge,本环境无网关,不做)。数据集 = 官方 `longmemeval_s_cleaned.json`(HF,500 题 ×~48 haystack session,277MB,**gitignore 不进仓**,`tests/mempalace_bench/data/` drop-in);缺文件时回退到 committed `subset.json`(6 条 format-faithful **synthetic 子集**,数仅示意)。**真集数未在本机产出**:Qwen3-0.6B 本地 CPU(contended)嵌 LongMemEval 长 haystack 太慢——**N=6 探测跑 1h40m 都没完**,全 500 题(~2.4 万 session 嵌入)不具备出数条件,需 GPU 或非 contended CPU 机器复跑。
 
-**验收**：(O6a) `cargo test --test golden_recall -- --nocapture` 打印一张 recall@{1,5,10} / ndcg@10 / mrr 表；(O6b) 故意把 `RRF_K` 改坏 → CI 红；(O6c) 产出一行可写进 README 的 LongMemEval 数。
+**验收**：(O6a) `cargo test --test golden_recall -- --nocapture` 打印一张 recall@{1,5,10} / ndcg@10 / mrr 表 ✅；(O6b) 故意把 `RRF_K` 改坏 → CI 红 ✅；(O6c) `cargo test --test mempalace_bench -- --ignored --nocapture` 在真集上产出一行可写进 README 的 session-recall 数 —— harness ✅，**真集数待快机**（见下）。
 
-**触点**：新增 `tests/golden_recall/`（语料 + qrels + baseline）、新 `tests/golden_recall.rs`（复用 `eval_metrics.rs` + `tests/common`）、`.github/workflows/ci.yml`（加 O6b test step）；可选 `tests/mempalace_bench.rs`。**不动 `src/`**（指标库已齐）。
-**风险**：低。纯测试侧增量，无 src 改动、无新依赖。唯一要把关的是金标集**脱敏 + 通用占位名**（公开仓）+ qrels 标注质量（relevant 判定要人工过一遍，错标会把 gate 锚歪）。
+**触点**：`tests/golden_recall/`（语料 + qrels + baseline）+ `tests/golden_recall.rs`（复用 `eval_metrics.rs`）+ `.github/workflows/ci.yml`（O6b 命名步骤）；`tests/mempalace_bench.rs` + `tests/mempalace_bench/{subset.json,.gitignore}`（O6c harness，复用 `eval_metrics` + 真 `EmbedAnythingEmbeddingProvider`）。**不动 `src/`**（指标库已齐）。
+**风险**：低。纯测试侧增量，无 src 改动、无新依赖。把关点：金标集**脱敏 + 通用占位名**（公开仓）+ qrels 标注质量；O6c 真集 277MB **必须 gitignore**（已挡 `tests/mempalace_bench/.gitignore: data/`）。
+
+**已落地（以代码为权威）**：
+- O6a/O6b：`feat(eval): gold-set recall regression gate`（`2e7a68f`，CI 全绿）。
+- O6c harness：`tests/mempalace_bench.rs`（`#[ignore]`）+ committed `subset.json`（6 条 format-faithful synthetic）+ `tests/mempalace_bench/.gitignore`（挡 277MB 真集）。bench 逻辑：每题 fresh `Store` → 每 haystack session 一条 capsule（真 Qwen3 batch 嵌入 + upsert）→ question 走真 hybrid `rank_with_hybrid_and_graph` → ranked capsule 映回 session id → `recall_any_at_k`/`recall_at_k`/`mrr` over `answer_session_ids`；type-stratified `LONGMEMEVAL_SAMPLE`（默认 50，0=全 500）。
+- **真集数（公开数）= 未产出**：本机 Qwen3-Embedding-0.6B（CPU、contended）嵌 LongMemEval ~48-session 长 haystack 太慢，**N=6 探测 1h40m 未完**；全 500 题 ~2.4 万 session 嵌入在本机不可行。需在 **GPU 或非 contended CPU** 机器上 drop-in 真集后复跑 `cargo test --test mempalace_bench --ignored` 才能得到可对外引用的 session-recall@k。在那之前 README **不写**任何 LongMemEval 数（避免拿 synthetic 子集示意数误导对比）。
 
 ---
 
@@ -236,6 +241,6 @@ FEEDBACK  ── 隐式 / 自动 ──
 | P1 ✅ | O3 capsule 多样化（`retrieve.rs`） | 🔍 | S | 消除头部近似条目霸占（per-source 软配额，默认 3，session 为 key） |
 | P2 ✅ | O4 graph degree 衰减（`retrieve.rs`） | 🔍 | S | 抑制热门节点过度 boost（spread_decay，按锚 fanout 反比） |
 | P2 | O5 secret 脱敏 | 📦/⚙️ | M（两层设计，先定边界） | 降低 verbatim 带来的泄露面 |
-| **P1 ⬜** | O6 召回质量 eval 框架（金标集 + CI 门 + parity） | 🔍/⚙️ | M（O6a 金标 S-M ／ O6b CI 门 S ／ O6c parity M） | 🔴 全赛道入场券：把 O1–O4 与未来每个排序改动从「手感」变「可度量」，并堵回归 |
+| **P1 ✅/⚠️** | O6 召回质量 eval 框架（金标集 + CI 门 + parity） | 🔍/⚙️ | M | 🔴 全赛道入场券。O6a/O6b ✅（`2e7a68f`，CI 全绿回归门）；O6c harness ✅、**真集公开数待快机**（本机 Qwen3-0.6B CPU N=6 跑 1h40m 未完，需 GPU/非 contended CPU drop-in 真集复跑） |
 
 > commit close 引用：O1 已落地 = `feat(schema): add last_used_at column` (`808cb59`) + `feat(lifecycle): retrieval reinforcement resets the decay clock via last_used_at` (`709c648`) + `docs(agents)` (`181fe67`)。
