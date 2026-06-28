@@ -264,9 +264,10 @@ async fn post_embed(
         "embedding worker completed job"
     );
 
-    // O2 (closes oss-memory-diff O2): write-time near-duplicate review
-    // flagging. The capsule's embedding now exists (just upserted), so
-    // we can find its nearest neighbor without re-embedding. Only an
+    // O2 + O7(a) (closes oss-memory-diff O2; O7 lane a): write-time
+    // near-duplicate review flagging. The capsule's embedding now exists
+    // (just upserted), so we can find its near-dup cluster and propose a
+    // supersede toward the cluster canonical without re-embedding. Only an
     // `Active` capsule is eligible — a Pending / Provisional / Archived
     // row is left alone. Best-effort: an error here is logged but never
     // fails the (already completed) embedding job. `embeddings[0]` is the
@@ -295,11 +296,20 @@ async fn post_embed(
     Ok(())
 }
 
-/// O2: find the nearest *other* active capsule to `vector`; if its
-/// cosine ≥ `threshold`, flip `capsule_id` to `PendingConfirmation` and
-/// record a `suspected_supersede` graph edge (new → neighbor) for human
-/// / agent review. No-op when nothing clears the bar. Runs off the
-/// ingest path in the embedding worker.
+/// O2 + O7(a): find the new capsule's near-duplicate *cluster* (every other
+/// active capsule with cosine ≥ `threshold`), pick the cluster **canonical**
+/// (longest content, tie → earlier — the keep-longest rule evolution merge
+/// uses), and if one exists flip `capsule_id` to `PendingConfirmation` and
+/// record a `suspected_supersede` graph edge (new → canonical) for human /
+/// agent review. No-op when nothing clears the bar. Runs off the ingest path
+/// in the embedding worker.
+///
+/// O7(a) generalizes O2: O2 pointed the proposal at the single cosine-nearest
+/// neighbor, which can be a short fragment; O7(a) points it at the most
+/// complete member of the near-dup cluster, so the reviewer sees the right
+/// merge target. Degenerates to O2 when only one near-dup exists. Verbatim-safe:
+/// proposes (PendingConfirmation + edge) only — never auto-archives, unlike the
+/// evolution merge it borrows the canonical rule from.
 async fn flag_if_near_duplicate(
     store: &dyn Backend,
     tenant: &str,
@@ -307,8 +317,8 @@ async fn flag_if_near_duplicate(
     vector: &[f32],
     threshold: f32,
 ) -> Result<(), StorageError> {
-    let Some((neighbor_id, cosine)) =
-        nearest_other_capsule(store, tenant, capsule_id, vector, threshold).await?
+    let Some((canonical_id, cosine)) =
+        cluster_canonical_near_duplicate(store, tenant, capsule_id, vector, threshold).await?
     else {
         return Ok(());
     };
@@ -331,43 +341,74 @@ async fn flag_if_near_duplicate(
     let now = current_timestamp();
     let edge = crate::domain::capability_capsule::GraphEdge {
         from_node_id: crate::pipeline::ingest::memory_node_id(capsule_id),
-        to_node_id: crate::pipeline::ingest::memory_node_id(&neighbor_id),
+        to_node_id: crate::pipeline::ingest::memory_node_id(&canonical_id),
         relation: "suspected_supersede".to_string(),
         valid_from: now,
         valid_to: None,
         confidence: Some(cosine),
-        extractor: Some("o2_neardup".to_string()),
+        extractor: Some("o7_neardup_cluster".to_string()),
         strength: None,
         stability: None,
         last_activated: None,
         access_count: None,
     };
     if let Err(e) = store.add_edge_direct(&edge).await {
-        warn!(error = %e, "O2: suspected_supersede edge write failed");
+        warn!(error = %e, "O7(a): suspected_supersede edge write failed");
     }
     info!(
         capability_capsule_id = %capsule_id,
-        neighbor = %neighbor_id,
+        canonical = %canonical_id,
         cosine = cosine,
-        "O2: flagged near-duplicate for review"
+        "O7(a): flagged near-duplicate for review (cluster canonical)"
     );
     Ok(())
 }
 
+/// A near-duplicate of the new capsule: an existing active capsule whose
+/// cosine to the new vector cleared `threshold`. `content_len` / `created_at`
+/// drive the cluster-canonical pick (O7(a)).
+struct NearDup {
+    id: String,
+    cosine: f32,
+    content_len: usize,
+    created_at: String,
+}
+
+/// O7(a): among the new capsule's near-duplicates (each already ≥ threshold),
+/// pick the cluster **canonical** — longest content, tie-broken by *earlier*
+/// `created_at` — mirroring the keep-longest rule `evolution_worker::execute_merge`
+/// uses, so the supersede proposal points the reviewer at the most complete
+/// member of the cluster rather than the merely cosine-nearest one. Returns
+/// `(canonical_id, cosine_of_new_to_canonical)`. Pure → unit-testable without a
+/// store.
+fn pick_cluster_canonical(neardups: &[NearDup]) -> Option<(String, f32)> {
+    neardups
+        .iter()
+        .max_by(|a, b| {
+            a.content_len
+                .cmp(&b.content_len)
+                .then_with(|| b.created_at.cmp(&a.created_at))
+        })
+        .map(|c| (c.id.clone(), c.cosine))
+}
+
 /// Vector-search the top-K nearest capsules (empty query text → the
-/// vector-only branch of `hybrid_candidates`), skip self, then compute
-/// exact cosine against each candidate's stored vector and return the
-/// best `(id, cosine)` at or above `threshold`.
-async fn nearest_other_capsule(
+/// vector-only branch of `hybrid_candidates`), skip self, compute exact cosine
+/// against each candidate's stored vector, keep every candidate at or above
+/// `threshold` (the near-dup cluster), then return the cluster canonical via
+/// [`pick_cluster_canonical`]. `None` when nothing clears the bar.
+async fn cluster_canonical_near_duplicate(
     store: &dyn Backend,
     tenant: &str,
     self_id: &str,
     vector: &[f32],
     threshold: f32,
 ) -> Result<Option<(String, f32)>, StorageError> {
-    const K: usize = 5;
+    // K bumped from O2's 5 → 12 so a multi-member near-dup cluster is captured
+    // (the canonical may not be the single cosine-nearest).
+    const K: usize = 12;
     let candidates = store.hybrid_candidates(tenant, "", vector, K).await?;
-    let mut best: Option<(String, f32)> = None;
+    let mut neardups: Vec<NearDup> = Vec::new();
     for (cand, _rrf) in candidates {
         if cand.capability_capsule_id == self_id {
             continue;
@@ -379,15 +420,16 @@ async fn nearest_other_capsule(
             continue;
         };
         let c = cosine(vector, &cand_vec);
-        let better = match &best {
-            None => true,
-            Some((_, bc)) => c > *bc,
-        };
-        if c >= threshold && better {
-            best = Some((cand.capability_capsule_id.clone(), c));
+        if c >= threshold {
+            neardups.push(NearDup {
+                id: cand.capability_capsule_id.clone(),
+                cosine: c,
+                content_len: cand.content.len(),
+                created_at: cand.created_at.clone(),
+            });
         }
     }
-    Ok(best)
+    Ok(pick_cluster_canonical(&neardups))
 }
 
 /// Standard cosine similarity: `dot / (|a| · |b|)`. Returns 0 on a
@@ -618,6 +660,105 @@ mod tests {
             b.status,
             CapabilityCapsuleStatus::Active,
             "a distinct capsule must not be flagged for review",
+        );
+    }
+
+    #[test]
+    fn pick_cluster_canonical_prefers_longest_then_earlier() {
+        // Longest content wins regardless of cosine (the cosine-nearest is short).
+        let nd = vec![
+            NearDup {
+                id: "short".into(),
+                cosine: 1.0,
+                content_len: 5,
+                created_at: "002".into(),
+            },
+            NearDup {
+                id: "long".into(),
+                cosine: 0.95,
+                content_len: 50,
+                created_at: "003".into(),
+            },
+        ];
+        let (id, cos) = pick_cluster_canonical(&nd).unwrap();
+        assert_eq!(id, "long");
+        assert_eq!(cos, 0.95);
+
+        // Tie on length → earlier created_at wins (mirrors evolution merge).
+        let tie = vec![
+            NearDup {
+                id: "newer".into(),
+                cosine: 0.99,
+                content_len: 10,
+                created_at: "005".into(),
+            },
+            NearDup {
+                id: "older".into(),
+                cosine: 0.99,
+                content_len: 10,
+                created_at: "001".into(),
+            },
+        ];
+        assert_eq!(pick_cluster_canonical(&tie).unwrap().0, "older");
+
+        // Empty cluster → no proposal.
+        assert!(pick_cluster_canonical(&[]).is_none());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn cluster_canonical_picks_longest_not_nearest() {
+        // O7(a) vs O2: two near-dups of the new capsule —
+        //   short_near: identical vector (cosine 1.0) but short content
+        //   long_near:  slightly-off vector (cosine ~0.99) but long content
+        // O2 pointed the supersede proposal at short_near (cosine-nearest);
+        // O7(a) must point it at long_near (cluster canonical = longest).
+        let dir = tempdir().unwrap();
+        let store = Store::open(&dir.path().join("o7a.lance")).await.unwrap();
+
+        let mut short_near = active_capsule("short_near");
+        short_near.content = "short".into();
+        let mut long_near = active_capsule("long_near");
+        long_near.content = "this is a substantially longer and more complete capsule body".into();
+        store.insert_capability_capsule(short_near).await.unwrap();
+        store.insert_capability_capsule(long_near).await.unwrap();
+        store
+            .insert_capability_capsule(active_capsule("new"))
+            .await
+            .unwrap();
+
+        let v = vec![1.0f32, 0.0, 0.0, 0.0];
+        put_embedding(&store, "new", &v).await;
+        put_embedding(&store, "short_near", &v).await; // cosine 1.0
+        put_embedding(&store, "long_near", &[0.99f32, 0.14, 0.0, 0.0]).await; // cosine ~0.990
+
+        flag_if_near_duplicate(&store, "local", "new", &v, 0.90)
+            .await
+            .unwrap();
+
+        let new_rec = store
+            .get_capability_capsule_for_tenant("local", "new")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(new_rec.status, CapabilityCapsuleStatus::PendingConfirmation);
+
+        let edges = store
+            .neighbors_within(&memory_node_id("new"), 1, None)
+            .await
+            .unwrap();
+        let supersede: Vec<_> = edges
+            .iter()
+            .filter(|e| e.relation == "suspected_supersede")
+            .collect();
+        assert_eq!(
+            supersede.len(),
+            1,
+            "exactly one supersede proposal expected, got {edges:?}"
+        );
+        assert_eq!(
+            supersede[0].to_node_id,
+            memory_node_id("long_near"),
+            "O7(a) must propose toward the longest-content canonical, not the cosine-nearest",
         );
     }
 }
