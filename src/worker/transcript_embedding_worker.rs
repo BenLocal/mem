@@ -120,7 +120,13 @@ pub async fn tick(
     // content is split into overlapping token windows so the tail is
     // embedded instead of silently truncated; short content stays a
     // single chunk equal to the original, one embedding row as before.
-    let chunks = embed_input_chunks(&message.content);
+    // (O5) Redact high-confidence secrets before chunking so a key accidentally
+    // pasted into a transcript never enters the conversation_message_embeddings
+    // vector index — the same pre-embedding mask the capsule embedding worker
+    // applies (`embedding_worker::embed_input_chunks`). Storage stays verbatim:
+    // `message.content` on disk is untouched; only this embedding copy is masked.
+    let redacted = crate::pipeline::redact::redact_secrets(&message.content);
+    let chunks = embed_input_chunks(redacted.as_ref());
     let chunk_refs: Vec<&str> = chunks.iter().map(|s| s.as_str()).collect();
     let results = match provider.embed_batch(&chunk_refs).await {
         Ok(v) => v,

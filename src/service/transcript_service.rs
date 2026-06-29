@@ -559,8 +559,32 @@ impl TranscriptService {
         );
 
         // ─── Phase 6: merge windows.
-        let windows = merge_windows(items);
+        let mut windows = merge_windows(items);
+
+        // ─── Phase 7 (O5): redact secrets in the search output (see
+        // `redact_window_blocks`).
+        redact_window_blocks(&mut windows);
         Ok(TranscriptSearchResult { windows })
+    }
+}
+
+/// (O5) Mask high-confidence secrets in transcript **search output** — the
+/// prompt-bound path whose blocks ride straight into an agent's context, so it
+/// is the transcript analog of `compress_text` for capsules. The verbatim-fetch
+/// paths (`transcripts_range` / `get_by_session`) are deliberately left
+/// unmasked, like `capability_capsule_get`. Storage is never touched — only the
+/// returned in-memory copy is rewritten. `redact_secrets` returns `Cow::Owned`
+/// iff a pattern matched, so clean blocks pay no allocation, and the whole pass
+/// is a no-op (every block `Borrowed`) when `MEM_REDACT_SECRETS_DISABLED` is set.
+fn redact_window_blocks(windows: &mut [MergedWindow]) {
+    for window in windows {
+        for block in &mut window.blocks {
+            if let std::borrow::Cow::Owned(red) =
+                crate::pipeline::redact::redact_secrets(&block.content)
+            {
+                block.content = red;
+            }
+        }
     }
 }
 
@@ -614,6 +638,38 @@ mod tests {
             created_at: "00000001778000000000".into(),
             meta_json: None,
         }
+    }
+
+    #[test]
+    fn search_output_redacts_secrets_but_leaves_clean_blocks_o5() {
+        let secret = text_block(
+            "mb-secret",
+            "deploy used openai key sk-FAKEabcdEFGH1234ijklMNOP then restarted",
+        );
+        let clean = text_block("mb-clean", "we discussed the Rust project layout");
+        let mut windows = vec![MergedWindow {
+            session_id: Some("S1".into()),
+            blocks: vec![secret, clean],
+            primary_ids: vec!["mb-secret".into()],
+            primary_scores: HashMap::new(),
+            score: 0,
+        }];
+
+        redact_window_blocks(&mut windows);
+
+        let blocks = &windows[0].blocks;
+        assert!(
+            blocks[0].content.contains("[redacted:sk]"),
+            "secret must be masked in search output: {}",
+            blocks[0].content
+        );
+        assert!(
+            !blocks[0].content.contains("sk-FAKEabcd"),
+            "key leaked into search output: {}",
+            blocks[0].content
+        );
+        // A clean block is left byte-for-byte verbatim (no spurious rewrite).
+        assert_eq!(blocks[1].content, "we discussed the Rust project layout");
     }
 
     /// MED-bug regression: when the query fails to embed (an infrastructure

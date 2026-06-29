@@ -190,13 +190,15 @@ FEEDBACK  ── 隐式 / 自动 ──
 
 **改法（两层，守 verbatim）**：原文在 access-control 下原样保留；只在**索引 / 输出层** redact 高置信密钥模式。不在存储层就地改写 content（那会破 verbatim 原则）。
 
-**已落地（以代码为权威）**：新模块 `pipeline/redact.rs`——`redact_secrets`(默认开,opt-out `MEM_REDACT_SECRETS_DISABLED=1`;无命中走 `Cow::Borrowed` 零分配快路)。**两个 seam**(用户拍板的覆盖面=嵌入前 + 答案 + 横幅,不含 transcript):
-- **答案 + 横幅**:redact 接在 `compress::compress_text`——所有压缩输出 prose(directive/fact/pattern body + source_summary + workflow goal/steps/signals)的**唯一 choke point**,一处即覆盖 MCP/HTTP search response;recall 横幅渲染的就是该 response,**transitively 覆盖横幅**,无需动 `hook.rs`。
-- **嵌入前**:redact 接在 `worker/embedding_worker.rs::embed_input_chunks`,密钥不进向量索引。
+**已落地（以代码为权威）**：新模块 `pipeline/redact.rs`——`redact_secrets`(默认开,opt-out `MEM_REDACT_SECRETS_DISABLED=1`;无命中走 `Cow::Borrowed` 零分配快路)。**四个 seam**——capsule 侧两个(首发)+ transcript 侧两个(2026-06-29 补盲):
+- **capsule 答案 + 横幅**:redact 接在 `compress::compress_text`——所有压缩输出 prose(directive/fact/pattern body + source_summary + workflow goal/steps/signals)的**唯一 choke point**,一处即覆盖 MCP/HTTP search response;recall 横幅渲染的就是该 response,**transitively 覆盖横幅**,无需动 `hook.rs`。
+- **capsule 嵌入前**:redact 接在 `worker/embedding_worker.rs::embed_input_chunks`,密钥不进向量索引。
+- **transcript 嵌入前**(补盲):redact 接在 `worker/transcript_embedding_worker.rs`(独立于 capsule worker 的 chunk 函数),密钥不进 `conversation_message_embeddings`——这正治本节开篇那条"verbatim 抬高泄露面"的反讽:transcript 存的是**原始对话粘贴**,误粘密钥概率远高于精炼后的 capsule,首发 O5 反而漏了这个高危面。
+- **transcript search 输出**(补盲):redact 接在 `service/transcript_service.rs::redact_window_blocks`(Phase 7,遍历 `MergedWindow.blocks`)——transcript **search** 是 prompt-bound 路径(结果直接进 agent 上下文),对标 capsule 的 `compress_text`。
 - **白名单**(高置信,token 模式带 `\b` 防 `ask-`→`sk-` 误命中):OpenAI/通用 `sk-`、AWS `AKIA`、私钥块 `-----BEGIN…PRIVATE KEY-----`、`<private>…</private>`、GitHub `gh[posru]_`、JWT、`Bearer`。替换成 `[redacted:<kind>]`。
-- **不动**:`capability_capsule_get`(显式 verbatim-fetch、access-controlled)+ 落盘 `content`/transcript content 保持原样。
+- **不动**(显式 verbatim-fetch、access-controlled):capsule `capability_capsule_get`;transcript `transcripts_range`/`get_by_session`——这俩是 transcript 的"取原始字节"路径,刻意不 redact(端到端 smoke 验证过:by-session 取回仍返回原始 `sk-FAKE…`)。落盘 `content`/transcript content 一律保持原样。
 
-**触点**：`pipeline/redact.rs`(新)、`pipeline/compress.rs::compress_text`、`worker/embedding_worker.rs::embed_input_chunks`。**不动** `memories.content` / transcript `content` 落盘。
+**触点**：`pipeline/redact.rs`(新)、`pipeline/compress.rs::compress_text`、`worker/embedding_worker.rs::embed_input_chunks`、`worker/transcript_embedding_worker.rs`、`service/transcript_service.rs::redact_window_blocks`。**不动** `memories.content` / transcript `content` 落盘。
 **风险**：中→低。误 redact 风险用「高置信模式 + `\b` 边界 + 仅输出层(存储 verbatim 不破)」收口;默认开是因为纯输出层 mask 不碰存储。
 
 ### O6 🔍/⚙️ — 召回质量 eval 框架：金标集 + parity bench + CI 回归门（P1）✅ O6a/O6b 落地（`2e7a68f`）· O6c harness 就绪、真集数待快机 ★最高杠杆的质量基础设施
