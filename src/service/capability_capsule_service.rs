@@ -92,6 +92,25 @@ impl From<CapabilityCapsuleRecord> for IngestCapabilityCapsuleResponse {
     }
 }
 
+/// G5 — the aggregated user/project profile returned by
+/// [`CapabilityCapsuleService::build_profile`]. A point-in-time view derived
+/// from live capsules + entities; not a stored object.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct ProfileResponse {
+    pub tenant: String,
+    pub project: Option<String>,
+    pub repo: Option<String>,
+    pub preference_count: usize,
+    pub workflow_count: usize,
+    pub entity_count: usize,
+    /// Active `Preference` capsules in scope — the directives / conventions.
+    pub preferences: Vec<CapabilityCapsuleRecord>,
+    /// Active `Workflow` capsules in scope — the procedural defaults.
+    pub workflows: Vec<CapabilityCapsuleRecord>,
+    /// Tenant's canonical entities (tenant-scoped, session-orthogonal).
+    pub entities: Vec<crate::domain::Entity>,
+}
+
 #[derive(Clone)]
 pub struct CapabilityCapsuleService {
     /// Shared storage handle. Phase 5: erased to `Arc<dyn Backend>`
@@ -746,6 +765,63 @@ impl CapabilityCapsuleService {
                 lim,
             )
             .await?)
+    }
+
+    /// G5 — structured user/project profile. A **read-side aggregation** (no
+    /// new storage, derived on demand) of the conventions already captured as
+    /// `Preference` (guidance / directives) and `Workflow` (procedural defaults)
+    /// capsules in the given scope, plus the tenant's known canonical
+    /// `entities`. Answers "what are this project's conventions?" in one call —
+    /// the queryable profile object Mem0 user-scope / Memobase profiles expose,
+    /// without a separately-maintained profile record (it always reflects the
+    /// live capsules). Active rows only; `project` / `repo` narrow the capsule
+    /// scope (entities are tenant-scoped by design, session-orthogonal).
+    pub async fn build_profile(
+        &self,
+        tenant: &str,
+        project: Option<&str>,
+        repo: Option<&str>,
+        limit: usize,
+    ) -> Result<ProfileResponse, ServiceError> {
+        let lim = if limit == 0 { 100 } else { limit };
+        let (preferences, _) = self
+            .list_capability_capsules_in_scope(
+                tenant,
+                project,
+                repo,
+                None,
+                Some("preference"),
+                Some("active"),
+                None,
+                None,
+                lim,
+            )
+            .await?;
+        let (workflows, _) = self
+            .list_capability_capsules_in_scope(
+                tenant,
+                project,
+                repo,
+                None,
+                Some("workflow"),
+                Some("active"),
+                None,
+                None,
+                lim,
+            )
+            .await?;
+        let entities = self.store.list_entities(tenant, None, None, lim).await?;
+        Ok(ProfileResponse {
+            tenant: tenant.to_string(),
+            project: project.map(str::to_string),
+            repo: repo.map(str::to_string),
+            preference_count: preferences.len(),
+            workflow_count: workflows.len(),
+            entity_count: entities.len(),
+            preferences,
+            workflows,
+            entities,
+        })
     }
 
     /// Hard-delete a memory. **Irreversible.** Backs

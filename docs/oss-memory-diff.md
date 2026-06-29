@@ -291,3 +291,17 @@ O6a/b/c 衡量召回质量都是**离线**（CI / 一次性 bench）。线上跑
 | **P1 (a)(b)(c)✅** | O7 Mem0 式自动抽取 + 冲突消解（零-额外-LLM 版） | 🔍 | (a) S-M ／ (b) M ／ (c) M | 🟠 对标 Mem0 写时抽取/对账，但默认零生成式 LLM。**(a) ✅**：簇级语义近重复→canonical supersede 提案（`flag_if_near_duplicate`+`pick_cluster_canonical`，`o7_neardup_cluster`）；**(b) ✅**：启发式高信号抽取→PendingConfirmation（`heuristic_extract.rs`，opt-in `MEM_MINE_HEURISTIC_EXTRACT`）；**(c) ✅**：生成式 LLM lane（`llm_extract.rs`，opt-in `MEM_MINE_LLM_EXTRACT` 默认关 + 三层 fail-safe，缺 LLM 静默退回 (a)+(b)）。三条都 review-gated。 |
 
 > commit close 引用：O1 已落地 = `feat(schema): add last_used_at column` (`808cb59`) + `feat(lifecycle): retrieval reinforcement resets the decay clock via last_used_at` (`709c648`) + `docs(agents)` (`181fe67`)。
+
+## 8. G-series 跟进（2026-06-29，更广赛道扫描的 follow-on）
+
+O1–O7 之外,沿 Zep/Graphiti/Letta/Mem0/Cognee 等更广赛道扫出的候选(G-series)。逐条评估实证 + 现状:
+
+| 项 | 主题 | 状态 | 结论 |
+|---|---|---|---|
+| **G1** | 召回质量 eval 框架 | ✅ → 即 **O6** | 已折叠进 O6（金标 CI 门 + LongMemEval parity harness）。 |
+| **G2** | 图驱动检索（多跳候选生成,HippoRAG/Graphiti） | ⏸ defer（scale-gated） | gap 属实但被默认 unbounded 池掩盖:`rank_with_hybrid_and_graph` 候选 = pool ∪ hybrid_hits,图只**加性 boost 已在候选集的行**、不生成新候选。默认全量活跃池下图邻居本就在候选集 → 增量≈0;待语料大到必须设 `MEM_RECALL_POOL_LIMIT` 时才有价值。真做 = 把图升成第三召回通道(`neighbors_within`→union 进候选 + floor/spread_decay gate)。 |
+| **G3** | 会话级 episodic 摘要 / reflection | ⏸ defer（价值待测） | 即 §6「Episodic 唯一缺口、暂不立项」同一条。已有 wake-up recent + transcript search 覆盖「最近会话」;忠实摘要要 LLM(撞零-LLM 默认)。低成本试点 = extractive(复用 O7(b) heuristic)→ `diary` 胶囊,默认关。 |
+| **G4** | 矛盾检测 + 自动失效（语义对立,非重复） | ✅ 部分落地（`cac99d2`） | 零-LLM 切片:`graph_add_edge` 写 functional（单值）谓词新事实时,自动闭同 `(from,predicate)` 不同 `to` 的旧活跃边(`auto_invalidate_conflicts`,复用 `neighbors`+`invalidate_edge`)。opt-in `MEM_KG_FUNCTIONAL_PREDICATES`(默认空=关),计入 `/metrics::kg_auto_invalidated`。自由文本低-cosine 语义对立仍需 LLM → O7(c)/defer。 |
+| **G5** | 结构化 user/project 画像（Mem0 user-scope / Memobase） | ✅ 落地（read-side MVP） | `build_profile` + `POST /capability_capsules/profile`:把某 scope 的**活跃** Preference(directives)+ Workflow(procedural)+ 租户 entities 聚合成可查询画像。**纯读、零新存储、按需派生**(始终反映 live 胶囊,无需单独维护 profile 记录);Active-only 与召回口径一致。 |
+| **G6** | agent 自主编辑工具（Letta memory_replace/insert/rethink） | ⏸ defer（缓） | 原语已有(supersede/review_accept/set_capsule_status/kg_*);Letta 式 merge/promote/relink 是包一层。但与 verbatim 有张力,且 evolution worker(E1)已服务端自主 merge/generalize,部分重复。 |
+| **G7** | 多检索模式 / query 路由（Cognee 14 模式） | ⏸ defer（过度设计） | 单 hybrid 管线 + intent 信号已自适应;14 模式对 local-first 过度设计。 |

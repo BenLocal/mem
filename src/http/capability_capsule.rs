@@ -37,6 +37,7 @@ pub fn router() -> Router<AppState> {
             "/capability_capsules/list",
             post(list_capability_capsules_in_scope),
         )
+        .route("/capability_capsules/profile", post(get_profile))
         .route("/capability_capsules/wings", get(list_wings))
         .route("/capability_capsules/taxonomy", get(get_taxonomy))
         .route("/capability_capsules/stats", get(capsule_stats))
@@ -198,6 +199,39 @@ async fn list_capability_capsules_in_scope(
         next_cursor,
         has_more,
     }))
+}
+
+/// G5 — `POST /capability_capsules/profile`. Aggregates the in-scope
+/// `Preference` + `Workflow` capsules and the tenant's entities into one
+/// queryable "developer / project conventions" view. Read-only; mirrors the
+/// `list` endpoint's POST-with-body shape.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "snake_case")]
+struct ProfileRequest {
+    #[serde(default = "default_tenant")]
+    tenant: String,
+    #[serde(default)]
+    project: Option<String>,
+    #[serde(default)]
+    repo: Option<String>,
+    #[serde(default)]
+    limit: Option<usize>,
+}
+
+async fn get_profile(
+    State(app): State<AppState>,
+    Json(req): Json<ProfileRequest>,
+) -> Result<Json<crate::service::capability_capsule_service::ProfileResponse>, AppError> {
+    let profile = app
+        .capability_capsule_service
+        .build_profile(
+            &req.tenant,
+            req.project.as_deref(),
+            req.repo.as_deref(),
+            req.limit.unwrap_or(100),
+        )
+        .await?;
+    Ok(Json(profile))
 }
 
 #[derive(Debug, Deserialize)]
