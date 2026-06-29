@@ -408,8 +408,6 @@ fn freshness_anchor_ts(memory: &CapabilityCapsuleRecord) -> u128 {
 /// "lifecycle" stack: scope, intent, confidence, validation, freshness,
 /// staleness, graph boost, status penalty). Used by `score_with_hybrid`
 /// after the Rust-side RRF score has been added.
-/// handles the common rest.
-#[allow(dead_code)] // callers are wired in subsequent Tasks 3-5
 fn apply_lifecycle_score(
     memory: &CapabilityCapsuleRecord,
     query: &SearchCapabilityCapsuleRequest,
