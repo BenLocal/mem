@@ -66,6 +66,29 @@ static PATTERNS: Lazy<Vec<Pat>> = Lazy::new(|| {
             re: Regex::new(r"(?i)\bbearer\s+[A-Za-z0-9._~+/=-]{12,}").unwrap(),
             repl: "[redacted:bearer]",
         },
+        // Stripe live secret / restricted keys (`sk_live_…` / `rk_live_…`).
+        // The `sk-` pattern above needs a hyphen, so Stripe's underscore form
+        // slips past it — a distinct, high-confidence prefix of its own.
+        Pat {
+            re: Regex::new(r"\b[rs]k_live_[A-Za-z0-9]{16,}").unwrap(),
+            repl: "[redacted:stripe]",
+        },
+        // GitHub fine-grained PAT (`github_pat_…`) — the newer format the
+        // classic `gh[posru]_` pattern doesn't cover.
+        Pat {
+            re: Regex::new(r"\bgithub_pat_[A-Za-z0-9_]{22,}").unwrap(),
+            repl: "[redacted:github]",
+        },
+        // Slack tokens (`xoxb-`/`xoxa-`/`xoxp-`/`xoxr-`/`xoxs-`).
+        Pat {
+            re: Regex::new(r"\bxox[baprs]-[A-Za-z0-9-]{10,}").unwrap(),
+            repl: "[redacted:slack]",
+        },
+        // Google API key (fixed `AIza` prefix + 35 chars).
+        Pat {
+            re: Regex::new(r"\bAIza[0-9A-Za-z_-]{35}").unwrap(),
+            repl: "[redacted:google]",
+        },
     ]
 });
 
@@ -145,6 +168,50 @@ mod tests {
                 .contains("[redacted:jwt]")
         );
         assert!(red("Authorization: Bearer abcdef1234567890XYZ").contains("[redacted:bearer]"));
+    }
+
+    #[test]
+    fn masks_stripe_github_pat_slack_google() {
+        // Each token is assembled at RUNTIME from a bare prefix + a low-entropy
+        // body, so no complete realistic-looking literal ever sits in the source
+        // file. That keeps GitHub push-protection / secret-scanning from
+        // flagging the test fixtures (a contiguous `sk_live_…` / `AIza…` literal
+        // would be rejected on push) while still exercising each regex.
+        let stripe = red(&format!("STRIPE_KEY=sk_live_{} done", "0".repeat(24)));
+        assert!(stripe.contains("[redacted:stripe]"), "got {stripe}");
+        assert!(!stripe.contains("sk_live_0"), "stripe key leaked: {stripe}");
+        assert!(red(&format!("rk_live_{}", "0".repeat(24))).contains("[redacted:stripe]"));
+
+        // GitHub fine-grained PAT (distinct from the classic gh*_ format).
+        let ghpat = red(&format!("token github_pat_{} ok", "0".repeat(30)));
+        assert!(ghpat.contains("[redacted:github]"), "got {ghpat}");
+        assert!(!ghpat.contains("github_pat_0"), "PAT leaked: {ghpat}");
+
+        // Slack tokens.
+        assert!(red(&format!("xoxb-{}", "0".repeat(16))).contains("[redacted:slack]"));
+        assert!(red(&format!("xoxp-{}", "0".repeat(16))).contains("[redacted:slack]"));
+
+        // Google API key (AIza + 35).
+        let g = red(&format!("key AIza{} here", "0".repeat(35)));
+        assert!(g.contains("[redacted:google]"), "got {g}");
+        assert!(!g.contains("AIza0"), "google key leaked: {g}");
+    }
+
+    #[test]
+    fn new_prefixes_dont_false_trigger_on_prose() {
+        // Bare prefixes / lookalikes without a real key body must NOT match
+        // (\b guard + length floors), so prose stays a zero-alloc Borrowed.
+        for clean in [
+            "we set sk_live_ mode off",        // prefix, no key body
+            "the github_pat process ran",      // no underscore+body
+            "xox is a placeholder token name", // not xox[baprs]-
+            "AIza is a short fragment",        // < 35 trailing chars
+        ] {
+            assert!(
+                matches!(redact_all(clean), Cow::Borrowed(_)),
+                "false positive on: {clean}"
+            );
+        }
     }
 
     #[test]
