@@ -4,7 +4,7 @@
 > - **①** MemPalace 对齐 —— [`mempalace-diff.md`](./mempalace-diff.md) (v1–v4) + 执行面板 [`ROADMAP.MD`](./ROADMAP.MD)（#1–#36 / K1–K12）
 > - **②** Backend 存储抽象 —— [`backend-coupling.md`](./backend-coupling.md)
 > - **③** 长内容召回 —— [`long-content-recall.md`](./long-content-recall.md)
-> - **④** OSS 记忆引擎对照（本篇）—— 参照 [mem0](https://github.com/mem0ai/mem0) 与 [agentmemory](https://github.com/rohitg00/agentmemory)，沿 **write → recall → feedback** 主轴找 mem 可借鉴的更优处理；产出 **O1–O5**
+> - **④** OSS 记忆引擎对照（本篇）—— 参照 [mem0](https://github.com/mem0ai/mem0) 与 [agentmemory](https://github.com/rohitg00/agentmemory)，沿 **write → recall → feedback** 主轴找 mem 可借鉴的更优处理；产出 **O1–O5 + O7**（O6 来自 2026-06-26 更广赛道扫描，见 §O6）
 >
 > **维护原则**同 ①/②/③：本篇与代码不一致时**以代码为权威**；落地一个 O 项后回 §5 表格更新状态（✅ done / 🚧 in progress）+ commit hash（格式 `… (closes oss-memory-diff O#)`）。新增 O 行要同步回 [`ROADMAP.MD`](./ROADMAP.MD) 的「OSS 对照路线（O 系列）」表。
 
@@ -200,7 +200,7 @@ FEEDBACK  ── 隐式 / 自动 ──
 
 ### O6 🔍/⚙️ — 召回质量 eval 框架：金标集 + parity bench + CI 回归门（P1）✅ O6a/O6b 落地（`2e7a68f`）· O6c harness 就绪、真集数待快机 ★最高杠杆的质量基础设施
 
-> **来源与 O1–O5 不同**：O1–O5 参照 mem0/agentmemory；O6 来自 2026-06-26 的更广赛道扫描（Zep/Graphiti 报 LongMemEval 63.8%、agentmemory 报 recall@5 95.2%、Cognee 自带 bench）——全赛道都用**可复现的准确率数**自证，而 mem 对外拿不出一个「召回有多准」的数。
+> **来源与其它 O 项不同**：O1–O5 与 O7 参照 mem0/agentmemory；唯独 O6 来自 2026-06-26 的更广赛道扫描（Zep/Graphiti 报 LongMemEval 63.8%、agentmemory 报 recall@5 95.2%、Cognee 自带 bench）——全赛道都用**可复现的准确率数**自证，而 mem 对外拿不出一个「召回有多准」的数。
 
 **现状（code，2026-06-26 实读 —— O6 是收口扩展，不是从零造）**：mem 其实已有 eval 地基：
 - `src/pipeline/eval_metrics.rs` —— 完整 IR 指标纯函数（`recall_at_k` / `ndcg_at_k` / `mrr` / `precision_at_k` / mempalace 式 `recall_any_at_k` / `recall_all_at_k`），全部 handworked 单测覆盖。
