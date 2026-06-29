@@ -243,7 +243,7 @@ O6a/b/c 衡量召回质量都是**离线**（CI / 一次性 bench）。线上跑
 - **写时去重**：`pipeline/ingest.rs` 只有 **exact `content_hash`**；同义改写落新行。O2（`worker/embedding_worker.rs::flag_if_near_duplicate`，opt-in 默认关）已做**pairwise** 近重复（new vs 最近邻，cosine ≥ `neardup_threshold` → `PendingConfirmation` + `suspected_supersede` 边）。
 - **簇级语义聚类**：`pipeline/evolution/map.rs::build_clusters`（pairwise cosine union-find）+ `worker/evolution_worker.rs` 的 merge/generalize 已有，但那是**背景批量扫全池**、且 merge 直接 **Archive loser**（非 review 提案）。
 - **抽取**：只有显式 `<mem-save>` 标签（`cli/mine.rs` 离线）或 agent 主动供 fact 才进库；**未打标签的对话里的高信号内容全丢**。
-- **冲突消解**：靠 agent 手动 `supersede` / bitemporal `invalidate_edge`；无自动「检出语义对立」（O2 抓的是近重复，不是矛盾）。
+- **冲突消解**：靠 agent 手动 `supersede` / bitemporal `invalidate_edge`；无自动「检出语义对立」（O2 抓的是近重复，不是矛盾）。**G4 ✅ 部分闭合**（零-LLM）：`graph_add_edge` 写 functional（单值）谓词的新事实时,自动闭掉同 `(from,predicate)` 不同 `to` 的旧活跃边（Graphiti「新事实取代冲突旧边」,结构化三元组比对、无 LLM）。opt-in `MEM_KG_FUNCTIONAL_PREDICATES`（默认空=关,operator 列出确属单值的谓词如 `located_in`）；`auto_invalidate_conflicts` 纯逻辑、`neighbors`+`invalidate_edge` 复用,闭边数计入 `/metrics::kg_auto_invalidated`。**仍缺**:自由文本里低-cosine 的语义对立（「用 Postgres」vs「迁离 Postgres」）需 LLM → 走 O7(c) opt-in 或 defer。
 
 **借鉴**：Mem0 写时把 `existing_memories` 喂 LLM 做 ADD/UPDATE 对账 + entity-link；agentmemory 的矛盾检测。**只取其形、不取其 LLM**。
 

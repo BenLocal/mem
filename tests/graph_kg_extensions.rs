@@ -290,3 +290,107 @@ async fn k5_suggestion_shape_includes_node_id_ready_to_retry() {
         "suggested_node_id should be the canonical entity:<uuid> the caller can re-query",
     );
 }
+
+// ────────────────────── G4: functional-predicate auto-invalidation ──────────────────────
+
+#[tokio::test(flavor = "multi_thread")]
+async fn g4_functional_predicate_auto_invalidates_conflicting_edge() {
+    use std::collections::HashSet;
+    let (_dir, store) = open_store().await;
+    let svc = CapabilityCapsuleService::new(store.clone());
+
+    // Old fact: entity:server located_in dc-east.
+    add_edge(
+        &store,
+        "entity:server",
+        "entity:dc-east",
+        "located_in",
+        "00000000000000000010",
+    )
+    .await;
+
+    let functional: HashSet<String> = ["located_in".to_string()].into_iter().collect();
+
+    // Assert a NEW conflicting fact: located_in dc-west (same from+predicate, new to).
+    let new_edge = GraphEdge {
+        from_node_id: "entity:server".into(),
+        to_node_id: "entity:dc-west".into(),
+        relation: "located_in".into(),
+        valid_from: "00000000000000000020".into(),
+        valid_to: None,
+        confidence: None,
+        extractor: None,
+        strength: None,
+        stability: None,
+        last_activated: None,
+        access_count: None,
+    };
+    let closed = svc
+        .auto_invalidate_conflicts(&new_edge, &functional)
+        .await
+        .unwrap();
+    assert_eq!(closed, 1, "the old located_in edge must be auto-closed");
+    store.add_edge_direct(&new_edge).await.unwrap();
+
+    // Only the new dc-west edge remains active.
+    let active: Vec<_> = store
+        .neighbors("entity:server")
+        .await
+        .unwrap()
+        .into_iter()
+        .filter(|e| e.relation == "located_in" && e.valid_to.is_none())
+        .collect();
+    assert_eq!(
+        active.len(),
+        1,
+        "exactly one active located_in edge: {active:?}"
+    );
+    assert_eq!(active[0].to_node_id, "entity:dc-west");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn g4_non_functional_predicate_keeps_all_edges() {
+    use std::collections::HashSet;
+    let (_dir, store) = open_store().await;
+    let svc = CapabilityCapsuleService::new(store.clone());
+
+    add_edge(
+        &store,
+        "entity:proj",
+        "entity:lib-a",
+        "uses",
+        "00000000000000000010",
+    )
+    .await;
+
+    // "uses" is NOT in the functional set → multi-valued, nothing closed.
+    let functional: HashSet<String> = ["located_in".to_string()].into_iter().collect();
+    let new_edge = GraphEdge {
+        from_node_id: "entity:proj".into(),
+        to_node_id: "entity:lib-b".into(),
+        relation: "uses".into(),
+        valid_from: "00000000000000000020".into(),
+        valid_to: None,
+        confidence: None,
+        extractor: None,
+        strength: None,
+        stability: None,
+        last_activated: None,
+        access_count: None,
+    };
+    let closed = svc
+        .auto_invalidate_conflicts(&new_edge, &functional)
+        .await
+        .unwrap();
+    assert_eq!(closed, 0, "non-functional predicate must close nothing");
+    store.add_edge_direct(&new_edge).await.unwrap();
+
+    let active = store
+        .neighbors("entity:proj")
+        .await
+        .unwrap()
+        .into_iter()
+        .filter(|e| e.relation == "uses" && e.valid_to.is_none())
+        .count();
+    assert_eq!(active, 2, "both uses edges stay active");
+}

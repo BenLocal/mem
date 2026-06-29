@@ -1,5 +1,5 @@
 use serde::Serialize;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 use thiserror::Error;
 
@@ -1308,7 +1308,51 @@ impl CapabilityCapsuleService {
         if edge.valid_from.trim().is_empty() {
             edge.valid_from = crate::storage::current_timestamp();
         }
+        // G4 (zero-LLM contradiction auto-invalidation): if `predicate` is
+        // configured single-valued, asserting this new fact closes any existing
+        // active `(from, predicate, other_to)` edge first (Graphiti's "new fact
+        // supersedes the conflicting old edge"). Opt-in / default-off.
+        let closed = self
+            .auto_invalidate_conflicts(&edge, &kg_functional_predicates())
+            .await?;
+        if closed > 0 {
+            crate::metrics::metrics().add_kg_auto_invalidated(closed as u64);
+        }
         Ok(self.store.add_edge_direct(&edge).await?)
+    }
+
+    /// G4 core (pure of env reads — takes the functional-predicate set
+    /// explicitly so it is unit-testable): when `edge.relation` is functional
+    /// (single-valued), close every existing **active** edge sharing the same
+    /// `(from_node_id, relation)` but pointing at a different `to_node_id`.
+    /// Returns the number of edges closed. A no-op (returns 0) when the
+    /// predicate is not in `functional` — so a multi-valued predicate keeps all
+    /// its edges. Only OUTGOING edges from `edge.from_node_id` are considered.
+    /// `pub` so callers can run explicit conflict resolution and tests can drive
+    /// it with an explicit set (no env coupling).
+    pub async fn auto_invalidate_conflicts(
+        &self,
+        edge: &GraphEdge,
+        functional: &HashSet<String>,
+    ) -> Result<usize, ServiceError> {
+        if !functional.contains(&edge.relation.to_ascii_lowercase()) {
+            return Ok(0);
+        }
+        let now = crate::storage::current_timestamp();
+        let mut closed = 0usize;
+        for e in self.store.neighbors(&edge.from_node_id).await? {
+            if e.valid_to.is_none()
+                && e.from_node_id == edge.from_node_id
+                && e.relation == edge.relation
+                && e.to_node_id != edge.to_node_id
+            {
+                self.store
+                    .invalidate_edge(&e.from_node_id, &e.relation, &e.to_node_id, &now)
+                    .await?;
+                closed += 1;
+            }
+        }
+        Ok(closed)
     }
 
     /// Invalidate one active edge by triple. `ended_at` defaults to
@@ -1672,6 +1716,30 @@ fn next_feedback_id() -> String {
     format!("fb_{}", uuid::Uuid::now_v7())
 }
 
+/// G4: parse a comma-separated functional-predicate list (lowercased, trimmed,
+/// empties dropped). Pure — unit-testable without touching the environment.
+fn parse_functional_predicates(raw: &str) -> HashSet<String> {
+    raw.split(',')
+        .map(|s| s.trim().to_ascii_lowercase())
+        .filter(|s| !s.is_empty())
+        .collect()
+}
+
+/// G4: the set of graph predicates treated as **functional** (single-valued) —
+/// asserting a new `(from, predicate, to)` edge auto-closes any existing active
+/// `(from, predicate, other_to)` edge. Read live from
+/// `MEM_KG_FUNCTIONAL_PREDICATES` (comma-separated); **default empty = feature
+/// OFF** (no edge is ever auto-closed). A deployment opts in only for predicates
+/// it knows are single-valued (e.g. `located_in`, `current_status`); a
+/// multi-valued predicate like `uses` must NOT be listed or valid edges would be
+/// wrongly closed. Read at the use site so it tunes without a restart.
+fn kg_functional_predicates() -> HashSet<String> {
+    std::env::var("MEM_KG_FUNCTIONAL_PREDICATES")
+        .ok()
+        .map(|v| parse_functional_predicates(&v))
+        .unwrap_or_default()
+}
+
 fn next_embedding_job_id() -> String {
     format!("ej_{}", uuid::Uuid::now_v7())
 }
@@ -1778,5 +1846,29 @@ mod summarize_tests {
     fn empty_or_whitespace_is_memory() {
         assert_eq!(summarize(""), "memory");
         assert_eq!(summarize("   \n\t \n"), "memory");
+    }
+}
+
+#[cfg(test)]
+mod g4_predicate_tests {
+    use super::parse_functional_predicates;
+
+    #[test]
+    fn parses_comma_list_lowercased_trimmed_empties_dropped() {
+        let set = parse_functional_predicates(" Located_In , current_status ,, uses_db ,");
+        assert!(set.contains("located_in"));
+        assert!(set.contains("current_status"));
+        assert!(set.contains("uses_db"));
+        assert_eq!(
+            set.len(),
+            3,
+            "empties between commas must be dropped: {set:?}"
+        );
+    }
+
+    #[test]
+    fn empty_input_is_empty_set_feature_off() {
+        assert!(parse_functional_predicates("").is_empty());
+        assert!(parse_functional_predicates("   ,  , ").is_empty());
     }
 }

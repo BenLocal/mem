@@ -51,6 +51,7 @@ pub struct Metrics {
     episode_ingest_total: AtomicU64,
     redaction_hits: AtomicU64,
     neardup_flags: AtomicU64,
+    kg_auto_invalidated: AtomicU64,
     feedback_useful: AtomicU64,
     feedback_applies_here: AtomicU64,
     feedback_outdated: AtomicU64,
@@ -104,6 +105,13 @@ impl Metrics {
         self.neardup_flags.fetch_add(1, Ordering::Relaxed);
     }
 
+    /// `n` stale graph edges were auto-closed by the G4 functional-predicate
+    /// contradiction sweep (asserting a new single-valued fact superseded
+    /// conflicting old ones).
+    pub fn add_kg_auto_invalidated(&self, n: u64) {
+        self.kg_auto_invalidated.fetch_add(n, Ordering::Relaxed);
+    }
+
     /// A feedback event was applied; routed to the per-kind counter. Typed on
     /// [`FeedbackKind`] so a new variant is a compile error here, not a silent
     /// miss.
@@ -130,6 +138,7 @@ impl Metrics {
             episode_ingest_total: load(&self.episode_ingest_total),
             redaction_hits: load(&self.redaction_hits),
             neardup_flags: load(&self.neardup_flags),
+            kg_auto_invalidated: load(&self.kg_auto_invalidated),
             feedback_useful: load(&self.feedback_useful),
             feedback_applies_here: load(&self.feedback_applies_here),
             feedback_outdated: load(&self.feedback_outdated),
@@ -151,6 +160,7 @@ pub struct MetricsSnapshot {
     pub episode_ingest_total: u64,
     pub redaction_hits: u64,
     pub neardup_flags: u64,
+    pub kg_auto_invalidated: u64,
     pub feedback_useful: u64,
     pub feedback_applies_here: u64,
     pub feedback_outdated: u64,
@@ -188,6 +198,7 @@ mod tests {
         m.inc_episode_ingest();
         m.inc_redaction_hit();
         m.inc_neardup_flag();
+        m.add_kg_auto_invalidated(3);
         let s = m.snapshot();
         assert_eq!(s.capsule_ingest_total, 2);
         assert_eq!(s.capsule_search_total, 1);
@@ -197,6 +208,7 @@ mod tests {
         assert_eq!(s.episode_ingest_total, 1);
         assert_eq!(s.redaction_hits, 1);
         assert_eq!(s.neardup_flags, 1);
+        assert_eq!(s.kg_auto_invalidated, 3);
     }
 
     #[test]
