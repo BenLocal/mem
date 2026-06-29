@@ -97,19 +97,24 @@ const REINDEX_DELTA_THRESHOLD: usize = 4_096;
 ///
 /// lancedb 0.30 derives `num_partitions = num_rows / target_partition_size`.
 /// Its default over-partitioned our embedding tables — 256 partitions for the
-/// ~49k-row `conversation_message_embeddings`, i.e. ~190 rows each. lance's
-/// reader then hit a ragged-record-batch bug materializing ANN results across that many small
-/// partitions — surfacing as `IO Error: ... all columns in a record batch must
-/// have the same length` → HTTP 500 on `/transcripts/search` for queries whose
-/// nearest centroid was a degenerate partition (others returned fine; capsule
-/// recall was unaffected — that table is flat-scanned, no IVF index).
+/// ~49k-row `conversation_message_embeddings`, i.e. ~190 rows each. Pinning
+/// ~1024 rows/partition (49k → 48 partitions, ~1025 rows each) keeps partitions
+/// large and KMeans better-conditioned, and scales with the table as the
+/// archive grows.
 ///
-/// Verified empirically: 256 partitions reliably reproduced the 500, while
-/// pinning ~1024 rows/partition (49k → 48 partitions, ~1025 rows each) cleared
-/// it across a broad query sweep. The empty-KMeans-cluster *ratio* was similar
-/// either way, so partition *size*, not emptiness, is the trigger — fewer,
-/// larger partitions keep the extension's materialization path happy and
-/// KMeans better-conditioned. Scales with the table as the archive grows.
+/// ROOT-CAUSE NOTE — reconciled with AGENTS.md "Lance STALE-INDEX ragged-batch"
+/// (authoritative): the `IO Error: ... all columns in a record batch must have
+/// the same length` on `/transcripts/search` was *originally* pinned on this
+/// over-partitioning, and a ~1024-rows/partition sweep appeared to clear it.
+/// That theory was **later superseded** — the authoritative root cause is a
+/// **stale / partially-covering index** (a scan merging the indexed segment
+/// with the unindexed append-tail yields unequal-length columns), a lance-core
+/// bug that partition sizing only *reduces*, never eliminates. So this constant
+/// is a **mitigation, not the fix**: keep it (large partitions still help), but
+/// the live defenses are (a) the soft-degrade and (b) the self-healing
+/// force-reindex-and-retry in `TranscriptService::search`; the true fix is
+/// upstream (lance 7.0 / lancedb 0.30). Capsule recall is unaffected — that
+/// table is flat-scanned, no IVF index.
 const IVF_TARGET_ROWS_PER_PARTITION: usize = 1_024;
 
 /// IVF partition count for a vector index over `row_count` rows. Scales with

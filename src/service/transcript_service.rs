@@ -14,10 +14,11 @@
 //! shape is `Vec<MergedWindow>`.
 
 use std::collections::{HashMap, HashSet};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
 
-use tracing::{debug, warn};
+use tracing::{debug, info, warn};
 
 use crate::domain::{BlockType, ConversationMessage, MessageRole};
 use crate::embedding::EmbeddingProvider;
@@ -25,6 +26,36 @@ use crate::pipeline::transcript_recall::{
     merge_windows, score_candidates, MergedWindow, PrimaryWithContext, ScoringOpts,
 };
 use crate::storage::{Backend, StorageError};
+
+/// Process-wide guard: at most one in-request force-reindex (the transcript
+/// ANN self-heal, see `TranscriptService::search`) runs at a time. The rebuild
+/// covers the whole process's indexes (one dataset per process), so a burst of
+/// queries that all hit the stale-index ragged-batch must NOT each kick off a
+/// full rebuild — the first claims the flag and rebuilds, the rest soft-degrade
+/// to BM25 for that query. Reset via the RAII [`ReindexGuard`] so a cancelled
+/// request can't strand the flag.
+static TRANSCRIPT_ANN_REINDEX_IN_FLIGHT: AtomicBool = AtomicBool::new(false);
+
+/// RAII reset for [`TRANSCRIPT_ANN_REINDEX_IN_FLIGHT`]. Acquire with
+/// [`ReindexGuard::try_acquire`]; the flag clears on drop (normal return,
+/// `?`-propagation, or future cancellation) so the self-heal can never wedge.
+struct ReindexGuard;
+
+impl ReindexGuard {
+    /// `Some` iff this caller won the CAS and now owns the in-flight slot.
+    fn try_acquire() -> Option<Self> {
+        TRANSCRIPT_ANN_REINDEX_IN_FLIGHT
+            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+            .ok()
+            .map(|_| ReindexGuard)
+    }
+}
+
+impl Drop for ReindexGuard {
+    fn drop(&mut self) {
+        TRANSCRIPT_ANN_REINDEX_IN_FLIGHT.store(false, Ordering::SeqCst);
+    }
+}
 
 /// Optional filters layered on top of the candidate set returned by
 /// scoring. All fields are AND-ed.
@@ -394,23 +425,56 @@ impl TranscriptService {
                 embed_ms = t.elapsed().as_millis();
                 if let Some(q_vec) = q_vec {
                     let t = Instant::now();
-                    // Defense-in-depth: the ANN scan can fail on lancedb 0.30 /
-                    // lance 7.0 with `IO Error: ... all columns in a record
-                    // batch must have the same length` when a query's nearest
-                    // IVF centroid is a degenerate (empty) partition.
-                    // KMeans leaves some partitions empty on tightly-clustered
-                    // embeddings, and which queries hit one varies per index
-                    // rebuild (non-deterministic KMeans init) — so the
-                    // partition-count fix only *reduces*, never eliminates, the
-                    // failure. Rather than 500 the whole request, degrade to the
-                    // always-on BM25 channel for this query and log it. Mirrors
-                    // the capsule side's soft-degrade on a missing embeddings
-                    // table.
-                    match self
+                    // The ANN scan can fail on lancedb 0.30 / lance 7.0 with
+                    // `IO Error: ... all columns in a record batch must have the
+                    // same length` — a lance-core ragged-batch bug on a STALE /
+                    // partially-covering IVF index (a scan merging the indexed
+                    // segment with the unindexed append-tail yields unequal-
+                    // length columns; see AGENTS.md "Lance STALE-INDEX
+                    // ragged-batch" + `maintenance.rs`). The larger-partition
+                    // tuning only reduces it; the true fix is upstream.
+                    //
+                    // Self-heal: on that failure, force a full index rebuild and
+                    // retry the scan ONCE — turning "silent ANN-recall loss for
+                    // this channel until the next scheduled reindex (≤ the vacuum
+                    // interval, default 1h)" into "one slow self-healing query".
+                    // A process-wide guard caps it at one in-flight rebuild so a
+                    // burst of failing queries can't stampede. If the rebuild, a
+                    // concurrent rebuild, or the retry still can't serve ANN,
+                    // soft-degrade to the always-on BM25 channel rather than 500.
+                    let mut sem_result = self
                         .store
                         .semantic_search_transcripts(tenant, &q_vec, oversample)
-                        .await
-                    {
+                        .await;
+                    if sem_result.is_err() {
+                        if let Some(_guard) = ReindexGuard::try_acquire() {
+                            if let Err(e) = &sem_result {
+                                warn!(
+                                    error = %e,
+                                    "transcript ANN search failed (stale-index ragged-batch?); force-reindexing and retrying once"
+                                );
+                            }
+                            match self.store.rebuild_query_indexes().await {
+                                Ok(_) => {
+                                    sem_result = self
+                                        .store
+                                        .semantic_search_transcripts(tenant, &q_vec, oversample)
+                                        .await;
+                                    if sem_result.is_ok() {
+                                        info!("transcript ANN recovered after force-reindex");
+                                    }
+                                }
+                                Err(re) => {
+                                    warn!(error = %re, "force-reindex after ANN failure failed");
+                                }
+                            }
+                        } else {
+                            warn!(
+                                "transcript ANN search failed; a force-reindex is already in flight, serving BM25-only for this query"
+                            );
+                        }
+                    }
+                    match sem_result {
                         Ok(sem_hits) => {
                             for (rank0, (msg, _sim)) in sem_hits.iter().enumerate() {
                                 semantic_ranks.insert(msg.message_block_id.clone(), rank0 + 1);
@@ -420,7 +484,7 @@ impl TranscriptService {
                         Err(e) => {
                             warn!(
                                 error = %e,
-                                "transcript ANN search failed; serving BM25-only results for this query"
+                                "transcript ANN search failed after self-heal; serving BM25-only results for this query"
                             );
                         }
                     }
@@ -675,6 +739,23 @@ mod tests {
         );
         // A clean block is left byte-for-byte verbatim (no spurious rewrite).
         assert_eq!(blocks[1].content, "we discussed the Rust project layout");
+    }
+
+    #[test]
+    fn reindex_guard_is_mutually_exclusive_and_resets_on_drop() {
+        // First claim wins.
+        let g1 = ReindexGuard::try_acquire();
+        assert!(g1.is_some(), "first acquire must win");
+        // While held, a second claim is refused (no stampede of rebuilds).
+        assert!(
+            ReindexGuard::try_acquire().is_none(),
+            "second acquire must be refused while the first is held"
+        );
+        // Dropping the holder frees the slot (cancellation-safe self-heal).
+        drop(g1);
+        let g2 = ReindexGuard::try_acquire();
+        assert!(g2.is_some(), "acquire must succeed again after drop");
+        drop(g2);
     }
 
     /// MED-bug regression: when the query fails to embed (an infrastructure
