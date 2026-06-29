@@ -8,6 +8,72 @@ are organized by feature wave (merge commit ranges on `master`).
 
 ## [Unreleased]
 
+## 2026-06-29 — `0.2.4`
+
+The **OSS-comparison line** (`docs/oss-memory-diff.md` O1–O7) plus its
+broader-track follow-ons (G-series G4/G5) and an online-observability layer.
+Two parallel themes: catch up to mem0 / agentmemory / Zep-Graphiti on
+write-time hygiene + recall quality, and make the running service measurable.
+
+### Added
+
+- **O5 — output-layer secret redaction** (default ON, opt out with
+  `MEM_REDACT_SECRETS_DISABLED=1`). `pipeline/redact.rs` masks high-confidence
+  secrets in *derived* output only — storage stays verbatim. Four seams: capsule
+  compress + capsule embedding worker, and the transcript pre-embed + transcript
+  **search** output (verbatim-fetch paths `capability_capsule_get` /
+  `transcripts_range` are intentionally not redacted). White-list: `sk-`, AWS
+  `AKIA`, private-key blocks, `<private>`, GitHub classic + fine-grained
+  (`github_pat_`), JWT, `Bearer`, Stripe (`sk_live_`/`rk_live_`), Slack
+  (`xox[baprs]-`), Google (`AIza…`); `\b`-guarded against in-word false hits.
+- **O6 — recall-quality eval framework.** Gold-set recall regression gate
+  (`tests/golden_recall/`, a hermetic non-ignored CI step) + LongMemEval parity
+  harness (`tests/mempalace_bench.rs`, `#[ignore]`; real-set public number
+  pending a faster machine).
+- **O6d — online observability** (`src/metrics.rs` + `GET /metrics`): a
+  process-local atomic-counter registry exposed as JSON. Pipeline-scoped names
+  (`capsule_*` / `transcript_*` / `episode_*` ingest+search) + `redaction_hits`
+  + `neardup_flags` + `kg_auto_invalidated` + per-`FeedbackKind` counts. The
+  online complement to O6's offline eval.
+- **O7 — Mem0-style auto-extraction, zero-LLM by default.** (a) cluster-canonical
+  near-duplicate supersede proposal in the embedding worker; (b) heuristic
+  high-signal extraction lane in `mem mine` (`MEM_MINE_HEURISTIC_EXTRACT`,
+  default off, review-gated); (c) opt-in generative-LLM lane
+  (`MEM_MINE_LLM_EXTRACT` + gateway, default off, fail-safe — silently falls
+  back to (a)/(b) when no LLM).
+- **O1 — retrieve freshness bonus.** The freshness score now anchors on
+  `last_used_at` (else `updated_at`), symmetric with the decay clock — a
+  recently *used* capsule ranks fresher, not just a recently *written* one.
+- **G4 — zero-LLM contradiction auto-invalidation.** Asserting a new
+  `(from, predicate, to)` whose predicate is configured functional
+  (`MEM_KG_FUNCTIONAL_PREDICATES`, default empty = off) auto-closes conflicting
+  active `(from, predicate, other_to)` edges (Graphiti's pattern, structured
+  triples only). Closures count in `/metrics::kg_auto_invalidated`.
+- **G5 — user/project profile.** `POST /capability_capsules/profile` aggregates
+  the in-scope active `Preference` + `Workflow` capsules and tenant entities into
+  one queryable "conventions" view — read-side, no new storage.
+- **Transcript ANN self-heal.** On the stale-index ragged-batch error, the
+  semantic channel now force-reindexes and retries once (guarded against
+  stampede) before falling back to the BM25-only soft-degrade.
+
+### Fixed
+
+- **Per-session ingest cap → HTTP 429** (was 400): the throttle now returns the
+  dedicated `StorageError::RateLimited`, and its counter map is soft-bounded
+  (100k sessions, fail-open reset) so it can't grow unbounded.
+
+### Changed
+
+- Recall headline spells out section counts in full words (`0 directives,
+  3 facts, …`) instead of `0d 3f`.
+- `mem mine` / pre-compact hook banner glyph `✦` → `🧠`.
+
+### Docs
+
+- New `docs/oss-memory-diff.md` §8 records the G-series (G1→O6, G4✅, G5✅, and
+  the deferred G2/G3/G6/G7 with assessments).
+- `AGENTS.md` "Key env vars" mega-paragraph split into a per-var bullet list.
+
 ## 2026-06-26 — `0.2.3`
 
 ### Fixed
