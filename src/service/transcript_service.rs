@@ -14,9 +14,9 @@
 //! shape is `Vec<MergedWindow>`.
 
 use std::collections::{HashMap, HashSet};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use tracing::{debug, info, warn};
 
@@ -54,6 +54,36 @@ impl ReindexGuard {
 impl Drop for ReindexGuard {
     fn drop(&mut self) {
         TRANSCRIPT_ANN_REINDEX_IN_FLIGHT.store(false, Ordering::SeqCst);
+    }
+}
+
+/// Cooldown between transcript-ANN self-heal reindexes (ms). The in-flight
+/// guard only stops *concurrent* rebuilds; this stops *rapid sequential* ones.
+/// Without it, a failure that a reindex can't actually fix would make EVERY
+/// transcript search force a full (~1s+) index rebuild — a worse storm than the
+/// plain BM25 soft-degrade it replaced. In the designed case (stale index →
+/// reindex fixes it) the next query hits a fresh index and never re-enters this
+/// path, so the cooldown is invisible.
+const TRANSCRIPT_ANN_REINDEX_COOLDOWN_MS: u64 = 300_000;
+
+/// Last self-heal reindex attempt (ms since epoch); `0` = never.
+static TRANSCRIPT_ANN_LAST_REINDEX_MS: AtomicU64 = AtomicU64::new(0);
+
+/// Whether a self-heal reindex may run now: true (and stamps "now") iff the
+/// cooldown has elapsed since the last attempt. The concurrent case is still
+/// handled by [`ReindexGuard`]; this only rate-limits sequential attempts, so a
+/// benign load/store race at the window boundary is acceptable.
+fn transcript_ann_reindex_cooldown_elapsed() -> bool {
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0);
+    let last = TRANSCRIPT_ANN_LAST_REINDEX_MS.load(Ordering::Relaxed);
+    if now.saturating_sub(last) >= TRANSCRIPT_ANN_REINDEX_COOLDOWN_MS {
+        TRANSCRIPT_ANN_LAST_REINDEX_MS.store(now, Ordering::Relaxed);
+        true
+    } else {
+        false
     }
 }
 
@@ -447,30 +477,39 @@ impl TranscriptService {
                         .semantic_search_transcripts(tenant, &q_vec, oversample)
                         .await;
                     if sem_result.is_err() {
-                        if let Some(_guard) = ReindexGuard::try_acquire() {
-                            if let Err(e) = &sem_result {
-                                warn!(
-                                    error = %e,
-                                    "transcript ANN search failed (stale-index ragged-batch?); force-reindexing and retrying once"
-                                );
-                            }
-                            match self.store.rebuild_query_indexes().await {
-                                Ok(_) => {
-                                    sem_result = self
-                                        .store
-                                        .semantic_search_transcripts(tenant, &q_vec, oversample)
-                                        .await;
-                                    if sem_result.is_ok() {
-                                        info!("transcript ANN recovered after force-reindex");
+                        // Self-heal only if BOTH the cooldown has elapsed (no
+                        // rapid-sequential rebuild storm when a reindex can't fix
+                        // the failure) AND no rebuild is already in flight.
+                        if transcript_ann_reindex_cooldown_elapsed() {
+                            if let Some(_guard) = ReindexGuard::try_acquire() {
+                                if let Err(e) = &sem_result {
+                                    warn!(
+                                        error = %e,
+                                        "transcript ANN search failed (stale-index ragged-batch?); force-reindexing and retrying once"
+                                    );
+                                }
+                                match self.store.rebuild_query_indexes().await {
+                                    Ok(_) => {
+                                        sem_result = self
+                                            .store
+                                            .semantic_search_transcripts(tenant, &q_vec, oversample)
+                                            .await;
+                                        if sem_result.is_ok() {
+                                            info!("transcript ANN recovered after force-reindex");
+                                        }
+                                    }
+                                    Err(re) => {
+                                        warn!(error = %re, "force-reindex after ANN failure failed");
                                     }
                                 }
-                                Err(re) => {
-                                    warn!(error = %re, "force-reindex after ANN failure failed");
-                                }
+                            } else {
+                                warn!(
+                                    "transcript ANN search failed; a force-reindex is already in flight, serving BM25-only for this query"
+                                );
                             }
                         } else {
                             warn!(
-                                "transcript ANN search failed; a force-reindex is already in flight, serving BM25-only for this query"
+                                "transcript ANN search failed; self-heal reindex on cooldown, serving BM25-only for this query"
                             );
                         }
                     }
@@ -756,6 +795,22 @@ mod tests {
         let g2 = ReindexGuard::try_acquire();
         assert!(g2.is_some(), "acquire must succeed again after drop");
         drop(g2);
+    }
+
+    #[test]
+    fn reindex_cooldown_rate_limits_sequential_attempts() {
+        // First attempt (last = 0, far in the past) is allowed and stamps "now";
+        // an immediate second attempt is refused — so a persistent failure can't
+        // trigger a full reindex on every query. Only this test touches the
+        // cooldown static, so the sequence is deterministic.
+        assert!(
+            transcript_ann_reindex_cooldown_elapsed(),
+            "first self-heal attempt must be allowed"
+        );
+        assert!(
+            !transcript_ann_reindex_cooldown_elapsed(),
+            "an immediate second attempt must be rate-limited by the cooldown"
+        );
     }
 
     /// MED-bug regression: when the query fails to embed (an infrastructure
