@@ -333,6 +333,9 @@ async fn flag_if_near_duplicate(
             crate::domain::capability_capsule::CapabilityCapsuleStatus::PendingConfirmation,
         )
         .await?;
+    // The status flip is the load-bearing part of the proposal — count it here
+    // (the edge write below is best-effort).
+    crate::metrics::metrics().inc_neardup_flag();
 
     // Record the suspected supersede as a graph edge — a memory→memory
     // pointer in the same family as `supersedes` / `contradicts`, which

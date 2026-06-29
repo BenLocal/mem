@@ -7,6 +7,7 @@ pub mod error;
 pub mod evolution;
 pub mod http;
 pub mod mcp;
+pub mod metrics;
 pub mod pipeline;
 pub mod service;
 pub mod storage;

@@ -393,6 +393,7 @@ impl CapabilityCapsuleService {
         };
 
         let stored = self.store.insert_capability_capsule(memory).await?;
+        crate::metrics::metrics().inc_ingest();
         let drafts = crate::pipeline::ingest::extract_graph_edge_drafts(&stored);
         let edges = resolve_drafts_to_edges(drafts, &*self.store, &stored.tenant, &now).await?;
         self.store.sync_memory_edges(&edges, &now).await?;
@@ -447,6 +448,9 @@ impl CapabilityCapsuleService {
         // ── Phase 2: bulk insert.
         if !to_insert.is_empty() {
             self.store.insert_capability_capsules(&to_insert).await?;
+            for _ in &to_insert {
+                crate::metrics::metrics().inc_ingest();
+            }
 
             // Collect graph edges across all new rows; resolve through
             // the entity registry; flush in one sync_memory_edges call.
@@ -1091,7 +1095,9 @@ impl CapabilityCapsuleService {
             note: note.filter(|s| !s.is_empty()),
         };
 
-        Ok(self.store.apply_feedback(&memory, feedback).await?)
+        let updated = self.store.apply_feedback(&memory, feedback).await?;
+        crate::metrics::metrics().record_feedback(&feedback_kind);
+        Ok(updated)
     }
 
     fn superseding_active_version(
@@ -1315,6 +1321,7 @@ impl CapabilityCapsuleService {
         &self,
         query: SearchCapabilityCapsuleRequest,
     ) -> Result<SearchCapabilityCapsuleResponse, ServiceError> {
+        crate::metrics::metrics().inc_search();
         let tenant = query.tenant.as_deref().unwrap_or("local");
 
         // Wake-up fast path: SessionStart hooks call us with `intent="wake_up"`

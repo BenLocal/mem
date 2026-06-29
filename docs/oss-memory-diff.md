@@ -229,6 +229,10 @@ FEEDBACK  ── 隐式 / 自动 ──
 - O6c harness：`tests/mempalace_bench.rs`（`#[ignore]`）+ committed `subset.json`（6 条 format-faithful synthetic）+ `tests/mempalace_bench/.gitignore`（挡 277MB 真集）。bench 逻辑：每题 fresh `Store` → 每 haystack session 一条 capsule（真 Qwen3 batch 嵌入 + upsert）→ question 走真 hybrid `rank_with_hybrid_and_graph` → ranked capsule 映回 session id → `recall_any_at_k`/`recall_at_k`/`mrr` over `answer_session_ids`；type-stratified `LONGMEMEVAL_SAMPLE`（默认 50，0=全 500）。
 - **真集数（公开数）= 未产出**：本机 Qwen3-Embedding-0.6B（CPU、contended）嵌 LongMemEval ~48-session 长 haystack 太慢，**N=6 探测 1h40m 未完**；全 500 题 ~2.4 万 session 嵌入在本机不可行。需在 **GPU 或非 contended CPU** 机器上 drop-in 真集后复跑 `cargo test --test mempalace_bench --ignored` 才能得到可对外引用的 session-recall@k。在那之前 README **不写**任何 LongMemEval 数（避免拿 synthetic 子集示意数误导对比）。
 
+#### O6d 在线观测计数 ✅ 落地（O6 离线 eval 的在线补充）
+
+O6a/b/c 衡量召回质量都是**离线**（CI / 一次性 bench）。线上跑着的服务**在做什么**——O5 脱敏到底有没有触发、O7(a) 近重复闸是过敏还是过松、feedback 回流率多少——之前只能 grep 日志。补一个**进程内原子计数器**注册表（`src/metrics.rs`，`once_cell::Lazy` 单例 + `AtomicU64`，零新依赖、不穿 `AppState`），经 `GET /metrics` 返回 JSON 快照（与 `/…/stats` 同风格、只读免鉴权同 `/health`）。计 5 类:`ingest_total`/`search_total`（速率分母）、`redaction_hits`（O5 命中:`redact_secrets` 返回 `Cow::Owned` 即 +1，不污染纯函数 `redact_all`）、`neardup_flags`（O2/O7(a) 翻 `PendingConfirmation` 成功后 +1）、`feedback_*`（按 6 种 `FeedbackKind` 分桶，typed 路由——新增 variant 是编译错而非静默漏）。**进程本地、重启清零、不持久化**（同 `MEM_MAX_INGEST_PER_SESSION` 语义），`Relaxed` 序、读路径无锁。埋点全在 choke point（`redact_secrets` / `embedding_worker::flag_if_near_duplicate` / `service::{ingest,ingest_batch,search,submit_feedback}`），坏请求 422 在进 handler 前被拒、不计数（端到端 smoke 验证过）。**触点**：新 `src/metrics.rs` + `src/http/metrics.rs` + 5 处 `metrics().inc_*()`。**风险**:极低（只读端点 + 计数器,不影响任何业务逻辑）。
+
 ### O7 🔍 — 对标 Mem0 的自动抽取 + 冲突消解：零-额外-LLM 版（P1）(a)(b)(c) ✅ ★(a)(b) 零 LLM，(c) opt-in 默认关 + fail-safe
 
 > **硬约束**：本部署**没有多余的生成式 LLM**（无可达网关，见 O6c 勘探）。所以这条对标 Mem0「写时 LLM 抽取 + ADD/UPDATE/DELETE 对账」的能力，**默认形态必须零生成式 LLM**——靠已有的 embedding + 启发式 + review 队列拿到 80% 价值；真要 mem0 级细腻抽取，做成**默认关**的 opt-in lane，没配 LLM 时静默退回现状，**永不强依赖**。这与 §6「不做 inline LLM 抽取」不矛盾：(a)(b) 不是 LLM 抽取（是嵌入去重 + 规则抽取，守 verbatim），(c) 才是那条被 §6 排除的路——所以把它关在 opt-in 后面。

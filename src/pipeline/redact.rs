@@ -84,7 +84,15 @@ pub fn redact_secrets(text: &str) -> Cow<'_, str> {
     if !enabled() {
         return Cow::Borrowed(text);
     }
-    redact_all(text)
+    let out = redact_all(text);
+    // `redact_all` returns `Owned` iff at least one pattern matched — the exact
+    // "a secret was masked" signal for the observability counter. Counted here
+    // (the env-gated entry), not in the pure `redact_all`, so unit tests of the
+    // pattern logic stay side-effect-free.
+    if matches!(out, Cow::Owned(_)) {
+        crate::metrics::metrics().inc_redaction_hit();
+    }
+    out
 }
 
 /// Pure pattern application, independent of the env switch — unit-testable.
