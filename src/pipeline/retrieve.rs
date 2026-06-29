@@ -387,6 +387,23 @@ fn graph_boosts_from_edges(
     boosts
 }
 
+/// O1 retrieve freshness bonus: the timestamp a capsule's freshness is credited
+/// from. Symmetric with the decay worker's anchor (`COALESCE(last_used_at,
+/// updated_at)`) — a capsule that has been *used* (retrieved into a response,
+/// stamped by the always-on last-used worker) is credited from its
+/// `last_used_at`, so retrieval reinforces freshness on the read path the same
+/// way it slows decay on the write path; an untouched capsule falls back to its
+/// write time `updated_at`. Returns ms-since-epoch (`0` = "very old"). A blank
+/// or unparseable `last_used_at` (`timestamp_score` → 0) falls back too.
+fn freshness_anchor_ts(memory: &CapabilityCapsuleRecord) -> u128 {
+    memory
+        .last_used_at
+        .as_deref()
+        .map(timestamp_score)
+        .filter(|&t| t > 0)
+        .unwrap_or_else(|| timestamp_score(&memory.updated_at))
+}
+
 /// Computes the additive non-recall portion of a memory's score (the
 /// "lifecycle" stack: scope, intent, confidence, validation, freshness,
 /// staleness, graph boost, status penalty). Used by `score_with_hybrid`
@@ -408,7 +425,7 @@ fn apply_lifecycle_score(
     score += memory_type_score(&memory.capability_capsule_type, &query.intent);
     score += confidence_score(memory.confidence);
     score += validation_score(memory.last_validated_at.is_some());
-    score += freshness_score(newest, timestamp_score(&memory.updated_at));
+    score += freshness_score(newest, freshness_anchor_ts(memory));
     score -= staleness_penalty(memory.decay_score);
 
     score += graph_boost_by_id
@@ -438,9 +455,13 @@ fn score_with_hybrid(
     hybrid_scores: &HashMap<String, f32>,
     graph_boost_by_id: &HashMap<String, i64>,
 ) -> Vec<ScoredMemory> {
+    // O1: anchor the freshness-pool "newest" on the same last_used_at-or-
+    // updated_at clock the per-memory freshness uses, so a recently *used*
+    // capsule can actually reach the freshness ceiling (not just a recently
+    // *written* one).
     let newest = candidates
         .iter()
-        .map(|memory| timestamp_score(&memory.updated_at))
+        .map(freshness_anchor_ts)
         .max()
         .unwrap_or(0);
 
@@ -884,6 +905,54 @@ mod tests {
         // None delegates to the process-wide default / MEM_MIN_SCORE.
         query.min_score = None;
         assert_eq!(effective_floor(&query), min_relevance_score());
+    }
+
+    #[test]
+    fn freshness_anchor_prefers_last_used_then_updated_o1() {
+        let mut m = fixture_memory("a");
+        m.updated_at = "00000000000000001000".to_string(); // ts 1000
+                                                           // No last_used_at → anchor on updated_at (write time).
+        assert_eq!(freshness_anchor_ts(&m), 1000);
+        // A recent last_used_at takes over → retrieval reinforces freshness.
+        m.last_used_at = Some("00000000000000009000".to_string()); // ts 9000
+        assert_eq!(freshness_anchor_ts(&m), 9000);
+        // Blank / zero last_used_at must NOT anchor on 0 — falls back.
+        m.last_used_at = Some(String::new());
+        assert_eq!(freshness_anchor_ts(&m), 1000);
+        m.last_used_at = Some("0".to_string());
+        assert_eq!(freshness_anchor_ts(&m), 1000);
+    }
+
+    #[test]
+    fn used_capsule_ranks_fresher_than_untouched_o1() {
+        // Two capsules written at the same time; only one has been *used*.
+        // O1's read-path reinforcement must rank the used one fresher.
+        let query = fixture_query();
+        let scope_filters: HashMap<String, Vec<String>> = HashMap::new();
+        let graph: HashMap<String, i64> = HashMap::new();
+
+        let mut used = fixture_memory("used");
+        used.updated_at = "00000000000000001000".to_string();
+        used.last_used_at = Some("00000000000000500000".to_string());
+
+        let mut untouched = fixture_memory("untouched");
+        untouched.updated_at = "00000000000000001000".to_string(); // same write time, never used
+
+        // Pool "newest" anchored on the same clock per-memory freshness uses.
+        let newest = [&used, &untouched]
+            .into_iter()
+            .map(freshness_anchor_ts)
+            .max()
+            .unwrap();
+
+        let used_score = apply_lifecycle_score(&used, &query, &[], &scope_filters, newest, &graph);
+        let untouched_score =
+            apply_lifecycle_score(&untouched, &query, &[], &scope_filters, newest, &graph);
+
+        assert!(
+            used_score > untouched_score,
+            "recently-used capsule must rank fresher: used={used_score} untouched={untouched_score}"
+        );
     }
 
     #[test]
