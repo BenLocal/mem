@@ -111,7 +111,9 @@ impl TranscriptService {
     /// `create_conversation_message`. Embedding job enqueueing is handled
     /// inside the repository; this method does not touch the vector index.
     pub async fn ingest(&self, msg: ConversationMessage) -> Result<(), StorageError> {
-        self.store.create_conversation_message(&msg).await
+        self.store.create_conversation_message(&msg).await?;
+        crate::metrics::metrics().add_transcript_ingest(1);
+        Ok(())
     }
 
     /// Bulk ingest of transcript blocks. Idempotent on
@@ -127,7 +129,9 @@ impl TranscriptService {
         if msgs.is_empty() {
             return Ok(0);
         }
-        self.store.create_conversation_messages(&msgs).await
+        let landed = self.store.create_conversation_messages(&msgs).await?;
+        crate::metrics::metrics().add_transcript_ingest(landed as u64);
+        Ok(landed)
     }
 
     /// Per-session aggregate summary of the transcript archive. Backs the
@@ -290,6 +294,7 @@ impl TranscriptService {
         limit: usize,
         opts: &TranscriptSearchOpts,
     ) -> Result<TranscriptSearchResult, StorageError> {
+        crate::metrics::metrics().inc_transcript_search();
         let limit = limit.clamp(1, 100);
         // Oversample factor (`k = limit * factor`) is read directly from env at
         // search time — keeps the override flexible without plumbing config

@@ -10,6 +10,15 @@
 //! over- or under-triggering?" / "what's the feedback-to-search ratio?" into a
 //! single curl.
 //!
+//! **Naming is scope-explicit on purpose.** mem runs two parallel pipelines —
+//! capsules and the verbatim transcript archive — plus episodes. Each ingest /
+//! search counter carries the pipeline as a prefix (`capsule_*` / `transcript_*`
+//! / `episode_*`) so a reader never mistakes a capsule-only count for total
+//! volume. (`redaction_hits` is intentionally a single cross-surface counter:
+//! it fires from every `redact_secrets` call — capsule compress + both
+//! embedding workers + transcript search — and the point is "is redaction
+//! firing at all".)
+//!
 //! Design: a `once_cell::Lazy` singleton of `std::sync::atomic` counters — zero
 //! new dependencies, no `AppState` plumbing (choke points reach the registry
 //! via [`metrics()`] directly). Counters are **process-local** — they reset on
@@ -35,8 +44,11 @@ pub fn metrics() -> &'static Metrics {
 /// touching the shared global so counts stay isolated.
 #[derive(Default)]
 pub struct Metrics {
-    ingest_total: AtomicU64,
-    search_total: AtomicU64,
+    capsule_ingest_total: AtomicU64,
+    capsule_search_total: AtomicU64,
+    transcript_ingest_total: AtomicU64,
+    transcript_search_total: AtomicU64,
+    episode_ingest_total: AtomicU64,
     redaction_hits: AtomicU64,
     neardup_flags: AtomicU64,
     feedback_useful: AtomicU64,
@@ -49,20 +61,39 @@ pub struct Metrics {
 
 impl Metrics {
     /// A new capsule row was persisted (idempotent re-ingests don't count —
-    /// they never reach the insert).
-    pub fn inc_ingest(&self) {
-        self.ingest_total.fetch_add(1, Ordering::Relaxed);
+    /// they never reach the insert). Used by both the single and batch path.
+    pub fn inc_capsule_ingest(&self) {
+        self.capsule_ingest_total.fetch_add(1, Ordering::Relaxed);
     }
 
     /// A capsule `search` was served (includes the wake-up fast path — every
     /// recall that can emit a redacted banner).
-    pub fn inc_search(&self) {
-        self.search_total.fetch_add(1, Ordering::Relaxed);
+    pub fn inc_capsule_search(&self) {
+        self.capsule_search_total.fetch_add(1, Ordering::Relaxed);
     }
 
-    /// An output text had at least one secret masked (O5). Counts
-    /// texts-with-redactions, not individual secrets — the right granularity
-    /// for a "is redaction firing" signal.
+    /// `n` transcript messages were persisted. The batch path passes the landed
+    /// row count; the single path passes 1.
+    pub fn add_transcript_ingest(&self, n: u64) {
+        self.transcript_ingest_total.fetch_add(n, Ordering::Relaxed);
+    }
+
+    /// A transcript `search` was served (the `transcripts_search` path — a
+    /// separate pipeline from capsule search, hence its own counter).
+    pub fn inc_transcript_search(&self) {
+        self.transcript_search_total.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// An episode row was persisted. (The workflow capsule an episode may spawn
+    /// is counted separately under `capsule_ingest_total` via the ingest path.)
+    pub fn inc_episode_ingest(&self) {
+        self.episode_ingest_total.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// An output text had at least one secret masked (O5). Cross-surface: fires
+    /// from capsule compress, both embedding workers, and transcript search.
+    /// Counts texts-with-redactions, not individual secrets — the right
+    /// granularity for a "is redaction firing" signal.
     pub fn inc_redaction_hit(&self) {
         self.redaction_hits.fetch_add(1, Ordering::Relaxed);
     }
@@ -92,8 +123,11 @@ impl Metrics {
     pub fn snapshot(&self) -> MetricsSnapshot {
         let load = |a: &AtomicU64| a.load(Ordering::Relaxed);
         MetricsSnapshot {
-            ingest_total: load(&self.ingest_total),
-            search_total: load(&self.search_total),
+            capsule_ingest_total: load(&self.capsule_ingest_total),
+            capsule_search_total: load(&self.capsule_search_total),
+            transcript_ingest_total: load(&self.transcript_ingest_total),
+            transcript_search_total: load(&self.transcript_search_total),
+            episode_ingest_total: load(&self.episode_ingest_total),
             redaction_hits: load(&self.redaction_hits),
             neardup_flags: load(&self.neardup_flags),
             feedback_useful: load(&self.feedback_useful),
@@ -110,8 +144,11 @@ impl Metrics {
 /// JSON keys returned by `GET /metrics`.
 #[derive(Debug, Clone, Serialize)]
 pub struct MetricsSnapshot {
-    pub ingest_total: u64,
-    pub search_total: u64,
+    pub capsule_ingest_total: u64,
+    pub capsule_search_total: u64,
+    pub transcript_ingest_total: u64,
+    pub transcript_search_total: u64,
+    pub episode_ingest_total: u64,
     pub redaction_hits: u64,
     pub neardup_flags: u64,
     pub feedback_useful: u64,
@@ -130,24 +167,34 @@ mod tests {
     fn counters_start_at_zero() {
         let m = Metrics::default();
         let s = m.snapshot();
-        assert_eq!(s.ingest_total, 0);
-        assert_eq!(s.search_total, 0);
+        assert_eq!(s.capsule_ingest_total, 0);
+        assert_eq!(s.capsule_search_total, 0);
+        assert_eq!(s.transcript_ingest_total, 0);
+        assert_eq!(s.transcript_search_total, 0);
+        assert_eq!(s.episode_ingest_total, 0);
         assert_eq!(s.redaction_hits, 0);
         assert_eq!(s.neardup_flags, 0);
         assert_eq!(s.feedback_useful, 0);
     }
 
     #[test]
-    fn increments_accumulate() {
+    fn increments_accumulate_per_pipeline() {
         let m = Metrics::default();
-        m.inc_ingest();
-        m.inc_ingest();
-        m.inc_search();
+        m.inc_capsule_ingest();
+        m.inc_capsule_ingest();
+        m.inc_capsule_search();
+        m.add_transcript_ingest(5);
+        m.inc_transcript_search();
+        m.inc_episode_ingest();
         m.inc_redaction_hit();
         m.inc_neardup_flag();
         let s = m.snapshot();
-        assert_eq!(s.ingest_total, 2);
-        assert_eq!(s.search_total, 1);
+        assert_eq!(s.capsule_ingest_total, 2);
+        assert_eq!(s.capsule_search_total, 1);
+        // Pipelines are counted independently — no cross-contamination.
+        assert_eq!(s.transcript_ingest_total, 5);
+        assert_eq!(s.transcript_search_total, 1);
+        assert_eq!(s.episode_ingest_total, 1);
         assert_eq!(s.redaction_hits, 1);
         assert_eq!(s.neardup_flags, 1);
     }
@@ -169,12 +216,14 @@ mod tests {
     }
 
     #[test]
-    fn snapshot_serialises_to_flat_json() {
+    fn snapshot_serialises_with_pipeline_prefixed_keys() {
         let m = Metrics::default();
-        m.inc_search();
+        m.inc_capsule_search();
+        m.inc_transcript_search();
         let json = serde_json::to_value(m.snapshot()).unwrap();
-        assert_eq!(json["search_total"], 1);
-        assert_eq!(json["ingest_total"], 0);
+        assert_eq!(json["capsule_search_total"], 1);
+        assert_eq!(json["transcript_search_total"], 1);
+        assert_eq!(json["capsule_ingest_total"], 0);
         // Per-kind feedback keys present.
         assert!(json.get("feedback_useful").is_some());
     }
