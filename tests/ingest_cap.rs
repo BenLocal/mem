@@ -12,8 +12,8 @@ use mem::{
     domain::capability_capsule::{
         CapabilityCapsuleType, IngestCapabilityCapsuleRequest, Scope, Visibility, WriteMode,
     },
-    service::CapabilityCapsuleService,
-    storage::Store,
+    service::{capability_capsule_service::ServiceError, CapabilityCapsuleService},
+    storage::{StorageError, Store},
 };
 use tempfile::tempdir;
 
@@ -142,6 +142,12 @@ async fn cap_blocks_after_threshold() {
         .ingest(request("over-cap content", None))
         .await
         .expect_err("4th ingest should hit cap");
+    // The cap is a rate limit, not a malformed request: must be the
+    // RateLimited variant so `error.rs` maps it to HTTP 429 (not 400).
+    assert!(
+        matches!(err, ServiceError::Storage(StorageError::RateLimited(_))),
+        "cap rejection must be RateLimited (→ HTTP 429), got: {err:?}"
+    );
     let msg = format!("{err}");
     assert!(
         msg.contains("per-session ingest cap reached"),

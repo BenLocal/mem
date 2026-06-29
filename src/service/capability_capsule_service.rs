@@ -276,13 +276,25 @@ impl CapabilityCapsuleService {
         let Some(cap) = self.ingest_settings.max_per_session else {
             return Ok(());
         };
+        // Soft bound on the process-local counter map so a long-running server
+        // with high session churn can't grow it without limit. On overflow,
+        // reset the whole window (fail-OPEN — counts restart, the same lenient
+        // effect as a process restart): this throttle is a coarse abuse guard,
+        // not an exact quota, so a rare reset of a 100k-session map is far
+        // preferable to unbounded memory. Only reached when a NEW session would
+        // push past the bound, so steady-state (≤ bound distinct sessions) never
+        // clears.
+        const MAX_TRACKED_SESSIONS: usize = 100_000;
         let mut counters = self
             .ingest_counters
             .lock()
             .expect("ingest_counters mutex poisoned");
+        if counters.len() >= MAX_TRACKED_SESSIONS && !counters.contains_key(session_id) {
+            counters.clear();
+        }
         let count = counters.entry(session_id.to_string()).or_insert(0);
         if *count >= cap {
-            return Err(ServiceError::Storage(StorageError::InvalidInput(format!(
+            return Err(ServiceError::Storage(StorageError::RateLimited(format!(
                 "per-session ingest cap reached: session {session_id} has {count} accepted writes \
                  (MEM_MAX_INGEST_PER_SESSION={cap}); restart mem or unset the env var to clear",
             ))));

@@ -96,6 +96,12 @@ pub enum StorageError {
     InvalidData(&'static str),
     #[error("invalid input: {0}")]
     InvalidInput(String),
+    /// A client/operator-policy rate limit was hit (e.g. the per-session
+    /// ingest cap). A *client* condition, not a backend fault — maps to HTTP
+    /// 429 in `error.rs`, distinct from `InvalidInput`'s 400 so a caller /
+    /// proxy can tell "slow down and retry" from "your request was malformed".
+    #[error("rate limited: {0}")]
+    RateLimited(String),
     #[error("vector index error: {0}")]
     VectorIndex(String),
     /// Internal-consistency lookup miss (e.g. an id returned by a
