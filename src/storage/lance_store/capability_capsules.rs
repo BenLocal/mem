@@ -1352,7 +1352,10 @@ impl LanceStore {
             .map_err(lancedb_err)?;
         table
             .update()
-            .only_if(format!("job_id = {}", sql_quote(job_id)))
+            .only_if(format!(
+                "job_id = {} AND status = 'processing'",
+                sql_quote(job_id)
+            ))
             .column("status", "'stale'")
             .column("updated_at", sql_quote(now))
             .execute()
@@ -1377,7 +1380,10 @@ impl LanceStore {
             .map_err(lancedb_err)?;
         table
             .update()
-            .only_if(format!("job_id = {}", sql_quote(job_id)))
+            .only_if(format!(
+                "job_id = {} AND status = 'processing'",
+                sql_quote(job_id)
+            ))
             .column("status", "'failed'")
             .column("attempt_count", new_attempt_count.to_string())
             .column("last_error", sql_quote(last_error))
@@ -1404,7 +1410,10 @@ impl LanceStore {
             .map_err(lancedb_err)?;
         table
             .update()
-            .only_if(format!("job_id = {}", sql_quote(job_id)))
+            .only_if(format!(
+                "job_id = {} AND status = 'processing'",
+                sql_quote(job_id)
+            ))
             .column("status", "'failed'")
             .column("attempt_count", new_attempt_count.to_string())
             .column("last_error", sql_quote(last_error))
@@ -2403,6 +2412,10 @@ mod tests {
         // Failed but attempt_count (5) >= max_retries (2) → not eligible.
         assert!(recl3.is_empty());
 
+        // job_1 is already 'completed', so mark_stale (guarded by
+        // status='processing') is a no-op — a terminal job is never clobbered
+        // back into a non-terminal state. (mark_stale's happy path on a
+        // processing job is covered by terminal_capsule_job_not_clobbered_by_stale_finalize.)
         repo.mark_embedding_job_stale("job_1", "00000001778000070000")
             .await
             .unwrap();
@@ -2410,7 +2423,7 @@ mod tests {
             .latest_embedding_job_status_for_hash("tenant-a", "mem_q1", "hash_q1")
             .await
             .unwrap();
-        assert_eq!(s_stale.as_deref(), Some("stale"));
+        assert_eq!(s_stale.as_deref(), Some("completed"));
 
         // list_embedding_jobs: tenant filter.
         let all = repo
@@ -2477,6 +2490,111 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(zero, 0);
+    }
+
+    /// Failure-path finalizers must not clobber a job that is no longer the
+    /// caller's live claim. After a slow worker's lease elapses and a second
+    /// worker reclaims + completes the job, the original worker's late
+    /// reschedule / permanently-fail / mark-stale must be a no-op — guarded by
+    /// `status = 'processing'`, the same fence `complete_embedding_job` uses.
+    #[tokio::test]
+    async fn terminal_capsule_job_not_clobbered_by_stale_finalize() {
+        let dir = tempdir().unwrap();
+        let repo = LanceStore::open(&dir.path().join("lance.store"))
+            .await
+            .unwrap();
+        repo.insert_capability_capsule(fixture("mem_x", "t"))
+            .await
+            .unwrap();
+        repo.try_enqueue_embedding_job(EmbeddingJobInsert {
+            job_id: "jx".into(),
+            tenant: "t".into(),
+            capability_capsule_id: "mem_x".into(),
+            target_content_hash: "hx".into(),
+            provider: "fake".into(),
+            available_at: "00000001778000000000".into(),
+            created_at: "00000001778000000000".into(),
+            updated_at: "00000001778000000000".into(),
+        })
+        .await
+        .unwrap();
+        repo.claim_next_n_embedding_jobs("00000001778000010000", 5, 5)
+            .await
+            .unwrap();
+        repo.complete_embedding_job("jx", "00000001778000020000")
+            .await
+            .unwrap();
+
+        repo.reschedule_embedding_job_failure(
+            "jx",
+            1,
+            "late",
+            "00000001778000030000",
+            "00000001778000030000",
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            repo.latest_embedding_job_status_for_hash("t", "mem_x", "hx")
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("completed"),
+            "stale reschedule must not clobber a completed job"
+        );
+        repo.permanently_fail_embedding_job("jx", 9, "late", "00000001778000040000")
+            .await
+            .unwrap();
+        assert_eq!(
+            repo.latest_embedding_job_status_for_hash("t", "mem_x", "hx")
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("completed"),
+            "stale permanently_fail must not clobber"
+        );
+        repo.mark_embedding_job_stale("jx", "00000001778000050000")
+            .await
+            .unwrap();
+        assert_eq!(
+            repo.latest_embedding_job_status_for_hash("t", "mem_x", "hx")
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("completed"),
+            "stale mark_stale must not clobber"
+        );
+
+        // Happy path: a job the worker still holds (processing) IS marked stale.
+        repo.insert_capability_capsule(fixture("mem_y", "t"))
+            .await
+            .unwrap();
+        repo.try_enqueue_embedding_job(EmbeddingJobInsert {
+            job_id: "jy".into(),
+            tenant: "t".into(),
+            capability_capsule_id: "mem_y".into(),
+            target_content_hash: "hy".into(),
+            provider: "fake".into(),
+            available_at: "00000001778000000000".into(),
+            created_at: "00000001778000000000".into(),
+            updated_at: "00000001778000000000".into(),
+        })
+        .await
+        .unwrap();
+        repo.claim_next_n_embedding_jobs("00000001778000060000", 5, 5)
+            .await
+            .unwrap();
+        repo.mark_embedding_job_stale("jy", "00000001778000070000")
+            .await
+            .unwrap();
+        assert_eq!(
+            repo.latest_embedding_job_status_for_hash("t", "mem_y", "hy")
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("stale"),
+            "mark_stale applies to a processing job"
+        );
     }
 
     /// HIGH-bug regression: a job left in `processing` (worker crash, process

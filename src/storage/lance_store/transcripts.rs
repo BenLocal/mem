@@ -274,7 +274,10 @@ impl LanceStore {
             .map_err(lancedb_err)?;
         table
             .update()
-            .only_if(format!("job_id = {}", sql_quote(job_id)))
+            .only_if(format!(
+                "job_id = {} AND status = 'processing'",
+                sql_quote(job_id)
+            ))
             .column("status", "'stale'")
             .column("updated_at", sql_quote(now))
             .execute()
@@ -299,7 +302,10 @@ impl LanceStore {
             .map_err(lancedb_err)?;
         table
             .update()
-            .only_if(format!("job_id = {}", sql_quote(job_id)))
+            .only_if(format!(
+                "job_id = {} AND status = 'processing'",
+                sql_quote(job_id)
+            ))
             .column("status", "'failed'")
             .column("attempt_count", new_attempt_count.to_string())
             .column("last_error", sql_quote(last_error))
@@ -326,7 +332,10 @@ impl LanceStore {
             .map_err(lancedb_err)?;
         table
             .update()
-            .only_if(format!("job_id = {}", sql_quote(job_id)))
+            .only_if(format!(
+                "job_id = {} AND status = 'processing'",
+                sql_quote(job_id)
+            ))
             .column("status", "'failed'")
             .column("attempt_count", new_attempt_count.to_string())
             .column("last_error", sql_quote(last_error))
@@ -1847,5 +1856,99 @@ mod tests {
             "orphaned transcript job must be reclaimed after the lease"
         );
         assert_eq!(reclaimed[0].job_id, "tjob_orph");
+    }
+
+    async fn transcript_job_status(repo: &LanceStore, job_id: &str) -> Option<String> {
+        repo.query_transcript_embedding_jobs(format!("job_id = {}", super::sql_quote(job_id)))
+            .await
+            .unwrap()
+            .into_iter()
+            .next()
+            .map(|r| r.status)
+    }
+
+    /// Failure-path finalizers must not clobber a job that is no longer the
+    /// caller's live claim. After a slow worker's lease elapses and a second
+    /// worker reclaims + completes the job, the original worker's late
+    /// reschedule / permanently-fail / mark-stale must be a no-op — guarded by
+    /// `status = 'processing'`, the same fence `complete_*` uses. (A still-held
+    /// processing claim is unaffected: see the happy-path tail.)
+    #[tokio::test]
+    pub async fn terminal_transcript_job_not_clobbered_by_stale_finalize() {
+        let dir = tempdir().unwrap();
+        let repo = LanceStore::open(&dir.path().join("lance.store"))
+            .await
+            .unwrap();
+
+        repo.try_enqueue_transcript_embedding_job(
+            "tjx".into(),
+            "t".into(),
+            "mbx".into(),
+            "fake".into(),
+            "00000001778000000000".into(),
+        )
+        .await
+        .unwrap();
+        let claimed = repo
+            .claim_next_n_transcript_embedding_jobs("00000001778000010000", 5, 5)
+            .await
+            .unwrap();
+        assert_eq!(claimed.len(), 1);
+        repo.complete_transcript_embedding_job("tjx", "00000001778000020000")
+            .await
+            .unwrap();
+
+        repo.reschedule_transcript_embedding_job_failure(
+            "tjx",
+            1,
+            "late",
+            "00000001778000030000",
+            "00000001778000030000",
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            transcript_job_status(&repo, "tjx").await.as_deref(),
+            Some("completed"),
+            "stale reschedule must not clobber a completed job"
+        );
+        repo.permanently_fail_transcript_embedding_job("tjx", 9, "late", "00000001778000040000")
+            .await
+            .unwrap();
+        assert_eq!(
+            transcript_job_status(&repo, "tjx").await.as_deref(),
+            Some("completed"),
+            "stale permanently_fail must not clobber"
+        );
+        repo.mark_transcript_embedding_job_stale("tjx", "00000001778000050000")
+            .await
+            .unwrap();
+        assert_eq!(
+            transcript_job_status(&repo, "tjx").await.as_deref(),
+            Some("completed"),
+            "stale mark_stale must not clobber"
+        );
+
+        // Happy path: a job the worker still holds (processing) IS marked stale.
+        repo.try_enqueue_transcript_embedding_job(
+            "tjy".into(),
+            "t".into(),
+            "mby".into(),
+            "fake".into(),
+            "00000001778000000000".into(),
+        )
+        .await
+        .unwrap();
+        repo.claim_next_n_transcript_embedding_jobs("00000001778000060000", 5, 5)
+            .await
+            .unwrap();
+        repo.mark_transcript_embedding_job_stale("tjy", "00000001778000070000")
+            .await
+            .unwrap();
+        assert_eq!(
+            transcript_job_status(&repo, "tjy").await.as_deref(),
+            Some("stale"),
+            "mark_stale applies to a processing job"
+        );
     }
 }
