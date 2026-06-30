@@ -113,6 +113,54 @@ impl LanceStore {
         Ok(())
     }
 
+    /// Block-ids in `block_ids` that already have a `transcript_embedding_jobs`
+    /// row, in ANY state. "Has a job row" ⟺ "was enqueued at least once":
+    /// completed jobs are kept (the worker flips status to `completed`, the row
+    /// is never deleted or vacuum-pruned), so this is the idempotency signal that
+    /// lets the write path repair an enqueue that failed AFTER the message row
+    /// committed — without ever re-enqueuing a block that was already queued
+    /// (even one whose embedding has since completed).
+    async fn transcript_jobs_present_for_blocks(
+        &self,
+        block_ids: &[&str],
+    ) -> Result<std::collections::HashSet<String>, StorageError> {
+        if block_ids.is_empty() {
+            return Ok(std::collections::HashSet::new());
+        }
+        let in_list = block_ids
+            .iter()
+            .map(|b| sql_quote(b))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let rows = self
+            .query_transcript_embedding_jobs(format!("message_block_id IN ({in_list})"))
+            .await?;
+        Ok(rows.into_iter().map(|r| r.message_block_id).collect())
+    }
+
+    /// Whether a `conversation_messages` row exists with this exact
+    /// `message_block_id`. The insert-dedup key is `(transcript_path,
+    /// line_number, block_index)`, which is NOT the block id — so an exists
+    /// probe by key can match a *different* block. The orphan-repair path uses
+    /// this to enqueue only for blocks that truly own a row, never for a message
+    /// that was deduplicated away by key.
+    async fn conversation_message_block_exists(
+        &self,
+        block_id: &str,
+    ) -> Result<bool, StorageError> {
+        let table = self
+            .conn
+            .open_table("conversation_messages")
+            .execute()
+            .await
+            .map_err(lancedb_err)?;
+        let n = table
+            .count_rows(Some(format!("message_block_id = {}", sql_quote(block_id))))
+            .await
+            .map_err(lancedb_err)?;
+        Ok(n > 0)
+    }
+
     /// Mirror of `claim_next_n_embedding_jobs` for the transcript
     /// queue. Eligible rows are `pending` or `failed` with
     /// `attempt_count < max_retries`, ordered `(available_at,
@@ -930,33 +978,56 @@ impl LanceStore {
             )))
             .await
             .map_err(lancedb_err)?;
-        if exists > 0 {
-            return Ok(());
+        let newly_inserted = exists == 0;
+        if newly_inserted {
+            let batch = conversation_messages_to_record_batch(std::slice::from_ref(msg))?;
+            table.add(batch).execute().await.map_err(lancedb_err)?;
         }
-        let batch = conversation_messages_to_record_batch(std::slice::from_ref(msg))?;
-        table.add(batch).execute().await.map_err(lancedb_err)?;
 
+        // The enqueue is a SEPARATE Lance commit from the row insert, so a
+        // transient failure after the row landed would orphan the block (no job)
+        // and the idempotent exists-probe above would skip it forever. Ensure a
+        // job exists: a fresh insert always needs one; a replay (row already
+        // present) enqueues only when no job row exists yet for the block — which
+        // repairs that orphan exactly once and never double-enqueues, since a
+        // completed job row is retained and still counts as "present".
         if msg.embed_eligible {
-            // Provider id is configured once at startup via
-            // `set_transcript_job_provider`. Failing loudly here is
-            // preferable to silently substituting a default that
-            // would later mismatch the worker's `job_provider_id()`.
-            let provider = self
-                .transcript_job_provider()
-                .ok_or(StorageError::InvalidData(
-                    "transcript embedding job provider not configured; \
-                     call LanceStore::set_transcript_job_provider during startup",
-                ))?;
-            let job_id = uuid::Uuid::now_v7().to_string();
-            let now = crate::storage::current_timestamp();
-            self.try_enqueue_transcript_embedding_job(
-                job_id,
-                msg.tenant.clone(),
-                msg.message_block_id.clone(),
-                provider,
-                now,
-            )
-            .await?;
+            // Enqueue when: just inserted (row certainly exists, no job yet), OR
+            // on a replay where no job row exists yet AND a row truly exists for
+            // THIS block id. The job probe is checked first so the common replay
+            // (job already present) short-circuits to a single query; the
+            // block-exists probe only runs when a repair looks needed, and guards
+            // against enqueuing for a message deduplicated away by key.
+            let needs_enqueue = newly_inserted
+                || (self
+                    .transcript_jobs_present_for_blocks(&[msg.message_block_id.as_str()])
+                    .await?
+                    .is_empty()
+                    && self
+                        .conversation_message_block_exists(&msg.message_block_id)
+                        .await?);
+            if needs_enqueue {
+                // Provider id is configured once at startup via
+                // `set_transcript_job_provider`. Failing loudly here is
+                // preferable to silently substituting a default that
+                // would later mismatch the worker's `job_provider_id()`.
+                let provider = self
+                    .transcript_job_provider()
+                    .ok_or(StorageError::InvalidData(
+                        "transcript embedding job provider not configured; \
+                         call LanceStore::set_transcript_job_provider during startup",
+                    ))?;
+                let job_id = uuid::Uuid::now_v7().to_string();
+                let now = crate::storage::current_timestamp();
+                self.try_enqueue_transcript_embedding_job(
+                    job_id,
+                    msg.tenant.clone(),
+                    msg.message_block_id.clone(),
+                    provider,
+                    now,
+                )
+                .await?;
+            }
         }
         Ok(())
     }
@@ -1000,10 +1071,15 @@ impl LanceStore {
         let existing = self
             .query_conversation_messages(format!("transcript_path IN ({in_list})"))
             .await?;
-        let mut seen: HashSet<(String, u64, u32)> = existing
-            .into_iter()
-            .map(|m| (m.transcript_path, m.line_number, m.block_index))
-            .collect();
+        // Capture the existing rows' keys (for dedup) AND their message_block_ids
+        // (so step 4's job reconciliation only ever targets blocks that actually
+        // have a row — a message deduplicated away by key must not get a job).
+        let mut seen: HashSet<(String, u64, u32)> = HashSet::with_capacity(existing.len());
+        let mut existing_block_ids: HashSet<String> = HashSet::with_capacity(existing.len());
+        for m in existing {
+            seen.insert((m.transcript_path, m.line_number, m.block_index));
+            existing_block_ids.insert(m.message_block_id);
+        }
 
         // 2. Walk the input, dropping rows whose key is already in
         //    `seen` (DB OR intra-batch dup). Insert key into `seen` so a
@@ -1019,31 +1095,70 @@ impl LanceStore {
                 to_insert.push(msg);
             }
         }
-        if to_insert.is_empty() {
-            return Ok(0);
+        // 3. One multi-row insert for the genuinely-new rows.
+        if !to_insert.is_empty() {
+            let owned: Vec<ConversationMessage> = to_insert.iter().map(|m| (*m).clone()).collect();
+            let batch = conversation_messages_to_record_batch(&owned)?;
+            table.add(batch).execute().await.map_err(lancedb_err)?;
         }
 
-        // 3. One multi-row insert.
-        let owned: Vec<ConversationMessage> = to_insert.iter().map(|m| (*m).clone()).collect();
-        let batch = conversation_messages_to_record_batch(&owned)?;
-        table.add(batch).execute().await.map_err(lancedb_err)?;
-
-        // 4. One multi-row enqueue for the embed-eligible subset.
-        let mut jobs: Vec<TranscriptEmbeddingJobRow> = Vec::new();
-        if to_insert.iter().any(|m| m.embed_eligible) {
-            let provider = self
-                .transcript_job_provider()
-                .ok_or(StorageError::InvalidData(
-                    "transcript embedding job provider not configured; \
-                         call LanceStore::set_transcript_job_provider during startup",
-                ))?;
+        // 4. Reconcile embedding jobs for every embed-eligible block that has a
+        //    row — freshly inserted OR already present — not just the inserted
+        //    subset. The enqueue is a separate commit from the row insert, so a
+        //    row that already existed may be orphaned (its original enqueue
+        //    failed after the row committed). Enqueue exactly the blocks that
+        //    have no job row yet, so a `mem mine` replay repairs orphans without
+        //    ever double-enqueuing (a completed job row is retained and counts as
+        //    "present"). Blocks deduplicated away by key own no row, so they are
+        //    excluded via `rows_present`.
+        let mut rows_present: HashSet<&str> = HashSet::with_capacity(to_insert.len());
+        for m in &to_insert {
+            rows_present.insert(m.message_block_id.as_str());
+        }
+        for bid in &existing_block_ids {
+            rows_present.insert(bid.as_str());
+        }
+        let mut eligible_block_ids: Vec<&str> = msgs
+            .iter()
+            .filter(|m| m.embed_eligible && rows_present.contains(m.message_block_id.as_str()))
+            .map(|m| m.message_block_id.as_str())
+            .collect();
+        eligible_block_ids.sort_unstable();
+        eligible_block_ids.dedup();
+        if !eligible_block_ids.is_empty() {
+            let present = self
+                .transcript_jobs_present_for_blocks(&eligible_block_ids)
+                .await?;
             let now = crate::storage::current_timestamp();
-            for msg in to_insert.iter().filter(|m| m.embed_eligible) {
+            let mut emitted: HashSet<&str> = HashSet::new();
+            let mut cached_provider: Option<String> = None;
+            let mut jobs: Vec<TranscriptEmbeddingJobRow> = Vec::new();
+            for msg in msgs
+                .iter()
+                .filter(|m| m.embed_eligible && rows_present.contains(m.message_block_id.as_str()))
+            {
+                let bid = msg.message_block_id.as_str();
+                if present.contains(bid) || !emitted.insert(bid) {
+                    continue;
+                }
+                let provider = match &cached_provider {
+                    Some(p) => p.clone(),
+                    None => {
+                        let p = self
+                            .transcript_job_provider()
+                            .ok_or(StorageError::InvalidData(
+                                "transcript embedding job provider not configured; \
+                                 call LanceStore::set_transcript_job_provider during startup",
+                            ))?;
+                        cached_provider = Some(p.clone());
+                        p
+                    }
+                };
                 jobs.push(TranscriptEmbeddingJobRow {
                     job_id: uuid::Uuid::now_v7().to_string(),
                     tenant: msg.tenant.clone(),
                     message_block_id: msg.message_block_id.clone(),
-                    provider: provider.clone(),
+                    provider,
                     status: "pending".to_string(),
                     attempt_count: 0,
                     last_error: None,
@@ -1052,20 +1167,20 @@ impl LanceStore {
                     updated_at: now.clone(),
                 });
             }
-        }
-        if !jobs.is_empty() {
-            let job_table = self
-                .conn
-                .open_table("transcript_embedding_jobs")
-                .execute()
-                .await
-                .map_err(lancedb_err)?;
-            let job_batch = transcript_embedding_job_rows_to_record_batch(&jobs)?;
-            job_table
-                .add(job_batch)
-                .execute()
-                .await
-                .map_err(lancedb_err)?;
+            if !jobs.is_empty() {
+                let job_table = self
+                    .conn
+                    .open_table("transcript_embedding_jobs")
+                    .execute()
+                    .await
+                    .map_err(lancedb_err)?;
+                let job_batch = transcript_embedding_job_rows_to_record_batch(&jobs)?;
+                job_table
+                    .add(job_batch)
+                    .execute()
+                    .await
+                    .map_err(lancedb_err)?;
+            }
         }
 
         Ok(to_insert.len())
@@ -1532,6 +1647,152 @@ mod tests {
         // must not touch the enqueue branch.
         let inserted = repo.create_conversation_messages_batch(&[]).await.unwrap();
         assert_eq!(inserted, 0);
+    }
+
+    async fn job_count(repo: &LanceStore, block_id: &str) -> usize {
+        repo.query_transcript_embedding_jobs(format!(
+            "message_block_id = {}",
+            super::sql_quote(block_id)
+        ))
+        .await
+        .unwrap()
+        .len()
+    }
+
+    async fn drop_job(repo: &LanceStore, block_id: &str) {
+        repo.conn
+            .open_table("transcript_embedding_jobs")
+            .execute()
+            .await
+            .unwrap()
+            .delete(&format!(
+                "message_block_id = {}",
+                super::sql_quote(block_id)
+            ))
+            .await
+            .unwrap();
+    }
+
+    /// Regression: the message insert and the embedding-job enqueue are two
+    /// separate Lance commits. If the row lands but the enqueue then fails
+    /// (transient), the block is orphaned — no job — and the idempotent
+    /// re-insert used to `return Ok(())` on the exists-probe BEFORE reaching the
+    /// enqueue, so the job was never created and the block silently lost ANN
+    /// coverage. Replaying create_conversation_message must REPAIR the missing
+    /// job, and must not duplicate one that already exists.
+    #[tokio::test]
+    pub async fn create_conversation_message_replay_repairs_orphaned_job() {
+        let dir = tempdir().unwrap();
+        let repo = LanceStore::open(&dir.path().join("lance.store"))
+            .await
+            .unwrap();
+        repo.set_transcript_job_provider("fake-test");
+
+        let m = msg(
+            "mb_orphan",
+            "tenant-a",
+            Some("sess_a"),
+            1,
+            0,
+            BlockType::Text,
+            "an embed-eligible block",
+            "00000001778000000010",
+        );
+        repo.create_conversation_message(&m).await.unwrap();
+        assert_eq!(
+            job_count(&repo, "mb_orphan").await,
+            1,
+            "first write enqueues one job"
+        );
+
+        // Simulate the enqueue having failed after the row committed.
+        drop_job(&repo, "mb_orphan").await;
+        assert_eq!(
+            job_count(&repo, "mb_orphan").await,
+            0,
+            "precondition: orphaned"
+        );
+
+        // Replay: row already exists; the fix must re-create the missing job.
+        repo.create_conversation_message(&m).await.unwrap();
+        assert_eq!(
+            job_count(&repo, "mb_orphan").await,
+            1,
+            "replay repairs the orphan"
+        );
+
+        // Replaying again must NOT duplicate the now-present job.
+        repo.create_conversation_message(&m).await.unwrap();
+        assert_eq!(
+            job_count(&repo, "mb_orphan").await,
+            1,
+            "no duplicate enqueue"
+        );
+    }
+
+    /// Same orphan-repair guarantee on the bulk path: when every row in the
+    /// batch already exists (a `mem mine` replay), the old code early-returned
+    /// before the enqueue block, so an orphaned block was never repaired. The
+    /// reconciliation must run over the whole batch regardless of how many rows
+    /// are freshly inserted.
+    #[tokio::test]
+    pub async fn create_conversation_messages_batch_replay_repairs_orphaned_job() {
+        let dir = tempdir().unwrap();
+        let repo = LanceStore::open(&dir.path().join("lance.store"))
+            .await
+            .unwrap();
+        repo.set_transcript_job_provider("fake-test");
+
+        let mut m = msg(
+            "mb_b_orphan",
+            "tenant-a",
+            Some("sess_a"),
+            5,
+            0,
+            BlockType::Text,
+            "bulk embed-eligible block",
+            "00000001778000000050",
+        );
+        m.transcript_path = "/tmp/bulk.jsonl".to_string();
+
+        assert_eq!(
+            repo.create_conversation_messages_batch(&[m.clone()])
+                .await
+                .unwrap(),
+            1
+        );
+        assert_eq!(job_count(&repo, "mb_b_orphan").await, 1);
+
+        drop_job(&repo, "mb_b_orphan").await;
+        assert_eq!(
+            job_count(&repo, "mb_b_orphan").await,
+            0,
+            "precondition: orphaned"
+        );
+
+        // Replay the same batch: every row already exists (inserted == 0), but
+        // the orphaned job must still be repaired.
+        assert_eq!(
+            repo.create_conversation_messages_batch(&[m.clone()])
+                .await
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            job_count(&repo, "mb_b_orphan").await,
+            1,
+            "bulk replay repairs the orphan"
+        );
+
+        // And no duplicate on a further replay.
+        repo.create_conversation_messages_batch(&[m.clone()])
+            .await
+            .unwrap();
+        assert_eq!(
+            job_count(&repo, "mb_b_orphan").await,
+            1,
+            "no duplicate enqueue"
+        );
     }
 
     /// Same HIGH-bug regression as the capsule queue, for the transcript
