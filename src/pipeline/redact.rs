@@ -14,8 +14,13 @@
 //! output-layer, doesn't touch storage); opt out with `MEM_REDACT_SECRETS_DISABLED=1`.
 //!
 //! Patterns are high-confidence only (the O5 white-list boundary) — the token
-//! patterns carry a leading `\b` so an `sk-` inside `ask-...` / an `AKIA` inside a
-//! word doesn't trigger a false redaction. Tune here; this is the one place.
+//! patterns carry a leading ASCII-only `(?-u:\b)` so an `sk-` inside `ask-...` /
+//! an `AKIA` inside a word doesn't trigger a false redaction. It must be the
+//! ASCII boundary, NOT the default Unicode `\b`: under Unicode rules a Han char
+//! is `\w`, so `\b` finds no boundary between `密钥` and a glued `sk-…` and the
+//! key slips through on this Chinese-heavy corpus. `(?-u:\b)` treats the Han
+//! char as a non-word char, restoring the boundary. Tune here; this is the one
+//! place.
 
 use once_cell::sync::Lazy;
 use regex::Regex;
@@ -42,51 +47,51 @@ static PATTERNS: Lazy<Vec<Pat>> = Lazy::new(|| {
         },
         // OpenAI / generic `sk-…` API keys.
         Pat {
-            re: Regex::new(r"\bsk-[A-Za-z0-9_-]{16,}").unwrap(),
+            re: Regex::new(r"(?-u:\b)sk-[A-Za-z0-9_-]{16,}").unwrap(),
             repl: "[redacted:sk]",
         },
         // AWS access key id.
         Pat {
-            re: Regex::new(r"\bAKIA[0-9A-Z]{16}").unwrap(),
+            re: Regex::new(r"(?-u:\b)AKIA[0-9A-Z]{16}").unwrap(),
             repl: "[redacted:aws]",
         },
         // GitHub tokens (ghp_/gho_/ghu_/ghs_/ghr_).
         Pat {
-            re: Regex::new(r"\bgh[posru]_[A-Za-z0-9]{20,}").unwrap(),
+            re: Regex::new(r"(?-u:\b)gh[posru]_[A-Za-z0-9]{20,}").unwrap(),
             repl: "[redacted:github]",
         },
         // JWT (three base64url segments).
         Pat {
-            re: Regex::new(r"\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{4,}")
+            re: Regex::new(r"(?-u:\b)eyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{4,}")
                 .unwrap(),
             repl: "[redacted:jwt]",
         },
         // Bearer tokens.
         Pat {
-            re: Regex::new(r"(?i)\bbearer\s+[A-Za-z0-9._~+/=-]{12,}").unwrap(),
+            re: Regex::new(r"(?i)(?-u:\b)bearer\s+[A-Za-z0-9._~+/=-]{12,}").unwrap(),
             repl: "[redacted:bearer]",
         },
         // Stripe live secret / restricted keys (`sk_live_…` / `rk_live_…`).
         // The `sk-` pattern above needs a hyphen, so Stripe's underscore form
         // slips past it — a distinct, high-confidence prefix of its own.
         Pat {
-            re: Regex::new(r"\b[rs]k_live_[A-Za-z0-9]{16,}").unwrap(),
+            re: Regex::new(r"(?-u:\b)[rs]k_live_[A-Za-z0-9]{16,}").unwrap(),
             repl: "[redacted:stripe]",
         },
         // GitHub fine-grained PAT (`github_pat_…`) — the newer format the
         // classic `gh[posru]_` pattern doesn't cover.
         Pat {
-            re: Regex::new(r"\bgithub_pat_[A-Za-z0-9_]{22,}").unwrap(),
+            re: Regex::new(r"(?-u:\b)github_pat_[A-Za-z0-9_]{22,}").unwrap(),
             repl: "[redacted:github]",
         },
         // Slack tokens (`xoxb-`/`xoxa-`/`xoxp-`/`xoxr-`/`xoxs-`).
         Pat {
-            re: Regex::new(r"\bxox[baprs]-[A-Za-z0-9-]{10,}").unwrap(),
+            re: Regex::new(r"(?-u:\b)xox[baprs]-[A-Za-z0-9-]{10,}").unwrap(),
             repl: "[redacted:slack]",
         },
         // Google API key (fixed `AIza` prefix + 35 chars).
         Pat {
-            re: Regex::new(r"\bAIza[0-9A-Za-z_-]{35}").unwrap(),
+            re: Regex::new(r"(?-u:\b)AIza[0-9A-Za-z_-]{35}").unwrap(),
             repl: "[redacted:google]",
         },
     ]
@@ -233,6 +238,38 @@ mod tests {
         assert!(
             out.contains("[redacted:sk]") && out.contains("[redacted:aws]"),
             "got {out}"
+        );
+    }
+
+    #[test]
+    fn masks_secret_glued_to_cjk_text() {
+        // `\b` is Unicode-aware and Han characters are word chars, so a key
+        // pasted directly after Chinese (no separating whitespace) had no word
+        // boundary and slipped through O5 entirely. ASCII-only `(?-u:\b)` treats
+        // the Han char as a non-word char, restoring the boundary.
+        let out = red("密钥是sk-abcdEFGH1234ijklMNOP收工");
+        assert!(out.contains("[redacted:sk]"), "glued sk- not masked: {out}");
+        assert!(!out.contains("sk-abcdEFGH"), "key leaked: {out}");
+
+        // Generality across prefixes: an AWS key glued to CJK must mask too.
+        let aws = red("访问密钥AKIAIOSFODNN7EXAMPLE结束");
+        assert!(
+            aws.contains("[redacted:aws]"),
+            "glued AKIA not masked: {aws}"
+        );
+    }
+
+    #[test]
+    fn cjk_fix_preserves_ascii_word_guard() {
+        // The ASCII false-positive guard must survive the boundary change:
+        // `ask-` (an ASCII letter immediately before `sk-`) is still not a key,
+        // so the text stays a zero-alloc Borrowed.
+        assert!(
+            matches!(
+                redact_all("please ask-questions-about-the-deployment-now"),
+                Cow::Borrowed(_)
+            ),
+            "ask- false-positive regression after CJK boundary fix"
         );
     }
 }
