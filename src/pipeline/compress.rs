@@ -229,7 +229,17 @@ fn compress_text(text: &str, budget: usize) -> String {
     if tokens.len() <= limit {
         return text.to_string();
     }
-    let truncated = bpe.decode(&tokens[..limit]).unwrap_or_default();
+    // tiktoken's `decode` does a strict `String::from_utf8` and ERRORS when the
+    // token cut lands inside a multi-byte char (routine for emoji / uncommon CJK,
+    // which o200k_base splits into byte-fragment tokens). The old
+    // `.unwrap_or_default()` silently turned that error into an empty snippet —
+    // blanking facts / patterns / `source_summary` whenever a budget forced such
+    // a cut. Decode the raw bytes and recover lossily, dropping only the dangling
+    // partial char at the cut (one trailing U+FFFD) rather than the whole string.
+    let bytes = bpe.decode_bytes(&tokens[..limit]).unwrap_or_default();
+    let truncated = String::from_utf8_lossy(&bytes)
+        .trim_end_matches('\u{FFFD}')
+        .to_string();
     if let Some(last_space) = truncated.rfind(char::is_whitespace) {
         if last_space > truncated.len() / 2 {
             return truncated[..last_space].trim_end().to_string();
@@ -421,5 +431,49 @@ mod tests {
 
         let result = compress_text(input, n);
         assert_eq!(result, input, "no truncation when token count == budget");
+    }
+
+    #[test]
+    fn compress_text_truncation_never_blanks_on_split_char() {
+        // tiktoken's strict `decode` errors when the token cut lands inside a
+        // multi-byte char: o200k_base splits emoji and uncommon CJK into
+        // byte-fragment tokens, so a prefix cut can end mid-char. The old
+        // `.unwrap_or_default()` turned that into a silently EMPTY snippet (the
+        // whitespace backstep can't help — no spaces at the cut). This content
+        // (emoji + CJK, ubiquitous in real transcripts) has many such split
+        // points; at every one, compress_text must still return non-empty,
+        // prefix-valid prose within budget. (Common repeated Chinese maps
+        // 1 token/char and never splits, which is why the budget=50 case above
+        // passed and hid this bug.)
+        let text: String = "任务✅完成了🚀部署到生产🔥环境🎉成功".repeat(6);
+        let bpe = tokenizer();
+        let toks = bpe.encode_with_special_tokens(text.as_str());
+
+        // The fixture must actually contain mid-char splits, else the test is
+        // vacuous and proves nothing.
+        let split_budgets: Vec<usize> = (8..toks.len())
+            .filter(|&n| bpe.decode(&toks[..n]).is_err())
+            .collect();
+        assert!(
+            !split_budgets.is_empty(),
+            "fixture must contain mid-char token splits to be a real regression"
+        );
+
+        for budget in split_budgets {
+            let out = compress_text(&text, budget);
+            assert!(
+                !out.is_empty(),
+                "compress_text blanked at mid-char split budget {budget}"
+            );
+            assert!(
+                text.starts_with(&out),
+                "result must stay a prefix of input at budget {budget}: {out:?}"
+            );
+            let out_tokens = bpe.encode_with_special_tokens(out.as_str()).len();
+            assert!(
+                out_tokens <= budget,
+                "budget {budget} violated: {out_tokens} tokens"
+            );
+        }
     }
 }

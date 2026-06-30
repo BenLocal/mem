@@ -55,7 +55,18 @@ pub fn chunk_text(text: &str, max_tokens: usize, overlap: usize) -> Vec<String> 
     let mut start = 0;
     while start < tokens.len() {
         let end = (start + max_tokens).min(tokens.len());
-        chunks.push(bpe.decode(&tokens[start..end]).unwrap_or_default());
+        // A window boundary can fall inside a multi-byte char (emoji / uncommon
+        // CJK are split into byte-fragment tokens), where tiktoken's strict
+        // `decode` errors and the old `.unwrap_or_default()` blanked the entire
+        // chunk — silently dropping that span from the embedding index. Decode
+        // the raw bytes and recover lossily, trimming a dangling partial char at
+        // either boundary (U+FFFD) instead of losing the whole window.
+        let bytes = bpe.decode_bytes(&tokens[start..end]).unwrap_or_default();
+        chunks.push(
+            String::from_utf8_lossy(&bytes)
+                .trim_matches('\u{FFFD}')
+                .to_string(),
+        );
         if end == tokens.len() {
             break;
         }
@@ -111,5 +122,25 @@ mod tests {
         // chunk[0]'s window — so the two share content.
         assert!(chunks.len() >= 2, "expected multiple chunks");
         assert_ne!(chunks[0], chunks[1], "consecutive windows must differ");
+    }
+
+    #[test]
+    fn split_char_chunks_are_never_empty() {
+        // o200k_base splits emoji / uncommon CJK into byte-fragment tokens, so a
+        // window boundary (`tokens[start..end]`) can cut mid-char at EITHER end.
+        // The old `decode(...).unwrap_or_default()` blanked the WHOLE chunk on
+        // such a cut, silently dropping that span from the embedding index. Every
+        // chunk of this emoji+CJK text must carry content, and that content must
+        // be a contiguous substring of the source (nothing fabricated).
+        let text: String = "任务✅完成了🚀部署到生产🔥环境🎉成功".repeat(20);
+        let chunks = chunk_text(&text, 16, 4);
+        assert!(chunks.len() > 1, "fixture must split into multiple chunks");
+        for (i, c) in chunks.iter().enumerate() {
+            assert!(!c.trim().is_empty(), "chunk {i} is empty");
+            assert!(
+                text.contains(c.as_str()),
+                "chunk {i} is not a substring of the source: {c:?}"
+            );
+        }
     }
 }
