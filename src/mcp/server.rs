@@ -38,6 +38,42 @@ impl MemMcpServer {
             .unwrap_or_else(|| self.default_tenant.clone())
     }
 
+    /// Build the `capability_capsules/search` body for the project-only
+    /// bootstrap tool. Extracted as a pure, unit-testable seam (the inline
+    /// version forwarded `args.tenant` raw, skipping the `resolve_tenant`
+    /// normalization the sibling search tools apply).
+    fn bootstrap_search_body(&self, args: &CapabilityCapsuleBootstrapArgs) -> Value {
+        json!({
+            "query": args.query,
+            "intent": "bootstrap",
+            "scope_filters": [format!("project:{}", args.project)],
+            "token_budget": args.token_budget.unwrap_or(120),
+            "caller_agent": args.caller_agent,
+            "expand_graph": false,
+            "tenant": self.resolve_tenant(Some(&args.tenant)),
+        })
+    }
+
+    /// Build the `capability_capsules/search` body for the intent-aware
+    /// contextual tool. `scope_filters` is assembled by the caller (it depends
+    /// on `include_repo` / `include_personal`); this seam owns the tenant
+    /// normalization so it matches `bootstrap_search_body` and the basic search.
+    fn contextual_search_body(
+        &self,
+        args: &CapabilityCapsuleSearchContextualArgs,
+        scope_filters: Vec<String>,
+    ) -> Value {
+        json!({
+            "query": args.query,
+            "intent": args.intent,
+            "scope_filters": scope_filters,
+            "token_budget": args.token_budget.unwrap_or(400),
+            "caller_agent": args.caller_agent,
+            "expand_graph": true,
+            "tenant": self.resolve_tenant(Some(&args.tenant)),
+        })
+    }
+
     async fn post_json(&self, path: &str, body: &Value) -> Result<CallToolResult, McpError> {
         match self
             .client
@@ -843,15 +879,7 @@ impl MemMcpServer {
         &self,
         Parameters(args): Parameters<CapabilityCapsuleBootstrapArgs>,
     ) -> Result<CallToolResult, McpError> {
-        let body = json!({
-            "query": args.query,
-            "intent": "bootstrap",
-            "scope_filters": [format!("project:{}", args.project)],
-            "token_budget": args.token_budget.unwrap_or(120),
-            "caller_agent": args.caller_agent,
-            "expand_graph": false,
-            "tenant": args.tenant,
-        });
+        let body = self.bootstrap_search_body(&args);
         match self
             .client
             .request_json(Method::POST, "capability_capsules/search", Some(&body))
@@ -884,15 +912,7 @@ impl MemMcpServer {
         if include_personal {
             scope_filters.push("scope:workspace".to_string());
         }
-        let body = json!({
-            "query": args.query,
-            "intent": args.intent,
-            "scope_filters": scope_filters,
-            "token_budget": args.token_budget.unwrap_or(400),
-            "caller_agent": args.caller_agent,
-            "expand_graph": true,
-            "tenant": args.tenant,
-        });
+        let body = self.contextual_search_body(&args, scope_filters);
         match self
             .client
             .request_json(Method::POST, "capability_capsules/search", Some(&body))
@@ -1969,5 +1989,80 @@ impl ServerHandler for MemMcpServer {
                 .to_string(),
         );
         info
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::mcp::config::McpConfig;
+
+    fn server(default_tenant: &str) -> MemMcpServer {
+        MemMcpServer::new(McpConfig {
+            base_url: "http://127.0.0.1:0".to_string(),
+            default_tenant: default_tenant.to_string(),
+            expose_embeddings: false,
+        })
+    }
+
+    fn bootstrap_args(tenant: &str) -> CapabilityCapsuleBootstrapArgs {
+        CapabilityCapsuleBootstrapArgs {
+            tenant: tenant.to_string(),
+            project: "proj".to_string(),
+            repo: None,
+            module: None,
+            caller_agent: "agent".to_string(),
+            query: "q".to_string(),
+            token_budget: None,
+        }
+    }
+
+    fn contextual_args(tenant: &str) -> CapabilityCapsuleSearchContextualArgs {
+        CapabilityCapsuleSearchContextualArgs {
+            tenant: tenant.to_string(),
+            project: "proj".to_string(),
+            repo: None,
+            module: None,
+            caller_agent: "agent".to_string(),
+            query: "q".to_string(),
+            intent: "implementation".to_string(),
+            include_repo: None,
+            include_personal: None,
+            token_budget: None,
+        }
+    }
+
+    #[test]
+    fn bootstrap_body_resolves_blank_tenant_to_default() {
+        // `tenant` is a required String on this tool, but a blank / whitespace
+        // value must normalize to MEM_TENANT (default_tenant) like the 9 sibling
+        // search tools that route through resolve_tenant — NOT be forwarded as
+        // "" (which the server maps to "local", silently querying the wrong
+        // tenant on a non-`local` deployment).
+        let s = server("acme");
+        assert_eq!(
+            s.bootstrap_search_body(&bootstrap_args("   "))["tenant"],
+            "acme"
+        );
+    }
+
+    #[test]
+    fn contextual_body_resolves_blank_tenant_to_default() {
+        let s = server("acme");
+        let body = s.contextual_search_body(&contextual_args(""), vec!["project:proj".to_string()]);
+        assert_eq!(body["tenant"], "acme");
+    }
+
+    #[test]
+    fn explicit_tenant_passes_through_both_tools() {
+        // A real tenant must still be honored verbatim (resolve_tenant returns
+        // the non-empty override unchanged).
+        let s = server("acme");
+        assert_eq!(
+            s.bootstrap_search_body(&bootstrap_args("team-x"))["tenant"],
+            "team-x"
+        );
+        let body = s.contextual_search_body(&contextual_args("team-x"), vec![]);
+        assert_eq!(body["tenant"], "team-x");
     }
 }
