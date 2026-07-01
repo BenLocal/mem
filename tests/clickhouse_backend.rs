@@ -21,10 +21,11 @@ mod ch {
         CapabilityCapsuleRecord, CapabilityCapsuleStatus, CapabilityCapsuleType, Scope, Visibility,
     };
     use mem::domain::EntityKind;
+    use mem::domain::{BlockType, ConversationMessage, MessageRole};
     use mem::storage::types::EmbeddingJobInsert;
     use mem::storage::{
         current_timestamp, CapsuleStore, ClickHouseBackend, EmbeddingJobStore,
-        EmbeddingVectorStore, EntityRegistry, FeedbackEvent, GraphStore,
+        EmbeddingVectorStore, EntityRegistry, FeedbackEvent, GraphStore, TranscriptStore,
     };
 
     fn fixture(id: &str, status: CapabilityCapsuleStatus) -> CapabilityCapsuleRecord {
@@ -320,6 +321,287 @@ mod ch {
         assert!(n
             .iter()
             .any(|e| e.to_node_id == "b" && e.relation == "rel:x"));
+    }
+
+    fn dated_edge(from: &str, to: &str, rel: &str, vfrom: &str, vto: Option<&str>) -> GraphEdge {
+        let mut e = edge(from, to, rel);
+        e.valid_from = vfrom.into();
+        e.valid_to = vto.map(str::to_string);
+        e
+    }
+
+    /// (e) neighbors_within must honor the point-in-time `as_of` window, not
+    /// BFS-walk only the currently-active edge set. `add_edge_direct` INSERTs
+    /// (synchronous, unlike the async ALTER mutations), and the fixed
+    /// `(from, relation, to, valid_from)` keys dedup under FINAL so re-runs are
+    /// idempotent against the persistent container.
+    #[tokio::test]
+    async fn neighbors_within_respects_as_of() {
+        let Some(be) = ch_backend().await else { return };
+
+        // Closed edge active over [100, 200); new edge active from 300.
+        be.add_edge_direct(&dated_edge(
+            "na",
+            "nb",
+            "rel:old",
+            "00000000000000000100",
+            Some("00000000000000000200"),
+        ))
+        .await
+        .unwrap();
+        be.add_edge_direct(&dated_edge(
+            "na",
+            "nc",
+            "rel:new",
+            "00000000000000000300",
+            None,
+        ))
+        .await
+        .unwrap();
+
+        let at_150 = be
+            .neighbors_within("na", 2, Some("00000000000000000150"))
+            .await
+            .unwrap();
+        assert!(
+            at_150.iter().any(|e| e.to_node_id == "nb"),
+            "closed edge active at 150 must be included"
+        );
+        assert!(
+            !at_150.iter().any(|e| e.to_node_id == "nc"),
+            "edge not yet valid at 150 must be excluded"
+        );
+
+        let at_350 = be
+            .neighbors_within("na", 2, Some("00000000000000000350"))
+            .await
+            .unwrap();
+        assert!(
+            !at_350.iter().any(|e| e.to_node_id == "nb"),
+            "expired edge must be excluded at 350"
+        );
+        assert!(
+            at_350.iter().any(|e| e.to_node_id == "nc"),
+            "active edge must be included at 350"
+        );
+    }
+
+    /// (e) query_predicate: `as_of=None` is the FULL history (active + closed),
+    /// and `as_of=Some(ts)` restricts to edges active at ts — the CH scaffold
+    /// ignored both and returned only the currently-active set.
+    #[tokio::test]
+    async fn query_predicate_as_of_and_full_history() {
+        let Some(be) = ch_backend().await else { return };
+
+        be.add_edge_direct(&dated_edge(
+            "qa",
+            "qb",
+            "pred:qp",
+            "00000000000000000100",
+            Some("00000000000000000200"),
+        ))
+        .await
+        .unwrap();
+        be.add_edge_direct(&dated_edge(
+            "qc",
+            "qd",
+            "pred:qp",
+            "00000000000000000300",
+            None,
+        ))
+        .await
+        .unwrap();
+
+        let all = be.query_predicate("pred:qp", None).await.unwrap();
+        assert_eq!(
+            all.len(),
+            2,
+            "as_of=None must return the full history (active + closed), got {}",
+            all.len()
+        );
+
+        let at_150 = be
+            .query_predicate("pred:qp", Some("00000000000000000150"))
+            .await
+            .unwrap();
+        assert_eq!(
+            at_150.len(),
+            1,
+            "as_of=150 must return only the edge active then"
+        );
+        assert_eq!(at_150[0].to_node_id, "qb");
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn cmsg(
+        block_id: &str,
+        line: u64,
+        created_at: &str,
+        role: MessageRole,
+        bt: BlockType,
+    ) -> ConversationMessage {
+        ConversationMessage {
+            message_block_id: block_id.into(),
+            session_id: Some("pg_s".into()),
+            tenant: "t".into(),
+            caller_agent: "test".into(),
+            transcript_path: "/tmp/pg.jsonl".into(),
+            line_number: line,
+            block_index: 0,
+            message_uuid: None,
+            role,
+            block_type: bt,
+            content: format!("block {line}"),
+            tool_name: None,
+            tool_use_id: None,
+            embed_eligible: matches!(bt, BlockType::Text),
+            created_at: created_at.into(),
+            meta_json: None,
+        }
+    }
+
+    /// (e) paged transcript read must apply the composite cursor AND the
+    /// role/block_type/time filters — the CH scaffold ignored them all and
+    /// always returned the first page from the start (broken/stuck pagination).
+    #[tokio::test]
+    async fn paged_transcript_read_applies_cursor_and_filters() {
+        let Some(be) = ch_backend().await else { return };
+
+        be.create_conversation_messages(&[
+            cmsg(
+                "pg1",
+                1,
+                "00000000000000000001",
+                MessageRole::Assistant,
+                BlockType::Text,
+            ),
+            cmsg(
+                "pg2",
+                2,
+                "00000000000000000002",
+                MessageRole::User,
+                BlockType::Text,
+            ),
+            cmsg(
+                "pg3",
+                3,
+                "00000000000000000003",
+                MessageRole::Assistant,
+                BlockType::ToolUse,
+            ),
+            cmsg(
+                "pg4",
+                4,
+                "00000000000000000004",
+                MessageRole::Assistant,
+                BlockType::Text,
+            ),
+        ])
+        .await
+        .unwrap();
+
+        // Cursor resume after (created_at="...002", line 2, block 0) → pg3, pg4.
+        let (after, _) = be
+            .get_conversation_messages_by_session_paged(
+                "t",
+                "pg_s",
+                None,
+                None,
+                None,
+                None,
+                Some(("00000000000000000002", 2, 0)),
+                10,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            after.len(),
+            2,
+            "cursor must resume after the given position"
+        );
+        assert_eq!(after[0].line_number, 3);
+        assert_eq!(after[1].line_number, 4);
+
+        // role filter → only the single user block.
+        let (users, _) = be
+            .get_conversation_messages_by_session_paged(
+                "t",
+                "pg_s",
+                None,
+                None,
+                Some("user"),
+                None,
+                None,
+                10,
+            )
+            .await
+            .unwrap();
+        assert_eq!(users.len(), 1, "role filter must narrow to user blocks");
+        assert_eq!(users[0].message_block_id, "pg2");
+    }
+
+    /// (e) cross-session range read: the LIMIT was a bound string (ClickHouse
+    /// rejects that outright) and role/block_type/cursor were ignored. Two
+    /// sessions under one tenant, half-open time window, then a role narrow.
+    #[tokio::test]
+    async fn range_transcript_read_applies_filters() {
+        let Some(be) = ch_backend().await else { return };
+
+        fn rmsg(id: &str, sess: &str, at: &str, role: MessageRole) -> ConversationMessage {
+            ConversationMessage {
+                message_block_id: id.into(),
+                session_id: Some(sess.into()),
+                tenant: "tr".into(),
+                caller_agent: "test".into(),
+                transcript_path: "/tmp/r.jsonl".into(),
+                line_number: 1,
+                block_index: 0,
+                message_uuid: None,
+                role,
+                block_type: BlockType::Text,
+                content: id.into(),
+                tool_name: None,
+                tool_use_id: None,
+                embed_eligible: true,
+                created_at: at.into(),
+                meta_json: None,
+            }
+        }
+        be.create_conversation_messages(&[
+            rmsg("r1", "rs_a", "00000000000000000010", MessageRole::Assistant),
+            rmsg("r2", "rs_b", "00000000000000000020", MessageRole::User),
+            rmsg("r3", "rs_a", "00000000000000000030", MessageRole::Assistant),
+        ])
+        .await
+        .unwrap();
+
+        // Half-open window [10, 30): r1 + r2 (r3 at 30 is excluded).
+        let (win, _) = be
+            .list_conversation_messages_in_range(
+                "tr",
+                Some("00000000000000000010"),
+                Some("00000000000000000030"),
+                None,
+                None,
+                None,
+                10,
+            )
+            .await
+            .unwrap();
+        let ids: Vec<&str> = win.iter().map(|m| m.message_block_id.as_str()).collect();
+        assert_eq!(
+            ids,
+            vec!["r1", "r2"],
+            "half-open window must exclude the upper bound"
+        );
+
+        // role filter across sessions.
+        let (users, _) = be
+            .list_conversation_messages_in_range("tr", None, None, Some("user"), None, None, 10)
+            .await
+            .unwrap();
+        assert_eq!(users.len(), 1);
+        assert_eq!(users[0].message_block_id, "r2");
     }
 
     /// P5 EntityRegistry: resolve creates an entity; a second resolve of the

@@ -215,23 +215,59 @@ impl TranscriptStore for ClickHouseBackend {
         &self,
         tenant: &str,
         session_id: &str,
-        _since: Option<&str>,
-        _until: Option<&str>,
-        _role: Option<&str>,
-        _block_type: Option<&str>,
-        _cursor: Option<(&str, i64, i64)>,
+        since: Option<&str>,
+        until: Option<&str>,
+        role: Option<&str>,
+        block_type: Option<&str>,
+        cursor: Option<(&str, i64, i64)>,
         limit: usize,
     ) -> Result<(Vec<ConversationMessage>, bool), StorageError> {
-        // Scaffold: returns the first `limit+1` rows ordered; filters/cursor
-        // resume are validation-phase TODO (§10).
-        let mut rows = self
-            .ch_messages(
-                "SELECT ?fields FROM conversation_messages FINAL \
-                 WHERE tenant = ? AND session_id = ? \
-                 ORDER BY created_at ASC, line_number ASC, block_index ASC LIMIT ?",
-                &[tenant, session_id, &(limit + 1).to_string()],
-            )
-            .await?;
+        // Apply the time/role/block_type filters and the composite
+        // `(created_at, line_number, block_index)` resume cursor, mirroring the
+        // lance + postgres backends. String values bind via `?`; the integer
+        // cursor components and the LIMIT are inlined as literals — ClickHouse
+        // rejects a bound (string) parameter in a `LIMIT`, and inlining the
+        // i64/usize (never user free-text) avoids the int-column-vs-string-bind
+        // comparison mismatch. The half-open time window is `>= since AND
+        // < until`, same as the other backends.
+        let mut sql = String::from(
+            "SELECT ?fields FROM conversation_messages FINAL \
+             WHERE tenant = ? AND session_id = ?",
+        );
+        let mut binds: Vec<String> = vec![tenant.to_string(), session_id.to_string()];
+        if let Some(s) = since {
+            sql.push_str(" AND created_at >= ?");
+            binds.push(s.to_string());
+        }
+        if let Some(u) = until {
+            sql.push_str(" AND created_at < ?");
+            binds.push(u.to_string());
+        }
+        if let Some(r) = role {
+            sql.push_str(" AND role = ?");
+            binds.push(r.to_string());
+        }
+        if let Some(bt) = block_type {
+            sql.push_str(" AND block_type = ?");
+            binds.push(bt.to_string());
+        }
+        if let Some((ca, line, block)) = cursor {
+            sql.push_str(&format!(
+                " AND (created_at > ? \
+                 OR (created_at = ? AND line_number > {line}) \
+                 OR (created_at = ? AND line_number = {line} AND block_index > {block}))"
+            ));
+            binds.push(ca.to_string());
+            binds.push(ca.to_string());
+            binds.push(ca.to_string());
+        }
+        sql.push_str(&format!(
+            " ORDER BY created_at ASC, line_number ASC, block_index ASC LIMIT {}",
+            limit + 1
+        ));
+
+        let bind_refs: Vec<&str> = binds.iter().map(String::as_str).collect();
+        let mut rows = self.ch_messages(&sql, &bind_refs).await?;
         let has_more = rows.len() > limit;
         rows.truncate(limit);
         Ok((rows, has_more))
@@ -277,21 +313,54 @@ impl TranscriptStore for ClickHouseBackend {
         tenant: &str,
         time_from: Option<&str>,
         time_to: Option<&str>,
-        _role: Option<&str>,
-        _block_type: Option<&str>,
-        _cursor: Option<(&str, i64, i64)>,
+        role: Option<&str>,
+        block_type: Option<&str>,
+        cursor: Option<(&str, i64, i64)>,
         limit: usize,
     ) -> Result<(Vec<ConversationMessage>, bool), StorageError> {
-        let from = time_from.unwrap_or("");
-        let to = time_to.unwrap_or("99999999999999999999");
-        let mut rows = self
-            .ch_messages(
-                "SELECT ?fields FROM conversation_messages FINAL \
-                 WHERE tenant = ? AND created_at >= ? AND created_at <= ? \
-                 ORDER BY created_at ASC, line_number ASC, block_index ASC LIMIT ?",
-                &[tenant, from, to, &(limit + 1).to_string()],
-            )
-            .await?;
+        // Cross-session range scan (`session_id != ''`, half-open
+        // [time_from, time_to)), with the same composite cursor + role /
+        // block_type filters as the per-session paged read. Mirrors the postgres
+        // backend. String values bind via `?`; the integer cursor components and
+        // the LIMIT are inlined (ClickHouse rejects a bound LIMIT param).
+        let mut sql = String::from(
+            "SELECT ?fields FROM conversation_messages FINAL \
+             WHERE tenant = ? AND session_id != ''",
+        );
+        let mut binds: Vec<String> = vec![tenant.to_string()];
+        if let Some(f) = time_from {
+            sql.push_str(" AND created_at >= ?");
+            binds.push(f.to_string());
+        }
+        if let Some(t) = time_to {
+            sql.push_str(" AND created_at < ?");
+            binds.push(t.to_string());
+        }
+        if let Some(r) = role {
+            sql.push_str(" AND role = ?");
+            binds.push(r.to_string());
+        }
+        if let Some(bt) = block_type {
+            sql.push_str(" AND block_type = ?");
+            binds.push(bt.to_string());
+        }
+        if let Some((ca, line, block)) = cursor {
+            sql.push_str(&format!(
+                " AND (created_at > ? \
+                 OR (created_at = ? AND line_number > {line}) \
+                 OR (created_at = ? AND line_number = {line} AND block_index > {block}))"
+            ));
+            binds.push(ca.to_string());
+            binds.push(ca.to_string());
+            binds.push(ca.to_string());
+        }
+        sql.push_str(&format!(
+            " ORDER BY created_at ASC, line_number ASC, block_index ASC LIMIT {}",
+            limit + 1
+        ));
+
+        let bind_refs: Vec<&str> = binds.iter().map(String::as_str).collect();
+        let mut rows = self.ch_messages(&sql, &bind_refs).await?;
         let has_more = rows.len() > limit;
         rows.truncate(limit);
         Ok((rows, has_more))

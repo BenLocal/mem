@@ -182,11 +182,22 @@ impl GraphStore for ClickHouseBackend {
         &self,
         node_id: &str,
         max_hops: u32,
-        _as_of: Option<&str>,
+        as_of: Option<&str>,
     ) -> Result<Vec<GraphEdge>, GraphError> {
-        // Scaffold: BFS over the currently-active edge set. Point-in-time
-        // (`as_of`) is not yet applied — validation-phase TODO (§10).
-        let edges = self.ch_active_edges().await?;
+        // BFS over the edge set active at `as_of` (bitemporal window), or the
+        // currently-active set when `as_of` is None. `valid_to = ''` is the CH
+        // "still open" sentinel — the analog of lance's `valid_to IS NULL`.
+        let edges = match as_of {
+            Some(ts) => {
+                self.ch_edges(
+                    "SELECT ?fields FROM graph_edges FINAL \
+                     WHERE valid_from <= ? AND (valid_to = '' OR valid_to > ?)",
+                    &[ts, ts],
+                )
+                .await?
+            }
+            None => self.ch_active_edges().await?,
+        };
         Ok(bfs(&edges, node_id, max_hops, None))
     }
 
@@ -204,15 +215,31 @@ impl GraphStore for ClickHouseBackend {
     async fn query_predicate(
         &self,
         predicate: &str,
-        _as_of: Option<&str>,
+        as_of: Option<&str>,
     ) -> Result<Vec<GraphEdge>, GraphError> {
-        let rows = self
-            .ch_edges(
-                "SELECT ?fields FROM graph_edges FINAL \
-                 WHERE valid_to = '' AND relation = ? ORDER BY from_node_id, to_node_id",
-                &[predicate],
-            )
-            .await?;
+        // `as_of=Some(ts)` → edges active at ts; `as_of=None` → the FULL history
+        // (active + closed) for the predicate. Ordered `valid_from ASC` to match
+        // the lance backend + the MCP contract. (The scaffold ignored `as_of`
+        // and returned only the currently-active set.)
+        let rows = match as_of {
+            Some(ts) => {
+                self.ch_edges(
+                    "SELECT ?fields FROM graph_edges FINAL \
+                     WHERE relation = ? AND valid_from <= ? AND (valid_to = '' OR valid_to > ?) \
+                     ORDER BY valid_from ASC",
+                    &[predicate, ts, ts],
+                )
+                .await?
+            }
+            None => {
+                self.ch_edges(
+                    "SELECT ?fields FROM graph_edges FINAL \
+                     WHERE relation = ? ORDER BY valid_from ASC",
+                    &[predicate],
+                )
+                .await?
+            }
+        };
         Ok(rows.into_iter().map(ChEdgeRow::into_edge).collect())
     }
 
