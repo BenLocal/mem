@@ -68,8 +68,11 @@ pub async fn tick(
     // Drain up to `batch_size` jobs per tick. This was a hardcoded 1, which made
     // `EMBEDDING_BATCH_SIZE` a silent no-op for the transcript queue (a `mem mine`
     // backlog then cleared at ~one block per poll interval). Each job embeds
-    // independently; a StorageError aborts the rest of the batch and the next
-    // tick retries — matching the memories worker's per-job `?`.
+    // independently; per-job embedding failures are recorded and swallowed. A
+    // StorageError aborts the rest of THIS batch — the still-`processing` jobs it
+    // already claimed are reclaimed after their lease expires (via the lease
+    // disjunct in `claim_next_n_transcript_embedding_jobs`), not on the next tick.
+    // Matches the memories worker's per-job `?`.
     let n = settings.batch_size.max(1);
     let claimed = store
         .claim_next_n_transcript_embedding_jobs(&now, settings.max_retries, n)
