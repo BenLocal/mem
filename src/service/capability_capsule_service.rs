@@ -598,6 +598,15 @@ impl CapabilityCapsuleService {
         .await
         .map_err(ServiceError::Storage)?;
 
+        // Per-session ingest cap (§4.3 #3) — enforced on the batch path too, or
+        // MEM_MAX_INGEST_PER_SESSION is silently defeated by the dominant bulk
+        // route (`mem mine`, /capability_capsules/batch, MCP batch_ingest). Runs
+        // AFTER the idempotency probe above (existing rows return early), so an
+        // idempotent re-ingest never consumes a slot — same as the single-item
+        // `ingest`. Over-cap returns RateLimited, which `ingest_batch` maps to a
+        // per-item Err (→ HTTP 429) while the other items still land.
+        self.check_and_reserve_ingest_slot(&session_id)?;
+
         let record = CapabilityCapsuleRecord {
             capability_capsule_id: next_memory_id(),
             tenant: request.tenant,

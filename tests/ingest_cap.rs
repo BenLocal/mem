@@ -12,7 +12,10 @@ use mem::{
     domain::capability_capsule::{
         CapabilityCapsuleType, IngestCapabilityCapsuleRequest, Scope, Visibility, WriteMode,
     },
-    service::{capability_capsule_service::ServiceError, CapabilityCapsuleService},
+    service::{
+        capability_capsule_service::{BatchIngestItem, ServiceError},
+        CapabilityCapsuleService,
+    },
     storage::{StorageError, Store},
 };
 use tempfile::tempdir;
@@ -182,6 +185,83 @@ async fn idempotency_short_circuit_does_not_consume_cap_slot() {
     svc.ingest(request("third unique", Some("idemp-3")))
         .await
         .expect_err("third unique should hit cap=2");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn cap_enforced_on_batch_path() {
+    // The batch path (`/capability_capsules/batch`, MCP `batch_ingest`, and the
+    // route `mem mine` uses) must honor the per-session cap too — otherwise
+    // MEM_MAX_INGEST_PER_SESSION is silently defeated by the dominant bulk route.
+    let (_dir, svc) = make_service(Some(2)).await;
+    let batch = vec![
+        request("batch a", None),
+        request("batch b", None),
+        request("batch c", None),
+        request("batch d", None),
+    ];
+    let results = svc.ingest_batch(batch).await.expect("batch call");
+    assert_eq!(results.len(), 4, "output preserves input order 1:1");
+
+    let ok = results
+        .iter()
+        .filter(|r| matches!(r, BatchIngestItem::Ok { .. }))
+        .count();
+    let errs: Vec<&String> = results
+        .iter()
+        .filter_map(|r| match r {
+            BatchIngestItem::Err { error } => Some(error),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(ok, 2, "cap=2 → exactly 2 items may land");
+    assert_eq!(
+        errs.len(),
+        2,
+        "the 2 over-cap items must be rejected per-item"
+    );
+    for e in errs {
+        assert!(
+            e.contains("per-session ingest cap reached"),
+            "over-cap rejection must be the cap error (→ 429), got: {e}"
+        );
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn batch_idempotent_items_do_not_consume_cap_slots() {
+    // Idempotent re-ingests short-circuit before the cap check on the batch
+    // path too (mirrors the single-item guarantee): the existing-row probe
+    // returns early, so a slot is never reserved for a dup.
+    let (_dir, svc) = make_service(Some(2)).await;
+    svc.ingest(request("u1", Some("idemp-1")))
+        .await
+        .expect("first single ingest consumes slot 1/2");
+
+    // Batch: re-ingest u1 (existing → no slot), u2 (new → slot 2/2),
+    // u3 (new → over cap).
+    let results = svc
+        .ingest_batch(vec![
+            request("u1", Some("idemp-1")),
+            request("u2", Some("idemp-2")),
+            request("u3", Some("idemp-3")),
+        ])
+        .await
+        .expect("batch call");
+    assert!(
+        matches!(results[0], BatchIngestItem::Ok { .. }),
+        "idempotent re-ingest returns the existing row: {:?}",
+        results[0]
+    );
+    assert!(
+        matches!(results[1], BatchIngestItem::Ok { .. }),
+        "the one remaining slot admits u2: {:?}",
+        results[1]
+    );
+    assert!(
+        matches!(results[2], BatchIngestItem::Err { .. }),
+        "u3 must hit the cap: {:?}",
+        results[2]
+    );
 }
 
 // ────────────────────── Step-3 quality gate (wiring) ──────────────────────
