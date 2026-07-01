@@ -743,12 +743,67 @@ pub async fn run_with_counts(args: MineArgs) -> anyhow::Result<MineCounts> {
     } else {
         None
     };
-    let (mut memories, blocks) =
+    let (memories, blocks) =
         parse_transcript_full(&args.transcript_path, heuristic && llm_cfg.is_none())?;
 
-    // O7(c): LLM extraction over untagged assistant text blocks. Fail-safe by
-    // construction (`llm_candidates` swallows every error → empty), so a dead
-    // gateway just yields no candidates and the mine proceeds.
+    let client = reqwest::Client::new();
+
+    // v3 #32 fast-skip: query the server's per-transcript cursor; if present,
+    // drop memories/blocks whose line_number ≤ cursor. Pure perf — server-side
+    // dedup (idempotency_key on capsules; (path, line, block_index) on
+    // transcript blocks) still catches anything we ship anyway, so a 404 /
+    // network failure on cursor read just degrades to the legacy "re-mine +
+    // re-dedup" path.
+    //
+    // This MUST run before the O7(c) LLM extraction below. The LLM lane has a
+    // bounded per-mine block budget (MAX_LLM_BLOCKS), so it has to spend that
+    // budget on genuinely-new blocks. When the filter ran *after* the LLM loop,
+    // already-mined blocks below the cursor consumed the budget only to have
+    // their candidates dropped here — starving the new tail (never extracted)
+    // and burning gateway calls. Filtering first fixes both.
+    let transcript_path_str = args.transcript_path.display().to_string();
+    let cursor_line: Option<i64> = match client
+        .get(format!("{}/mine/cursors", args.remote.base_url))
+        .query(&[("transcript_path", transcript_path_str.as_str())])
+        .send()
+        .await
+    {
+        Ok(resp) if resp.status().is_success() => resp
+            .json::<serde_json::Value>()
+            .await
+            .ok()
+            .and_then(|v| v.get("last_line_number").and_then(|n| n.as_i64())),
+        _ => None,
+    };
+    let (mut memories, blocks) = if let Some(c) = cursor_line {
+        let before_mem = memories.len();
+        let before_blk = blocks.len();
+        let memories: Vec<_> = memories
+            .into_iter()
+            .filter(|m| (m.line_number as i64) > c)
+            .collect();
+        let blocks: Vec<_> = blocks
+            .into_iter()
+            .filter(|b| (b.line_number as i64) > c)
+            .collect();
+        eprintln!(
+            "mine: cursor at line {c}; skipped {} capsules + {} blocks already mined",
+            before_mem - memories.len(),
+            before_blk - blocks.len(),
+        );
+        (memories, blocks)
+    } else {
+        (memories, blocks)
+    };
+
+    // O7(c): LLM extraction over the (now cursor-filtered) untagged assistant
+    // text blocks. Fail-safe by construction (`llm_candidates` swallows every
+    // error → empty), so a dead gateway just yields no candidates and the mine
+    // proceeds. NOTE: the candidate content is the LLM's nondeterministic output,
+    // so the `:h{sha8(content)}` idempotency key is NOT stable across re-runs;
+    // the cursor advance (below, after a clean run) is what prevents a mined
+    // block from being re-extracted — a partial-failure run that doesn't advance
+    // the cursor can still re-propose differently-worded duplicates for review.
     if let Some(cfg) = &llm_cfg {
         // Bound the per-mine gateway fan-out so a huge transcript can't hammer
         // the gateway; the rest still mine via tags (and the next run resumes).
@@ -775,52 +830,10 @@ pub async fn run_with_counts(args: MineArgs) -> anyhow::Result<MineCounts> {
         }
     }
 
-    let client = reqwest::Client::new();
     let mut mem_ok: u32 = 0;
     let mut mem_fail: u32 = 0;
     let mut block_ok: u32 = 0;
     let mut block_fail: u32 = 0;
-
-    // v3 #32 fast-skip: query the server's per-transcript cursor; if
-    // present, drop memories/blocks whose line_number ≤ cursor. Pure
-    // perf — server-side dedup (idempotency_key on capsules; (path,
-    // line, block_index) on transcript blocks) still catches anything
-    // we choose to ship anyway, so a 404 / network failure on cursor
-    // read just degrades to the legacy "re-mine + re-dedup" path.
-    let transcript_path_str = args.transcript_path.display().to_string();
-    let cursor_line: Option<i64> = match client
-        .get(format!("{}/mine/cursors", args.remote.base_url))
-        .query(&[("transcript_path", transcript_path_str.as_str())])
-        .send()
-        .await
-    {
-        Ok(resp) if resp.status().is_success() => resp
-            .json::<serde_json::Value>()
-            .await
-            .ok()
-            .and_then(|v| v.get("last_line_number").and_then(|n| n.as_i64())),
-        _ => None,
-    };
-    let (memories, blocks) = if let Some(c) = cursor_line {
-        let before_mem = memories.len();
-        let before_blk = blocks.len();
-        let memories: Vec<_> = memories
-            .into_iter()
-            .filter(|m| (m.line_number as i64) > c)
-            .collect();
-        let blocks: Vec<_> = blocks
-            .into_iter()
-            .filter(|b| (b.line_number as i64) > c)
-            .collect();
-        eprintln!(
-            "mine: cursor at line {c}; skipped {} capsules + {} blocks already mined",
-            before_mem - memories.len(),
-            before_blk - blocks.len(),
-        );
-        (memories, blocks)
-    } else {
-        (memories, blocks)
-    };
 
     // Capture max line_number BEFORE the moves below so we can update
     // the cursor after both batches succeed.
