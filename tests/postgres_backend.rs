@@ -1924,8 +1924,9 @@ emb_test!(graph_invalidate_close_timeline_predicate_tunnels, store, {
         .unwrap();
     assert!(after.is_empty());
 
-    // close_edges_for_capability_capsule closes all active edges FROM the
-    // capsule node.
+    // close_edges_for_capability_capsule closes all active edges INCIDENT to the
+    // capsule node — outgoing AND incoming (a capsule can be an edge's to_node,
+    // e.g. a suspected_supersede new→canonical edge).
     store
         .add_edge_direct(&edge(
             "capability_capsule:c9",
@@ -1936,12 +1937,32 @@ emb_test!(graph_invalidate_close_timeline_predicate_tunnels, store, {
         ))
         .await
         .unwrap();
+    // Incoming edge: another capsule → c9 (the dangling-edge case a FROM-only
+    // close would strand).
+    store
+        .add_edge_direct(&edge(
+            "capability_capsule:c9_newer",
+            "capability_capsule:c9",
+            "suspected_supersede",
+            "00000001778000010001",
+            None,
+        ))
+        .await
+        .unwrap();
     let n = store
         .close_edges_for_capability_capsule("c9")
         .await
         .unwrap();
-    assert_eq!(n, 1);
+    assert_eq!(n, 2, "both incident edges (outgoing + incoming) are closed");
     assert!(store.neighbors("entity:e9").await.unwrap().is_empty());
+    assert!(
+        store
+            .neighbors("capability_capsule:c9")
+            .await
+            .unwrap()
+            .is_empty(),
+        "no active edge survives on the closed capsule (incoming included)"
+    );
 
     // user-tunnel discovery: list / find / follow.
     store

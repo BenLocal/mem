@@ -290,7 +290,7 @@ impl LanceStore {
         &self,
         capability_capsule_id: &str,
     ) -> Result<usize, GraphError> {
-        let from = format!("capability_capsule:{capability_capsule_id}");
+        let node = format!("capability_capsule:{capability_capsule_id}");
         let now = crate::storage::current_timestamp();
         let table = self
             .conn
@@ -298,7 +298,14 @@ impl LanceStore {
             .execute()
             .await
             .map_err(|e| GraphError::Backend(e.to_string()))?;
-        let filter = format!("from_node_id = {} AND valid_to IS NULL", sql_quote(&from));
+        // Close every ACTIVE edge INCIDENT to the node — outgoing AND incoming.
+        // A capsule can be the `to_node` (e.g. a `suspected_supersede`
+        // new→canonical edge, or a `contradicts` edge), so a FROM-only close
+        // would leave a dangling edge pointing at the deleted capsule in active
+        // reads. Matches the clickhouse/postgres cascade.
+        let node_q = sql_quote(&node);
+        let filter =
+            format!("(from_node_id = {node_q} OR to_node_id = {node_q}) AND valid_to IS NULL");
         let count = table
             .count_rows(Some(filter.clone()))
             .await

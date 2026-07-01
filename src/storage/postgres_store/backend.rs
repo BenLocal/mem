@@ -1746,15 +1746,19 @@ impl GraphStore for PostgresCapsuleStore {
         &self,
         capability_capsule_id: &str,
     ) -> Result<usize, GraphError> {
-        // Close every active edge originating from `capability_capsule:<id>`
-        // (the node-id format the Lance writer uses).
-        let from = format!("capability_capsule:{capability_capsule_id}");
+        // Close every active edge INCIDENT to `capability_capsule:<id>` —
+        // outgoing AND incoming (the node-id format the Lance writer uses). A
+        // capsule can be the `to_node` of an edge (e.g. a `suspected_supersede`
+        // new→canonical edge, or a `contradicts` edge), so a FROM-only close
+        // would leave a dangling edge pointing at the capsule. Matches the
+        // lance/clickhouse helper.
+        let node = format!("capability_capsule:{capability_capsule_id}");
         let now = crate::storage::current_timestamp();
         let res = sqlx::query(
             "UPDATE graph_edges SET valid_to = $2 \
-             WHERE from_node_id = $1 AND valid_to IS NULL",
+             WHERE (from_node_id = $1 OR to_node_id = $1) AND valid_to IS NULL",
         )
-        .bind(&from)
+        .bind(&node)
         .bind(&now)
         .execute(self.pool())
         .await

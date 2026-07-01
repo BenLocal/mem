@@ -394,3 +394,60 @@ async fn g4_non_functional_predicate_keeps_all_edges() {
         .count();
     assert_eq!(active, 2, "both uses edges stay active");
 }
+
+// ───────────── hard-delete closes BOTH incident directions ─────────────
+
+/// Regression: `close_edges_for_capability_capsule` (the hard-delete cascade)
+/// must close every ACTIVE edge INCIDENT to the capsule node — outgoing AND
+/// incoming. A capsule can be the `to_node` of an edge (e.g. a
+/// `suspected_supersede` new→canonical edge, or a `contradicts` edge), so a
+/// FROM-only close leaves a dangling edge pointing at the deleted capsule in
+/// active graph reads. All three backends must agree; this pins the Lance one.
+#[tokio::test(flavor = "multi_thread")]
+async fn hard_delete_closes_incoming_and_outgoing_edges() {
+    let (_dir, store) = open_store().await;
+    let now = current_timestamp();
+    let victim = "capability_capsule:victim";
+
+    // Outgoing edge: victim → entity (the common ingest shape).
+    add_edge(&store, victim, "entity:topic", "mentions", &now).await;
+    // Incoming edge: another capsule → victim (suspected_supersede canonical).
+    add_edge(
+        &store,
+        "capability_capsule:newer",
+        victim,
+        "suspected_supersede",
+        &now,
+    )
+    .await;
+
+    // Precondition: both edges are active on the victim node.
+    let active_before = store
+        .neighbors(victim)
+        .await
+        .unwrap()
+        .into_iter()
+        .filter(|e| e.valid_to.is_none())
+        .count();
+    assert_eq!(active_before, 2, "precondition: both edges active");
+
+    // Hard-delete cascade.
+    store
+        .close_edges_for_capability_capsule("victim")
+        .await
+        .unwrap();
+
+    // Both incident edges must now be closed — no dangling edge toward the
+    // deleted capsule survives in active reads.
+    let active_after = store
+        .neighbors(victim)
+        .await
+        .unwrap()
+        .into_iter()
+        .filter(|e| e.valid_to.is_none())
+        .count();
+    assert_eq!(
+        active_after, 0,
+        "both incoming and outgoing edges must be closed on hard-delete"
+    );
+}

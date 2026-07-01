@@ -350,13 +350,24 @@ mod ch {
         ))
         .await
         .unwrap();
+        // Incoming edge: another capsule → c_del_ch (e.g. a suspected_supersede
+        // new→canonical edge). A FROM-only close would strand this one.
+        be.add_edge_direct(&dated_edge(
+            "capability_capsule:c_del_ch_newer",
+            "capability_capsule:c_del_ch",
+            "suspected_supersede",
+            "00000000000000000101",
+            None,
+        ))
+        .await
+        .unwrap();
         assert_eq!(
             be.neighbors("capability_capsule:c_del_ch")
                 .await
                 .unwrap()
                 .len(),
-            1,
-            "edge must be active before the delete"
+            2,
+            "both incident edges (outgoing + incoming) must be active before the delete"
         );
 
         be.delete_capability_capsule_hard("t", "c_del_ch")
