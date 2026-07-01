@@ -1629,6 +1629,14 @@ impl LanceStore {
 
         // Update the parent memory row. Status / last_validated_at are
         // optionally set; confidence + decay + updated_at always.
+        //
+        // confidence / decay_score are applied as ADDITIVE SQL against the live
+        // row (`least(1.0, col + delta)`), NOT as an absolute value derived from
+        // the caller's `memory` snapshot. A snapshot-absolute write would revert
+        // any concurrent decay-sweep update (`decay.rs::apply_time_decay`, also
+        // additive SQL) that committed between the caller's read and here — a
+        // lost update. Every FeedbackKind delta is >= 0, so the `least(1.0, …)`
+        // upper clamp suffices (no lower clamp needed); mirrors decay.rs.
         let mem_table = self
             .conn
             .open_table("capability_capsules")
@@ -1641,8 +1649,14 @@ impl LanceStore {
                 "capability_capsule_id = {}",
                 sql_quote(&updated.capability_capsule_id)
             ))
-            .column("confidence", format!("{}", updated.confidence))
-            .column("decay_score", format!("{}", updated.decay_score))
+            .column(
+                "confidence",
+                format!("least(1.0, confidence + {})", kind.confidence_delta()),
+            )
+            .column(
+                "decay_score",
+                format!("least(1.0, decay_score + {})", kind.decay_delta()),
+            )
             .column("updated_at", sql_quote(&updated.updated_at));
         if let Some(s) = status_after {
             update = update.column("status", sql_quote(&enum_to_str(&s)?));
@@ -2296,6 +2310,72 @@ mod tests {
         // Empty feedback for a memory with none
         let summary_none = repo.feedback_summary("never-feedback'd").await.unwrap();
         assert_eq!(summary_none.total, 0);
+    }
+
+    /// apply_feedback must ADD its delta to the live row, not write back an
+    /// absolute value computed from a possibly-stale caller snapshot. Otherwise
+    /// a concurrent decay-sweep update (additive SQL) that commits between the
+    /// caller's read and this write is silently reverted (lost update).
+    #[tokio::test]
+    pub async fn apply_feedback_is_additive_not_lost_update() {
+        let dir = tempdir().unwrap();
+        let repo = LanceStore::open(&dir.path().join("lance.store"))
+            .await
+            .unwrap();
+
+        let mut memory = fixture("mem_lu", "tenant");
+        memory.confidence = 0.5;
+        memory.decay_score = 0.5;
+        repo.insert_capability_capsule(memory.clone())
+            .await
+            .unwrap();
+
+        // Concurrent decay sweep commits AFTER the caller captured `memory`
+        // (0.5/0.5) but BEFORE apply_feedback writes: bump the live row.
+        repo.conn
+            .open_table("capability_capsules")
+            .execute()
+            .await
+            .unwrap()
+            .update()
+            .only_if(format!("capability_capsule_id = {}", sql_quote("mem_lu")))
+            .column("confidence", "CAST(0.7 AS float)")
+            .column("decay_score", "CAST(0.9 AS float)")
+            .execute()
+            .await
+            .unwrap();
+
+        // `useful` = +0.10 confidence, +0 decay. Applied to the STALE snapshot
+        // (0.5/0.5) the old absolute write stored 0.6/0.5 — clobbering the
+        // concurrent 0.7/0.9. The additive fix must land 0.8/0.9 instead.
+        repo.apply_feedback(
+            &memory,
+            FeedbackEvent {
+                feedback_id: "fb_lu".into(),
+                capability_capsule_id: "mem_lu".into(),
+                feedback_kind: "useful".into(),
+                created_at: "2026-06-30T00:00:00Z".into(),
+                note: None,
+            },
+        )
+        .await
+        .unwrap();
+
+        let stored = repo
+            .get_capability_capsule_for_tenant("tenant", "mem_lu")
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            (stored.confidence - 0.8).abs() < 1e-4,
+            "confidence must be live(0.7)+0.1=0.8, got {}",
+            stored.confidence
+        );
+        assert!(
+            (stored.decay_score - 0.9).abs() < 1e-4,
+            "decay must stay live(0.9)+0=0.9 (not clobbered to snapshot 0.5), got {}",
+            stored.decay_score
+        );
     }
 
     /// embedding_jobs queue end-to-end:
