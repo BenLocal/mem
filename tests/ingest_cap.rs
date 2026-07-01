@@ -264,6 +264,47 @@ async fn batch_idempotent_items_do_not_consume_cap_slots() {
     );
 }
 
+#[tokio::test(flavor = "multi_thread")]
+async fn batch_intra_batch_idempotency_dedupes_within_one_call() {
+    // Two items in the SAME batch that share an idempotency_key must dedupe
+    // against each other, exactly as the single-item path dedupes on
+    // (tenant, idempotency_key)/content_hash. The old batch path probed storage
+    // for every item BEFORE any insert, so neither item saw the other and both
+    // landed as separate rows. Assert only ONE row is created: both results
+    // carry the same capability_capsule_id, and the single cap slot is consumed
+    // just once (a following unique ingest still fits under cap=2).
+    let (_dir, svc) = make_service(Some(2)).await;
+    let results = svc
+        .ingest_batch(vec![
+            request("intra-batch dup A", Some("dup-key")),
+            request("intra-batch dup B", Some("dup-key")),
+        ])
+        .await
+        .expect("batch call");
+
+    let id0 = match &results[0] {
+        BatchIngestItem::Ok { response } => response.capability_capsule_id.clone(),
+        other => panic!("item 0 must be Ok: {other:?}"),
+    };
+    let id1 = match &results[1] {
+        BatchIngestItem::Ok { response } => response.capability_capsule_id.clone(),
+        other => panic!("item 1 must be Ok: {other:?}"),
+    };
+    assert_eq!(
+        id0, id1,
+        "intra-batch idempotent items must resolve to a single row, not two"
+    );
+
+    // Only one slot was consumed (dedup didn't reserve a second), so a distinct
+    // capsule still fits, and the one after that hits cap=2.
+    svc.ingest(request("distinct after dedup", Some("k2")))
+        .await
+        .expect("second distinct row fits: dedup consumed only one slot");
+    svc.ingest(request("over cap", Some("k3")))
+        .await
+        .expect_err("third distinct row must hit cap=2");
+}
+
 // ────────────────────── Step-3 quality gate (wiring) ──────────────────────
 
 #[tokio::test(flavor = "multi_thread")]

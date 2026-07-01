@@ -458,9 +458,12 @@ impl CapabilityCapsuleService {
         let mut outcomes: Vec<Option<BatchIngestItem>> = vec![None; requests.len()];
         let mut to_insert: Vec<CapabilityCapsuleRecord> = Vec::new();
         let mut session_ids: Vec<String> = Vec::new();
+        // Dedup items against earlier items in THIS batch (the storage probe only
+        // sees already-committed rows, none of which this batch has inserted yet).
+        let mut dedup = BatchDedup::default();
 
         for (idx, request) in requests.into_iter().enumerate() {
-            match self.prepare_one(request, &now).await {
+            match self.prepare_one(request, &now, &mut dedup).await {
                 Ok(PreparedIngest::Existing(resp)) => {
                     outcomes[idx] = Some(BatchIngestItem::Ok { response: resp });
                 }
@@ -556,6 +559,7 @@ impl CapabilityCapsuleService {
         &self,
         request: IngestCapabilityCapsuleRequest,
         now: &str,
+        dedup: &mut BatchDedup,
     ) -> Result<PreparedIngest, ServiceError> {
         let content_hash = compute_content_hash(&request);
         if let Some(existing) = self
@@ -564,6 +568,15 @@ impl CapabilityCapsuleService {
             .await?
         {
             return Ok(PreparedIngest::Existing(existing.into()));
+        }
+        // No committed row matched; check earlier items in this same batch before
+        // reserving a slot, so intra-batch duplicates resolve to one row.
+        if let Some(hit) = dedup.lookup(
+            &request.tenant,
+            request.idempotency_key.as_deref(),
+            &content_hash,
+        ) {
+            return Ok(PreparedIngest::Existing(hit.clone()));
         }
 
         let status = initial_status(&request.capability_capsule_type, &request.write_mode);
@@ -639,6 +652,10 @@ impl CapabilityCapsuleService {
             last_recalled_at: None,
             expires_at: request.expires_at.clone(),
         };
+        // Register so a later item in this batch with the same idempotency_key /
+        // content dedups against this row instead of inserting a second copy.
+        let response: IngestCapabilityCapsuleResponse = record.clone().into();
+        dedup.register(&record, response);
         Ok(PreparedIngest::New {
             record: Box::new(record),
             session_id,
@@ -1844,6 +1861,57 @@ enum PreparedIngest {
         record: Box<CapabilityCapsuleRecord>,
         session_id: String,
     },
+}
+
+/// Intra-batch idempotency dedup for `ingest_batch`. The per-item storage probe
+/// (`find_by_idempotency_or_hash`) runs before ANY row is inserted, so two items
+/// in the same batch sharing an idempotency_key (or content) would both miss the
+/// probe and both land as separate rows — violating the idempotency the
+/// single-item path guarantees. `prepare_one` consults this map (populated by
+/// earlier items in the same batch) right after the storage miss and before it
+/// reserves a cap slot, so a duplicate resolves to the first item's row and
+/// consumes neither a second insert nor a second slot. Keyed the same way the
+/// storage probe dedups: by (tenant, idempotency_key) OR (tenant, content_hash).
+#[derive(Default)]
+struct BatchDedup {
+    by_idem: std::collections::HashMap<(String, String), IngestCapabilityCapsuleResponse>,
+    by_hash: std::collections::HashMap<(String, String), IngestCapabilityCapsuleResponse>,
+}
+
+impl BatchDedup {
+    /// An earlier in-batch item this one duplicates, if any. Empty idempotency
+    /// keys are ignored (treated as absent), matching the storage probe.
+    fn lookup(
+        &self,
+        tenant: &str,
+        idempotency_key: Option<&str>,
+        content_hash: &str,
+    ) -> Option<&IngestCapabilityCapsuleResponse> {
+        if let Some(key) = idempotency_key.filter(|k| !k.is_empty()) {
+            if let Some(hit) = self.by_idem.get(&(tenant.to_string(), key.to_string())) {
+                return Some(hit);
+            }
+        }
+        self.by_hash
+            .get(&(tenant.to_string(), content_hash.to_string()))
+    }
+
+    /// Register a freshly-prepared record so later items in the batch dedup
+    /// against it.
+    fn register(
+        &mut self,
+        record: &CapabilityCapsuleRecord,
+        response: IngestCapabilityCapsuleResponse,
+    ) {
+        if let Some(key) = record.idempotency_key.as_deref().filter(|k| !k.is_empty()) {
+            self.by_idem
+                .insert((record.tenant.clone(), key.to_string()), response.clone());
+        }
+        self.by_hash.insert(
+            (record.tenant.clone(), record.content_hash.clone()),
+            response,
+        );
+    }
 }
 
 fn next_episode_id() -> String {
