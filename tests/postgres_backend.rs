@@ -1672,6 +1672,41 @@ fn edge(from: &str, to: &str, rel: &str, valid_from: &str, valid_to: Option<&str
     }
 }
 
+emb_test!(hard_delete_closes_capsule_graph_edges, store, {
+    // A hard-delete must close the deleted capsule's active graph edges, or the
+    // `capability_capsule:<id>` node dangles in active graph reads (which scan
+    // graph_edges with no join to the parent). Mirrors the lance backend's
+    // cascade; on postgres it runs IN the delete transaction.
+    store
+        .insert_capability_capsule(fixture("c_del", CapabilityCapsuleStatus::Active))
+        .await
+        .unwrap();
+    assert!(store
+        .add_edge_direct(&edge(
+            "capability_capsule:c_del",
+            "entity:e_del",
+            "mentions",
+            "00000001778000010000",
+            None,
+        ))
+        .await
+        .unwrap());
+
+    let before = store.neighbors("capability_capsule:c_del").await.unwrap();
+    assert_eq!(before.len(), 1, "edge must be active before the delete");
+
+    store
+        .delete_capability_capsule_hard("t", "c_del")
+        .await
+        .unwrap();
+
+    let after = store.neighbors("capability_capsule:c_del").await.unwrap();
+    assert!(
+        after.is_empty(),
+        "hard-delete must leave no active edge for the deleted capsule node, got {after:?}"
+    );
+});
+
 emb_test!(graph_add_edge_direct_and_neighbors, store, {
     // add_edge_direct preserves valid_from verbatim, dedups active dups.
     assert!(store

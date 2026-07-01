@@ -24,6 +24,7 @@ use crate::domain::capability_capsule::{
     CapabilityCapsuleRecord, CapabilityCapsuleStatus, CapsuleStats, FeedbackKind, FeedbackSummary,
 };
 use crate::storage::capsule_store::CapsuleStore;
+use crate::storage::graph_store::GraphStore;
 use crate::storage::time::current_timestamp;
 use crate::storage::types::{FeedbackEvent, StorageError};
 
@@ -525,6 +526,14 @@ impl CapsuleStore for ClickHouseBackend {
             .execute()
             .await
             .map_err(ch_err)?;
+        // Close active graph edges incident to this capsule node so a hard-delete
+        // doesn't leave dangling `capability_capsule:<id>` edges in active reads —
+        // mirrors the lance backend's cascade (reuses the GraphStore helper; CH
+        // has no transactions, so this is a separate async ALTER like the deletes
+        // above).
+        self.close_edges_for_capability_capsule(capability_capsule_id)
+            .await
+            .map_err(|e| StorageError::InvalidInput(format!("close edges: {e}")))?;
         Ok(())
     }
 

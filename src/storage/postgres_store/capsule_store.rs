@@ -867,6 +867,23 @@ impl CapsuleStore for PostgresCapsuleStore {
             .execute(&mut *tx)
             .await
             .map_err(sqlx_err)?;
+        // Close active graph edges originating from this capsule node, so a
+        // hard-delete doesn't leave dangling `capability_capsule:<id>` edges in
+        // active reads (graph reads scan graph_edges with no join to the parent
+        // capsule). Mirrors the lance backend's cascade; done IN the transaction
+        // so the whole hard-delete stays atomic. FROM-only, matching the
+        // lance/postgres `close_edges_for_capability_capsule` contract.
+        let node = format!("capability_capsule:{capability_capsule_id}");
+        let now = crate::storage::current_timestamp();
+        sqlx::query(
+            "UPDATE graph_edges SET valid_to = $2 \
+             WHERE from_node_id = $1 AND valid_to IS NULL",
+        )
+        .bind(&node)
+        .bind(&now)
+        .execute(&mut *tx)
+        .await
+        .map_err(sqlx_err)?;
         tx.commit().await.map_err(sqlx_err)?;
         Ok(())
     }

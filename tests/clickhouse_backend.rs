@@ -330,6 +330,59 @@ mod ch {
         e
     }
 
+    /// A hard-delete must close the deleted capsule's active graph edges so the
+    /// `capability_capsule:<id>` node doesn't dangle in active reads. Mirrors the
+    /// lance backend's cascade. ClickHouse `ALTER … UPDATE` mutations are async,
+    /// so the close is polled within a bounded window rather than asserted
+    /// instantly.
+    #[tokio::test]
+    async fn hard_delete_closes_capsule_graph_edges() {
+        let Some(be) = ch_backend().await else { return };
+        be.insert_capability_capsule(fixture("c_del_ch", CapabilityCapsuleStatus::Active))
+            .await
+            .unwrap();
+        be.add_edge_direct(&dated_edge(
+            "capability_capsule:c_del_ch",
+            "entity:e_del_ch",
+            "mentions",
+            "00000000000000000100",
+            None,
+        ))
+        .await
+        .unwrap();
+        assert_eq!(
+            be.neighbors("capability_capsule:c_del_ch")
+                .await
+                .unwrap()
+                .len(),
+            1,
+            "edge must be active before the delete"
+        );
+
+        be.delete_capability_capsule_hard("t", "c_del_ch")
+            .await
+            .unwrap();
+
+        // ALTER … UPDATE is an async mutation — poll until it applies.
+        let mut closed = false;
+        for _ in 0..50 {
+            if be
+                .neighbors("capability_capsule:c_del_ch")
+                .await
+                .unwrap()
+                .is_empty()
+            {
+                closed = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+        assert!(
+            closed,
+            "hard-delete must close the deleted capsule's active edges"
+        );
+    }
+
     /// (e) neighbors_within must honor the point-in-time `as_of` window, not
     /// BFS-walk only the currently-active edge set. `add_edge_direct` INSERTs
     /// (synchronous, unlike the async ALTER mutations), and the fixed
