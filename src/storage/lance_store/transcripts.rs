@@ -138,29 +138,6 @@ impl LanceStore {
         Ok(rows.into_iter().map(|r| r.message_block_id).collect())
     }
 
-    /// Whether a `conversation_messages` row exists with this exact
-    /// `message_block_id`. The insert-dedup key is `(transcript_path,
-    /// line_number, block_index)`, which is NOT the block id — so an exists
-    /// probe by key can match a *different* block. The orphan-repair path uses
-    /// this to enqueue only for blocks that truly own a row, never for a message
-    /// that was deduplicated away by key.
-    async fn conversation_message_block_exists(
-        &self,
-        block_id: &str,
-    ) -> Result<bool, StorageError> {
-        let table = self
-            .conn
-            .open_table("conversation_messages")
-            .execute()
-            .await
-            .map_err(lancedb_err)?;
-        let n = table
-            .count_rows(Some(format!("message_block_id = {}", sql_quote(block_id))))
-            .await
-            .map_err(lancedb_err)?;
-        Ok(n > 0)
-    }
-
     /// Mirror of `claim_next_n_embedding_jobs` for the transcript
     /// queue. Eligible rows are `pending` or `failed` with
     /// `attempt_count < max_retries`, ordered `(available_at,
@@ -1001,41 +978,58 @@ impl LanceStore {
         // repairs that orphan exactly once and never double-enqueues, since a
         // completed job row is retained and still counts as "present".
         if msg.embed_eligible {
-            // Enqueue when: just inserted (row certainly exists, no job yet), OR
-            // on a replay where no job row exists yet AND a row truly exists for
-            // THIS block id. The job probe is checked first so the common replay
-            // (job already present) short-circuits to a single query; the
-            // block-exists probe only runs when a repair looks needed, and guards
-            // against enqueuing for a message deduplicated away by key.
-            let needs_enqueue = newly_inserted
-                || (self
-                    .transcript_jobs_present_for_blocks(&[msg.message_block_id.as_str()])
-                    .await?
-                    .is_empty()
-                    && self
-                        .conversation_message_block_exists(&msg.message_block_id)
-                        .await?);
-            if needs_enqueue {
-                // Provider id is configured once at startup via
-                // `set_transcript_job_provider`. Failing loudly here is
-                // preferable to silently substituting a default that
-                // would later mismatch the worker's `job_provider_id()`.
-                let provider = self
-                    .transcript_job_provider()
-                    .ok_or(StorageError::InvalidData(
-                        "transcript embedding job provider not configured; \
-                         call LanceStore::set_transcript_job_provider during startup",
-                    ))?;
-                let job_id = uuid::Uuid::now_v7().to_string();
-                let now = crate::storage::current_timestamp();
-                self.try_enqueue_transcript_embedding_job(
-                    job_id,
-                    msg.tenant.clone(),
-                    msg.message_block_id.clone(),
-                    provider,
-                    now,
-                )
-                .await?;
+            // The block id that actually OWNS the row: the caller-supplied id
+            // when we just inserted it, else the STORED row's id. The ingest
+            // path re-mints `message_block_id` per request (server-side
+            // `uuid::now_v7`) while dedup keeps the original row, so on a replay
+            // the caller's id will NOT match the stored row — reconcile the job
+            // against the stored id, not the caller's. A message deduplicated
+            // away by key owns no row (query returns nothing) → skipped.
+            let owning_block_id = if newly_inserted {
+                Some(msg.message_block_id.clone())
+            } else {
+                self.query_conversation_messages(format!(
+                    "transcript_path = {} AND line_number = {} AND block_index = {}",
+                    sql_quote(&msg.transcript_path),
+                    msg.line_number,
+                    msg.block_index,
+                ))
+                .await?
+                .into_iter()
+                .next()
+                .map(|r| r.message_block_id)
+            };
+            if let Some(block_id) = owning_block_id {
+                // Enqueue when the owning row has no job row yet. A completed job
+                // row is retained and counts as "present", so a replay repairs an
+                // orphan exactly once and never double-enqueues.
+                let needs_enqueue = newly_inserted
+                    || self
+                        .transcript_jobs_present_for_blocks(&[block_id.as_str()])
+                        .await?
+                        .is_empty();
+                if needs_enqueue {
+                    // Provider id is configured once at startup via
+                    // `set_transcript_job_provider`. Failing loudly here is
+                    // preferable to silently substituting a default that
+                    // would later mismatch the worker's `job_provider_id()`.
+                    let provider =
+                        self.transcript_job_provider()
+                            .ok_or(StorageError::InvalidData(
+                                "transcript embedding job provider not configured; \
+                             call LanceStore::set_transcript_job_provider during startup",
+                            ))?;
+                    let job_id = uuid::Uuid::now_v7().to_string();
+                    let now = crate::storage::current_timestamp();
+                    self.try_enqueue_transcript_embedding_job(
+                        job_id,
+                        msg.tenant.clone(),
+                        block_id,
+                        provider,
+                        now,
+                    )
+                    .await?;
+                }
             }
         }
         Ok(())
@@ -1080,14 +1074,17 @@ impl LanceStore {
         let existing = self
             .query_conversation_messages(format!("transcript_path IN ({in_list})"))
             .await?;
-        // Capture the existing rows' keys (for dedup) AND their message_block_ids
-        // (so step 4's job reconciliation only ever targets blocks that actually
-        // have a row — a message deduplicated away by key must not get a job).
+        // Capture the existing rows' keys (for dedup) AND the STORED block ids of
+        // the embed-eligible ones (so step 4 reconciles orphaned jobs against the
+        // id that actually owns the row — the ingest path re-mints the caller id
+        // per request, so a replay's id won't match the stored row).
         let mut seen: HashSet<(String, u64, u32)> = HashSet::with_capacity(existing.len());
-        let mut existing_block_ids: HashSet<String> = HashSet::with_capacity(existing.len());
+        let mut existing_eligible: Vec<(String, String)> = Vec::new();
         for m in existing {
+            if m.embed_eligible {
+                existing_eligible.push((m.message_block_id.clone(), m.tenant.clone()));
+            }
             seen.insert((m.transcript_path, m.line_number, m.block_index));
-            existing_block_ids.insert(m.message_block_id);
         }
 
         // 2. Walk the input, dropping rows whose key is already in
@@ -1112,42 +1109,34 @@ impl LanceStore {
         }
 
         // 4. Reconcile embedding jobs for every embed-eligible block that has a
-        //    row — freshly inserted OR already present — not just the inserted
-        //    subset. The enqueue is a separate commit from the row insert, so a
-        //    row that already existed may be orphaned (its original enqueue
-        //    failed after the row committed). Enqueue exactly the blocks that
-        //    have no job row yet, so a `mem mine` replay repairs orphans without
-        //    ever double-enqueuing (a completed job row is retained and counts as
-        //    "present"). Blocks deduplicated away by key own no row, so they are
-        //    excluded via `rows_present`.
-        let mut rows_present: HashSet<&str> = HashSet::with_capacity(to_insert.len());
+        //    row — freshly inserted (caller id) OR already present (STORED id) —
+        //    not just the inserted subset. The enqueue is a separate commit from
+        //    the row insert, so a row that already existed may be orphaned (its
+        //    original enqueue failed after the row committed). Enqueue exactly the
+        //    owning ids that have no job row yet, so a `mem mine` replay repairs
+        //    orphans without ever double-enqueuing (a completed job row is
+        //    retained and counts as "present"). Candidates are (block_id,
+        //    tenant); a block deduplicated away by key owns no row, so it
+        //    contributes no candidate.
+        let mut candidates: Vec<(String, String)> = Vec::with_capacity(to_insert.len());
         for m in &to_insert {
-            rows_present.insert(m.message_block_id.as_str());
+            if m.embed_eligible {
+                candidates.push((m.message_block_id.clone(), m.tenant.clone()));
+            }
         }
-        for bid in &existing_block_ids {
-            rows_present.insert(bid.as_str());
-        }
-        let mut eligible_block_ids: Vec<&str> = msgs
-            .iter()
-            .filter(|m| m.embed_eligible && rows_present.contains(m.message_block_id.as_str()))
-            .map(|m| m.message_block_id.as_str())
-            .collect();
-        eligible_block_ids.sort_unstable();
-        eligible_block_ids.dedup();
-        if !eligible_block_ids.is_empty() {
-            let present = self
-                .transcript_jobs_present_for_blocks(&eligible_block_ids)
-                .await?;
+        candidates.extend(existing_eligible);
+        // Dedup by block id (a freshly-inserted id and an existing id never
+        // collide; this also guards against any duplicate row in `existing`).
+        let mut seen_ids: HashSet<String> = HashSet::with_capacity(candidates.len());
+        candidates.retain(|(bid, _)| seen_ids.insert(bid.clone()));
+        if !candidates.is_empty() {
+            let ids: Vec<&str> = candidates.iter().map(|(bid, _)| bid.as_str()).collect();
+            let present = self.transcript_jobs_present_for_blocks(&ids).await?;
             let now = crate::storage::current_timestamp();
-            let mut emitted: HashSet<&str> = HashSet::new();
             let mut cached_provider: Option<String> = None;
             let mut jobs: Vec<TranscriptEmbeddingJobRow> = Vec::new();
-            for msg in msgs
-                .iter()
-                .filter(|m| m.embed_eligible && rows_present.contains(m.message_block_id.as_str()))
-            {
-                let bid = msg.message_block_id.as_str();
-                if present.contains(bid) || !emitted.insert(bid) {
+            for (bid, tenant) in &candidates {
+                if present.contains(bid.as_str()) {
                     continue;
                 }
                 let provider = match &cached_provider {
@@ -1165,8 +1154,8 @@ impl LanceStore {
                 };
                 jobs.push(TranscriptEmbeddingJobRow {
                     job_id: uuid::Uuid::now_v7().to_string(),
-                    tenant: msg.tenant.clone(),
-                    message_block_id: msg.message_block_id.clone(),
+                    tenant: tenant.clone(),
+                    message_block_id: bid.clone(),
                     provider,
                     status: "pending".to_string(),
                     attempt_count: 0,
@@ -1689,6 +1678,13 @@ mod tests {
     /// enqueue, so the job was never created and the block silently lost ANN
     /// coverage. Replaying create_conversation_message must REPAIR the missing
     /// job, and must not duplicate one that already exists.
+    ///
+    /// Critically, a real replay goes through the ingest path, which re-mints
+    /// `message_block_id` per request (server-side `uuid::now_v7`). The row is
+    /// deduped by `(transcript_path, line_number, block_index)`, so the STORED
+    /// row keeps its ORIGINAL id and the replay carries a DIFFERENT one. The
+    /// repair must reconcile the job against the stored id, not the caller's
+    /// freshly-minted one — so this test replays with a new id each time.
     #[tokio::test]
     pub async fn create_conversation_message_replay_repairs_orphaned_job() {
         let dir = tempdir().unwrap();
@@ -1697,8 +1693,10 @@ mod tests {
             .unwrap();
         repo.set_transcript_job_provider("fake-test");
 
-        let m = msg(
-            "mb_orphan",
+        // Shared path so the dedup key collides regardless of the block id.
+        let shared_path = "/tmp/orphan_replay.jsonl";
+        let mut v1 = msg(
+            "mb_orphan_v1",
             "tenant-a",
             Some("sess_a"),
             1,
@@ -1707,33 +1705,45 @@ mod tests {
             "an embed-eligible block",
             "00000001778000000010",
         );
-        repo.create_conversation_message(&m).await.unwrap();
+        v1.transcript_path = shared_path.to_string();
+        repo.create_conversation_message(&v1).await.unwrap();
         assert_eq!(
-            job_count(&repo, "mb_orphan").await,
+            job_count(&repo, "mb_orphan_v1").await,
             1,
-            "first write enqueues one job"
+            "first write enqueues one job for the stored id"
         );
 
         // Simulate the enqueue having failed after the row committed.
-        drop_job(&repo, "mb_orphan").await;
+        drop_job(&repo, "mb_orphan_v1").await;
         assert_eq!(
-            job_count(&repo, "mb_orphan").await,
+            job_count(&repo, "mb_orphan_v1").await,
             0,
             "precondition: orphaned"
         );
 
-        // Replay: row already exists; the fix must re-create the missing job.
-        repo.create_conversation_message(&m).await.unwrap();
+        // Replay with a DIFFERENT message_block_id but the SAME dedup key: the
+        // stored row (v1) is kept, v2 is discarded. The fix must re-create the
+        // missing job for the STORED id v1, never for the caller's v2.
+        let mut v2 = v1.clone();
+        v2.message_block_id = "mb_orphan_v2".to_string();
+        repo.create_conversation_message(&v2).await.unwrap();
         assert_eq!(
-            job_count(&repo, "mb_orphan").await,
+            job_count(&repo, "mb_orphan_v1").await,
             1,
-            "replay repairs the orphan"
+            "replay repairs the orphan against the stored id"
+        );
+        assert_eq!(
+            job_count(&repo, "mb_orphan_v2").await,
+            0,
+            "no job is created for the discarded caller id"
         );
 
-        // Replaying again must NOT duplicate the now-present job.
-        repo.create_conversation_message(&m).await.unwrap();
+        // Replaying yet again (another fresh id) must NOT duplicate the job.
+        let mut v3 = v1.clone();
+        v3.message_block_id = "mb_orphan_v3".to_string();
+        repo.create_conversation_message(&v3).await.unwrap();
         assert_eq!(
-            job_count(&repo, "mb_orphan").await,
+            job_count(&repo, "mb_orphan_v1").await,
             1,
             "no duplicate enqueue"
         );
@@ -1743,7 +1753,8 @@ mod tests {
     /// batch already exists (a `mem mine` replay), the old code early-returned
     /// before the enqueue block, so an orphaned block was never repaired. The
     /// reconciliation must run over the whole batch regardless of how many rows
-    /// are freshly inserted.
+    /// are freshly inserted — and, like the single path, against the STORED
+    /// block id (the replay re-mints the caller id per request).
     #[tokio::test]
     pub async fn create_conversation_messages_batch_replay_repairs_orphaned_job() {
         let dir = tempdir().unwrap();
@@ -1752,8 +1763,9 @@ mod tests {
             .unwrap();
         repo.set_transcript_job_provider("fake-test");
 
-        let mut m = msg(
-            "mb_b_orphan",
+        let shared_path = "/tmp/bulk_orphan.jsonl";
+        let mut v1 = msg(
+            "mb_b_orphan_v1",
             "tenant-a",
             Some("sess_a"),
             5,
@@ -1762,43 +1774,52 @@ mod tests {
             "bulk embed-eligible block",
             "00000001778000000050",
         );
-        m.transcript_path = "/tmp/bulk.jsonl".to_string();
+        v1.transcript_path = shared_path.to_string();
 
         assert_eq!(
-            repo.create_conversation_messages_batch(&[m.clone()])
+            repo.create_conversation_messages_batch(&[v1.clone()])
                 .await
                 .unwrap(),
             1
         );
-        assert_eq!(job_count(&repo, "mb_b_orphan").await, 1);
+        assert_eq!(job_count(&repo, "mb_b_orphan_v1").await, 1);
 
-        drop_job(&repo, "mb_b_orphan").await;
+        drop_job(&repo, "mb_b_orphan_v1").await;
         assert_eq!(
-            job_count(&repo, "mb_b_orphan").await,
+            job_count(&repo, "mb_b_orphan_v1").await,
             0,
             "precondition: orphaned"
         );
 
-        // Replay the same batch: every row already exists (inserted == 0), but
-        // the orphaned job must still be repaired.
+        // Replay with a fresh id but the same dedup key: inserted == 0, but the
+        // orphaned job must be repaired against the STORED id v1.
+        let mut v2 = v1.clone();
+        v2.message_block_id = "mb_b_orphan_v2".to_string();
         assert_eq!(
-            repo.create_conversation_messages_batch(&[m.clone()])
+            repo.create_conversation_messages_batch(&[v2.clone()])
                 .await
                 .unwrap(),
             0
         );
         assert_eq!(
-            job_count(&repo, "mb_b_orphan").await,
+            job_count(&repo, "mb_b_orphan_v1").await,
             1,
-            "bulk replay repairs the orphan"
+            "bulk replay repairs the orphan against the stored id"
+        );
+        assert_eq!(
+            job_count(&repo, "mb_b_orphan_v2").await,
+            0,
+            "no job is created for the discarded caller id"
         );
 
-        // And no duplicate on a further replay.
-        repo.create_conversation_messages_batch(&[m.clone()])
+        // No duplicate on a further replay (yet another fresh id).
+        let mut v3 = v1.clone();
+        v3.message_block_id = "mb_b_orphan_v3".to_string();
+        repo.create_conversation_messages_batch(&[v3.clone()])
             .await
             .unwrap();
         assert_eq!(
-            job_count(&repo, "mb_b_orphan").await,
+            job_count(&repo, "mb_b_orphan_v1").await,
             1,
             "no duplicate enqueue"
         );
