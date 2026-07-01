@@ -218,15 +218,17 @@ impl GraphStore for ClickHouseBackend {
         as_of: Option<&str>,
     ) -> Result<Vec<GraphEdge>, GraphError> {
         // `as_of=Some(ts)` → edges active at ts; `as_of=None` → the FULL history
-        // (active + closed) for the predicate. Ordered `valid_from ASC` to match
-        // the lance backend + the MCP contract. (The scaffold ignored `as_of`
-        // and returned only the currently-active set.)
+        // (active + closed) for the predicate. Ordered `(valid_from, from_node_id,
+        // to_node_id) ASC` to match the lance + postgres backends exactly — the
+        // tie-break keys make same-`valid_from` edges deterministic (ClickHouse
+        // FINAL + parallel merge gives no order among equal sort keys otherwise).
+        // (The scaffold ignored `as_of` and returned only the currently-active set.)
         let rows = match as_of {
             Some(ts) => {
                 self.ch_edges(
                     "SELECT ?fields FROM graph_edges FINAL \
                      WHERE relation = ? AND valid_from <= ? AND (valid_to = '' OR valid_to > ?) \
-                     ORDER BY valid_from ASC",
+                     ORDER BY valid_from ASC, from_node_id ASC, to_node_id ASC",
                     &[predicate, ts, ts],
                 )
                 .await?
@@ -234,7 +236,8 @@ impl GraphStore for ClickHouseBackend {
             None => {
                 self.ch_edges(
                     "SELECT ?fields FROM graph_edges FINAL \
-                     WHERE relation = ? ORDER BY valid_from ASC",
+                     WHERE relation = ? \
+                     ORDER BY valid_from ASC, from_node_id ASC, to_node_id ASC",
                     &[predicate],
                 )
                 .await?

@@ -411,13 +411,27 @@ mod ch {
         ))
         .await
         .unwrap();
+        // Tie on valid_from with qa→qb (both "...100"), but a from_node_id that
+        // sorts first — exercises the (valid_from, from_node_id, to_node_id)
+        // tie-break so the order is deterministic (matches lance/postgres).
+        // Closed at "...120" (before the as_of=150 probe) so it only affects the
+        // full-history ordering, not the point-in-time count below.
+        be.add_edge_direct(&dated_edge(
+            "q0",
+            "qz",
+            "pred:qp",
+            "00000000000000000100",
+            Some("00000000000000000120"),
+        ))
+        .await
+        .unwrap();
 
         let all = be.query_predicate("pred:qp", None).await.unwrap();
+        let from_order: Vec<&str> = all.iter().map(|e| e.from_node_id.as_str()).collect();
         assert_eq!(
-            all.len(),
-            2,
-            "as_of=None must return the full history (active + closed), got {}",
-            all.len()
+            from_order,
+            vec!["q0", "qa", "qc"],
+            "full history must be ordered by (valid_from, from_node_id, to_node_id); got {from_order:?}"
         );
 
         let at_150 = be
