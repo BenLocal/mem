@@ -65,15 +65,31 @@ pub async fn tick(
     settings: &EmbeddingSettings,
 ) -> Result<(), StorageError> {
     let now = current_timestamp();
-    // Single-claim cadence (one job per tick) — matches the legacy
-    // shape; `Store::claim_next_n_transcript_embedding_jobs` returns
-    // up to N but we ask for 1.
+    // Drain up to `batch_size` jobs per tick. This was a hardcoded 1, which made
+    // `EMBEDDING_BATCH_SIZE` a silent no-op for the transcript queue (a `mem mine`
+    // backlog then cleared at ~one block per poll interval). Each job embeds
+    // independently; a StorageError aborts the rest of the batch and the next
+    // tick retries — matching the memories worker's per-job `?`.
+    let n = settings.batch_size.max(1);
     let claimed = store
-        .claim_next_n_transcript_embedding_jobs(&now, settings.max_retries, 1)
+        .claim_next_n_transcript_embedding_jobs(&now, settings.max_retries, n)
         .await?;
-    let Some(job) = claimed.into_iter().next() else {
-        return Ok(());
-    };
+    for job in claimed {
+        process_job(store, provider, settings, job).await?;
+    }
+    Ok(())
+}
+
+/// Embed one claimed transcript job: validate the provider, fetch the block,
+/// chunk + redact + embed, then complete it. Per-job embedding failures are
+/// recorded and swallowed (returns Ok) so they don't abort the rest of the
+/// tick's batch; only a StorageError propagates.
+async fn process_job(
+    store: &dyn Backend,
+    provider: &dyn EmbeddingProvider,
+    settings: &EmbeddingSettings,
+    job: crate::storage::ClaimedTranscriptEmbeddingJob,
+) -> Result<(), StorageError> {
     info!(
         job_id = %job.job_id,
         tenant = %job.tenant,
@@ -259,6 +275,74 @@ fn embed_input_chunks(content: &str) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    use crate::config::{EmbeddingProviderKind, EmbeddingSettings};
+    use crate::domain::{BlockType, ConversationMessage, MessageRole};
+    use crate::embedding::FakeEmbeddingProvider;
+    use crate::storage::Store;
+
+    fn tmsg(line: u64, content: &str) -> ConversationMessage {
+        ConversationMessage {
+            message_block_id: format!("mb_{line}"),
+            session_id: Some("s".into()),
+            tenant: "t".into(),
+            caller_agent: "test".into(),
+            transcript_path: "/tmp/d.jsonl".into(),
+            line_number: line,
+            block_index: 0,
+            message_uuid: None,
+            role: MessageRole::Assistant,
+            block_type: BlockType::Text,
+            content: content.into(),
+            tool_name: None,
+            tool_use_id: None,
+            embed_eligible: true,
+            created_at: format!("0000000177800000{line:04}"),
+            meta_json: None,
+        }
+    }
+
+    /// One tick must drain up to `batch_size` jobs, not a hardcoded 1 — otherwise
+    /// `EMBEDDING_BATCH_SIZE` is silently a no-op for the transcript queue and a
+    /// `mem mine` backlog clears at ~one block per poll interval.
+    #[tokio::test]
+    async fn tick_drains_batch_size_jobs_per_tick() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path().join("store")).await.unwrap();
+        store.set_transcript_job_provider("fake");
+
+        // 3 embed-eligible blocks → 3 enqueued jobs.
+        for i in 0..3u64 {
+            store
+                .create_conversation_message(&tmsg(i + 1, &format!("block {i}")))
+                .await
+                .unwrap();
+        }
+
+        let mut settings = EmbeddingSettings::development_defaults();
+        settings.provider = EmbeddingProviderKind::Fake; // job_provider_id() == "fake"
+        settings.batch_size = 3;
+        let provider = FakeEmbeddingProvider::from_settings(&settings);
+
+        // Single tick.
+        tick(&store, &provider, &settings).await.unwrap();
+
+        // If the tick honored batch_size it processed all 3 → nothing left to
+        // claim. The old hardcoded-1 tick leaves 2 pending.
+        let remaining = store
+            .claim_next_n_transcript_embedding_jobs(
+                "99999999999999999999",
+                settings.max_retries,
+                10,
+            )
+            .await
+            .unwrap();
+        assert!(
+            remaining.is_empty(),
+            "one tick must drain all 3 jobs (batch_size); {} left",
+            remaining.len()
+        );
+    }
 
     #[test]
     fn short_message_is_single_chunk_equal_to_content() {
