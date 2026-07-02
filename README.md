@@ -462,22 +462,44 @@ Response shape: `{ "windows": [{ "session_id": "...", "blocks": [...], "primary_
 | `MEM_TRANSCRIPT_EMBED_DISABLED` | unset | Set to `1` to stop the transcript embedding worker (e.g. when using OpenAI to avoid double provider spend). Blocks still archive verbatim. |
 | `MEM_TRANSCRIPT_OVERSAMPLE` | 4 | Candidate fan-out factor for transcript search (`k = limit * factor`). Read live in `TranscriptService::search`; invalid values (non-numeric or 0) silently fall back to default. |
 
-## Benches: Two Different Tools, Different Questions
+## Benches: Four Tools, Different Questions
 
-Mem ships two benches that look similar (both use `tests/bench/` plumbing,
-both produce per-rung JSON in `target/bench-out/`) but answer different
-questions. Pick the right one:
+Mem ships four benches that answer different questions. Pick the right one:
 
 | Bench | Question | When to use | Where |
 |---|---|---|---|
-| **Recall Quality Bench** | Internal: do mem's own ranking signals each carry weight? Should we invest in cross-encoder rerank? | When tuning mem's stack; CI regression smoke | `tests/recall_bench.rs`, 10-rung ablation, synthetic + real fixtures |
-| **MemPalace LongMemEval Parity** | External: how does mem's stack score on the same dataset + protocol that mempalace published baselines for? | Cross-system comparison; manual decision tool | `tests/mempalace_bench.rs`, 3-rung mapping (raw / rooms / full), LongMemEval dataset |
+| **Recall Quality Bench** | Internal: do mem's own ranking signals each carry weight? Should we invest in cross-encoder rerank? | When tuning mem's stack | `tests/recall_bench.rs`, 8-rung ablation (`--ignored`), deterministic geometry embeddings |
+| **Gold-set Regression Gate** | Internal: did this ranking edit make recall worse? | Every CI run (non-ignored, hermetic, ~8s) | `tests/golden_recall.rs` + versioned `tests/golden_recall/baseline.json` |
+| **LongMemEval Parity** | External: session-level memory recall on the benchmark Zep / agentmemory report against | Cross-system comparison | `tests/mempalace_bench.rs`, real `longmemeval_s_cleaned.json` drop-in |
+| **LoCoMo Parity** | External: same question on the track's second common benchmark (mem0 / MemOS / Zep all quote LoCoMo) | Cross-system comparison | `tests/locomo_bench.rs`, real `locomo10.json` drop-in |
 
-The recall-quality bench uses `FakeEmbeddingProvider` (CI-cheap, deterministic,
-ablation-only); the LongMemEval parity bench uses production embedding
-(`Config::from_env()`) so the numbers are real. Don't compare absolute
-NDCG values across the two — different fixtures, different judgments,
-different embedders.
+The internal benches use deterministic fake embeddings (CI-cheap,
+ablation-only); the two parity benches use the production embedding model
+(Qwen3-Embedding-0.6B) so the numbers are real. Don't compare absolute
+values across internal and external benches.
+
+### Published retrieval numbers (2026-07-02)
+
+Both numbers are **session-level memory recall of evidence sessions**
+through mem's real hybrid pipeline (jieba BM25 + Qwen3-0.6B ANN + RRF +
+ranking stack). They are *retrieval recall* — deliberately NOT the
+LLM-judged end-to-end QA accuracy that Zep (LongMemEval 63.8%) or
+mem0/Zep (LoCoMo) headline, which measures a QA model on top of
+retrieval and is a different, harder axis.
+
+| Benchmark | any@5 | recall@5 | recall@10 | mrr | Sample |
+|---|---|---|---|---|---|
+| **LongMemEval-S** (real `longmemeval_s_cleaned.json`) | **0.860** | 0.780 | 0.897 | 0.770 | n=50, type-stratified over the 6 question types |
+| **LoCoMo** (real `locomo10.json`) | **0.660** | 0.607 | 0.688 | 0.502 | n=50, category-stratified across all 10 conversations, adversarial excluded |
+
+`any@5` = ≥1 evidence session in the top-5 (the axis comparable to
+agentmemory's self-reported recall@5); `recall@5` = fraction of ALL
+evidence sessions retrieved. Per-type breakdowns print with each run —
+current weak spots are LongMemEval `single-session-preference`
+(any@5 0.625) and LoCoMo `multi-hop` / `open-domain` (any@5 0.462 /
+0.417), the latter two being the motivating case for graph-as-a-
+retrieval-channel work (oss-memory-diff G2). Reproduce with the
+commands below.
 
 ## Recall Quality Bench (transcripts)
 
@@ -544,45 +566,51 @@ Watch for these synthetic-fixture artifacts (do not generalize to production):
   production — rung differences are config tuples, not parallel rankers.
 - Output JSON shape: see `tests/bench/runner.rs::write_json`.
 
-## MemPalace LongMemEval Parity Bench
+## LongMemEval & LoCoMo Parity Benches
 
-External-comparison benchmark for mem vs mempalace's published
-LongMemEval baselines. Apple-to-apple at the protocol level: same
-dataset (LongMemEval Standard), same per-Q ephemeral corpus, same
-top-K retrieval, same Recall@5/Recall@10/NDCG@10 metrics. mem runs
-its own ranking stack (BM25 + HNSW + ScoringOpts) under three
-rungs (raw / rooms / full equivalents).
+External-comparison harnesses (`#[ignore]`, never in CI — real model,
+real datasets). Shared metric discipline: ingest one capsule per
+conversation session, retrieve with the production hybrid ranker, map
+ranked capsules back to sessions, score `recall@k` / `any@k` / `mrr`
+against the benchmark's evidence-session labels. Sample sizes are
+env-tunable and always printed — carry them into any quote.
 
-### Run
+### LongMemEval (`tests/mempalace_bench.rs`)
 
-Pre-download `longmemeval_s_cleaned.json` from the LongMemEval
-upstream repo (https://github.com/xiaowu0162/LongMemEval). Set
-`EMBEDDING_PROVIDER=embedanything`, `EMBEDDING_MODEL=...`,
-`EMBEDDING_DIM=...` per `.env.example`. Then:
+Drop the official dataset (277 MB, gitignored) into place, then run:
 
-    MEM_LONGMEMEVAL_PATH=/path/to/longmemeval_s_cleaned.json \
-      cargo test --test mempalace_bench longmemeval -- --ignored --nocapture
+    curl -L -o tests/mempalace_bench/data/longmemeval_s_cleaned.json \
+      https://huggingface.co/datasets/xiaowu0162/longmemeval-cleaned/resolve/main/longmemeval_s_cleaned.json
+    LONGMEMEVAL_SAMPLE=50 cargo test --release --test mempalace_bench -- --ignored --nocapture
 
-For a smoke (50 questions instead of 500):
+`LONGMEMEVAL_SAMPLE` (default 50, `0` = full 500) is a deterministic
+type-stratified sample; `LONGMEMEVAL_DATA` overrides the path. Without
+the real file the bench falls back to a bundled synthetic subset and
+labels its output as illustrative-only. Wall-clock: ~6 h for n=50 on a
+96-core CPU box (per-question fresh store; the session embedding
+dominates). One question ≈ 40-50 session embeds.
 
-    MEM_LONGMEMEVAL_PATH=/path/... \
-    MEM_LONGMEMEVAL_LIMIT=50 \
-      cargo test --test mempalace_bench longmemeval -- --ignored --nocapture
+### LoCoMo (`tests/locomo_bench.rs`)
 
-Wall-clock: ~1.5-3 hours for 500 questions x 3 rungs (the embedding
-ingest dominates; rung re-rank is fast).
+    curl -L -o tests/locomo_bench/data/locomo10.json \
+      https://raw.githubusercontent.com/snap-research/locomo/main/data/locomo10.json
+    LOCOMO_SAMPLE=50 cargo test --release --test locomo_bench -- --ignored --nocapture
 
-### Reading the output
+`LOCOMO_SAMPLE` (default 50, `0` = full ~1500 answerable QAs) is
+category-stratified AND spread across all 10 conversations. LoCoMo QAs
+share their conversation's haystack, so the bench builds one store per
+conversation (not per question) — n=50 runs in ~35 min. Category 5
+(adversarial / unanswerable) is excluded, mirroring LongMemEval's
+`_abs` exclusion. Image-only turns fall back to their caption text.
 
-Three JSON files written to `target/bench-out/`:
-- `results_mem_longmemeval_raw_<unix_ts>.json` (vs mempalace `raw` ≈ 0.966 R@5)
-- `results_mem_longmemeval_rooms_<unix_ts>.json` (vs mempalace `rooms` ≈ 0.894 R@5)
-- `results_mem_longmemeval_full_<unix_ts>.json` (vs mempalace `full` per their README)
+### Caveats that ride every quote
 
-Plus a stdout comparison table. The `! Embedding-model parity caveat`
-footer notes that mem uses Qwen3 1024-dim while mempalace uses
-all-MiniLM-L6-v2 384-dim — absolute mem-vs-mempalace deltas include
-both ranking-algorithm AND embedding-model contributions.
+- Retrieval recall ≠ QA accuracy. Comparing these numbers against
+  Zep's 63.8% LongMemEval or mem0's LoCoMo scores compares different
+  axes; the comparable external number is agentmemory's recall@5.
+- Embedding-model parity: mem runs Qwen3-Embedding-0.6B (1024-dim);
+  systems built on other embedders fold ranking AND embedding deltas
+  into any absolute difference.
 
 ## Entity Registry (entities + entity_aliases)
 

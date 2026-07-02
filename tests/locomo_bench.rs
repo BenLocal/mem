@@ -200,24 +200,40 @@ impl Acc {
     }
 }
 
-/// Deterministic, category-stratified sample of up to `n` QA indices
-/// (0 = all): bucket by category in file order, pull round-robin so
-/// every category is represented before any is over-sampled. Mirrors
-/// `mempalace_bench::stratified_sample`.
+/// Deterministic sample of up to `n` QA indices (0 = all), stratified
+/// by category AND spread across conversations: each category bucket
+/// is ordered "first QA of every conversation before the second of
+/// any" (occurrence-within-conversation, then conversation index), and
+/// buckets are drained round-robin. Plain file-order buckets (the
+/// `mempalace_bench` shape) would let the first conversations' QAs
+/// fill the whole sample — a 50-QA sample covering 2 of 10
+/// conversations is a much narrower measurement than it looks.
 fn stratified_qa_sample(qas: &[(usize, LocomoQa)], n: usize) -> Vec<usize> {
     if n == 0 || n >= qas.len() {
         return (0..qas.len()).collect();
     }
-    let mut buckets: BTreeMap<u32, Vec<usize>> = BTreeMap::new();
-    for (i, (_, qa)) in qas.iter().enumerate() {
-        buckets.entry(qa.category).or_default().push(i);
+    // Per (category, conversation) occurrence counters give each QA a
+    // "how many of my conversation's QAs precede me in this bucket"
+    // rank; sorting by (rank, conversation) interleaves conversations.
+    let mut occ: HashMap<(u32, usize), usize> = HashMap::new();
+    let mut buckets: BTreeMap<u32, Vec<(usize, usize, usize)>> = BTreeMap::new(); // (occ, conv, idx)
+    for (i, (conv, qa)) in qas.iter().enumerate() {
+        let slot = occ.entry((qa.category, *conv)).or_insert(0);
+        buckets
+            .entry(qa.category)
+            .or_default()
+            .push((*slot, *conv, i));
+        *slot += 1;
+    }
+    for ids in buckets.values_mut() {
+        ids.sort_unstable();
     }
     let mut order: Vec<usize> = Vec::new();
     let mut round = 0;
     while order.len() < n {
         let mut progressed = false;
         for ids in buckets.values() {
-            if let Some(&idx) = ids.get(round) {
+            if let Some(&(_, _, idx)) = ids.get(round) {
                 order.push(idx);
                 progressed = true;
                 if order.len() >= n {
@@ -540,6 +556,30 @@ mod parse_tests {
         assert!(
             sessions[1].text.contains("Ben: a photo of a bridge"),
             "image turns fall back to the caption"
+        );
+    }
+
+    #[test]
+    fn stratified_sample_spreads_across_conversations() {
+        // 5 conversations × 4 QAs of category 1 each; a sample of 5
+        // must touch EVERY conversation, not drain conversation 0.
+        let qa = || LocomoQa {
+            question: "q".into(),
+            evidence: vec![serde_json::json!("D1:1")],
+            category: 1,
+        };
+        let mut qas: Vec<(usize, LocomoQa)> = Vec::new();
+        for conv in 0..5 {
+            for _ in 0..4 {
+                qas.push((conv, qa()));
+            }
+        }
+        let keep = stratified_qa_sample(&qas, 5);
+        let convs: HashSet<usize> = keep.iter().map(|&i| qas[i].0).collect();
+        assert_eq!(
+            convs.len(),
+            5,
+            "sample must cover all 5 conversations: {convs:?}"
         );
     }
 
