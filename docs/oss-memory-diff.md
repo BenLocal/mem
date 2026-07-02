@@ -229,7 +229,7 @@ FEEDBACK  ── 隐式 / 自动 ──
 **已落地（以代码为权威）**：
 - O6a/O6b：`feat(eval): gold-set recall regression gate`（`2e7a68f`，CI 全绿）。
 - O6c harness：`tests/mempalace_bench.rs`（`#[ignore]`）+ committed `subset.json`（6 条 format-faithful synthetic）+ `tests/mempalace_bench/.gitignore`（挡 277MB 真集）。bench 逻辑：每题 fresh `Store` → 每 haystack session 一条 capsule（真 Qwen3 batch 嵌入 + upsert）→ question 走真 hybrid `rank_with_hybrid_and_graph` → ranked capsule 映回 session id → `recall_any_at_k`/`recall_at_k`/`mrr` over `answer_session_ids`；type-stratified `LONGMEMEVAL_SAMPLE`（默认 50，0=全 500）。
-- **真集数（公开数）= 已可产出、待跑 N=50**：~~本机 contended、N=6 探测 1h40m 未完~~ → **2026-07-02 复跑成功**：空闲机（96 核 load~16）+ **`--release`**（此前 dev-profile 编译 candle 推理是慢的另一半嫌疑）下真集 N=6 **45min 跑完**——recall@5=1.0 / any@5=1.0 / mrr=0.833（n=6 仅证明管线可跑，**不作公开引用**）。外推：默认 N=50 ≈ 6h（可行，过夜跑）；全 500 题仍不实际（~60h+），公开数按 N=50 口径产出并标注样本量。命令：`LONGMEMEVAL_SAMPLE=50 cargo test --release --test mempalace_bench -- --ignored --nocapture`。在 N=50 数产出前 README 仍**不写**任何 LongMemEval 数。
+- **真集数（公开数）✅ 已产出（2026-07-02，N=50 真集，6h02m wall）**：**any@5 = 0.860**（top-5 命中 ≥1 evidence session——agentmemory recall@5 的可比口径）、recall@5 = 0.780（evidence session 覆盖率）、recall@10 = 0.897、mrr = 0.770。分型：knowledge-update 最强（any@5=1.0）、temporal-reasoning any@5=1.0、**single-session-preference 最弱（any@5=0.625, mrr=0.450）**——偏好类问题的召回是下一个排序优化的明确靶子。注意 harness 的 README candidate 行里 `recall@5=0.860` 引用的是 any@5 口径（与 agentmemory 自报可比），措辞引用时带上两口径。历史：6-28 contended+dev-profile N=6 1h40m 未完 → 07-02 idle+release N=6 45min → N=50 6h。命令：`LONGMEMEVAL_SAMPLE=50 cargo test --release --test mempalace_bench -- --ignored --nocapture`。README 引用解禁（建议与 LoCoMo 数一同上）。
 
 #### O6d 在线观测计数 ✅ 落地（O6 离线 eval 的在线补充）
 
