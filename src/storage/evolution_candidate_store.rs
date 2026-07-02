@@ -23,8 +23,14 @@ pub trait EvolutionCandidateStore: Send + Sync {
         candidate: EvolutionCandidate,
     ) -> Result<(), StorageError>;
 
-    /// List candidates for `tenant`, optionally filtered by status
-    /// (`pending` / `executed` / `cancelled`). Sweep-time read.
+    /// List candidates for `tenant`, optionally filtered by status.
+    /// Lifecycle statuses: `pending` (accumulating evidence) /
+    /// `executed` (operation ran; suppresses re-proposals) /
+    /// `cancelled` (evidence decayed below the hysteresis floor) /
+    /// `rejected` (reviewer rejected the executed proposal — E3; stops
+    /// the executed-history suppression so the cluster may re-earn the
+    /// K gate) / `rolled_back` (operator rolled the execution back —
+    /// §11 audit tombstone). Sweep-time read.
     async fn list_evolution_candidates(
         &self,
         tenant: &str,

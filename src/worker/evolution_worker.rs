@@ -332,6 +332,125 @@ pub async fn sweep_once(
     Ok(report)
 }
 
+/// Result of rolling back one executed candidate — §11's audit unit.
+/// Serialized verbatim as the HTTP response of
+/// `POST /reviews/evolution/rollback`.
+#[derive(Debug, Serialize)]
+pub struct RollbackReport {
+    pub candidate_id: String,
+    pub op_kind: String,
+    /// Capsules whose status was written back (merge: losers → Active;
+    /// generalize: the proposal capsule → Archived).
+    pub restored: Vec<String>,
+    /// Lineage edges closed (`valid_to` stamped — never deleted).
+    pub closed_edges: usize,
+}
+
+/// Roll back one executed candidate (doc §11). The rollback unit is a
+/// whole executed candidate row; the inverse is exact because ① merge
+/// only flips loser status + writes lineage edges (E1's documented
+/// deviation from the supersede-chain design) and ② generalize only
+/// inserts a proposal capsule + lineage edges:
+///
+/// - `merge`: losers → `Active` again, their `merged_into` edges get
+///   `valid_to` stamped (closed, never deleted — §11 audit semantics).
+/// - `generalize`: the proposal capsule → `Archived`, ALL its edges
+///   closed; sources were never touched so rollback doesn't touch them.
+///
+/// Edge-close failures are warned and skipped (same tolerance as the
+/// forward path's lineage writes) — the status writes are the
+/// retrieval-semantics restore and DO propagate errors. The candidate
+/// row is kept as a `rolled_back` tombstone, never deleted.
+pub async fn rollback_candidate(
+    store: &dyn Backend,
+    tenant: &str,
+    candidate_id: &str,
+) -> Result<RollbackReport, StorageError> {
+    let all = store.list_evolution_candidates(tenant, None).await?;
+    let mut candidate = all
+        .into_iter()
+        .find(|c| c.candidate_id == candidate_id)
+        .ok_or_else(|| {
+            StorageError::InvalidInput(format!("unknown evolution candidate: {candidate_id}"))
+        })?;
+    if candidate.status != "executed" {
+        return Err(StorageError::InvalidInput(format!(
+            "candidate {candidate_id} is '{}' — only executed candidates can be rolled back",
+            candidate.status
+        )));
+    }
+
+    let now = current_timestamp();
+    let mut restored = Vec::new();
+    let mut closed_edges = 0usize;
+    match candidate.op_kind.as_str() {
+        "merge" => {
+            let canonical =
+                candidate
+                    .result_capsule_ids
+                    .first()
+                    .cloned()
+                    .ok_or(StorageError::InvalidData(
+                        "executed merge candidate has no canonical id",
+                    ))?;
+            for loser in candidate.member_ids.iter().filter(|m| **m != canonical) {
+                store
+                    .set_capsule_status(tenant, loser, CapabilityCapsuleStatus::Active)
+                    .await?;
+                restored.push(loser.clone());
+                match store
+                    .invalidate_edge(
+                        &format!("capability_capsule:{loser}"),
+                        "merged_into",
+                        &format!("capability_capsule:{canonical}"),
+                        &now,
+                    )
+                    .await
+                {
+                    Ok(n) => closed_edges += n,
+                    Err(e) => {
+                        warn!(error = %e, loser = %loser, "rollback: merged_into edge close failed")
+                    }
+                }
+            }
+        }
+        "generalize" => {
+            let proposal =
+                candidate
+                    .result_capsule_ids
+                    .first()
+                    .cloned()
+                    .ok_or(StorageError::InvalidData(
+                        "executed generalize candidate has no proposal id",
+                    ))?;
+            store
+                .set_capsule_status(tenant, &proposal, CapabilityCapsuleStatus::Archived)
+                .await?;
+            restored.push(proposal.clone());
+            match store.close_edges_for_capability_capsule(&proposal).await {
+                Ok(n) => closed_edges += n,
+                Err(e) => {
+                    warn!(error = %e, proposal = %proposal, "rollback: generalizes edge close failed")
+                }
+            }
+        }
+        other => {
+            return Err(StorageError::InvalidInput(format!(
+                "candidate {candidate_id} has unrecognized op_kind '{other}'"
+            )));
+        }
+    }
+
+    candidate.status = "rolled_back".to_string();
+    store.upsert_evolution_candidate(candidate.clone()).await?;
+    Ok(RollbackReport {
+        candidate_id: candidate.candidate_id,
+        op_kind: candidate.op_kind,
+        restored,
+        closed_edges,
+    })
+}
+
 fn gate_label(d: GateDecision) -> &'static str {
     match d {
         GateDecision::Execute => "execute",
@@ -635,7 +754,16 @@ async fn execute_generalize(
     Ok(vec![proposal_id])
 }
 
-fn lineage_edge(from_capsule: &str, to_capsule: &str, relation: &str, now: &str) -> GraphEdge {
+/// Evolution lineage edge (`extractor="evolution"`). `pub(crate)` so the
+/// review-accept path (`capability_capsule_service::edit_and_accept_pending`)
+/// re-writes the SAME edge shape when it moves generalize lineage onto
+/// the accepted successor (E3 "accept 时写边").
+pub(crate) fn lineage_edge(
+    from_capsule: &str,
+    to_capsule: &str,
+    relation: &str,
+    now: &str,
+) -> GraphEdge {
     GraphEdge {
         from_node_id: format!("capability_capsule:{from_capsule}"),
         to_node_id: format!("capability_capsule:{to_capsule}"),

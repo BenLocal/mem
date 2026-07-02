@@ -8,6 +8,38 @@ are organized by feature wave (merge commit ranges on `master`).
 
 ## [Unreleased]
 
+### Added — evolution E2/E3, review-loop closure (2026-07-02)
+
+- **Rollback of one executed evolution candidate** (doc §11):
+  `POST /reviews/evolution/rollback {tenant, candidate_id}` +
+  `evolution_worker::rollback_candidate`. merge: losers → `Active`,
+  `merged_into` lineage edges closed; generalize: proposal capsule →
+  `Archived`, all its edges closed. The candidate row survives as a
+  `rolled_back` tombstone — nothing is ever physically deleted. Done as
+  service + HTTP (not the design's interim CLI): `mem serve` is the Lance
+  dataset's single writer, a second direct-store process would conflict.
+- **Reject closes the loop** (E3): `reject_pending` now closes the rejected
+  capsule's incident graph edges (terminal-transition hygiene — supersede
+  and hard-delete already did this) and, for evolution proposals, flips the
+  producing candidate row `executed` → `rejected`. The cluster may then
+  re-propose, but as a fresh candidate it must re-earn the K-cycle gate
+  before another placeholder reaches the review queue.
+- **Accept carries lineage** (E3): `edit_and_accept_pending` re-writes
+  `generalizes` edges from the accepted successor (a NEW capsule id) to the
+  sources recorded in the placeholder's `evidence` — proposal-time edges on
+  the placeholder are closed by the accept and would otherwise orphan the
+  lineage.
+- Acceptance tests: `tests/evolution_merge.rs` (post-merge retrieval sees
+  only the canonical; dry-run preview set == live execution set; rollback
+  round-trips incl. HTTP) + `tests/evolution_review.rs` (both review legs).
+
+### Changed
+
+- **Dedup narrowed to mirror duplicates** (§12.1 settled with E2):
+  `MEM_DEDUP_THRESHOLD` default 0.92 → **0.95**. The 0.88–0.95
+  near-duplicate band is the evolution ① merge operator's territory now, so
+  the two workers never make competing archive-vs-merge calls on one pair.
+
 ## 2026-06-29 — `0.2.4`
 
 The **OSS-comparison line** (`docs/oss-memory-diff.md` O1–O7) plus its

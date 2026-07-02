@@ -20,6 +20,7 @@ pub fn router() -> Router<AppState> {
         .route("/reviews/auto_promote", post(auto_promote))
         .route("/reviews/idle_archive", post(idle_archive))
         .route("/reviews/evolution", post(evolution))
+        .route("/reviews/evolution/rollback", post(evolution_rollback))
 }
 
 #[derive(Debug, Deserialize)]
@@ -211,6 +212,30 @@ async fn evolution(
     Ok(Json(
         app.capability_capsule_service
             .evolution_sweep(&request.tenant, &app.config.evolution, request.dry_run)
+            .await?,
+    ))
+}
+
+/// §11 rollback of one EXECUTED evolution candidate — the exact inverse
+/// of what a real sweep executed (merge: losers → Active + `merged_into`
+/// edges closed; generalize: proposal → Archived + edges closed). No
+/// `dry_run` field: rollback IS the safety valve, and it errors (400)
+/// on unknown / non-executed candidate ids instead of no-op'ing.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "snake_case")]
+struct EvolutionRollbackRequest {
+    #[serde(default = "default_tenant")]
+    tenant: String,
+    candidate_id: String,
+}
+
+async fn evolution_rollback(
+    State(app): State<AppState>,
+    Json(request): Json<EvolutionRollbackRequest>,
+) -> Result<Json<crate::worker::evolution_worker::RollbackReport>, AppError> {
+    Ok(Json(
+        app.capability_capsule_service
+            .evolution_rollback(&request.tenant, &request.candidate_id)
             .await?,
     ))
 }

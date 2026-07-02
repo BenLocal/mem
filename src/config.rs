@@ -179,12 +179,15 @@ pub struct DedupSettings {
     /// and the duplicates it catches accumulate slowly (one extra
     /// row per redundant mining pass).
     pub interval_secs: u64,
-    /// Cosine similarity threshold. Default 0.92 — pairs with cosine
-    /// at or above this are treated as near-duplicates. The 0.92
-    /// floor catches transcript-miner re-runs without flagging
-    /// genuinely related but distinct capsules (`mempalace/dedup.py`
-    /// uses 0.85 as its lowest setting, but mem capsules are
-    /// typically shorter / more focused so the threshold is higher).
+    /// Cosine similarity threshold. Default 0.95 — pairs with cosine
+    /// at or above this are treated as mirror duplicates. Was 0.92
+    /// until the evolution ① merge operator went live; §12.1 of
+    /// `docs/evolution-worker.md` (settled with E2) narrows dedup to
+    /// mirror-duplicate duty so the two workers never make competing
+    /// "archive vs merge" calls on the same pair — near-duplicates in
+    /// the 0.88–0.95 band are now the merge operator's territory.
+    /// (`mempalace/dedup.py` uses 0.85 as its lowest setting, but mem
+    /// capsules are typically shorter / more focused.)
     pub threshold: f32,
     /// Per-sweep cap on candidate capsules pulled. Default 2_000.
     /// Bigger tenants need a higher cap (or per-scope iteration in a
@@ -340,7 +343,7 @@ pub struct EvolutionSettings {
     pub cluster_threshold: f32,
     /// Cosine threshold for the ① merge operator's sub-grouping inside
     /// a cluster. Between the 0.80 map floor and the dedup worker's
-    /// 0.92 near-duplicate floor. Default 0.88.
+    /// 0.95 mirror-duplicate floor (§12.1). Default 0.88.
     pub merge_threshold: f32,
     /// Minimum number of episodic capsules a stable cluster needs
     /// before the ② generalize operator proposes an abstraction.
@@ -819,13 +822,13 @@ impl VacuumSettings {
 }
 
 impl DedupSettings {
-    /// Default: worker OFF, 6-hour cadence, threshold 0.92, 2_000 cap.
+    /// Default: worker OFF, 6-hour cadence, threshold 0.95, 2_000 cap.
     /// Opt in via `MEM_DEDUP_ENABLED=1`.
     pub fn development_defaults() -> Self {
         Self {
             enabled: false,
             interval_secs: 6 * 3_600,
-            threshold: 0.92,
+            threshold: 0.95,
             scan_limit: 2_000,
         }
     }
@@ -1779,5 +1782,21 @@ mod tests {
             let err = EvolutionSettings::from_env_vars(env(&[(var, bad)]));
             assert!(err.is_err(), "{var}={bad} must be rejected");
         }
+    }
+
+    #[test]
+    fn dedup_default_threshold_is_mirror_duplicate_only() {
+        // §12.1 decision (evolution-worker.md, settled with E2): with the
+        // evolution ① merge operator live, dedup narrows to mirror-duplicate
+        // duty — default cosine floor 0.95, safely above the evolution
+        // merge_threshold (0.88) so the two workers never compete for the
+        // same pair. MEM_DEDUP_THRESHOLD still overrides.
+        let s = DedupSettings::from_env_vars(env(&[])).unwrap();
+        assert!(!s.enabled, "dedup stays opt-in");
+        assert!(
+            (s.threshold - 0.95).abs() < 1e-6,
+            "default dedup threshold must be 0.95 (mirror-only), got {}",
+            s.threshold
+        );
     }
 }

@@ -1055,14 +1055,51 @@ impl CapabilityCapsuleService {
         tenant: &str,
         capability_capsule_id: &str,
     ) -> Result<CapabilityCapsuleRecord, ServiceError> {
-        self.store
+        let original = self
+            .store
             .get_pending(tenant, capability_capsule_id)
             .await?
             .ok_or(ServiceError::NotFound)?;
-        Ok(self
+        let rejected = self
             .store
             .reject_pending(tenant, capability_capsule_id)
-            .await?)
+            .await?;
+
+        // Terminal transition: close incident edges so active graph
+        // reads never see edges pointing at a Rejected row — the
+        // plain-reject analogue of the close inside
+        // `edit_and_accept_pending` (supersede and hard-delete already
+        // close). Edge hygiene must not fail the reject itself.
+        if let Err(e) = self
+            .store
+            .close_edges_for_capability_capsule(capability_capsule_id)
+            .await
+        {
+            tracing::warn!(error = %e, "edge close failed on reject; edges left active");
+        }
+
+        // E3: rejecting an evolution proposal also flips its executed
+        // candidate row to `rejected`. The sweep's executed-history
+        // suppression then stops matching, so the cluster MAY re-propose
+        // — but as a fresh candidate it has to re-earn the K-cycle gate
+        // before another placeholder reaches the review queue.
+        if original.source_agent == crate::worker::evolution_worker::EVOLUTION_SOURCE_AGENT {
+            let executed = self
+                .store
+                .list_evolution_candidates(tenant, Some("executed"))
+                .await?;
+            for mut candidate in executed {
+                if candidate
+                    .result_capsule_ids
+                    .iter()
+                    .any(|id| id == capability_capsule_id)
+                {
+                    candidate.status = "rejected".to_string();
+                    self.store.upsert_evolution_candidate(candidate).await?;
+                }
+            }
+        }
+        Ok(rejected)
     }
 
     /// Service entry point for the auto-promote sweep — delegates to
@@ -1110,6 +1147,21 @@ impl CapabilityCapsuleService {
         dry_run: bool,
     ) -> Result<crate::worker::evolution_worker::EvolutionReport, ServiceError> {
         crate::worker::evolution_worker::sweep_once(&*self.store, settings, tenant, dry_run)
+            .await
+            .map_err(ServiceError::Storage)
+    }
+
+    /// Service entry point for §11 evolution rollback — delegates to
+    /// `evolution_worker::rollback_candidate`. Backs
+    /// `POST /reviews/evolution/rollback`. The rollback unit is one
+    /// EXECUTED candidate; unknown / non-executed ids error (mapped to
+    /// HTTP 400 via `StorageError::InvalidInput`).
+    pub async fn evolution_rollback(
+        &self,
+        tenant: &str,
+        candidate_id: &str,
+    ) -> Result<crate::worker::evolution_worker::RollbackReport, ServiceError> {
+        crate::worker::evolution_worker::rollback_candidate(&*self.store, tenant, candidate_id)
             .await
             .map_err(ServiceError::Storage)
     }
@@ -1180,6 +1232,29 @@ impl CapabilityCapsuleService {
         let edges =
             resolve_drafts_to_edges(drafts, &*self.store, &superseding.tenant, &now).await?;
         self.store.sync_memory_edges(&edges, &now).await?;
+
+        // E3 "accept 时写边": accepting an evolution generalize proposal
+        // mints a NEW capsule id, and the close above just ended the
+        // placeholder's proposal-time lineage — re-own it from the
+        // successor. Source ids ride on the placeholder's `evidence`
+        // (`execute_generalize` puts member ids there exactly so the
+        // lineage survives without the graph).
+        if original.source_agent == crate::worker::evolution_worker::EVOLUTION_SOURCE_AGENT {
+            for source_id in &original.evidence {
+                let edge = crate::worker::evolution_worker::lineage_edge(
+                    &superseding.capability_capsule_id,
+                    source_id,
+                    "generalizes",
+                    &now,
+                );
+                if let Err(e) = self.store.add_edge_direct(&edge).await {
+                    tracing::warn!(
+                        error = %e, source = %source_id,
+                        "generalizes lineage re-write failed on accept"
+                    );
+                }
+            }
+        }
 
         self.enqueue_embedding_job_for_memory(&superseding).await?;
 

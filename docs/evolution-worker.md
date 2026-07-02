@@ -82,7 +82,7 @@ EvoMap（Matthe/Ringel/Skiera 2023；arXiv:2511.04611 是其 Python 工具箱）
 一次 sweep（单 tenant，沿用 `cooccurrence_worker::run(store: Arc<dyn Backend>, settings, tenant)` 的单租户 worker 形态）：
 
 1. **快照**：拉 active 胶囊 id + 元数据 + 嵌入（capped at `scan_limit`，先例同 `dedup_worker`/`cooccurrence_worker`）。
-2. **聚类**：嵌入空间内 union-find on pairwise cosine ≥ `cluster_threshold`（直接复用 `dedup_worker` 已实现的 union-find 骨架，阈值放宽——dedup 找的是近重复 ~0.92+，地图簇找的是同主题 ~0.80 量级）。MVP 用 union-find 够了；簇质量不满意再换 HDBSCAN（纯 Rust 实现存在，留为开放问题 §12）。
+2. **聚类**：嵌入空间内 union-find on pairwise cosine ≥ `cluster_threshold`（直接复用 `dedup_worker` 已实现的 union-find 骨架，阈值放宽——dedup 找的是镜像重复 ~0.95+（E2 起；曾 0.92），地图簇找的是同主题 ~0.80 量级）。MVP 用 union-find 够了；簇质量不满意再换 HDBSCAN（纯 Rust 实现存在，留为开放问题 §12）。
 3. **跨期对齐**（联合映射的离散化）：本期每个簇与上期簇做成员 Jaccard 匹配，≥0.5 视为同一簇延续（继承 `cluster_id`），否则新簇。由此每个簇有了跨期身份，可计算：
    - **簇涌现**：新 `cluster_id` 连续 ≥K 期存在且规模 ≥`min_cluster_size`；
    - **簇稳定性**：成员 churn 率（对称差/并集）的滑动均值；
@@ -309,10 +309,10 @@ HTTP 手动一击：`POST /reviews/evolution {dry_run: bool, ops?: [...]}`（先
 | E# | 里程碑 | 内容 | 验收 |
 |---|---|---|---|
 | E1 ✅(2026-06-11 实现并验收，commit acf2ea2，含 ①② 执行路径) | 地图层+①②一条线 | 快照+聚类+跨期对齐+证据表落库；`POST /reviews/evolution {dry_run:true}` 输出簇报告与候选 | 集成测试：构造 3 期合成数据，簇对齐正确、K 闸生效（2 期信号不触发、3 期触发）、重启证据不丢 |
-| **E1.5** | **解锁②泛化：共享主题信号**（前置依赖，§12.6.5） | 线上 265 条胶囊 `topics` 全空 → ② 结构性沉默。两条路：(a) **推荐·短期**——`detect_generalize` 的共享信号改 `topics ∪ tags`（lowercased 并集；实测 2026-06-11：255/265 条有 ≥2 个 tags 且值有语义如 rust/tools4a/dlhs/performance，立刻可触发，改动面只在 worker 检测函数 + 单测）；(b) **中期**——ingest 侧补 topics 抽取（实体/关键词启发式，零 LLM），绑 ROADMAP #20「内容抽实体」一起做，tags 路线作为其落地前的过渡。两路不互斥，(a) 先行 | 验收：①线上副本 dry-run ② 产生 ≥1 条人工认可的合理提议、无跨主题误聚；②tags-only 语料的检测单测（含 tags 与 topics 混合、大小写归一）；③worker 保持零 LLM；④信号源变更对 ① merge 无行为影响（回归测试） |
+| **E1.5 ✅**(2026-06-12 落地并验收，commit e23a1b5，(a) 路线) | **解锁②泛化：共享主题信号**（前置依赖，§12.6.5） | 线上 265 条胶囊 `topics` 全空 → ② 结构性沉默。两条路：(a) **推荐·短期**——`detect_generalize` 的共享信号改 `topics ∪ tags`（lowercased 并集；实测 2026-06-11：255/265 条有 ≥2 个 tags 且值有语义如 rust/tools4a/dlhs/performance，立刻可触发，改动面只在 worker 检测函数 + 单测）；(b) **中期**——ingest 侧补 topics 抽取（实体/关键词启发式，零 LLM），绑 ROADMAP #20「内容抽实体」一起做，tags 路线作为其落地前的过渡。两路不互斥，(a) 先行。**落地注**：检测与执行共用 `member_themes`/`shared_themes` helper（同一份归一化逻辑，防提议/落库主题集不一致）；(b) 中期路线仍开放、绑 #20 | 验收（已过）：①线上副本 dry-run ② 恰产出 1 条合理提议（同 tags 簇）、无跨主题误聚；②tags-only / 大小写归一 / 不相交主题守卫三形态单测（`tests/evolution.rs`）；③零 LLM；④① merge 行为回归不变 |
 | **E1.6 ✅**(2026-06-12 随立随修) | **auto-promote 绕过 review 闸**（漏洞修补） | 线上 `auto_promote` 默认 ON（age≥3d 的 pending experience 自动转正），而 ② 泛化占位胶囊正是 PendingConfirmation 的 experience——若 3 天内没人 review，**原料占位文会被自动转正进活跃池**，绕过 §6.2「产物强制过 review、永不直接 Active」的设计闸。修复：`auto_promote_worker::sweep_once` 按 `source_agent == EVOLUTION_SOURCE_AGENT`（evolution_worker 导出的共享常量，所有进化产物统一打标）过滤候选，Rust 侧过滤保证 dry-run 预览与真实路径永不分叉 | 验收（已过）：同龄同型双胶囊，evolution 来源的 preview/real 双路均不晋升、对照组正常晋升；原有 auto-promote 测试回归不变 |
-| E2 | ① merge live | keep-longest + supersede 链 + `merged_into` 边 + 滞回 | `tests/evolution_merge.rs`：合并后检索只回 canonical（复用 version_chain_dedup 断言形态）；dry-run 与 live 集合一致；回滚脚本可还原 |
-| E3 | ② generalize（review 形态） | 稳定簇检测 + 占位候选进 pending review + `generalizes` 边（accept 时写） | review 面全流程：list→edit_accept→新 semantic 胶囊 Active、源不动；reject→候选 cancelled 且 K 期内不复提 |
+| **E2 ✅**(2026-07-02 形式验收补齐；执行路径/滞回随 E1 已在跑，线上已真实执行过 merge) | ① merge live | keep-longest + `merged_into` 边 + 滞回（E1 已载）；本期补：`tests/evolution_merge.rs` 验收 + §11 回滚 + §12.1 决策落地（dedup 默认阈值 0.92→**0.95** 收窄为镜像专用，`config.rs::DedupSettings`） | 验收（已过）：合并后 `search_candidates` 只回 canonical（version_chain_dedup 断言形态）、loser 行保留 Archived；dry-run 与 live 集合逐 id 一致；回滚可还原——**实现注**：回滚做成 `POST /reviews/evolution/rollback`（service+HTTP）而非原稿的 CLI 一击，因为 `mem serve` 是数据集单写者，第二个直连 store 的写进程会打架；`evolution_worker::rollback_candidate` 按候选行反做（merge: loser→Active + `invalidate_edge` 关 `merged_into`；generalize: 占位→Archived + 关全部边），候选行留 `rolled_back` 墓碑 |
+| **E3 ✅**(2026-07-02) | ② generalize（review 形态） | 稳定簇检测 + 占位候选进 pending review（E1 已载）；本期补 review 环闭合：reject→候选 `rejected` + 关占位边；edit_accept→血缘重写到 successor | 验收（已过，`tests/evolution_review.rs`）：list→edit_accept→新 semantic 胶囊 Active、源不动、**successor 重持有 4 条 `generalizes` 边**；reject→候选 `executed`→`rejected`（executed-history 抑制解除）且新占位 K 期内不进 review、K 期后闸门重开——**实现注**：「`generalizes` 边 accept 时写」的真实形态 = 提案时写在占位上（E1 行为保留）+ reject 时随胶囊关边 + edit_accept 时从占位 `evidence`（=源 id 清单）重写到新 id 的 successor；因 edit_accept 铸新 id，纯 accept-时-写无法覆盖占位被拒的审计需求。候选状态机扩为 pending/executed/cancelled/`rejected`/`rolled_back` |
 | E4 | ⑤ reweight + ⑥ Hebbian | feedback_events 通道调权；`co_recalled_with` 建边+剪枝 | 调权可在 feedback_events 审计到；剪枝只动 `extractor="evolution"` 边 |
 | E5 | Phase 2 合成后端 | `SynthesisBackend` trait + `review` 后端（=E3 行为收编）+ ③④ 检测器 | `synthesis=off→review` 切换无行为差异（E3 即 review 后端的验证） |
 | E6（LATER） | `local`/`api` 后端 | 自动合成，产物仍强制过 review | 需求出现再做 |
@@ -329,12 +329,12 @@ HTTP 手动一击：`POST /reviews/evolution {dry_run: bool, ops?: [...]}`（先
   - ②：归档 semantic 新胶囊 + 关 `generalizes` 边（源本来就没动过）；
   - ⑤：feedback_events 有逆向量（按 note 圈出后反向施加）；
   - ⑥：边置 `valid_to`（点时查询可回看）。
-- 提供 `POST /reviews/evolution/rollback {candidate_id}`（MVP 可先做成 CLI 一击，HTTP 面 E4 后补）。
+- ✅ `POST /reviews/evolution/rollback {tenant, candidate_id}`（E2 落地，2026-07-02）：直接做了 HTTP 面而没走「CLI 一击」过渡——`mem serve` 是 Lance 数据集的单写者，独立 CLI 进程直连 store 会与在跑的 serve 冲突。unknown / 非 executed 候选返回 400。
 - **永不物理删**：任何路径都不删行、不删边、不改 content——回滚后的世界与执行前在检索语义上等价，在审计语义上多一段历史。
 
 ## 12. 风险与开放问题
 
-1. **与 `dedup_worker` 的职权重叠**：① merge 落地后建议 dedup 收窄为 cosine ≥0.95 的镜像重复专用（或直接退役并入 ①），避免两个 worker 对同一对胶囊做出"归档 vs 合并"的竞争决策。定夺放 E2。
+1. **与 `dedup_worker` 的职权重叠**：~~① merge 落地后建议 dedup 收窄为 cosine ≥0.95 的镜像重复专用（或直接退役并入 ①），避免两个 worker 对同一对胶囊做出"归档 vs 合并"的竞争决策。定夺放 E2。~~ ✅ E2 定夺（2026-07-02）：**收窄不退役**——`DedupSettings` 默认阈值 0.92→0.95（`MEM_DEDUP_THRESHOLD` 仍可覆写），0.88–0.95 带交给 ① merge；退役是不可逆动作，观察一个周期 ① 覆盖良好后再评估。
 2. **⑤ 的 feedback 通道污染**：用 `applies_here + note` 会混入人工反馈统计；新增系统侧 `FeedbackKind`（如 `system_reweight`）更干净但动 domain 枚举。倾向后者，E4 定夺。
 3. **聚类算法升级**：union-find 单链效应在大簇上会"桥接"不相干主题；HDBSCAN 纯 Rust 生态可选项待调研（E1 后评估簇质量再决定）。
 4. **多租户**：沿用单租户 worker（env 指定）先例；多租户 fan-out 与 `auto_promote_worker` 一起将来统一解决。
