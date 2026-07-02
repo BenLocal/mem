@@ -305,3 +305,23 @@ O1–O7 之外,沿 Zep/Graphiti/Letta/Mem0/Cognee 等更广赛道扫出的候选
 | **G5** | 结构化 user/project 画像（Mem0 user-scope / Memobase） | ✅ 落地（read-side MVP） | `build_profile` + `POST /capability_capsules/profile`:把某 scope 的**活跃** Preference(directives)+ Workflow(procedural)+ 租户 entities 聚合成可查询画像。**纯读、零新存储、按需派生**(始终反映 live 胶囊,无需单独维护 profile 记录);Active-only 与召回口径一致。 |
 | **G6** | agent 自主编辑工具（Letta memory_replace/insert/rethink） | ⏸ defer（缓） | 原语已有(supersede/review_accept/set_capsule_status/kg_*);Letta 式 merge/promote/relink 是包一层。但与 verbatim 有张力,且 evolution worker(E1)已服务端自主 merge/generalize,部分重复。 |
 | **G7** | 多检索模式 / query 路由（Cognee 14 模式） | ⏸ defer（过度设计） | 单 hybrid 管线 + intent 信号已自适应;14 模式对 local-first 过度设计。 |
+
+## 9. H-series 跟进（2026-07-02，第三轮赛道扫描：MemOS / A-Mem / MIRIX / Letta sleep-time / LangMem）
+
+> 扫描动机：G-series（06-29）之后赛道又有新主角——MemTensor **MemOS**（自进化记忆 OS，LongMemEval +40%、35% token 节省自报）、NeurIPS'25 **A-Mem**（Zettelkasten 式 agentic memory）、**MIRIX**（六型记忆多 agent 系统）；Letta 的 **sleep-time compute** 成为正式范式、LangChain 推 **LangMem**。逐个对照 mem 现状（E1–E5 六算子 Phase 1 已闭合后的状态）研判。
+>
+> **先说结论——mem 已覆盖对方主打卖点的部分**（别重复造）：Zep 时序 KG ≈ bitemporal `graph_edges`+G4；Letta sleep-time 后台重组 ≈ evolution worker（且 mem 是零-LLM 版）；MemOS 渐进式披露省 token ≈ `MEM_RECALL_STYLE=index`（实测 -45%）；MemOS MemScheduler 异步摄入 ≈ `embedding_jobs` 队列；MIRIX 六型记忆 ≈ mem 六 capsule type（experience/implementation/preference/episode/workflow/diary）；LangMem 后台偏好抽取 ≈ O7(b) heuristic lane + propose_preference。
+
+| 项 | 主题（来源） | 研判 | 论据与触点 |
+|---|---|---|---|
+| **H1** | **ingest 时近邻连边**（A-Mem 链接网络思想的零-LLM 切片） | 🟢 值得做（S） | A-Mem 每条新记忆 LLM 建链 + 触发旧记忆演化；mem 的零-LLM 等价切片：embedding worker 嵌完新胶囊后（`flag_if_near_duplicate` 同一时机）对 cosine ∈ [连接阈值, 近重复阈值) 的 top-k 邻居写 `related_to` 边（extractor=`ingest_link`，非 review、纯连通性）。直接喂 O4 graph boost，也为 G2「图第三召回通道」预铺边密度。风险低：不动状态、不动内容，只加边。 |
+| **H2** | **反馈笔记 → 修订提案**（MemOS「自然语言纠错」的 review-gated 版） | 🟢 值得做（S，复用 E5 ③） | MemOS 支持用 NL 反馈直接修正记忆；mem 的对应件已经齐了 90%：`outdated`/`incorrect` 反馈的 `note` 本就 verbatim 落 `feedback_events`，E5 ③ refine 已把 `outdated≥2` 当冲突信号——差的只是把这些 note **抄进 refine 占位的冲突证据清单**（现在只写计数），reviewer 一眼看到"为什么旧"。零 LLM、零新表，改动面 = refine 检测收集 note + `SynthesisTask::Refine` 原料。 |
+| **H3** | **LoCoMo bench harness**（mem0/MemOS/Zep 通用第二基准） | 🟢 值得做（M） | 赛道自报口径已从单一 LongMemEval 变成 LongMemEval+LoCoMo（+PersonaMem/PrefEval）双基准起步；mem 只有 LongMemEval parity（O6c，N=50 出数中）。复用 `mempalace_bench` 骨架（fresh Store→ingest→hybrid→recall@k），换数据装载器即可。对外可比性直接翻倍。 |
+| **H4** | **Skill 结晶**（MemOS crystallized skills / LangMem prompt optimization） | 🟡 部分已有，差一刀 | mem 已有 episode→workflow 抽取（`pipeline/workflow.rs`）+ ② generalize；缺的是「重复出现的 experience 簇 → **Workflow 型**泛化提案」（现在 ② 固定产 experience 型）。绑 evolution Phase 2 做：`detect_generalize` 按簇成员 task_type/步骤形态判定产物类型。不单独立项。 |
+| **H5** | **MemCube 组合式记忆空间**（MemOS 跨用户/项目/agent 的隔离+受控共享+动态组合） | ⏸ defer | mem 的 tenant+scope+visibility 三轴已覆盖 local-first 单用户的需求；cube 级共享/组合是多用户 SaaS 形态的痛点，等 mem 有第二真实用户再评估。 |
+| **H6** | **Resource/多模态记忆**（MIRIX Resource Memory + Knowledge Vault） | ⏸ defer | code_refs + transcripts 档案覆盖本地开发 agent 的大头；图片/音频引用型记忆无真实语料驱动。Knowledge Vault（凭证保险库）与 O5 脱敏哲学冲突（mem 选择"输出层 mask、存储 verbatim"，不做专门密钥库）。 |
+| **H7** | **sleep-time LLM 重写 / 自动合成**（Letta sleep-time agents 用 LLM 改写 memory blocks） | ⏸ = E6，维持 LATER | 外部趋势印证了 E6（`local`/`api` 合成后端）的方向，但也印证了 mem 的差异化：review-gated 零-LLM 默认是卖点不是短板（Letta 的 LLM 重写无审计闸）。需求出现再做，产物仍强制过 review。 |
+
+**建议批次**：H1+H2 一批（都是 S、都零 LLM、都复用既有管线——H1 挂 embedding worker、H2 挂 E5 refine）；H3 单独一批（纯测试侧）；H4 绑 evolution Phase 2；H5–H7 defer。
+
+**来源**（2026-07-02 检索）：MemOS github.com/MemTensor/MemOS（MemScheduler/MemCube/NL-feedback/35.24% token 节省/LongMemEval +40.43% 自报）；A-Mem arxiv 2502.12110 + github.com/WujiangXu/A-mem-sys（NeurIPS'25，Zettelkasten 建链+记忆演化）；MIRIX arxiv 2507.07957 + github.com/Mirix-AI/MIRIX（六型记忆+多 agent 路由）；Letta sleep-time compute（letta.com/blog/sleep-time-compute）；LangMem（LangGraph 内置 store + 后台记忆管理器）；综述 github.com/TsinghuaC3I/Awesome-Memory-for-Agents。
