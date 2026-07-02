@@ -358,6 +358,13 @@ pub struct EvolutionSettings {
     /// — separately-hot capsules keep their edge (see worker note).
     /// Default 3; 0 rejected.
     pub prune_idle_cycles: u32,
+    /// ④ split (E5): a multi-chunk capsule proposes a split only when
+    /// its chunk groups are SEPARATED below this cosine — every
+    /// cross-group chunk pair must sit at or under this value (doc §4④
+    /// "两簇 cosine 距离 > split_threshold", expressed as a similarity
+    /// ceiling). Well below `cluster_threshold` by design: mild
+    /// internal drift must not shred long capsules. Default 0.5.
+    pub split_threshold: f32,
     /// Phase-2 synthesis backend selection (doc §6.2). E1 implements
     /// `off` (detect-only placeholders) and `review` (defer content to
     /// the pending-review queue — zero LLM in the worker). `local` /
@@ -1137,6 +1144,7 @@ impl EvolutionSettings {
             generalize_min_n: 4,
             scan_limit: 2_000,
             prune_idle_cycles: 3,
+            split_threshold: 0.5,
             synthesis: EvolutionSynthesisMode::Off,
         }
     }
@@ -1223,6 +1231,14 @@ impl EvolutionSettings {
                 return Err(invalid(VAR, &raw));
             }
             s.prune_idle_cycles = n;
+        }
+        if let Some(raw) = get("MEM_EVOLUTION_SPLIT_THRESHOLD") {
+            const VAR: &str = "MEM_EVOLUTION_SPLIT_THRESHOLD";
+            let n: f32 = raw.parse().map_err(|_| invalid(VAR, &raw))?;
+            if !(0.0 < n && n <= 1.0) {
+                return Err(invalid(VAR, &raw));
+            }
+            s.split_threshold = n;
         }
         if let Some(raw) = get("MEM_EVOLUTION_SYNTHESIS") {
             const VAR: &str = "MEM_EVOLUTION_SYNTHESIS";
@@ -1813,6 +1829,24 @@ mod tests {
             EvolutionSettings::from_env_vars(env(&[("MEM_EVOLUTION_PRUNE_IDLE_CYCLES", "0")]))
                 .is_err()
         );
+    }
+
+    #[test]
+    fn evolution_split_threshold_default_and_override() {
+        // ④ split (E5): chunk groups must be separated at or below this
+        // cosine for a split proposal. Default 0.5; range (0, 1].
+        let s = EvolutionSettings::from_env_vars(env(&[])).unwrap();
+        assert!((s.split_threshold - 0.5).abs() < 1e-6);
+        let s = EvolutionSettings::from_env_vars(env(&[("MEM_EVOLUTION_SPLIT_THRESHOLD", "0.4")]))
+            .unwrap();
+        assert!((s.split_threshold - 0.4).abs() < 1e-6);
+        for bad in ["0", "1.5", "nope"] {
+            assert!(
+                EvolutionSettings::from_env_vars(env(&[("MEM_EVOLUTION_SPLIT_THRESHOLD", bad)]))
+                    .is_err(),
+                "{bad} must be rejected"
+            );
+        }
     }
 
     #[test]

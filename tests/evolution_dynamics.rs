@@ -109,6 +109,7 @@ fn dynamics_settings(k_cycles: u32) -> EvolutionSettings {
         generalize_min_n: 99,
         scan_limit: 1_000,
         prune_idle_cycles: 3,
+        split_threshold: 0.5,
         synthesis: EvolutionSynthesisMode::Review,
     }
 }

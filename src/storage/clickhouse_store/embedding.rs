@@ -62,6 +62,15 @@ struct VecOnlyRow {
     embedding: Vec<f32>,
 }
 
+/// Projection: `(chunk_index, embedding)` for the chunk-set read
+/// (`get_capability_capsule_embedding_chunks`) — chunk_index is needed
+/// to drop superseded `row_version`s of the same chunk.
+#[derive(Debug, Row, Deserialize)]
+struct ChunkVecRow {
+    chunk_index: u32,
+    embedding: Vec<f32>,
+}
+
 /// Projection: the `(model, content_hash, source_updated_at)` triple
 /// (`get_capability_capsule_embedding_row`).
 #[derive(Debug, Row, Deserialize)]
@@ -229,6 +238,36 @@ impl EmbeddingVectorStore for ClickHouseBackend {
             .await
             .map_err(ch_err)?;
         Ok(rows.into_iter().next().map(|r| r.embedding))
+    }
+
+    async fn get_capability_capsule_embedding_chunks(
+        &self,
+        capability_capsule_id: &str,
+    ) -> Result<Vec<Vec<f32>>, StorageError> {
+        // ReplacingMergeTree may still hold superseded versions of a
+        // chunk row until a background merge — order by row_version and
+        // keep the newest per chunk_index in Rust.
+        let rows = self
+            .client
+            .query(
+                "SELECT ?fields FROM capability_capsule_embeddings \
+                 WHERE capability_capsule_id = ? \
+                 ORDER BY chunk_index ASC, row_version DESC",
+            )
+            .bind(capability_capsule_id)
+            .fetch_all::<ChunkVecRow>()
+            .await
+            .map_err(ch_err)?;
+        let mut out: Vec<Vec<f32>> = Vec::new();
+        let mut last_idx: Option<u32> = None;
+        for r in rows {
+            if last_idx == Some(r.chunk_index) {
+                continue; // superseded row_version of the same chunk
+            }
+            last_idx = Some(r.chunk_index);
+            out.push(r.embedding);
+        }
+        Ok(out)
     }
 
     async fn upsert_conversation_message_embedding(

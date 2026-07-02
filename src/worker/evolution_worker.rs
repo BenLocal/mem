@@ -59,7 +59,7 @@ use crate::domain::capability_capsule::{
     GraphEdge,
 };
 use crate::evolution::map::{
-    build_clusters, match_candidate, update_on_signal, update_on_silence, GateDecision,
+    build_clusters, cosine, match_candidate, update_on_signal, update_on_silence, GateDecision,
     GateSettings,
 };
 use crate::evolution::synthesis::{ReviewSynthesisBackend, SynthesisBackend, SynthesisTask};
@@ -94,6 +94,13 @@ const DYING_DECAY_FLOOR: f32 = 0.8;
 /// response fanning out is weak evidence for PAIRWISE association, and
 /// the pair count is quadratic in group size.
 const CORECALL_MAX_GROUP: usize = 12;
+/// ③ refine value gate (E5, doc §4③): only capsules recalled within
+/// this window are worth revising — a contradicted capsule nobody
+/// recalls is decay/idle-archive's problem, not refine's.
+const REFINE_RECENT_WINDOW_SECS: u64 = 30 * 86_400;
+/// ③ refine contradiction floor: accumulated `outdated` feedback
+/// events at/above this count as a conflict signal.
+const REFINE_MIN_OUTDATED: u64 = 2;
 
 /// Sweep result — serialized verbatim as the HTTP response of
 /// `POST /reviews/evolution`.
@@ -215,14 +222,25 @@ pub async fn sweep_once(
         .take(settings.scan_limit)
         .collect();
     report.scanned = active.len();
+    // One embeddings read per capsule (same query count as the old
+    // single-vector read, all rows instead of LIMIT 1): the first chunk
+    // feeds the map exactly as before; capsules with ≥2 chunks also
+    // feed ④ split detection (E5).
     let mut vectors: Vec<(usize, Vec<f32>)> = Vec::with_capacity(active.len());
+    let mut chunk_sets: HashMap<usize, Vec<Vec<f32>>> = HashMap::new();
     for (idx, c) in active.iter().enumerate() {
-        match store
-            .get_capability_capsule_embedding_vector(&c.capability_capsule_id)
+        let chunks: Vec<Vec<f32>> = store
+            .get_capability_capsule_embedding_chunks(&c.capability_capsule_id)
             .await?
-        {
-            Some(v) if !v.is_empty() => vectors.push((idx, v)),
-            _ => {} // not embedded yet — joins the map next sweep
+            .into_iter()
+            .filter(|v| !v.is_empty())
+            .collect();
+        match chunks.first() {
+            Some(first) => vectors.push((idx, first.clone())),
+            None => continue, // not embedded yet — joins the map next sweep
+        }
+        if chunks.len() >= 2 {
+            chunk_sets.insert(idx, chunks);
         }
     }
     report.embedded = vectors.len();
@@ -247,6 +265,77 @@ pub async fn sweep_once(
         if let Some(p) = detect_reweight_decay(cluster, &active) {
             proposals.push(p);
         }
+    }
+    // E5 ④ split: multi-chunk capsules whose chunks separate into
+    // well-apart groups (multi-topic in embedding space).
+    for (&idx, chunks) in &chunk_sets {
+        if let Some(p) = detect_split(idx, chunks, &active, settings) {
+            proposals.push(p);
+        }
+    }
+    // E5 ③ refine: contradiction signal (hanging suspected_supersede
+    // edge, or accumulated `outdated` feedback) AND value signal
+    // (recalled within the last 30 days). The value gate runs first so
+    // the per-capsule feedback reads stay bounded to the hot set.
+    let recall_cutoff = ms_cutoff(&now, REFINE_RECENT_WINDOW_SECS);
+    let suspect_targets: HashSet<String> = match store
+        .query_predicate("suspected_supersede", None)
+        .await
+    {
+        Ok(edges) => edges
+            .into_iter()
+            .filter(|e| e.valid_to.is_none())
+            .filter_map(|e| {
+                e.to_node_id
+                    .strip_prefix("capability_capsule:")
+                    .map(str::to_string)
+            })
+            .collect(),
+        Err(e) => {
+            warn!(error = %e, "suspected_supersede read failed — refine signal degraded this sweep");
+            HashSet::new()
+        }
+    };
+    for c in &active {
+        if is_guidance(&c.capability_capsule_type) || c.decay_score > DYING_DECAY_FLOOR {
+            continue;
+        }
+        if c.last_recalled_at
+            .as_deref()
+            .is_none_or(|t| t < recall_cutoff.as_str())
+        {
+            continue;
+        }
+        let mut conflicts: Vec<String> = Vec::new();
+        if suspect_targets.contains(&c.capability_capsule_id) {
+            conflicts.push(
+                "active suspected_supersede edge points at this capsule \
+                 (unresolved O2/O7a near-duplicate proposal)"
+                    .to_string(),
+            );
+        }
+        match store.feedback_summary(&c.capability_capsule_id).await {
+            Ok(s) if s.outdated >= REFINE_MIN_OUTDATED => {
+                conflicts.push(format!(
+                    "{} accumulated `outdated` feedback event(s)",
+                    s.outdated
+                ));
+            }
+            Ok(_) => {}
+            Err(e) => warn!(error = %e, "feedback summary read failed during refine detection"),
+        }
+        if conflicts.is_empty() {
+            continue;
+        }
+        let params = serde_json::to_string(&conflicts)
+            .map(|s| format!("{{\"conflicts\":{s}}}"))
+            .unwrap_or_else(|_| "{}".to_string());
+        proposals.push(Proposal {
+            op_kind: "refine".to_string(),
+            member_ids: vec![c.capability_capsule_id.clone()],
+            members: vec![preview(c)],
+            params,
+        });
     }
     // E4 ⑥ co-recall: pairs sharing a last_used_worker flush batch.
     // Pairs already carrying an active edge are skipped at detection —
@@ -287,8 +376,11 @@ pub async fn sweep_once(
         // recurring ⑤ reweight candidates never park in `executed`,
         // and a ⑥ corecall pair must be re-earnable after its edge is
         // pruned (or rolled back).
-        if matches!(proposal.op_kind.as_str(), "merge" | "generalize")
-            && match_candidate(&proposal.op_kind, &proposal.member_ids, &executed_history).is_some()
+        if matches!(
+            proposal.op_kind.as_str(),
+            "merge" | "generalize" | "refine" | "split"
+        ) && match_candidate(&proposal.op_kind, &proposal.member_ids, &executed_history)
+            .is_some()
         {
             continue;
         }
@@ -377,6 +469,28 @@ pub async fn sweep_once(
                     .await?
                 }
                 "corecall" => execute_corecall(store, &proposal.member_ids, &now).await?,
+                "refine" => {
+                    execute_refine(
+                        store,
+                        tenant,
+                        &proposal.member_ids,
+                        &active,
+                        &proposal.params,
+                        &now,
+                    )
+                    .await?
+                }
+                "split" => {
+                    execute_split(
+                        store,
+                        tenant,
+                        &proposal.member_ids,
+                        &active,
+                        &proposal.params,
+                        &now,
+                    )
+                    .await?
+                }
                 other => {
                     warn!(op_kind = other, "unknown evolution op kind — skipping");
                     Vec::new()
@@ -515,14 +629,17 @@ pub async fn rollback_candidate(
                 }
             }
         }
-        "generalize" => {
+        // ②③④ share the placeholder shape — rollback archives the
+        // placeholder and closes its lineage edges; sources were never
+        // touched by any of the three (§11).
+        "generalize" | "refine" | "split" => {
             let proposal =
                 candidate
                     .result_capsule_ids
                     .first()
                     .cloned()
                     .ok_or(StorageError::InvalidData(
-                        "executed generalize candidate has no proposal id",
+                        "executed placeholder candidate has no proposal id",
                     ))?;
             store
                 .set_capsule_status(tenant, &proposal, CapabilityCapsuleStatus::Archived)
@@ -531,7 +648,7 @@ pub async fn rollback_candidate(
             match store.close_edges_for_capability_capsule(&proposal).await {
                 Ok(n) => closed_edges += n,
                 Err(e) => {
-                    warn!(error = %e, proposal = %proposal, "rollback: generalizes edge close failed")
+                    warn!(error = %e, proposal = %proposal, "rollback: lineage edge close failed")
                 }
             }
         }
@@ -1009,6 +1126,196 @@ fn detect_corecall(
         }
     }
     out
+}
+
+/// ④ split detection (E5): a capsule's chunk vectors separate into ≥2
+/// groups (union-find at `cluster_threshold`, the map's own geometry)
+/// AND every cross-group chunk pair sits at/below `split_threshold` —
+/// well-separated topics, not mild internal drift. Guidance and dying
+/// capsules are excluded (⑤ precedent).
+fn detect_split(
+    idx: usize,
+    chunks: &[Vec<f32>],
+    active: &[CapabilityCapsuleRecord],
+    settings: &EvolutionSettings,
+) -> Option<Proposal> {
+    let c = &active[idx];
+    if is_guidance(&c.capability_capsule_type) || c.decay_score > DYING_DECAY_FLOOR {
+        return None;
+    }
+    let indexed: Vec<(usize, Vec<f32>)> = chunks.iter().cloned().enumerate().collect();
+    let mut groups = build_clusters(&indexed, settings.cluster_threshold);
+    if groups.len() < 2 {
+        return None;
+    }
+    for g in &mut groups {
+        g.sort_unstable();
+    }
+    groups.sort();
+    for (gi, ga) in groups.iter().enumerate() {
+        for gb in groups.iter().skip(gi + 1) {
+            for &a in ga {
+                for &b in gb {
+                    if cosine(&chunks[a], &chunks[b]) > settings.split_threshold {
+                        return None;
+                    }
+                }
+            }
+        }
+    }
+    let params = serde_json::to_string(&groups)
+        .map(|s| format!("{{\"chunk_groups\":{s}}}"))
+        .unwrap_or_else(|_| "{}".to_string());
+    Some(Proposal {
+        op_kind: "split".to_string(),
+        member_ids: vec![c.capability_capsule_id.clone()],
+        members: vec![preview(c)],
+        params,
+    })
+}
+
+/// Insert ONE `PendingConfirmation` review placeholder + its lineage
+/// edges (placeholder → each source). Shared by ③ refine and ④ split;
+/// ② generalize predates this helper and builds the same shape inline.
+async fn insert_review_placeholder(
+    store: &dyn Backend,
+    tenant: &str,
+    sources: &[&CapabilityCapsuleRecord],
+    synthesized: crate::evolution::synthesis::SynthesizedProposal,
+    op_tag: &str,
+    lineage_relation: &str,
+    now: &str,
+) -> Result<Vec<String>, StorageError> {
+    let project = common_value(sources.iter().map(|s| s.project.clone()));
+    let repo = common_value(sources.iter().map(|s| s.repo.clone()));
+    let proposal_id = format!("mem_{}", uuid::Uuid::now_v7());
+    let mut record = CapabilityCapsuleRecord {
+        capability_capsule_id: proposal_id.clone(),
+        tenant: tenant.to_string(),
+        capability_capsule_type: CapabilityCapsuleType::Experience,
+        status: CapabilityCapsuleStatus::PendingConfirmation,
+        scope: sources[0].scope.clone(),
+        visibility: sources[0].visibility.clone(),
+        version: 1,
+        summary: synthesized.summary,
+        content: synthesized.content,
+        // Source ids double as evidence refs — auditable from the row
+        // itself even without the graph (generalize precedent; also the
+        // handle `edit_and_accept_pending` uses to re-own lineage).
+        evidence: sources
+            .iter()
+            .map(|s| s.capability_capsule_id.clone())
+            .collect(),
+        code_refs: vec![],
+        project,
+        repo,
+        module: None,
+        task_type: None,
+        tags: vec![format!("evolution:{op_tag}")],
+        topics: vec![],
+        confidence: 0.6,
+        decay_score: 0.0,
+        content_hash: String::new(),
+        idempotency_key: None,
+        session_id: None,
+        supersedes_capability_capsule_id: None,
+        source_agent: EVOLUTION_SOURCE_AGENT.to_string(),
+        created_at: now.to_string(),
+        updated_at: now.to_string(),
+        last_validated_at: None,
+        last_used_at: None,
+        last_recalled_at: None,
+        expires_at: None,
+    };
+    record.content_hash = compute_content_hash_from_record(&record);
+    store.insert_capability_capsule(record).await?;
+    for s in sources {
+        let edge = lineage_edge(
+            &proposal_id,
+            &s.capability_capsule_id,
+            lineage_relation,
+            now,
+        );
+        if let Err(e) = store.add_edge_direct(&edge).await {
+            warn!(error = %e, relation = lineage_relation, "lineage edge write failed");
+        }
+    }
+    Ok(vec![proposal_id])
+}
+
+/// Execute ③ refine: ONE `PendingConfirmation` placeholder +
+/// `refined_from` lineage. The source is NOT touched — Phase 1 review
+/// form; the reviewer writes the correction via `review_edit_accept`
+/// and supersedes the original explicitly.
+async fn execute_refine(
+    store: &dyn Backend,
+    tenant: &str,
+    member_ids: &[String],
+    active: &[CapabilityCapsuleRecord],
+    params: &str,
+    now: &str,
+) -> Result<Vec<String>, StorageError> {
+    let Some(source) = active
+        .iter()
+        .find(|c| member_ids.contains(&c.capability_capsule_id))
+    else {
+        return Ok(Vec::new());
+    };
+    let conflicts: Vec<String> = serde_json::from_str::<serde_json::Value>(params)
+        .ok()
+        .and_then(|v| serde_json::from_value(v.get("conflicts")?.clone()).ok())
+        .unwrap_or_default();
+    let synthesized = ReviewSynthesisBackend.synthesize(&SynthesisTask::Refine {
+        source,
+        conflicts: &conflicts,
+    });
+    insert_review_placeholder(
+        store,
+        tenant,
+        &[source],
+        synthesized,
+        "refine",
+        "refined_from",
+        now,
+    )
+    .await
+}
+
+/// Execute ④ split: ONE `PendingConfirmation` placeholder +
+/// `split_from` lineage carrying the chunk-group plan. Source untouched
+/// (same Phase 1 review form as ③).
+async fn execute_split(
+    store: &dyn Backend,
+    tenant: &str,
+    member_ids: &[String],
+    active: &[CapabilityCapsuleRecord],
+    params: &str,
+    now: &str,
+) -> Result<Vec<String>, StorageError> {
+    let Some(source) = active
+        .iter()
+        .find(|c| member_ids.contains(&c.capability_capsule_id))
+    else {
+        return Ok(Vec::new());
+    };
+    let chunk_groups: Vec<Vec<usize>> = serde_json::from_str::<serde_json::Value>(params)
+        .ok()
+        .and_then(|v| serde_json::from_value(v.get("chunk_groups")?.clone()).ok())
+        .unwrap_or_default();
+    let synthesized = ReviewSynthesisBackend.synthesize(&SynthesisTask::Split {
+        source,
+        chunk_groups: &chunk_groups,
+    });
+    insert_review_placeholder(
+        store,
+        tenant,
+        &[source],
+        synthesized,
+        "split",
+        "split_from",
+        now,
+    )
+    .await
 }
 
 /// Execute ⑤ reweight over one candidate's members: one auditable

@@ -110,6 +110,7 @@ fn settings_execute_first_sweep() -> EvolutionSettings {
         generalize_min_n: 4,
         scan_limit: 1_000,
         prune_idle_cycles: 3,
+        split_threshold: 0.5,
         synthesis: EvolutionSynthesisMode::Review,
     }
 }

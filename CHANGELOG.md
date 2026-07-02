@@ -8,6 +8,39 @@ are organized by feature wave (merge commit ranges on `master`).
 
 ## [Unreleased]
 
+### Added — evolution E5, ③ refine + ④ split detectors (2026-07-02)
+
+- **③ refine** (`closes evolution-worker E5`): a capsule that is BOTH
+  contradicted (hanging `suspected_supersede` edge from O2/O7a, or ≥2
+  accumulated `outdated` feedback events) AND still valuable (recalled
+  within 30 days — the value gate runs first so per-capsule feedback reads
+  stay bounded to the hot set) earns a K-gated `PendingConfirmation`
+  review placeholder with `refined_from` lineage. Raw material references
+  the source by id + summary + conflict list — never copies content
+  (verbatim rule; deliberate deviation from the doc's "旧内容" wording,
+  generalize precedent). The fact_check triple-conflict channel is left
+  unwired pending real triple corpora.
+- **④ split**: a multi-chunk capsule whose chunk vectors form ≥2 groups
+  (union-find at `cluster_threshold`) with EVERY cross-group pair at/below
+  `split_threshold` (`MEM_EVOLUTION_SPLIT_THRESHOLD`, default 0.5) earns a
+  split placeholder carrying the chunk-group plan + `split_from` lineage.
+  Mild internal drift (e.g. 45° ≈ 0.707 cosine) never shreds a capsule.
+  New `EmbeddingVectorStore::get_capability_capsule_embedding_chunks`
+  read on all three backends (lance / postgres / clickhouse); the sweep's
+  map vector is the first chunk — per-capsule query count unchanged.
+- **SynthesisTask::{Refine, Split}** variants on the review backend;
+  `synthesis=off` ↔ `review` produce byte-identical placeholders (the E5
+  fold-in acceptance — Phase 1 IS the review backend).
+- ③④ inherit the whole E2–E4 machinery: K gate, executed-history
+  suppression, reject→`rejected`+re-earn, rollback (shared placeholder
+  arm), and `edit_and_accept_pending` now re-owns lineage with the
+  placeholder's OWN relation (tag-routed: generalizes / refined_from /
+  split_from).
+- Phase 1 of ③④ never touches the source capsule — after accepting the
+  rewritten/split content, the reviewer supersedes or archives the source
+  explicitly (the "edit another capsule" review action stays an open
+  design item, same as ⑤'s deferred topics relocation).
+
 ### Added — evolution E4, ⑤ reweight + ⑥ Hebbian (2026-07-02)
 
 - **⑤ reweight** (`closes evolution-worker E4`): stable, highly-recalled

@@ -79,6 +79,18 @@ pub trait EmbeddingVectorStore: Send + Sync {
         capability_capsule_id: &str,
     ) -> Result<Option<Vec<f32>>, StorageError>;
 
+    /// Read ALL embedding rows for one capsule — the chunk-vector set
+    /// written by [`Self::upsert_capability_capsule_embedding_chunks`]
+    /// (a single-vector capsule returns one element). Order follows
+    /// `chunk_index` on backends that store it (postgres/clickhouse);
+    /// Lance rows carry no index and return in scan order — consumers
+    /// (④ split detection, E5) treat the set as unordered. Empty when
+    /// the table doesn't exist yet or no row matches.
+    async fn get_capability_capsule_embedding_chunks(
+        &self,
+        capability_capsule_id: &str,
+    ) -> Result<Vec<Vec<f32>>, StorageError>;
+
     /// Upsert a transcript-block embedding. Same wire format as
     /// the capsule side; targets the separate
     /// `conversation_message_embeddings` table.
@@ -196,6 +208,15 @@ impl EmbeddingVectorStore for Store {
     ) -> Result<Option<Vec<f32>>, StorageError> {
         self.lance
             .get_capability_capsule_embedding_vector(capability_capsule_id)
+            .await
+    }
+
+    async fn get_capability_capsule_embedding_chunks(
+        &self,
+        capability_capsule_id: &str,
+    ) -> Result<Vec<Vec<f32>>, StorageError> {
+        self.lance
+            .get_capability_capsule_embedding_chunks(capability_capsule_id)
             .await
     }
 

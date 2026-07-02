@@ -2015,6 +2015,69 @@ impl LanceStore {
         Ok(None)
     }
 
+    /// All embedding rows for one capsule — the chunk-vector set (E5 ④
+    /// split detection). Lance rows carry no chunk index; scan order.
+    pub async fn get_capability_capsule_embedding_chunks(
+        &self,
+        capability_capsule_id: &str,
+    ) -> Result<Vec<Vec<f32>>, StorageError> {
+        let names = self
+            .conn
+            .table_names()
+            .execute()
+            .await
+            .map_err(lancedb_err)?;
+        if !names.iter().any(|n| n == "capability_capsule_embeddings") {
+            return Ok(Vec::new());
+        }
+        let table = self
+            .conn
+            .open_table("capability_capsule_embeddings")
+            .execute()
+            .await
+            .map_err(lancedb_err)?;
+        let stream = table
+            .query()
+            .only_if(format!(
+                "capability_capsule_id = {}",
+                sql_quote(capability_capsule_id)
+            ))
+            .execute()
+            .await
+            .map_err(lancedb_err)?;
+        let batches: Vec<RecordBatch> = stream
+            .try_collect()
+            .await
+            .map_err(|e| StorageError::InvalidInput(format!("lancedb stream: {e}")))?;
+        let mut out = Vec::new();
+        for b in &batches {
+            if b.num_rows() == 0 {
+                continue;
+            }
+            let fsl = parse_col::<arrow_array::FixedSizeListArray>(
+                b,
+                "capability_capsule_embeddings",
+                "embedding",
+            )?;
+            for row in 0..b.num_rows() {
+                let values = fsl.value(row);
+                let floats = values
+                    .as_any()
+                    .downcast_ref::<Float32Array>()
+                    .ok_or_else(|| {
+                        tracing::error!(
+                            table = "capability_capsule_embeddings",
+                            column = "embedding",
+                            "FixedSizeList inner is not Float32Array",
+                        );
+                        StorageError::InvalidData("embedding inner not Float32")
+                    })?;
+                out.push(floats.values().to_vec());
+            }
+        }
+        Ok(out)
+    }
+
     pub async fn latest_embedding_job_status_for_hash(
         &self,
         tenant: &str,

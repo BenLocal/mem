@@ -15,14 +15,29 @@
 
 use crate::domain::capability_capsule::CapabilityCapsuleRecord;
 
-/// One synthesis request. E1 only needs ② generalize — ① merge is
-/// non-generative in E1 (keep-longest selection, no new content).
+/// One synthesis request. ① merge stays non-generative (keep-longest
+/// selection, no new content); ②③④ each carry the raw material their
+/// review placeholder needs.
 #[derive(Debug)]
 pub enum SynthesisTask<'a> {
     /// Abstract N episodic capsules into one semantic principle.
     Generalize {
         sources: &'a [&'a CapabilityCapsuleRecord],
         shared_topics: &'a [String],
+    },
+    /// ③ (E5): revise one contradicted-but-still-valuable capsule.
+    /// `conflicts` names the signals that fired (e.g. a hanging
+    /// `suspected_supersede` edge, accumulated `outdated` feedback).
+    Refine {
+        source: &'a CapabilityCapsuleRecord,
+        conflicts: &'a [String],
+    },
+    /// ④ (E5): split one multi-topic capsule. `chunk_groups` is the
+    /// per-group chunk-index assignment from the embedding map (group
+    /// per proposed new capsule).
+    Split {
+        source: &'a CapabilityCapsuleRecord,
+        chunk_groups: &'a [Vec<usize>],
     },
 }
 
@@ -67,6 +82,60 @@ impl SynthesisBackend for ReviewSynthesisBackend {
                     "[evolution:generalize] proposal over {} capsules ({})",
                     sources.len(),
                     shared_topics.join("/"),
+                );
+                SynthesizedProposal { content, summary }
+            }
+            SynthesisTask::Refine { source, conflicts } => {
+                // Verbatim rule (generalize precedent): reference the
+                // source by id + summary, never copy its full content —
+                // the reviewer fetches it via capability_capsule_get.
+                let mut content = String::new();
+                content.push_str(
+                    "EVOLUTION PROPOSAL — refine (contradicted but still recalled)\n\
+                     Review task: fetch the source capsule below, reconcile it \
+                     with the conflict evidence, and write the corrected version \
+                     via review_edit_accept. To retire the outdated original, \
+                     supersede it explicitly afterwards (capability_capsule_supersede) \
+                     — this proposal does NOT touch the source.\n\n",
+                );
+                content.push_str(&format!(
+                    "Source capsule: {} — {}\n\nConflict evidence:\n",
+                    source.capability_capsule_id, source.summary,
+                ));
+                for c in conflicts.iter() {
+                    content.push_str(&format!("- {c}\n"));
+                }
+                let summary = format!(
+                    "[evolution:refine] proposal for {} ({} conflict signal(s))",
+                    source.capability_capsule_id,
+                    conflicts.len(),
+                );
+                SynthesizedProposal { content, summary }
+            }
+            SynthesisTask::Split {
+                source,
+                chunk_groups,
+            } => {
+                let mut content = String::new();
+                content.push_str(
+                    "EVOLUTION PROPOSAL — split (one capsule carries multiple topics)\n\
+                     Review task: fetch the source capsule below; its embedding \
+                     chunks separate into the groups listed here. Write one \
+                     focused capsule per group (ingest them directly), then \
+                     supersede or archive the source explicitly — this proposal \
+                     does NOT touch it.\n\n",
+                );
+                content.push_str(&format!(
+                    "Source capsule: {} — {}\n\nChunk groups (0-based chunk indices):\n",
+                    source.capability_capsule_id, source.summary,
+                ));
+                for (i, group) in chunk_groups.iter().enumerate() {
+                    content.push_str(&format!("- group {}: chunks {:?}\n", i + 1, group));
+                }
+                let summary = format!(
+                    "[evolution:split] proposal for {} into {} parts",
+                    source.capability_capsule_id,
+                    chunk_groups.len(),
                 );
                 SynthesizedProposal { content, summary }
             }

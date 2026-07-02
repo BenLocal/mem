@@ -1233,24 +1233,33 @@ impl CapabilityCapsuleService {
             resolve_drafts_to_edges(drafts, &*self.store, &superseding.tenant, &now).await?;
         self.store.sync_memory_edges(&edges, &now).await?;
 
-        // E3 "accept 时写边": accepting an evolution generalize proposal
-        // mints a NEW capsule id, and the close above just ended the
+        // E3 "accept 时写边": accepting an evolution proposal mints a
+        // NEW capsule id, and the close above just ended the
         // placeholder's proposal-time lineage — re-own it from the
         // successor. Source ids ride on the placeholder's `evidence`
-        // (`execute_generalize` puts member ids there exactly so the
-        // lineage survives without the graph).
+        // (the execute fns put member ids there exactly so the lineage
+        // survives without the graph). The relation follows the
+        // placeholder's op tag: ② generalizes / ③ refined_from /
+        // ④ split_from (E5).
         if original.source_agent == crate::worker::evolution_worker::EVOLUTION_SOURCE_AGENT {
+            let relation = if original.tags.iter().any(|t| t == "evolution:refine") {
+                "refined_from"
+            } else if original.tags.iter().any(|t| t == "evolution:split") {
+                "split_from"
+            } else {
+                "generalizes"
+            };
             for source_id in &original.evidence {
                 let edge = crate::worker::evolution_worker::lineage_edge(
                     &superseding.capability_capsule_id,
                     source_id,
-                    "generalizes",
+                    relation,
                     &now,
                 );
                 if let Err(e) = self.store.add_edge_direct(&edge).await {
                     tracing::warn!(
-                        error = %e, source = %source_id,
-                        "generalizes lineage re-write failed on accept"
+                        error = %e, source = %source_id, relation,
+                        "lineage re-write failed on accept"
                     );
                 }
             }

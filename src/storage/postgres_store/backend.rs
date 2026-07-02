@@ -1172,6 +1172,30 @@ impl EmbeddingVectorStore for PostgresCapsuleStore {
         }
     }
 
+    async fn get_capability_capsule_embedding_chunks(
+        &self,
+        capability_capsule_id: &str,
+    ) -> Result<Vec<Vec<f32>>, StorageError> {
+        if !embeddings_table_exists(self, "capability_capsule_embeddings").await? {
+            return Ok(Vec::new());
+        }
+        let rows = sqlx::query(
+            "SELECT embedding FROM capability_capsule_embeddings \
+             WHERE capability_capsule_id = $1 ORDER BY chunk_index",
+        )
+        .bind(capability_capsule_id)
+        .fetch_all(self.pool())
+        .await
+        .map_err(sqlx_err)?;
+        rows.into_iter()
+            .map(|r| {
+                r.try_get::<pgvector::Vector, _>("embedding")
+                    .map(|v| v.to_vec())
+                    .map_err(sqlx_err)
+            })
+            .collect()
+    }
+
     #[allow(clippy::too_many_arguments)]
     async fn upsert_conversation_message_embedding(
         &self,
