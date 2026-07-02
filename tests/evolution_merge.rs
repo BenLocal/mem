@@ -109,6 +109,7 @@ fn settings_execute_first_sweep() -> EvolutionSettings {
         merge_threshold: 0.88,
         generalize_min_n: 4,
         scan_limit: 1_000,
+        prune_idle_cycles: 3,
         synthesis: EvolutionSynthesisMode::Review,
     }
 }

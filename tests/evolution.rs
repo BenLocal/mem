@@ -217,6 +217,7 @@ fn evo_settings() -> EvolutionSettings {
         merge_threshold: 0.88,
         generalize_min_n: 4,
         scan_limit: 1_000,
+        prune_idle_cycles: 3,
         synthesis: EvolutionSynthesisMode::Review,
     }
 }
@@ -362,13 +363,18 @@ async fn merge_gate_holds_two_cycles_then_executes_on_third() {
     assert_eq!(executed[0].result_capsule_ids, vec!["winner".to_string()]);
     assert!(executed[0].executed_at.is_some());
 
-    // Cycle 4: nothing left to propose (loser archived out of the map).
+    // Cycle 4: the executed merge must not re-propose (loser archived
+    // out of the map). NOTE: since E4 the surviving canonical — now a
+    // zero-recall map singleton — legitimately draws a ⑤
+    // `reweight_decay` proposal, so the assertion is op-scoped rather
+    // than "no proposals at all".
     let report = evolution_worker::sweep_once(&*store, &settings, TENANT, false)
         .await
         .unwrap();
     assert!(
-        report.proposals.is_empty(),
-        "no re-proposal after execution"
+        report.proposals.iter().all(|p| p.op_kind != "merge"),
+        "no merge re-proposal after execution: got {:?}",
+        report.proposals
     );
     assert!(report.executed.is_empty());
 }

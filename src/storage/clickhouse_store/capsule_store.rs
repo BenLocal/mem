@@ -220,6 +220,8 @@ struct ChFeedbackSummaryRow {
     applies_here: u64,
     does_not_apply_here: u64,
     auto_promoted: u64,
+    system_reweight_up: u64,
+    system_reweight_decay: u64,
 }
 
 #[derive(Debug, Row, Deserialize)]
@@ -552,7 +554,9 @@ impl CapsuleStore for ClickHouseBackend {
                     countIf(feedback_kind = 'incorrect') AS incorrect, \
                     countIf(feedback_kind = 'applies_here') AS applies_here, \
                     countIf(feedback_kind = 'does_not_apply_here') AS does_not_apply_here, \
-                    countIf(feedback_kind = 'auto_promoted') AS auto_promoted \
+                    countIf(feedback_kind = 'auto_promoted') AS auto_promoted, \
+                    countIf(feedback_kind = 'system_reweight_up') AS system_reweight_up, \
+                    countIf(feedback_kind = 'system_reweight_decay') AS system_reweight_decay \
                  FROM feedback_events WHERE capability_capsule_id = ?",
             )
             .bind(capability_capsule_id)
@@ -569,6 +573,8 @@ impl CapsuleStore for ClickHouseBackend {
                 applies_here: s.applies_here,
                 does_not_apply_here: s.does_not_apply_here,
                 auto_promoted: s.auto_promoted,
+                system_reweight_up: s.system_reweight_up,
+                system_reweight_decay: s.system_reweight_decay,
             },
             None => FeedbackSummary::default(),
         })

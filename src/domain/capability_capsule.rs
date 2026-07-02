@@ -79,6 +79,19 @@ pub enum FeedbackKind {
     /// stays queryable. Not a user-driven judgment; never sent by
     /// `submit_feedback`.
     AutoPromoted,
+    /// System-emitted (E4 ⑤ reweight): the evolution worker observed a
+    /// stable, highly-recalled cluster and nudged a member's confidence
+    /// up (+0.02 per signal cycle; the worker stops emitting at 0.9 —
+    /// §4⑤'s cap sits below `apply_feedback`'s generic 1.0 clamp).
+    /// Audit-only from the API's perspective: rejected by
+    /// `submit_feedback` (see [`Self::is_system`]).
+    SystemReweightUp,
+    /// System-emitted (E4 ⑤ reweight): a capsule sat outside every
+    /// cluster with zero recalls for K consecutive sweeps — accelerate
+    /// its slide toward idle-archive (+0.05 decay per signal cycle).
+    /// Archiving itself stays `idle_archive_worker`'s job; this only
+    /// adjusts the signal. Rejected by `submit_feedback`.
+    SystemReweightDecay,
 }
 
 impl FeedbackKind {
@@ -90,6 +103,8 @@ impl FeedbackKind {
             Self::AppliesHere => "applies_here",
             Self::DoesNotApplyHere => "does_not_apply_here",
             Self::AutoPromoted => "auto_promoted",
+            Self::SystemReweightUp => "system_reweight_up",
+            Self::SystemReweightDecay => "system_reweight_decay",
         }
     }
 
@@ -108,6 +123,8 @@ impl FeedbackKind {
             "applies_here" => Self::AppliesHere,
             "does_not_apply_here" => Self::DoesNotApplyHere,
             "auto_promoted" => Self::AutoPromoted,
+            "system_reweight_up" => Self::SystemReweightUp,
+            "system_reweight_decay" => Self::SystemReweightDecay,
             _ => return None,
         })
     }
@@ -116,6 +133,7 @@ impl FeedbackKind {
         match self {
             Self::Useful => 0.1,
             Self::AppliesHere => 0.05,
+            Self::SystemReweightUp => 0.02,
             _ => 0.0,
         }
     }
@@ -124,8 +142,22 @@ impl FeedbackKind {
         match self {
             Self::Outdated => 0.2,
             Self::DoesNotApplyHere => 0.1,
+            Self::SystemReweightDecay => 0.05,
             _ => 0.0,
         }
+    }
+
+    /// System-emitted kinds are audit records written by workers, not
+    /// user judgments — the public feedback surface
+    /// (`submit_feedback`, HTTP `POST /capability_capsules/feedback`,
+    /// MCP `capability_capsule_feedback`) rejects them so an external
+    /// caller can't forge worker-only signal (or archive-bypassing
+    /// status flips) through the review-facing API.
+    pub fn is_system(&self) -> bool {
+        matches!(
+            self,
+            Self::AutoPromoted | Self::SystemReweightUp | Self::SystemReweightDecay
+        )
     }
 
     pub fn marks_validated(&self) -> bool {
@@ -417,6 +449,14 @@ pub struct FeedbackSummary {
     /// `Default`), so this is backward-compatible.
     #[serde(default)]
     pub auto_promoted: u64,
+    /// Counter for `FeedbackKind::SystemReweightUp` (E4 ⑤ cluster
+    /// stability bump). `#[serde(default)]` for pre-E4 payloads.
+    #[serde(default)]
+    pub system_reweight_up: u64,
+    /// Counter for `FeedbackKind::SystemReweightDecay` (E4 ⑤ orphan
+    /// decay nudge). `#[serde(default)]` for pre-E4 payloads.
+    #[serde(default)]
+    pub system_reweight_decay: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]

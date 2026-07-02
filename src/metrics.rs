@@ -58,6 +58,8 @@ pub struct Metrics {
     feedback_does_not_apply_here: AtomicU64,
     feedback_incorrect: AtomicU64,
     feedback_auto_promoted: AtomicU64,
+    feedback_system_reweight_up: AtomicU64,
+    feedback_system_reweight_decay: AtomicU64,
 }
 
 impl Metrics {
@@ -123,6 +125,8 @@ impl Metrics {
             FeedbackKind::DoesNotApplyHere => &self.feedback_does_not_apply_here,
             FeedbackKind::Incorrect => &self.feedback_incorrect,
             FeedbackKind::AutoPromoted => &self.feedback_auto_promoted,
+            FeedbackKind::SystemReweightUp => &self.feedback_system_reweight_up,
+            FeedbackKind::SystemReweightDecay => &self.feedback_system_reweight_decay,
         };
         counter.fetch_add(1, Ordering::Relaxed);
     }
@@ -145,6 +149,8 @@ impl Metrics {
             feedback_does_not_apply_here: load(&self.feedback_does_not_apply_here),
             feedback_incorrect: load(&self.feedback_incorrect),
             feedback_auto_promoted: load(&self.feedback_auto_promoted),
+            feedback_system_reweight_up: load(&self.feedback_system_reweight_up),
+            feedback_system_reweight_decay: load(&self.feedback_system_reweight_decay),
         }
     }
 }
@@ -167,6 +173,8 @@ pub struct MetricsSnapshot {
     pub feedback_does_not_apply_here: u64,
     pub feedback_incorrect: u64,
     pub feedback_auto_promoted: u64,
+    pub feedback_system_reweight_up: u64,
+    pub feedback_system_reweight_decay: u64,
 }
 
 #[cfg(test)]

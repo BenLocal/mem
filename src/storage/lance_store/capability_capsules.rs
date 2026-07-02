@@ -1721,6 +1721,8 @@ impl LanceStore {
                 "applies_here" => summary.applies_here += 1,
                 "does_not_apply_here" => summary.does_not_apply_here += 1,
                 "auto_promoted" => summary.auto_promoted += 1,
+                "system_reweight_up" => summary.system_reweight_up += 1,
+                "system_reweight_decay" => summary.system_reweight_decay += 1,
                 _ => {} // future kinds — counted in `total` only
             }
         }

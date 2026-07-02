@@ -919,6 +919,8 @@ impl CapsuleStore for PostgresCapsuleStore {
                 "applies_here" => summary.applies_here += cnt,
                 "does_not_apply_here" => summary.does_not_apply_here += cnt,
                 "auto_promoted" => summary.auto_promoted += cnt,
+                "system_reweight_up" => summary.system_reweight_up += cnt,
+                "system_reweight_decay" => summary.system_reweight_decay += cnt,
                 _ => {} // future kinds — counted in `total` only
             }
         }

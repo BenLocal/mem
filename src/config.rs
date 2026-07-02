@@ -351,6 +351,13 @@ pub struct EvolutionSettings {
     pub generalize_min_n: usize,
     /// Per-sweep cap on candidate capsules pulled. Default 2_000.
     pub scan_limit: usize,
+    /// ⑥ Hebbian weak-edge retirement (E4): an evolution-owned
+    /// `co_recalled_with` edge is closed after this many sweep cycles
+    /// without co-recall evidence. Idleness is measured conservatively
+    /// against max(edge `valid_from`, either endpoint's `last_used_at`)
+    /// — separately-hot capsules keep their edge (see worker note).
+    /// Default 3; 0 rejected.
+    pub prune_idle_cycles: u32,
     /// Phase-2 synthesis backend selection (doc §6.2). E1 implements
     /// `off` (detect-only placeholders) and `review` (defer content to
     /// the pending-review queue — zero LLM in the worker). `local` /
@@ -1129,6 +1136,7 @@ impl EvolutionSettings {
             merge_threshold: 0.88,
             generalize_min_n: 4,
             scan_limit: 2_000,
+            prune_idle_cycles: 3,
             synthesis: EvolutionSynthesisMode::Off,
         }
     }
@@ -1207,6 +1215,14 @@ impl EvolutionSettings {
                 return Err(invalid(VAR, &raw));
             }
             s.scan_limit = n;
+        }
+        if let Some(raw) = get("MEM_EVOLUTION_PRUNE_IDLE_CYCLES") {
+            const VAR: &str = "MEM_EVOLUTION_PRUNE_IDLE_CYCLES";
+            let n: u32 = raw.parse().map_err(|_| invalid(VAR, &raw))?;
+            if n == 0 {
+                return Err(invalid(VAR, &raw));
+            }
+            s.prune_idle_cycles = n;
         }
         if let Some(raw) = get("MEM_EVOLUTION_SYNTHESIS") {
             const VAR: &str = "MEM_EVOLUTION_SYNTHESIS";
@@ -1782,6 +1798,21 @@ mod tests {
             let err = EvolutionSettings::from_env_vars(env(&[(var, bad)]));
             assert!(err.is_err(), "{var}={bad} must be rejected");
         }
+    }
+
+    #[test]
+    fn evolution_prune_idle_cycles_default_and_override() {
+        // ⑥ Hebbian weak-edge retirement (E4): default 3 idle sweep
+        // cycles, env-tunable, zero rejected loudly (dedup precedent).
+        let s = EvolutionSettings::from_env_vars(env(&[])).unwrap();
+        assert_eq!(s.prune_idle_cycles, 3);
+        let s = EvolutionSettings::from_env_vars(env(&[("MEM_EVOLUTION_PRUNE_IDLE_CYCLES", "5")]))
+            .unwrap();
+        assert_eq!(s.prune_idle_cycles, 5);
+        assert!(
+            EvolutionSettings::from_env_vars(env(&[("MEM_EVOLUTION_PRUNE_IDLE_CYCLES", "0")]))
+                .is_err()
+        );
     }
 
     #[test]

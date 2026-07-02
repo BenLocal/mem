@@ -8,6 +8,39 @@ are organized by feature wave (merge commit ranges on `master`).
 
 ## [Unreleased]
 
+### Added — evolution E4, ⑤ reweight + ⑥ Hebbian (2026-07-02)
+
+- **⑤ reweight** (`closes evolution-worker E4`): stable, highly-recalled
+  clusters (>0.5 of members recalled within one sweep interval) gain +0.02
+  confidence per signal cycle (emission stops at the 0.9 cap); K-cycle map
+  orphans with zero recalls gain +0.05 decay per cycle (archiving stays
+  `idle_archive_worker`'s job). Every nudge is an auditable
+  `feedback_events` row via two new typed system kinds
+  `system_reweight_up` / `system_reweight_decay` (§12.2 settled) with their
+  own `FeedbackSummary` + `/metrics` buckets. Reweight candidates are
+  RECURRING — they never park in `executed`; the open gate re-fires each
+  cycle the signal holds, silence decays them as usual.
+- **⑥ Hebbian co-recall edges**: capsules stamped by the same
+  `last_used_worker` flush (identical `last_used_at`) are one co-recall
+  batch; a pair earns a `co_recalled_with` edge (`extractor="evolution"`,
+  feeding O4's 1-hop graph boost) after K FRESH batches — the candidate's
+  `params` carries the batch timestamp so a stale batch re-observed across
+  sweeps is silence, not evidence. Weak-edge retirement closes idle
+  evolution-owned co_recalled_with edges after `prune_idle_cycles`
+  (`MEM_EVOLUTION_PRUNE_IDLE_CYCLES`, default 3) sweep intervals, measured
+  conservatively against max(edge birth, potentiation stamp, either
+  endpoint's own `last_used_at`); caller edges and `user_tunnel:*` are
+  never touched. Corecall rollback closes the edge via the E2 rollback
+  surface.
+- **Public feedback API hardening**: `FeedbackKind::is_system()` —
+  `submit_feedback` (HTTP + MCP) now rejects system-emitted kinds,
+  enforcing `AutoPromoted`'s long-documented "never sent by
+  submit_feedback" for the first time.
+- Deferred with notes: ⑤'s topics-relocation review proposal (needs an
+  "edit another capsule" review action type — revisit with E5); ⑤ rollback
+  stays note-based inversion per §11 (recurring ops have no single
+  executed state).
+
 ### Added — evolution E2/E3, review-loop closure (2026-07-02)
 
 - **Rollback of one executed evolution candidate** (doc §11):

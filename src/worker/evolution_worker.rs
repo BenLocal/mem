@@ -45,7 +45,7 @@
 //! (`POST /reviews/evolution {dry_run:true}`) works regardless and
 //! writes NOTHING — no candidates, no status flips, no edges.
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -55,7 +55,8 @@ use tracing::{info, warn};
 
 use crate::config::EvolutionSettings;
 use crate::domain::capability_capsule::{
-    CapabilityCapsuleRecord, CapabilityCapsuleStatus, CapabilityCapsuleType, GraphEdge,
+    CapabilityCapsuleRecord, CapabilityCapsuleStatus, CapabilityCapsuleType, FeedbackKind,
+    GraphEdge,
 };
 use crate::evolution::map::{
     build_clusters, match_candidate, update_on_signal, update_on_silence, GateDecision,
@@ -64,7 +65,7 @@ use crate::evolution::map::{
 use crate::evolution::synthesis::{ReviewSynthesisBackend, SynthesisBackend, SynthesisTask};
 use crate::pipeline::ingest::compute_content_hash_from_record;
 use crate::storage::types::StorageError;
-use crate::storage::{current_timestamp, Backend, EvolutionCandidate};
+use crate::storage::{current_timestamp, Backend, EvolutionCandidate, FeedbackEvent};
 
 /// `source_agent` stamped on every capsule the evolution worker
 /// creates. Load-bearing beyond provenance: `auto_promote_worker`
@@ -79,6 +80,20 @@ pub const EVOLUTION_SOURCE_AGENT: &str = "evolution_worker";
 const GENERALIZE_MIN_CONFIDENCE: f32 = 0.6;
 /// Minimum shared (lowercased) topics across a generalize cluster.
 const GENERALIZE_MIN_SHARED_TOPICS: usize = 2;
+/// ⑤ reweight-up stops emitting once a member reaches this confidence
+/// (doc §4⑤'s 0.9 cap — enforced at emission because `apply_feedback`'s
+/// generic clamp sits at 1.0).
+const REWEIGHT_UP_CONFIDENCE_CAP: f32 = 0.9;
+/// ⑤ reweight-up fires only when MORE than this share of a cluster was
+/// recalled within the last sweep interval (doc §4⑤ "活跃占比 > 0.5").
+const REWEIGHT_ACTIVE_SHARE_FLOOR: f32 = 0.5;
+/// §5 dying filter for ⑤: capsules already decayed past this floor are
+/// left to decay/idle-archive — don't spend evolution signal on them.
+const DYING_DECAY_FLOOR: f32 = 0.8;
+/// ⑥ skips co-recall batches larger than this — one giant search
+/// response fanning out is weak evidence for PAIRWISE association, and
+/// the pair count is quadratic in group size.
+const CORECALL_MAX_GROUP: usize = 12;
 
 /// Sweep result — serialized verbatim as the HTTP response of
 /// `POST /reviews/evolution`.
@@ -96,6 +111,10 @@ pub struct EvolutionReport {
     /// Candidate ids cancelled this sweep (evidence decayed below the
     /// hysteresis floor).
     pub cancelled: Vec<String>,
+    /// ⑥ weak-edge retirement: evolution-owned `co_recalled_with`
+    /// edges closed this sweep for lack of co-recall evidence inside
+    /// the idle window (E4). Always 0 on dry-run.
+    pub pruned_edges: usize,
 }
 
 /// One detected proposal with its gate state after this sweep.
@@ -180,6 +199,7 @@ pub async fn sweep_once(
         proposals: Vec::new(),
         executed: Vec::new(),
         cancelled: Vec::new(),
+        pruned_edges: 0,
     };
     if !dry_run && !settings.enabled {
         return Ok(report);
@@ -214,10 +234,35 @@ pub async fn sweep_once(
 
     // 3. Detect proposals.
     let mut proposals: Vec<Proposal> = Vec::new();
+    let recent_cutoff = ms_cutoff(&now, settings.interval_secs);
     for cluster in &clusters {
         proposals.extend(detect_merge(cluster, &active, &vector_by_idx, settings));
         if let Some(p) = detect_generalize(cluster, &active, settings) {
             proposals.push(p);
+        }
+        // E4 ⑤ reweight: recurring signal adjustments per cluster shape.
+        if let Some(p) = detect_reweight_up(cluster, &active, &recent_cutoff) {
+            proposals.push(p);
+        }
+        if let Some(p) = detect_reweight_decay(cluster, &active) {
+            proposals.push(p);
+        }
+    }
+    // E4 ⑥ co-recall: pairs sharing a last_used_worker flush batch.
+    // Pairs already carrying an active edge are skipped at detection —
+    // on a failed edge read we skip the whole channel this sweep
+    // (proposing anyway would only add candidate noise).
+    match store.query_predicate("co_recalled_with", None).await {
+        Ok(edges) => {
+            let existing: HashSet<(String, String)> = edges
+                .into_iter()
+                .filter(|e| e.valid_to.is_none())
+                .map(|e| (e.from_node_id, e.to_node_id))
+                .collect();
+            proposals.extend(detect_corecall(&active, &existing));
+        }
+        Err(e) => {
+            warn!(error = %e, "co_recalled_with read failed — corecall detection skipped this sweep")
         }
     }
 
@@ -238,15 +283,30 @@ pub async fn sweep_once(
     for proposal in proposals {
         // Suppress re-proposals of already-executed operations (the
         // generalize sources stay Active, so without this the same
-        // cluster would re-propose forever).
-        if match_candidate(&proposal.op_kind, &proposal.member_ids, &executed_history).is_some() {
+        // cluster would re-propose forever). One-shot ops only:
+        // recurring ⑤ reweight candidates never park in `executed`,
+        // and a ⑥ corecall pair must be re-earnable after its edge is
+        // pruned (or rolled back).
+        if matches!(proposal.op_kind.as_str(), "merge" | "generalize")
+            && match_candidate(&proposal.op_kind, &proposal.member_ids, &executed_history).is_some()
+        {
             continue;
         }
         let (mut candidate, decision_label, decision) =
             match match_candidate(&proposal.op_kind, &proposal.member_ids, &pending) {
                 Some(i) => {
+                    // ⑥ freshness guard: the SAME flush-batch timestamp
+                    // re-observed is not new co-recall evidence — leave
+                    // the candidate unmatched so silence decay applies.
+                    if proposal.op_kind == "corecall" && pending[i].params == proposal.params {
+                        continue;
+                    }
                     matched_pending[i] = true;
                     let mut c = pending[i].clone();
+                    if proposal.op_kind == "corecall" {
+                        // Carry the newest batch ts for the next guard.
+                        c.params = proposal.params.clone();
+                    }
                     let d = update_on_signal(&mut c, &gate, &now);
                     (c, gate_label(d), d)
                 }
@@ -294,12 +354,42 @@ pub async fn sweep_once(
                 "generalize" => {
                     execute_generalize(store, tenant, &proposal.member_ids, &active, &now).await?
                 }
+                "reweight_up" => {
+                    execute_reweight(
+                        store,
+                        &proposal.member_ids,
+                        &active,
+                        FeedbackKind::SystemReweightUp,
+                        &candidate.candidate_id,
+                        &now,
+                    )
+                    .await?
+                }
+                "reweight_decay" => {
+                    execute_reweight(
+                        store,
+                        &proposal.member_ids,
+                        &active,
+                        FeedbackKind::SystemReweightDecay,
+                        &candidate.candidate_id,
+                        &now,
+                    )
+                    .await?
+                }
+                "corecall" => execute_corecall(store, &proposal.member_ids, &now).await?,
                 other => {
                     warn!(op_kind = other, "unknown evolution op kind — skipping");
                     Vec::new()
                 }
             };
-            candidate.status = "executed".to_string();
+            // Recurring ⑤ ops stay `pending`: the doc's "+δ per signal
+            // cycle" means the open gate re-fires every cycle the
+            // signal holds (and silence still decays/cancels them).
+            // One-shot ops park in `executed` and its re-proposal
+            // suppression.
+            if !matches!(proposal.op_kind.as_str(), "reweight_up" | "reweight_decay") {
+                candidate.status = "executed".to_string();
+            }
             candidate.executed_at = Some(now.clone());
             candidate.result_capsule_ids = result_ids.clone();
             report.executed.push(ExecutedOp {
@@ -326,6 +416,17 @@ pub async fn sweep_once(
         }
         if !dry_run {
             store.upsert_evolution_candidate(c).await?;
+        }
+    }
+
+    // 6. ⑥ weak-edge retirement (E4): close evolution-owned
+    //    co_recalled_with edges that show no evidence inside the idle
+    //    window. Dry-run never prunes. A prune failure is logged and
+    //    skipped — retirement retries next sweep.
+    if !dry_run {
+        match prune_idle_corecall_edges(store, &active, settings, &now).await {
+            Ok(n) => report.pruned_edges = n,
+            Err(e) => warn!(error = %e, "co_recalled_with prune failed — skipped this sweep"),
         }
     }
 
@@ -433,6 +534,38 @@ pub async fn rollback_candidate(
                     warn!(error = %e, proposal = %proposal, "rollback: generalizes edge close failed")
                 }
             }
+        }
+        "corecall" => {
+            // §11 ⑥: the rollback of an earned edge is closing it
+            // (point-in-time reads keep the history).
+            let (Some(a), Some(b)) = (candidate.member_ids.first(), candidate.member_ids.get(1))
+            else {
+                return Err(StorageError::InvalidData(
+                    "executed corecall candidate is missing its pair",
+                ));
+            };
+            match store
+                .invalidate_edge(
+                    &format!("capability_capsule:{a}"),
+                    "co_recalled_with",
+                    &format!("capability_capsule:{b}"),
+                    &now,
+                )
+                .await
+            {
+                Ok(n) => closed_edges += n,
+                Err(e) => warn!(error = %e, "rollback: co_recalled_with edge close failed"),
+            }
+        }
+        "reweight_up" | "reweight_decay" => {
+            // Recurring ⑤ candidates never park in `executed`; their
+            // rollback path is §11's note-based inversion of the
+            // feedback_events rows (note = "evolution:<kind>:candidate=…"),
+            // not a candidate-unit rollback.
+            return Err(StorageError::InvalidInput(format!(
+                "candidate {candidate_id} is a recurring reweight op — invert its \
+                 feedback_events rows (note 'evolution:*:candidate={candidate_id}') instead"
+            )));
         }
         other => {
             return Err(StorageError::InvalidInput(format!(
@@ -752,6 +885,258 @@ async fn execute_generalize(
         }
     }
     Ok(vec![proposal_id])
+}
+
+/// ⑤ reweight-up detection (E4): a cluster of ≥2 whose recently-
+/// recalled share EXCEEDS the 0.5 floor ("recent" = `last_used_at`
+/// within one sweep interval). Recurring — the gate re-fires every
+/// signal cycle after it first opens.
+fn detect_reweight_up(
+    cluster: &[usize],
+    active: &[CapabilityCapsuleRecord],
+    recent_cutoff: &str,
+) -> Option<Proposal> {
+    if cluster.len() < 2 {
+        return None;
+    }
+    let recalled = cluster
+        .iter()
+        .filter(|&&i| {
+            active[i]
+                .last_used_at
+                .as_deref()
+                .is_some_and(|t| t >= recent_cutoff)
+        })
+        .count();
+    if (recalled as f32) / (cluster.len() as f32) <= REWEIGHT_ACTIVE_SHARE_FLOOR {
+        return None;
+    }
+    let mut member_ids: Vec<String> = cluster
+        .iter()
+        .map(|&i| active[i].capability_capsule_id.clone())
+        .collect();
+    member_ids.sort();
+    Some(Proposal {
+        op_kind: "reweight_up".to_string(),
+        members: cluster.iter().map(|&i| preview(&active[i])).collect(),
+        member_ids,
+        params: "{}".to_string(),
+    })
+}
+
+/// ⑤ reweight-decay detection (E4): a map singleton (no cluster
+/// membership) with ZERO recalls ever. Guidance capsules are excluded
+/// (curated, not evolved — merge precedent) and so are dying capsules
+/// (§5: decay > 0.8 gets no evolution budget; decay/idle-archive
+/// already own them).
+fn detect_reweight_decay(
+    cluster: &[usize],
+    active: &[CapabilityCapsuleRecord],
+) -> Option<Proposal> {
+    if cluster.len() != 1 {
+        return None;
+    }
+    let c = &active[cluster[0]];
+    if c.last_used_at.is_some()
+        || c.decay_score > DYING_DECAY_FLOOR
+        || is_guidance(&c.capability_capsule_type)
+    {
+        return None;
+    }
+    Some(Proposal {
+        op_kind: "reweight_decay".to_string(),
+        member_ids: vec![c.capability_capsule_id.clone()],
+        members: vec![preview(c)],
+        params: "{}".to_string(),
+    })
+}
+
+/// ⑥ co-recall detection (E4): capsules sharing one exact
+/// `last_used_at` value were stamped by the same `last_used_worker`
+/// flush — one co-recall batch (the signal source doc §4⑥ names).
+/// `params` carries the batch timestamp so the reconcile freshness
+/// guard can tell a NEW batch from the same one re-observed. Pairs
+/// already holding an active edge are skipped; oversized batches are
+/// skipped whole (weak pairwise evidence, quadratic pair count).
+fn detect_corecall(
+    active: &[CapabilityCapsuleRecord],
+    existing_pairs: &HashSet<(String, String)>,
+) -> Vec<Proposal> {
+    let mut by_batch: HashMap<&str, Vec<usize>> = HashMap::new();
+    for (i, c) in active.iter().enumerate() {
+        if let Some(ts) = c.last_used_at.as_deref() {
+            by_batch.entry(ts).or_default().push(i);
+        }
+    }
+    let mut out = Vec::new();
+    for (ts, group) in by_batch {
+        if group.len() < 2 {
+            continue;
+        }
+        if group.len() > CORECALL_MAX_GROUP {
+            warn!(
+                size = group.len(),
+                "co-recall batch above pair cap — skipped"
+            );
+            continue;
+        }
+        for (x, &i) in group.iter().enumerate() {
+            for &j in &group[x + 1..] {
+                let (a, b) = {
+                    let (ai, bi) = (
+                        &active[i].capability_capsule_id,
+                        &active[j].capability_capsule_id,
+                    );
+                    if ai <= bi {
+                        (ai.clone(), bi.clone())
+                    } else {
+                        (bi.clone(), ai.clone())
+                    }
+                };
+                if existing_pairs.contains(&(
+                    format!("capability_capsule:{a}"),
+                    format!("capability_capsule:{b}"),
+                )) {
+                    continue;
+                }
+                out.push(Proposal {
+                    op_kind: "corecall".to_string(),
+                    members: vec![preview(&active[i]), preview(&active[j])],
+                    member_ids: vec![a, b],
+                    params: format!("{{\"batch_ts\":\"{ts}\"}}"),
+                });
+            }
+        }
+    }
+    out
+}
+
+/// Execute ⑤ reweight over one candidate's members: one auditable
+/// `feedback_events` row per touched capsule (the SAME channel human
+/// feedback uses — §4⑤'s "走可审计通道"), additive delta applied by
+/// `apply_feedback`. Per-member guards: dying capsules skipped, and
+/// reweight-up stops at the 0.9 cap. Returns the touched ids.
+async fn execute_reweight(
+    store: &dyn Backend,
+    member_ids: &[String],
+    active: &[CapabilityCapsuleRecord],
+    kind: FeedbackKind,
+    candidate_id: &str,
+    now: &str,
+) -> Result<Vec<String>, StorageError> {
+    let mut touched = Vec::new();
+    for c in active
+        .iter()
+        .filter(|c| member_ids.contains(&c.capability_capsule_id))
+    {
+        if c.decay_score > DYING_DECAY_FLOOR {
+            continue;
+        }
+        if kind == FeedbackKind::SystemReweightUp && c.confidence >= REWEIGHT_UP_CONFIDENCE_CAP {
+            continue;
+        }
+        let event = FeedbackEvent {
+            feedback_id: format!("fb_{}", uuid::Uuid::now_v7()),
+            capability_capsule_id: c.capability_capsule_id.clone(),
+            feedback_kind: kind.as_str().to_string(),
+            created_at: now.to_string(),
+            // §11 ⑤: the note is the rollback handle — events carrying
+            // this candidate id can be inverted later.
+            note: Some(format!(
+                "evolution:{}:candidate={candidate_id}",
+                kind.as_str()
+            )),
+        };
+        store.apply_feedback(c, event).await?;
+        crate::metrics::metrics().record_feedback(&kind);
+        touched.push(c.capability_capsule_id.clone());
+    }
+    Ok(touched)
+}
+
+/// Execute ⑥: write the earned `co_recalled_with` edge (sorted pair,
+/// one direction, `extractor="evolution"` — cooccurrence precedent).
+/// The edge feeds O4's 1-hop graph boost immediately.
+async fn execute_corecall(
+    store: &dyn Backend,
+    member_ids: &[String],
+    now: &str,
+) -> Result<Vec<String>, StorageError> {
+    let (Some(a), Some(b)) = (member_ids.first(), member_ids.get(1)) else {
+        return Ok(Vec::new());
+    };
+    let mut edge = lineage_edge(a, b, "co_recalled_with", now);
+    edge.last_activated = Some(now.to_string());
+    edge.access_count = Some(1);
+    if let Err(e) = store.add_edge_direct(&edge).await {
+        warn!(error = %e, "co_recalled_with edge write failed");
+    }
+    Ok(member_ids.to_vec())
+}
+
+/// ⑥ weak-edge retirement: close evolution-owned `co_recalled_with`
+/// edges with no evidence inside `prune_idle_cycles × interval_secs`.
+/// Idleness is measured CONSERVATIVELY against the latest of edge
+/// birth, its potentiation stamp, and EITHER endpoint's own
+/// `last_used_at` — without a per-pair co-access event log we cannot
+/// distinguish "pair co-recalled" from "members individually hot", so
+/// individually-hot pairs keep their edge (erring toward keeping a
+/// strengthening signal). Caller edges (`extractor != "evolution"`)
+/// and non-`co_recalled_with` relations (incl. `user_tunnel:*`) are
+/// never touched.
+async fn prune_idle_corecall_edges(
+    store: &dyn Backend,
+    active: &[CapabilityCapsuleRecord],
+    settings: &EvolutionSettings,
+    now: &str,
+) -> Result<usize, crate::storage::GraphError> {
+    let cutoff = ms_cutoff(
+        now,
+        u64::from(settings.prune_idle_cycles).saturating_mul(settings.interval_secs),
+    );
+    let last_used: HashMap<&str, &str> = active
+        .iter()
+        .filter_map(|c| {
+            c.last_used_at
+                .as_deref()
+                .map(|t| (c.capability_capsule_id.as_str(), t))
+        })
+        .collect();
+    let mut pruned = 0usize;
+    for edge in store.query_predicate("co_recalled_with", None).await? {
+        if edge.valid_to.is_some() || edge.extractor.as_deref() != Some("evolution") {
+            continue;
+        }
+        let mut latest = edge.valid_from.as_str();
+        if let Some(t) = edge.last_activated.as_deref() {
+            if t > latest {
+                latest = t;
+            }
+        }
+        for node in [&edge.from_node_id, &edge.to_node_id] {
+            if let Some(id) = node.strip_prefix("capability_capsule:") {
+                if let Some(t) = last_used.get(id) {
+                    if *t > latest {
+                        latest = t;
+                    }
+                }
+            }
+        }
+        if latest >= cutoff.as_str() {
+            continue;
+        }
+        pruned += store
+            .invalidate_edge(&edge.from_node_id, &edge.relation, &edge.to_node_id, now)
+            .await?;
+    }
+    Ok(pruned)
+}
+
+/// Millisecond-string timestamp `secs` before `now`, zero-padded to
+/// the storage width so lexicographic compare == numeric compare.
+fn ms_cutoff(now: &str, secs: u64) -> String {
+    let now_ms: u64 = now.parse().unwrap_or(0);
+    format!("{:020}", now_ms.saturating_sub(secs.saturating_mul(1000)))
 }
 
 /// Evolution lineage edge (`extractor="evolution"`). `pub(crate)` so the

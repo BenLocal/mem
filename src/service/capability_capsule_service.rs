@@ -1271,6 +1271,17 @@ impl CapabilityCapsuleService {
         feedback_kind: FeedbackKind,
         note: Option<String>,
     ) -> Result<CapabilityCapsuleRecord, ServiceError> {
+        // System-emitted kinds (auto_promoted, system_reweight_*) are
+        // worker-only audit records — an external caller must not be
+        // able to forge worker signal (or the status flips some system
+        // kinds carry) through the public feedback surface. Workers
+        // bypass this by calling `store.apply_feedback` directly.
+        if feedback_kind.is_system() {
+            return Err(ServiceError::Storage(StorageError::InvalidInput(format!(
+                "feedback_kind '{}' is system-emitted and cannot be submitted via the feedback API",
+                feedback_kind.as_str()
+            ))));
+        }
         let memory = self
             .store
             .get_capability_capsule_for_tenant(tenant, capability_capsule_id)

@@ -113,6 +113,7 @@ fn generalize_only_settings(k_cycles: u32) -> EvolutionSettings {
         merge_threshold: 1.1, // unreachable — generalize-only
         generalize_min_n: 4,
         scan_limit: 1_000,
+        prune_idle_cycles: 3,
         synthesis: EvolutionSynthesisMode::Review,
     }
 }
