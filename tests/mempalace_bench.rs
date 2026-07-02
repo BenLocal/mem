@@ -314,7 +314,7 @@ async fn longmemeval_session_recall() {
 
         // Retrieve with the real hybrid pipeline.
         let query_vec = provider
-            .embed_text(&item.question)
+            .embed_query(&item.question)
             .await
             .expect("embed query");
         let k = item.haystack_session_ids.len().max(50);

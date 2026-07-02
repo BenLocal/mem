@@ -1675,7 +1675,7 @@ impl CapabilityCapsuleService {
             let Some(provider) = self.embedding_search_provider.as_ref() else {
                 return Vec::new();
             };
-            provider.embed_text(&query.query).await.unwrap_or_default()
+            provider.embed_query(&query.query).await.unwrap_or_default()
         };
         let (pool_res, query_vec) = tokio::join!(pool_fut, query_vec_fut);
         let pool = pool_res.map_err(ServiceError::Storage)?;

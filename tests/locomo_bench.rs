@@ -399,7 +399,7 @@ async fn locomo_session_recall() {
         // Score this conversation's sampled QAs against the shared store.
         for qa in qas {
             let query_vec = provider
-                .embed_text(&qa.question)
+                .embed_query(&qa.question)
                 .await
                 .expect("embed query");
             let k = sessions.len().max(50);

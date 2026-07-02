@@ -442,7 +442,7 @@ impl TranscriptService {
                 // hits already gathered above. Mirrors the capsule search side
                 // (`unwrap_or_default()` on the same call) and the ANN
                 // soft-degrade immediately below.
-                let q_vec = match provider.embed_text(query).await {
+                let q_vec = match provider.embed_query(query).await {
                     Ok(v) => Some(v),
                     Err(e) => {
                         warn!(

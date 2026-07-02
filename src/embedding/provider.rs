@@ -20,6 +20,17 @@ pub trait EmbeddingProvider: Send + Sync {
     /// native batch path.
     async fn embed_text(&self, text: &str) -> Result<Vec<f32>, EmbeddingError>;
 
+    /// Embed a retrieval QUERY, as opposed to a document. Defaults to
+    /// [`Self::embed_text`]; providers whose model was trained with an
+    /// asymmetric query/document scheme (Qwen3-Embedding's instructed
+    /// queries) override this to apply the query-side template. Storage
+    /// and worker paths must keep using `embed_text` / `embed_batch` —
+    /// only the query side is templated, so every stored vector stays
+    /// valid without re-embedding.
+    async fn embed_query(&self, text: &str) -> Result<Vec<f32>, EmbeddingError> {
+        self.embed_text(text).await
+    }
+
     /// Embed a batch of strings in a single call when the provider
     /// supports it. Returns one `Result` per input, in the same order, so
     /// a partial failure (one bad item in the batch) does not poison the
