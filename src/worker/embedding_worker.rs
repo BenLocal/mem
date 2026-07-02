@@ -293,6 +293,35 @@ async fn post_embed(
             );
         }
     }
+
+    // H1 (oss-memory-diff §9): ingest-time neighbor linking. Same
+    // eligibility as the near-dup lane (fresh Active capsule, vector
+    // just landed), same best-effort posture. Runs AFTER the near-dup
+    // check on purpose: the [link, neardup) band never overlaps the
+    // supersede lane, and a capsule the O2 lane just flipped to
+    // PendingConfirmation still gets its connectivity (edges are
+    // status-agnostic).
+    if settings.ingest_link_enabled
+        && memory_after.status == crate::domain::capability_capsule::CapabilityCapsuleStatus::Active
+        && !embeddings.is_empty()
+    {
+        if let Err(e) = link_related_neighbors(
+            store,
+            &job.tenant,
+            &job.capability_capsule_id,
+            &embeddings[0],
+            settings.ingest_link_threshold,
+            settings.neardup_threshold,
+        )
+        .await
+        {
+            warn!(
+                error = %e,
+                capability_capsule_id = %job.capability_capsule_id,
+                "H1 ingest-link failed (embedding job already completed)"
+            );
+        }
+    }
     Ok(())
 }
 
@@ -364,6 +393,69 @@ async fn flag_if_near_duplicate(
         cosine = cosine,
         "O7(a): flagged near-duplicate for review (cluster canonical)"
     );
+    Ok(())
+}
+
+/// H1 (oss-memory-diff §9) per-capsule link budget — keeps the graph
+/// sparse; only the top-K in-band neighbors by cosine get an edge.
+const INGEST_LINK_MAX_EDGES: usize = 4;
+
+/// H1 (oss-memory-diff §9): zero-LLM slice of A-Mem's link network.
+/// After embedding a fresh `Active` capsule, connect it to its semantic
+/// neighborhood with `related_to` edges (`extractor="ingest_link"`,
+/// cosine riding as edge confidence). Band is [link_threshold,
+/// neardup_threshold): anything at/above the near-dup floor belongs to
+/// the O2/O7(a) supersede-proposal lane, not plain linking. Pure
+/// connectivity — no status flips, no content writes; the edges feed
+/// O4's graph boost immediately and pre-build density for a future G2
+/// third retrieval channel. Best-effort like the O2 lane: errors are
+/// logged, never fail the completed embedding job.
+async fn link_related_neighbors(
+    store: &dyn Backend,
+    tenant: &str,
+    capsule_id: &str,
+    vector: &[f32],
+    link_threshold: f32,
+    neardup_threshold: f32,
+) -> Result<(), StorageError> {
+    const K: usize = 12;
+    let candidates = store.hybrid_candidates(tenant, "", vector, K).await?;
+    let mut in_band: Vec<(String, f32)> = Vec::new();
+    for (cand, _rrf) in candidates {
+        if cand.capability_capsule_id == capsule_id {
+            continue;
+        }
+        let Some(cand_vec) = store
+            .get_capability_capsule_embedding_vector(&cand.capability_capsule_id)
+            .await?
+        else {
+            continue;
+        };
+        let c = cosine(vector, &cand_vec);
+        if c >= link_threshold && c < neardup_threshold {
+            in_band.push((cand.capability_capsule_id.clone(), c));
+        }
+    }
+    in_band.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+    let now = current_timestamp();
+    for (neighbor, c) in in_band.into_iter().take(INGEST_LINK_MAX_EDGES) {
+        let edge = crate::domain::capability_capsule::GraphEdge {
+            from_node_id: crate::pipeline::ingest::memory_node_id(capsule_id),
+            to_node_id: crate::pipeline::ingest::memory_node_id(&neighbor),
+            relation: "related_to".to_string(),
+            valid_from: now.clone(),
+            valid_to: None,
+            confidence: Some(c),
+            extractor: Some("ingest_link".to_string()),
+            strength: None,
+            stability: None,
+            last_activated: None,
+            access_count: None,
+        };
+        if let Err(e) = store.add_edge_direct(&edge).await {
+            warn!(error = %e, neighbor = %neighbor, "H1: related_to edge write failed");
+        }
+    }
     Ok(())
 }
 
@@ -766,5 +858,99 @@ mod tests {
             memory_node_id("long_near"),
             "O7(a) must propose toward the longest-content canonical, not the cosine-nearest",
         );
+    }
+
+    // ── H1: ingest-time neighbor linking (oss-memory-diff §9) ───────
+
+    /// Only neighbors inside [link_threshold, neardup_threshold) get a
+    /// `related_to` edge — near-identical rows belong to the O2/O7(a)
+    /// supersede lane, distant rows are noise. Cosine rides as edge
+    /// confidence, extractor marks provenance.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn related_neighbors_get_linked_within_band_only() {
+        let dir = tempdir().unwrap();
+        let store = Store::open(&dir.path().join("h1.lance")).await.unwrap();
+        for id in ["new", "kin", "twin", "far"] {
+            store
+                .insert_capability_capsule(active_capsule(id))
+                .await
+                .unwrap();
+        }
+        let v_new = [1.0_f32, 0.0, 0.0, 0.0];
+        put_embedding(&store, "new", &v_new).await;
+        put_embedding(&store, "kin", &[0.85, 0.527, 0.0, 0.0]).await; // cos ≈ 0.85 — in band
+        put_embedding(&store, "twin", &[0.999, 0.02, 0.0, 0.0]).await; // cos ≈ 1.0 — neardup lane
+        put_embedding(&store, "far", &[0.3, 0.954, 0.0, 0.0]).await; // cos ≈ 0.3 — noise
+
+        link_related_neighbors(&store, "local", "new", &v_new, 0.80, 0.92)
+            .await
+            .unwrap();
+
+        let edges = store
+            .neighbors_within(&memory_node_id("new"), 1, None)
+            .await
+            .unwrap();
+        let related: Vec<_> = edges
+            .iter()
+            .filter(|e| e.relation == "related_to")
+            .collect();
+        assert_eq!(related.len(), 1, "exactly the in-band neighbor: {edges:?}");
+        assert_eq!(related[0].to_node_id, memory_node_id("kin"));
+        assert_eq!(related[0].extractor.as_deref(), Some("ingest_link"));
+        let conf = related[0].confidence.expect("cosine rides as confidence");
+        assert!(
+            (conf - 0.85).abs() < 0.02,
+            "confidence ≈ cosine, got {conf}"
+        );
+    }
+
+    /// The per-capsule link budget keeps the graph sparse: only the
+    /// top-`INGEST_LINK_MAX_EDGES` in-band neighbors by cosine link.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn ingest_links_are_capped_at_top_k_by_cosine() {
+        let dir = tempdir().unwrap();
+        let store = Store::open(&dir.path().join("h1cap.lance")).await.unwrap();
+        store
+            .insert_capability_capsule(active_capsule("new"))
+            .await
+            .unwrap();
+        let v_new = [1.0_f32, 0.0, 0.0, 0.0];
+        put_embedding(&store, "new", &v_new).await;
+        // Six in-band neighbors at descending cosine.
+        for (i, x) in [0.91_f32, 0.90, 0.89, 0.88, 0.85, 0.82].iter().enumerate() {
+            let id = format!("n{i}");
+            store
+                .insert_capability_capsule(active_capsule(&id))
+                .await
+                .unwrap();
+            let y = (1.0 - x * x).sqrt();
+            put_embedding(&store, &id, &[*x, y, 0.0, 0.0]).await;
+        }
+
+        link_related_neighbors(&store, "local", "new", &v_new, 0.80, 0.92)
+            .await
+            .unwrap();
+
+        let edges = store
+            .neighbors_within(&memory_node_id("new"), 1, None)
+            .await
+            .unwrap();
+        let mut related: Vec<String> = edges
+            .iter()
+            .filter(|e| e.relation == "related_to")
+            .map(|e| e.to_node_id.clone())
+            .collect();
+        related.sort();
+        assert_eq!(
+            related.len(),
+            INGEST_LINK_MAX_EDGES,
+            "cap must hold: {related:?}"
+        );
+        for kept in ["n0", "n1", "n2", "n3"] {
+            assert!(
+                related.contains(&memory_node_id(kept)),
+                "top-cosine neighbor {kept} must be linked: {related:?}"
+            );
+        }
     }
 }

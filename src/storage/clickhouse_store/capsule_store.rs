@@ -192,7 +192,7 @@ impl ChCapsuleRow {
     }
 }
 
-#[derive(Debug, Row, Serialize)]
+#[derive(Debug, Row, Serialize, Deserialize)]
 struct ChFeedbackRow {
     feedback_id: String,
     capability_capsule_id: String,
@@ -538,6 +538,38 @@ impl CapsuleStore for ClickHouseBackend {
             .await
             .map_err(|e| StorageError::InvalidInput(format!("close edges: {e}")))?;
         Ok(())
+    }
+
+    async fn list_feedback_for_memory(
+        &self,
+        capability_capsule_id: &str,
+    ) -> Result<Vec<FeedbackEvent>, StorageError> {
+        // `note` is stored as an empty string for None (ClickHouse
+        // non-nullable column) — map back on read.
+        let rows = self
+            .client
+            .query(
+                "SELECT ?fields FROM feedback_events \
+                 WHERE capability_capsule_id = ? ORDER BY created_at",
+            )
+            .bind(capability_capsule_id)
+            .fetch_all::<ChFeedbackRow>()
+            .await
+            .map_err(ch_err)?;
+        Ok(rows
+            .into_iter()
+            .map(|r| FeedbackEvent {
+                feedback_id: r.feedback_id,
+                capability_capsule_id: r.capability_capsule_id,
+                feedback_kind: r.feedback_kind,
+                created_at: r.created_at,
+                note: if r.note.is_empty() {
+                    None
+                } else {
+                    Some(r.note)
+                },
+            })
+            .collect())
     }
 
     async fn feedback_summary(

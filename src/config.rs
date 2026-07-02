@@ -63,6 +63,19 @@ pub struct EmbeddingSettings {
     /// conservative (prefer missing a dup to false-flagging a distinct
     /// capsule). Tune via `MEM_INGEST_NEARDUP_THRESHOLD`.
     pub neardup_threshold: f32,
+    /// H1 (oss-memory-diff §9): ingest-time neighbor linking — after
+    /// embedding a fresh `Active` capsule, write `related_to` edges to
+    /// its top in-band semantic neighbors (cosine in
+    /// [`ingest_link_threshold`, `neardup_threshold`)). Pure
+    /// connectivity for the graph boost; zero LLM, no status flips.
+    /// Default OFF (opt in via `MEM_INGEST_LINK_ENABLED=1`) — same
+    /// conservative posture as the near-dup lane.
+    pub ingest_link_enabled: bool,
+    /// Lower cosine bound of the H1 linking band. Default 0.80 (the
+    /// evolution map's "same topic" floor); the upper bound is always
+    /// `neardup_threshold`. Tune via `MEM_INGEST_LINK_THRESHOLD`;
+    /// invalid values silently fall back (best-effort lane).
+    pub ingest_link_threshold: f32,
     // Vestigial usearch sidecar tuning fields (`vector_index_flush_every`,
     // `vector_index_oversample`, `vector_index_use_legacy`,
     // `transcript_vector_index_flush_every`, `transcript_search_oversample`)
@@ -552,6 +565,8 @@ impl EmbeddingSettings {
             // O2 near-dup review flagging — opt-in, conservative threshold.
             neardup_enabled: false,
             neardup_threshold: 0.92,
+            ingest_link_enabled: false,
+            ingest_link_threshold: 0.80,
         }
     }
 
@@ -638,6 +653,21 @@ impl EmbeddingSettings {
             if let Ok(t) = raw.parse::<f32>() {
                 if (0.0..=1.0).contains(&t) {
                     s.neardup_threshold = t;
+                }
+            }
+        }
+
+        if let Some(raw) = get("MEM_INGEST_LINK_ENABLED") {
+            s.ingest_link_enabled =
+                matches!(raw.to_ascii_lowercase().as_str(), "1" | "true" | "yes");
+        }
+
+        if let Some(raw) = get("MEM_INGEST_LINK_THRESHOLD") {
+            // Same lenient fallback as the near-dup threshold — the
+            // linking lane is best-effort.
+            if let Ok(t) = raw.parse::<f32>() {
+                if (0.0..=1.0).contains(&t) {
+                    s.ingest_link_threshold = t;
                 }
             }
         }
@@ -1829,6 +1859,26 @@ mod tests {
             EvolutionSettings::from_env_vars(env(&[("MEM_EVOLUTION_PRUNE_IDLE_CYCLES", "0")]))
                 .is_err()
         );
+    }
+
+    #[test]
+    fn ingest_link_settings_default_and_override() {
+        // H1 (oss-memory-diff §9): default OFF + 0.80 band floor;
+        // junk threshold falls back silently (best-effort lane, same
+        // lenient pattern as the near-dup threshold).
+        let s = EmbeddingSettings::from_env_vars(env(&[])).unwrap();
+        assert!(!s.ingest_link_enabled);
+        assert!((s.ingest_link_threshold - 0.80).abs() < 1e-6);
+        let s = EmbeddingSettings::from_env_vars(env(&[
+            ("MEM_INGEST_LINK_ENABLED", "1"),
+            ("MEM_INGEST_LINK_THRESHOLD", "0.7"),
+        ]))
+        .unwrap();
+        assert!(s.ingest_link_enabled);
+        assert!((s.ingest_link_threshold - 0.7).abs() < 1e-6);
+        let s = EmbeddingSettings::from_env_vars(env(&[("MEM_INGEST_LINK_THRESHOLD", "junk")]))
+            .unwrap();
+        assert!((s.ingest_link_threshold - 0.80).abs() < 1e-6);
     }
 
     #[test]

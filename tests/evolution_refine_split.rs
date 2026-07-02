@@ -289,6 +289,59 @@ async fn refine_fires_on_accumulated_outdated_feedback() {
     );
 }
 
+/// H2 (oss-memory-diff §9): the verbatim notes riding `outdated`
+/// feedback events flow into the refine placeholder as conflict
+/// evidence — the reviewer sees WHY it's stale, not just a count
+/// (review-gated version of MemOS's natural-language correction).
+#[tokio::test(flavor = "multi_thread")]
+async fn refine_placeholder_carries_outdated_feedback_notes() {
+    let dir = tempdir().unwrap();
+    let store = Arc::new(Store::open(&dir.path().join("evo.lance")).await.unwrap());
+    let service = CapabilityCapsuleService::new(store.clone());
+    seed(&store, &capsule("stale"), (1.0, 0.0)).await;
+    let now = current_timestamp();
+    store
+        .bump_last_used_at(TENANT, &["stale".into()], &now)
+        .await
+        .unwrap();
+    for note in [
+        "the lance write path moved to route-B in June",
+        "MEM_READ_ENGINE was removed entirely",
+    ] {
+        service
+            .submit_feedback(
+                TENANT,
+                "stale",
+                FeedbackKind::Outdated,
+                Some(note.to_string()),
+            )
+            .await
+            .unwrap();
+    }
+
+    let r = sweep(&store, &settings(1, EvolutionSynthesisMode::Review)).await;
+    let refine = r
+        .executed
+        .iter()
+        .find(|e| e.op_kind == "refine")
+        .expect("outdated x2 must execute a refine");
+    let placeholder = record_of(&store, &refine.result_capsule_ids[0]).await;
+    assert!(
+        placeholder
+            .content
+            .contains("the lance write path moved to route-B in June"),
+        "first outdated note must appear verbatim: {}",
+        placeholder.content
+    );
+    assert!(
+        placeholder
+            .content
+            .contains("MEM_READ_ENGINE was removed entirely"),
+        "second outdated note must appear verbatim: {}",
+        placeholder.content
+    );
+}
+
 /// ④ acceptance: chunks in two distinct, well-separated groups →
 /// split placeholder with the group plan + `split_from` lineage;
 /// coherent chunks and two-groups-but-not-separated both stay silent.

@@ -250,6 +250,15 @@ pub trait CapsuleStore: Send + Sync {
         capability_capsule_id: &str,
     ) -> Result<FeedbackSummary, StorageError>;
 
+    /// All feedback events for one capsule, oldest first — notes ride
+    /// verbatim. Powers ③ refine's conflict evidence (oss-memory-diff
+    /// H2): the reviewer sees WHY a capsule was flagged `outdated`,
+    /// not just how many times.
+    async fn list_feedback_for_memory(
+        &self,
+        capability_capsule_id: &str,
+    ) -> Result<Vec<FeedbackEvent>, StorageError>;
+
     /// Distinct `project` names for the tenant, sorted ascending.
     /// Capsules with `NULL` project are dropped from the list (every
     /// entry is a real project name). Powers the navigation sidebar
@@ -414,6 +423,15 @@ impl CapsuleStore for Store {
         capability_capsule_id: &str,
     ) -> Result<FeedbackSummary, StorageError> {
         self.lance.feedback_summary(capability_capsule_id).await
+    }
+
+    async fn list_feedback_for_memory(
+        &self,
+        capability_capsule_id: &str,
+    ) -> Result<Vec<FeedbackEvent>, StorageError> {
+        self.lance
+            .list_feedback_for_memory(capability_capsule_id)
+            .await
     }
 
     async fn list_wings(&self, tenant: &str) -> Result<Vec<String>, StorageError> {
@@ -736,6 +754,22 @@ impl CapsuleStore for InMemoryCapsuleStore {
                 .retain(|ev| ev.capability_capsule_id != capability_capsule_id);
             Ok(())
         })
+    }
+
+    async fn list_feedback_for_memory(
+        &self,
+        capability_capsule_id: &str,
+    ) -> Result<Vec<FeedbackEvent>, StorageError> {
+        Ok(self.with_state(|s| {
+            let mut out: Vec<FeedbackEvent> = s
+                .feedback
+                .iter()
+                .filter(|ev| ev.capability_capsule_id == capability_capsule_id)
+                .cloned()
+                .collect();
+            out.sort_by(|a, b| a.created_at.cmp(&b.created_at));
+            out
+        }))
     }
 
     async fn feedback_summary(

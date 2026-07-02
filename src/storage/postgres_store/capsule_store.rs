@@ -890,6 +890,31 @@ impl CapsuleStore for PostgresCapsuleStore {
         Ok(())
     }
 
+    async fn list_feedback_for_memory(
+        &self,
+        capability_capsule_id: &str,
+    ) -> Result<Vec<FeedbackEvent>, StorageError> {
+        let rows = sqlx::query(
+            "SELECT feedback_id, capability_capsule_id, feedback_kind, created_at, note \
+             FROM feedback_events WHERE capability_capsule_id = $1 ORDER BY created_at",
+        )
+        .bind(capability_capsule_id)
+        .fetch_all(self.pool())
+        .await
+        .map_err(sqlx_err)?;
+        rows.into_iter()
+            .map(|r| {
+                Ok(FeedbackEvent {
+                    feedback_id: r.try_get("feedback_id").map_err(sqlx_err)?,
+                    capability_capsule_id: r.try_get("capability_capsule_id").map_err(sqlx_err)?,
+                    feedback_kind: r.try_get("feedback_kind").map_err(sqlx_err)?,
+                    created_at: r.try_get("created_at").map_err(sqlx_err)?,
+                    note: r.try_get("note").map_err(sqlx_err)?,
+                })
+            })
+            .collect()
+    }
+
     async fn feedback_summary(
         &self,
         capability_capsule_id: &str,

@@ -8,6 +8,32 @@ are organized by feature wave (merge commit ranges on `master`).
 
 ## [Unreleased]
 
+### Added — H-series borrowings: ingest linking, note evidence, LoCoMo (2026-07-02)
+
+- **H1 — ingest-time neighbor linking** (zero-LLM slice of A-Mem's link
+  network, `closes oss-memory-diff H1`): after embedding a fresh `Active`
+  capsule, the embedding worker writes `related_to` edges
+  (`extractor="ingest_link"`, cosine riding as edge confidence) to its top-4
+  semantic neighbors inside [`MEM_INGEST_LINK_THRESHOLD` (default 0.80),
+  near-dup threshold) — at/above that band belongs to the O2/O7(a) supersede
+  lane. Pure connectivity for O4's graph boost; opt-in
+  `MEM_INGEST_LINK_ENABLED` (default OFF), best-effort after the O2 check.
+- **H2 — feedback notes as refine evidence** (review-gated version of
+  MemOS's natural-language correction, `closes oss-memory-diff H2`):
+  `execute_refine` now pulls the verbatim notes riding `outdated` feedback
+  events (new `CapsuleStore::list_feedback_for_memory`, implemented on
+  lance / postgres / clickhouse / in-memory) into the refine placeholder's
+  conflict-evidence list — the reviewer sees WHY a capsule is stale, not
+  just how many times it was flagged.
+- **H3 — LoCoMo parity bench harness** (`closes oss-memory-diff H3`):
+  `tests/locomo_bench.rs` mirrors `mempalace_bench`'s discipline —
+  session-level evidence recall@k (explicitly NOT the LLM-judged LoCoMo QA
+  accuracy mem0/Zep quote), categories 1–4 with adversarial excluded,
+  `LOCOMO_SAMPLE` stratified sampling, per-conversation shared stores, real
+  `locomo10.json` drop-in with a committed synthetic fallback subset.
+  Harness validated end-to-end on the subset; the real-dataset public
+  number is pending a run.
+
 ### Added — evolution E5, ③ refine + ④ split detectors (2026-07-02)
 
 - **③ refine** (`closes evolution-worker E5`): a capsule that is BOTH

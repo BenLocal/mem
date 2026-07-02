@@ -1261,10 +1261,33 @@ async fn execute_refine(
     else {
         return Ok(Vec::new());
     };
-    let conflicts: Vec<String> = serde_json::from_str::<serde_json::Value>(params)
+    let mut conflicts: Vec<String> = serde_json::from_str::<serde_json::Value>(params)
         .ok()
         .and_then(|v| serde_json::from_value(v.get("conflicts")?.clone()).ok())
         .unwrap_or_default();
+    // H2 (oss-memory-diff §9): surface the verbatim notes riding
+    // `outdated` feedback as conflict evidence — the reviewer sees WHY
+    // the capsule is stale, not just how many times it was flagged
+    // (review-gated version of MemOS's natural-language correction).
+    // A failed read degrades to the count-only evidence, never aborts.
+    match store
+        .list_feedback_for_memory(&source.capability_capsule_id)
+        .await
+    {
+        Ok(events) => {
+            for ev in events {
+                if ev.feedback_kind != "outdated" {
+                    continue;
+                }
+                if let Some(note) = ev.note.filter(|n| !n.is_empty()) {
+                    conflicts.push(format!("outdated note: {note}"));
+                }
+            }
+        }
+        Err(e) => {
+            warn!(error = %e, "feedback events read failed — refine note evidence degraded")
+        }
+    }
     let synthesized = ReviewSynthesisBackend.synthesize(&SynthesisTask::Refine {
         source,
         conflicts: &conflicts,
