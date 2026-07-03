@@ -46,7 +46,7 @@ use mem::embedding::{EmbedAnythingEmbeddingProvider, EmbeddingProvider};
 use mem::pipeline::eval_metrics::{mrr, recall_any_at_k, recall_at_k};
 use mem::pipeline::retrieve::rank_with_hybrid_and_graph;
 use mem::service::CapabilityCapsuleService;
-use mem::storage::{GraphStore, Store};
+use mem::storage::{EmbeddingVectorStore, GraphStore, Store};
 use serde::Deserialize;
 use tempfile::tempdir;
 
@@ -284,6 +284,8 @@ async fn locomo_session_recall() {
     }
     assert!(!by_conv.is_empty(), "no answerable QAs to evaluate");
 
+    let graph_on = std::env::var("LOCOMO_GRAPH").is_ok_and(|v| v == "1");
+
     // ---- one embedanything provider (model loads once, shared).
     let settings = EmbeddingSettings::development_defaults();
     let provider: Arc<dyn EmbeddingProvider> = Arc::new(
@@ -396,6 +398,34 @@ async fn locomo_session_recall() {
             }
         }
 
+        // G2 evaluation posture (opt-in via LOCOMO_GRAPH=1): build the
+        // production-shaped link graph (H1 `related_to`, band
+        // [0.80, 0.92), top-4 — the exact ingest-link lane) so
+        // `expand_graph` has capsule↔capsule edges to walk. Measured
+        // trade-off on this corpus (n=50): +8pt open-domain any@5 and
+        // +4pt any@10, but -15pt multi-hop any@5 (top-5 crowding) — so
+        // the DEFAULT headline posture keeps the graph channel off.
+        if graph_on {
+            for (uuid, _) in &stored {
+                if let Some(vec) = store
+                    .get_capability_capsule_embedding_vector(uuid)
+                    .await
+                    .expect("vector read")
+                {
+                    mem::worker::embedding_worker::link_related_neighbors(
+                        store.as_ref(),
+                        TENANT,
+                        uuid,
+                        &vec,
+                        0.80,
+                        0.92,
+                    )
+                    .await
+                    .expect("ingest link");
+                }
+            }
+        }
+
         // Score this conversation's sampled QAs against the shared store.
         for qa in qas {
             let query_vec = provider
@@ -417,14 +447,21 @@ async fn locomo_session_recall() {
                 scope_filters: vec![],
                 token_budget: 8192,
                 caller_agent: "bench".into(),
-                expand_graph: false,
+                expand_graph: graph_on,
                 tenant: Some(TENANT.into()),
                 min_score: Some(0),
             };
             let graph: &dyn GraphStore = store.as_ref();
-            let ranked = rank_with_hybrid_and_graph(pool, hybrid_hits, &request, graph, None)
-                .await
-                .expect("rank_with_hybrid_and_graph");
+            let ranked = rank_with_hybrid_and_graph(
+                pool,
+                hybrid_hits,
+                &request,
+                graph,
+                None,
+                Some(store.as_ref() as &dyn mem::storage::CapsuleStore),
+            )
+            .await
+            .expect("rank_with_hybrid_and_graph");
 
             let mut run: Vec<String> = Vec::new();
             let mut seen: HashSet<String> = HashSet::new();
@@ -468,7 +505,14 @@ async fn locomo_session_recall() {
     );
     println!("metric    : session-level memory recall of evidence sessions");
     println!("            *** retrieval recall — NOT LLM-judged QA accuracy (mem0/Zep LoCoMo headline) ***");
-    println!("pipeline  : mem hybrid (jieba BM25 + {model} ANN + RRF)");
+    println!(
+        "pipeline  : mem hybrid (jieba BM25 + {model} ANN + RRF){}",
+        if graph_on {
+            " + G2 graph channel (H1 related_to links, expand_graph) [LOCOMO_GRAPH=1]"
+        } else {
+            ""
+        }
+    );
     println!("---------------------------------------------------------------------");
     println!(
         "recall@1={r1:.3}  recall@5={r5:.3}  recall@10={r10:.3}   (fraction of evidence sessions)"

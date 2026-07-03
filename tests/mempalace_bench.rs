@@ -337,7 +337,7 @@ async fn longmemeval_session_recall() {
             min_score: Some(0),
         };
         let graph: &dyn GraphStore = store.as_ref();
-        let ranked = rank_with_hybrid_and_graph(pool, hybrid_hits, &request, graph, None)
+        let ranked = rank_with_hybrid_and_graph(pool, hybrid_hits, &request, graph, None, None)
             .await
             .expect("rank_with_hybrid_and_graph");
 

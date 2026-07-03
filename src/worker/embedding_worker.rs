@@ -409,8 +409,10 @@ const INGEST_LINK_MAX_EDGES: usize = 4;
 /// connectivity — no status flips, no content writes; the edges feed
 /// O4's graph boost immediately and pre-build density for a future G2
 /// third retrieval channel. Best-effort like the O2 lane: errors are
-/// logged, never fail the completed embedding job.
-async fn link_related_neighbors(
+/// logged, never fail the completed embedding job. `pub` so parity
+/// benches (and operators) can build production-shaped link graphs on
+/// corpora that bypass the embedding worker.
+pub async fn link_related_neighbors(
     store: &dyn Backend,
     tenant: &str,
     capsule_id: &str,

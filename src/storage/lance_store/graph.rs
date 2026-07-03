@@ -783,7 +783,7 @@ impl LanceStore {
     pub async fn incident_edges_for_nodes(
         &self,
         node_ids: &[String],
-    ) -> Result<Vec<(String, String)>, GraphError> {
+    ) -> Result<Vec<(String, String, Option<f32>)>, GraphError> {
         if node_ids.is_empty() {
             return Ok(Vec::new());
         }
@@ -798,7 +798,7 @@ impl LanceStore {
         let edges = self.query_graph_edges(filter).await?;
         Ok(edges
             .into_iter()
-            .map(|e| (e.from_node_id, e.to_node_id))
+            .map(|e| (e.from_node_id, e.to_node_id, e.confidence))
             .collect())
     }
 }

@@ -489,7 +489,7 @@ retrieval and is a different, harder axis.
 
 | Benchmark | any@5 | recall@5 | recall@10 | mrr | Sample |
 |---|---|---|---|---|---|
-| **LongMemEval-S** (real `longmemeval_s_cleaned.json`) | **0.860**† | 0.780† | 0.897† | 0.770† | n=50, type-stratified over the 6 question types |
+| **LongMemEval-S** (real `longmemeval_s_cleaned.json`) | **0.860** | 0.792 | 0.897 | 0.757 | n=50, type-stratified over the 6 question types |
 | **LoCoMo** (real `locomo10.json`) | **0.700** | 0.619 | 0.688 | 0.495 | n=50, category-stratified across all 10 conversations, adversarial excluded |
 
 `any@5` = ≥1 evidence session in the top-5 (the axis comparable to
@@ -498,12 +498,16 @@ evidence sessions retrieved. Per-type breakdowns print with each run —
 current weak spots are LongMemEval `single-session-preference`
 (any@5 0.625) and LoCoMo `open-domain` (any@5 0.417), the latter being
 the motivating case for graph-as-a-retrieval-channel work
-(oss-memory-diff G2). LoCoMo numbers include the Qwen3 query-side
+(oss-memory-diff G2). Both rows use the Qwen3 query-side
 instruction template (asymmetric retrieval — documents embed raw,
-queries instructed), which lifted any@5 0.660 → 0.700 and multi-hop
-any@5 0.462 → 0.615. † LongMemEval numbers predate that change; a
-re-run on the instructed query path is pending. Reproduce with the
-commands below.
+queries instructed), which lifted LoCoMo any@5 0.660 → 0.700 and
+multi-hop any@5 0.462 → 0.615, and re-validated LongMemEval unchanged
+(any@5 0.860). The optional G2 graph channel (`LOCOMO_GRAPH=1`: H1
+`related_to` links + `expand_graph`) trades top-5 precision for depth
+on this corpus — measured +8pt open-domain any@5 and +4pt any@10
+against -15pt multi-hop any@5 — so the headline posture keeps it off;
+production callers opt in per request via `expand_graph`. Reproduce
+with the commands below.
 
 ## Recall Quality Bench (transcripts)
 

@@ -1701,6 +1701,7 @@ impl CapabilityCapsuleService {
             &query,
             self.store.as_ref(),
             dynamics_ctx.as_ref(),
+            Some(self.store.as_ref() as &dyn crate::storage::CapsuleStore),
         )
         .await
         {
@@ -1718,6 +1719,7 @@ impl CapabilityCapsuleService {
                     &q2,
                     self.store.as_ref(),
                     None,
+                    Some(self.store.as_ref() as &dyn crate::storage::CapsuleStore),
                 )
                 .await
                 .unwrap_or_default()

@@ -1618,13 +1618,13 @@ impl GraphStore for PostgresCapsuleStore {
     async fn incident_edges_for_nodes(
         &self,
         node_ids: &[String],
-    ) -> Result<Vec<(String, String)>, GraphError> {
+    ) -> Result<Vec<(String, String, Option<f32>)>, GraphError> {
         if node_ids.is_empty() {
             return Ok(Vec::new());
         }
         let owned: Vec<String> = node_ids.to_vec();
         let rows = sqlx::query(
-            "SELECT from_node_id, to_node_id FROM graph_edges \
+            "SELECT from_node_id, to_node_id, confidence FROM graph_edges \
              WHERE (from_node_id = ANY($1) OR to_node_id = ANY($1)) AND valid_to IS NULL",
         )
         .bind(&owned)
@@ -1636,6 +1636,8 @@ impl GraphStore for PostgresCapsuleStore {
                 Ok((
                     r.try_get::<String, _>("from_node_id").map_err(graph_err)?,
                     r.try_get::<String, _>("to_node_id").map_err(graph_err)?,
+                    r.try_get::<Option<f32>, _>("confidence")
+                        .map_err(graph_err)?,
                 ))
             })
             .collect()

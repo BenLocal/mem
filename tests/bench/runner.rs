@@ -342,9 +342,10 @@ async fn run_rung(ing: &IngestedFixture, f: &Fixture, rung: Rung) -> RungReport 
                 min_score: None,
             };
             let graph: &dyn GraphStore = ing.store.as_ref();
-            let ranked = rank_with_hybrid_and_graph(pool, hybrid_hits, &request, graph, dynamics)
-                .await
-                .expect("rank_with_hybrid_and_graph");
+            let ranked =
+                rank_with_hybrid_and_graph(pool, hybrid_hits, &request, graph, dynamics, None)
+                    .await
+                    .expect("rank_with_hybrid_and_graph");
             ranked
                 .iter()
                 .map(|r| r.capability_capsule_id.clone())

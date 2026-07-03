@@ -191,6 +191,11 @@ pub async fn rank_with_hybrid_and_graph(
     query: &SearchCapabilityCapsuleRequest,
     graph: &dyn GraphStore,
     dynamics: Option<&EdgeDynamicsCtx>,
+    // G2 (oss-memory-diff §8): when `Some`, graph-boosted capsules
+    // missing from pool ∪ hybrid are hydrated by id — the graph becomes
+    // a CANDIDATE channel, not just a boost on rows already fetched.
+    // `None` keeps the pre-G2 boost-only behavior.
+    capsules: Option<&dyn crate::storage::CapsuleStore>,
 ) -> Result<Vec<CapabilityCapsuleRecord>, crate::storage::GraphError> {
     let hybrid_scores: HashMap<String, f32> = hybrid_hits
         .iter()
@@ -240,6 +245,49 @@ pub async fn rank_with_hybrid_and_graph(
     }
 
     let boost_by_id = compute_graph_boosts(graph, &anchors, dynamics).await?;
+
+    // G2: hydrate boosted-but-missing capsules. Under the default
+    // unbounded pool every active capsule is already a candidate and
+    // this is a no-op; with `MEM_RECALL_POOL_LIMIT` (or a capsule that
+    // matches neither BM25 nor ANN for this query) a graph-reachable
+    // row would otherwise be unreachable no matter how strong its
+    // edges. Hydration keeps the recall posture — Active + unexpired
+    // only — and degrades softly: a failed fetch just means the boosts
+    // apply to the already-fetched candidates.
+    let mut candidates = candidates;
+    if let Some(store) = capsules {
+        let known: HashSet<&str> = candidates
+            .iter()
+            .map(|m| m.capability_capsule_id.as_str())
+            .collect();
+        let missing: Vec<&str> = boost_by_id
+            .keys()
+            .map(String::as_str)
+            .filter(|id| !known.contains(id))
+            .collect();
+        if !missing.is_empty() {
+            if let Some(tenant) = query.tenant.as_deref() {
+                match store
+                    .fetch_capability_capsules_by_ids(tenant, &missing)
+                    .await
+                {
+                    Ok(rows) => {
+                        for m in rows {
+                            if m.status == CapabilityCapsuleStatus::Active && !is_expired(&m, &now)
+                            {
+                                candidates.push(m);
+                            }
+                        }
+                    }
+                    Err(e) => tracing::warn!(
+                        error = %e,
+                        "G2 graph-channel hydration failed; boosts apply to fetched candidates only"
+                    ),
+                }
+            }
+        }
+    }
+
     Ok(finalize(
         score_with_hybrid(candidates, query, &hybrid_scores, &boost_by_id),
         floor,
@@ -262,6 +310,17 @@ pub struct EdgeDynamicsCtx {
 /// hop gets this added to its score. K9 scales it by the connecting
 /// edge's time-decayed strength.
 const GRAPH_BOOST: i64 = 12;
+
+/// G2 scale for SIMILARITY-MINTED capsule↔capsule edges — the ones
+/// carrying a cosine confidence (H1 `related_to`, O2
+/// `suspected_supersede`). These are dense and individually weak
+/// evidence, so they get a nudge sized like a rank tiebreaker
+/// (adjacent RRF ranks differ by ~0.2–1 point; ×conf ≈ 3 lifts a
+/// near-miss a few ranks) instead of `GRAPH_BOOST` (≈ a 30-rank jump,
+/// measured to crowd organic top-5 hits out: LoCoMo multi-hop any@5
+/// -15pts). Confidence-less edges (entity anchors, curated links,
+/// lineage) keep the full `GRAPH_BOOST` — sparse and strong.
+const CONFIDENCE_EDGE_BOOST: i64 = 4;
 
 /// O4 (closes oss-memory-diff O4) — spread decay: dilute an anchor's
 /// graph boost by its *fanout* (the number of capsules linked to it),
@@ -329,7 +388,11 @@ async fn compute_graph_boosts(
                 relation: edge.relation.clone(),
             });
             let strength = crate::domain::edge_dynamics::decayed_strength(edge, &ctx.now);
-            let boost = ((GRAPH_BOOST as f32) * spread * strength).round() as i64;
+            let base = match edge.confidence {
+                Some(c) => (CONFIDENCE_EDGE_BOOST as f32) * c.clamp(0.0, 1.0),
+                None => GRAPH_BOOST as f32,
+            };
+            let boost = (base * spread * strength).round() as i64;
             for endpoint in [&edge.from_node_id, &edge.to_node_id] {
                 if anchor_set.contains(endpoint.as_str()) {
                     continue;
@@ -353,30 +416,40 @@ async fn compute_graph_boosts(
 /// ([`spread_decay`]), and each non-anchor capsule endpoint takes the max
 /// over the anchors that reach it. Pure for testability.
 fn graph_boosts_from_edges(
-    edges: &[(String, String)],
+    edges: &[(String, String, Option<f32>)],
     anchor_set: &HashSet<&str>,
 ) -> HashMap<String, i64> {
     // Pass 1: per-anchor capsule fanout degree (count edges whose *other*
     // endpoint is a capsule — entity↔entity edges don't inflate it).
     let mut degree: HashMap<&str, usize> = HashMap::new();
-    for (from, to) in edges {
+    for (from, to, _) in edges {
         for (endpoint, other) in [(from.as_str(), to.as_str()), (to.as_str(), from.as_str())] {
             if anchor_set.contains(endpoint) && other.starts_with("capability_capsule:") {
                 *degree.entry(endpoint).or_insert(0) += 1;
             }
         }
     }
-    // Pass 2: boost each non-anchor capsule endpoint by spread(degree) of
-    // the anchor it links to, maxed across anchors.
+    // Pass 2: boost each non-anchor capsule endpoint by
+    // spread(degree) · edge confidence, maxed across anchors. The
+    // confidence factor (G2 tuning) grades capsule↔capsule edges by the
+    // cosine they were minted at (H1 related_to ∈ [0.80, 0.92), O2
+    // suspected_supersede ≥ 0.92) — without it every neighbor of the
+    // top hit lands the same flat boost and crowds the head of the
+    // ranking (measured: LoCoMo multi-hop any@5 -15pts). A
+    // confidence-less edge (entity links, lineage) keeps full weight.
     let mut boosts: HashMap<String, i64> = HashMap::new();
-    for (from, to) in edges {
+    for (from, to, confidence) in edges {
         for (anchor, other) in [(from.as_str(), to.as_str()), (to.as_str(), from.as_str())] {
             if !anchor_set.contains(anchor) || anchor_set.contains(other) {
                 continue;
             }
             if let Some(mid) = other.strip_prefix("capability_capsule:") {
                 let d = degree.get(anchor).copied().unwrap_or(0);
-                let boost = ((GRAPH_BOOST as f32) * spread_decay(d)).round() as i64;
+                let base = match confidence {
+                    Some(c) => (CONFIDENCE_EDGE_BOOST as f32) * c.clamp(0.0, 1.0),
+                    None => GRAPH_BOOST as f32,
+                };
+                let boost = (base * spread_decay(d)).round() as i64;
                 boosts
                     .entry(mid.to_string())
                     .and_modify(|m| *m = (*m).max(boost))
@@ -809,10 +882,16 @@ mod tests {
         expired.capability_capsule_type = CapabilityCapsuleType::Preference;
         expired.expires_at = Some("00000001000000000000".to_string()); // long past
 
-        let out =
-            rank_with_hybrid_and_graph(vec![live, expired], vec![], &fixture_query(), &store, None)
-                .await
-                .unwrap();
+        let out = rank_with_hybrid_and_graph(
+            vec![live, expired],
+            vec![],
+            &fixture_query(),
+            &store,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
 
         let ids: Vec<String> = out
             .iter()
@@ -1366,8 +1445,8 @@ mod tests {
         ]
         .into_iter()
         .collect();
-        let e = |a: String, b: &str| (a, b.to_string());
-        let mut edges: Vec<(String, String)> = (1..=20)
+        let e = |a: String, b: &str| (a, b.to_string(), None);
+        let mut edges: Vec<(String, String, Option<f32>)> = (1..=20)
             .map(|i| e(format!("capability_capsule:c{i}"), "project:hub"))
             .collect(); // hub fanout degree = 20
         edges.push(e("capability_capsule:c1".into(), "module:narrow")); // narrow degree = 1
@@ -1390,6 +1469,46 @@ mod tests {
         );
         // anchorcap is itself an anchor → never boosted.
         assert_eq!(boosts.get("anchorcap"), None);
+    }
+
+    #[test]
+    fn graph_boosts_weight_by_edge_confidence() {
+        use std::collections::HashSet;
+        // G2 tuning: a capsule↔capsule edge carrying a cosine confidence
+        // (H1 related_to, O2 suspected_supersede) contributes
+        // GRAPH_BOOST · spread · confidence — a 0.5-confidence edge is
+        // worth half a confidence-less (entity) edge. Prevents the flat
+        // top-of-list crowding that cost LoCoMo multi-hop 15pts in the
+        // first G2 A/B.
+        let anchors: HashSet<&str> = ["capability_capsule:seed"].into_iter().collect();
+        let edges = vec![
+            (
+                "capability_capsule:seed".to_string(),
+                "capability_capsule:half".to_string(),
+                Some(0.5_f32),
+            ),
+            (
+                "capability_capsule:seed".to_string(),
+                "capability_capsule:full".to_string(),
+                None,
+            ),
+        ];
+        let boosts = graph_boosts_from_edges(&edges, &anchors);
+        let full = *boosts.get("full").expect("confidence-less edge boosts");
+        let half = *boosts.get("half").expect("half-confidence edge boosts");
+        assert_eq!(
+            full, GRAPH_BOOST,
+            "confidence-less (entity/lineage) edges keep the strong scale"
+        );
+        assert_eq!(
+            half,
+            ((CONFIDENCE_EDGE_BOOST as f32) * 0.5).round() as i64,
+            "similarity-minted edges use the tiebreaker scale × confidence"
+        );
+        assert!(
+            half < full,
+            "similarity edges must never outrank curated ones"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread")]

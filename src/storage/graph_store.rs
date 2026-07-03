@@ -80,10 +80,13 @@ pub trait GraphStore: Send + Sync {
     /// `compute_graph_boosts` derive per-anchor fanout degree + the
     /// degree-decayed boost without a `neighbors_within` round-trip per
     /// anchor.
+    /// `(from, to, confidence)` triples of every ACTIVE edge incident
+    /// to the node set. Confidence rides along so ranking can grade
+    /// capsule↔capsule edges by the cosine they were minted at (G2).
     async fn incident_edges_for_nodes(
         &self,
         node_ids: &[String],
-    ) -> Result<Vec<(String, String)>, GraphError>;
+    ) -> Result<Vec<(String, String, Option<f32>)>, GraphError>;
 
     /// Idempotent edge upsert for memory-derived edges. Writes
     /// active edges (`valid_from = now`, `valid_to = NULL`); a
@@ -179,7 +182,7 @@ impl GraphStore for Store {
     async fn incident_edges_for_nodes(
         &self,
         node_ids: &[String],
-    ) -> Result<Vec<(String, String)>, GraphError> {
+    ) -> Result<Vec<(String, String, Option<f32>)>, GraphError> {
         Store::incident_edges_for_nodes(self, node_ids).await
     }
 

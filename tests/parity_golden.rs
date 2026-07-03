@@ -868,7 +868,8 @@ async fn lance_parity_matches_golden() {
             "find_tunnels_caps": graph_edges_json(tunnels_caps),
             "find_tunnels_any": graph_edges_json(tunnels_any),
             "follow_tunnels_cap_b": graph_edges_json(followed),
-            "incident_edges_proj_mem": sorted_pairs(incident),
+            "incident_edges_proj_mem":
+                sorted_pairs(incident.into_iter().map(|(a, b, _)| (a, b)).collect()),
         }),
     );
 

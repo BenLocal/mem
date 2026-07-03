@@ -353,7 +353,7 @@ impl GraphStore for ClickHouseBackend {
     async fn incident_edges_for_nodes(
         &self,
         node_ids: &[String],
-    ) -> Result<Vec<(String, String)>, GraphError> {
+    ) -> Result<Vec<(String, String, Option<f32>)>, GraphError> {
         if node_ids.is_empty() {
             return Ok(Vec::new());
         }
@@ -365,7 +365,11 @@ impl GraphStore for ClickHouseBackend {
             if set.contains(e.from_node_id.as_str()) || set.contains(e.to_node_id.as_str()) {
                 let pair = (e.from_node_id.clone(), e.to_node_id.clone());
                 if seen.insert(pair.clone()) {
-                    out.push(pair);
+                    // CH stores confidence as a bare f32 with 0.0 standing in for
+                    // "unset" (see module header) — map 0.0 back to None so an
+                    // unweighted edge keeps full ranking weight, matching lance.
+                    let confidence = (e.confidence != 0.0).then_some(e.confidence);
+                    out.push((pair.0, pair.1, confidence));
                 }
             }
         }
