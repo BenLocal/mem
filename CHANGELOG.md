@@ -8,6 +8,49 @@ are organized by feature wave (merge commit ranges on `master`).
 
 ## [Unreleased]
 
+### Fixed — 2026-07-03 audit wave: evolution signals, G2 posture, graph parity (2026-07-06)
+
+Two parallel audit passes over the post-2026-06-30 code (E2–E5 / H1–H3 /
+Qwen3 / G2) surfaced 15 defects; all fixed with RED→GREEN regressions.
+The two load-bearing roots:
+
+- **E4 keyed recall on the wrong column** (`fix(evolution)`): every ⑤⑥
+  detector read `last_used_at`, which the hourly decay sweep stamps on
+  EVERY active row as its clock — so reweight-up saw 100% "recently
+  recalled" clusters (runaway +0.02/sweep toward the 0.9 cap, and
+  `idle_archive`'s confidence clause permanently defeated), reweight-decay
+  could only ever fire in a capsule's first hour, co-recall turned the
+  hourly stamp into all-pairs Hebbian edges on small tenants, and prune
+  never fired. All four now key on `last_recalled_at` (the durable,
+  bump-only recall signal). Same commit: the executed-history re-proposal
+  suppression was dead code (`match_candidate` hard-skipped non-pending
+  rows), so executed generalize/refine/split re-executed every K cycles,
+  flooding review with duplicate placeholders; accept/edit-accept now
+  settle the candidate to `accepted` (suppression survives, §11 rollback
+  refuses instead of falsely reporting success); prune skips edges with no
+  endpoint in the scanned tenant set (it used to close OTHER tenants'
+  edges); cancelled corecall batches stop re-minting candidate rows;
+  reweight-up excludes guidance capsules like every sibling operator.
+- **G2 hydration bypassed the pool's recall posture** (`fix(graph)`): the
+  graph channel admitted any Active+unexpired row, resurrecting Diary
+  capsules (excluded by both other channels) and versions superseded by an
+  Active successor (the `supersedes` lineage edge made that deterministic
+  whenever the successor ranked top-5); an omitted tenant silently
+  disabled the channel instead of defaulting to `local`. The two-class
+  edge weighting is now keyed on the `extractor` tag instead of
+  `confidence.is_some()` — a curated fact edge declaring confidence 1.0
+  used to score 4 while the identical undeclared edge scored 12
+  (`IncidentEdge` struct through all three backends). ClickHouse graph
+  reads: no more pair-dedup (lance/pg return all rows; ranking maxes),
+  and `neighbors_within`'s 0.0-confidence sentinel reads back as `None`.
+- **Embedding lanes** (`fix(embedding)`): the H1 band's upper bound opens
+  to ∞ when the near-dup lane is off (cos ≥ 0.92 neighbors were falling
+  into a dead zone nothing owned) with a startup warning for an empty
+  band; H1/O2 skip neighbors whose stored vector was minted by another
+  model; the OpenAI-compatible provider applies the same Qwen3
+  query-instruction template as embed_anything (shared
+  `query_embed_input`).
+
 ### Added — H-series borrowings: ingest linking, note evidence, LoCoMo (2026-07-02)
 
 - **H1 — ingest-time neighbor linking** (zero-LLM slice of A-Mem's link
