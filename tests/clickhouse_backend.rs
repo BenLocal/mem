@@ -728,4 +728,77 @@ mod ch {
             Some("completed".to_string())
         );
     }
+
+    /// Audit 2026-07-03 ⑨⑩ — graph-read parity with lance/pg:
+    /// (⑩) a (from,to) pair carrying TWO relations must come back as
+    /// two rows from `incident_edges_for_nodes` (no pair-dedup —
+    /// ranking maxes over the classes), and (⑨) the 0.0 confidence
+    /// sentinel reads back as `None` on BOTH the incident-edges and
+    /// `neighbors_within` paths, while a real confidence + extractor
+    /// round-trips intact.
+    #[tokio::test]
+    async fn incident_edges_no_dedup_and_confidence_sentinel_parity() {
+        let Some(be) = ch_backend().await else { return };
+        let mut sim = dated_edge(
+            "capability_capsule:g2a",
+            "capability_capsule:g2b",
+            "related_to",
+            "00000000000000000100",
+            None,
+        );
+        sim.confidence = Some(0.85);
+        sim.extractor = Some("ingest_link".into());
+        let mut curated = dated_edge(
+            "capability_capsule:g2a",
+            "capability_capsule:g2b",
+            "supports",
+            "00000000000000000100",
+            None,
+        );
+        curated.confidence = None; // the fixture defaults to Some(1.0)
+        curated.extractor = None;
+        be.add_edge_direct(&sim).await.unwrap();
+        be.add_edge_direct(&curated).await.unwrap();
+
+        let incident = be
+            .incident_edges_for_nodes(&["capability_capsule:g2a".into()])
+            .await
+            .unwrap();
+        let rows: Vec<_> = incident
+            .iter()
+            .filter(|e| e.to == "capability_capsule:g2b")
+            .collect();
+        assert!(
+            rows.len() >= 2,
+            "pair-dedup must not collapse the two relations: {rows:?}"
+        );
+        assert!(
+            rows.iter()
+                .any(|e| e.confidence.is_none() && e.extractor.is_none()),
+            "curated edge: the 0.0 sentinel must read back as None: {rows:?}"
+        );
+        assert!(
+            rows.iter().any(|e| {
+                e.extractor.as_deref() == Some("ingest_link")
+                    && e.confidence
+                        .map(|c| (c - 0.85).abs() < 1e-4)
+                        .unwrap_or(false)
+            }),
+            "similarity edge must round-trip confidence + extractor: {rows:?}"
+        );
+
+        // ⑨: the BFS read path maps the sentinel identically.
+        let neighbors = be
+            .neighbors_within("capability_capsule:g2a", 1, None)
+            .await
+            .unwrap();
+        let cur = neighbors
+            .iter()
+            .find(|e| e.relation == "supports")
+            .expect("curated edge visible via neighbors_within");
+        assert_eq!(
+            cur.confidence, None,
+            "neighbors_within must read the 0.0 sentinel as None"
+        );
+    }
 }

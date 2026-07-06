@@ -775,15 +775,16 @@ impl LanceStore {
 
     /// Route-B bucket "graph-tunnel": native lancedb-Rust equivalent of
     /// `DuckDbQuery::incident_edges_for_nodes`. Every active 1-hop edge
-    /// (`valid_to IS NULL`) incident to any node in `node_ids`, as raw
-    /// `(from_node_id, to_node_id)` pairs. The DuckDB query has no ORDER
-    /// BY, so the pair order is not load-bearing — callers (and the
-    /// golden) sort deterministically. Empty input short-circuits.
+    /// (`valid_to IS NULL`) incident to any node in `node_ids`, as
+    /// [`IncidentEdge`]s (endpoints + confidence + extractor, the G2
+    /// boost-class signals). The DuckDB query had no ORDER BY, so the
+    /// order is not load-bearing — callers (and the golden) sort
+    /// deterministically. Empty input short-circuits.
     /// Parity-gated by `tests/parity_golden.rs`.
     pub async fn incident_edges_for_nodes(
         &self,
         node_ids: &[String],
-    ) -> Result<Vec<(String, String, Option<f32>)>, GraphError> {
+    ) -> Result<Vec<crate::storage::graph_store::IncidentEdge>, GraphError> {
         if node_ids.is_empty() {
             return Ok(Vec::new());
         }
@@ -797,8 +798,8 @@ impl LanceStore {
         );
         let edges = self.query_graph_edges(filter).await?;
         Ok(edges
-            .into_iter()
-            .map(|e| (e.from_node_id, e.to_node_id, e.confidence))
+            .iter()
+            .map(crate::storage::graph_store::IncidentEdge::from)
             .collect())
     }
 }

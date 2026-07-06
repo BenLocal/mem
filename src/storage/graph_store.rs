@@ -16,6 +16,34 @@ use crate::domain::capability_capsule::{GraphEdge, GraphStats};
 use crate::storage::types::GraphError;
 use crate::storage::Store;
 
+/// One active edge incident to ranking's anchor set, carrying exactly
+/// the signals `pipeline::retrieve` grades boosts by (G2): the
+/// endpoints, the confidence the edge was minted at, and the producer
+/// tag. `extractor` is the BOOST-CLASS discriminator — the
+/// similarity-minted lanes stamp `"ingest_link"` (H1) /
+/// `"o7_neardup_cluster"` (O2), and only those edges take the
+/// confidence-scaled nudge; keying the class on `confidence.is_some()`
+/// instead inverted curated edges that declare high confidence (audit
+/// 2026-07-03 ⑥).
+#[derive(Debug, Clone, PartialEq)]
+pub struct IncidentEdge {
+    pub from: String,
+    pub to: String,
+    pub confidence: Option<f32>,
+    pub extractor: Option<String>,
+}
+
+impl From<&GraphEdge> for IncidentEdge {
+    fn from(e: &GraphEdge) -> Self {
+        Self {
+            from: e.from_node_id.clone(),
+            to: e.to_node_id.clone(),
+            confidence: e.confidence,
+            extractor: e.extractor.clone(),
+        }
+    }
+}
+
 #[async_trait]
 pub trait GraphStore: Send + Sync {
     /// 1-hop active neighbors of `node_id` (either endpoint).
@@ -75,18 +103,19 @@ pub trait GraphStore: Send + Sync {
         node_ids: &[String],
     ) -> Result<Vec<String>, GraphError>;
 
-    /// O4 (perf): every active 1-hop edge incident to any node in
-    /// `node_ids`, as raw `(from, to)` pairs, in one query. Lets
+    /// O4 (perf): every ACTIVE 1-hop edge incident to any node in
+    /// `node_ids`, in one query, as [`IncidentEdge`]s. Lets
     /// `compute_graph_boosts` derive per-anchor fanout degree + the
     /// degree-decayed boost without a `neighbors_within` round-trip per
-    /// anchor.
-    /// `(from, to, confidence)` triples of every ACTIVE edge incident
-    /// to the node set. Confidence rides along so ranking can grade
-    /// capsule↔capsule edges by the cosine they were minted at (G2).
+    /// anchor; confidence + extractor ride along so ranking can grade
+    /// capsule↔capsule edges by class and minting cosine (G2, audit ⑥).
+    /// ALL active rows come back (a `(from,to)` pair may carry several
+    /// relations with different classes — ranking maxes over them);
+    /// backends must not dedup.
     async fn incident_edges_for_nodes(
         &self,
         node_ids: &[String],
-    ) -> Result<Vec<(String, String, Option<f32>)>, GraphError>;
+    ) -> Result<Vec<IncidentEdge>, GraphError>;
 
     /// Idempotent edge upsert for memory-derived edges. Writes
     /// active edges (`valid_from = now`, `valid_to = NULL`); a
@@ -182,7 +211,7 @@ impl GraphStore for Store {
     async fn incident_edges_for_nodes(
         &self,
         node_ids: &[String],
-    ) -> Result<Vec<(String, String, Option<f32>)>, GraphError> {
+    ) -> Result<Vec<IncidentEdge>, GraphError> {
         Store::incident_edges_for_nodes(self, node_ids).await
     }
 

@@ -1291,7 +1291,7 @@ impl Store {
     pub async fn incident_edges_for_nodes(
         &self,
         node_ids: &[String],
-    ) -> Result<Vec<(String, String, Option<f32>)>, GraphError> {
+    ) -> Result<Vec<crate::storage::graph_store::IncidentEdge>, GraphError> {
         self.lance.incident_edges_for_nodes(node_ids).await
     }
 

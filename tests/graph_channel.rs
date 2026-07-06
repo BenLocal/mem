@@ -176,3 +176,118 @@ async fn hydration_respects_active_and_expiry_posture() {
         "hydration must not resurrect archived/expired rows: {ids:?}"
     );
 }
+
+/// Audit 2026-07-03 #4: hydration keeps the POOL's posture, not just
+/// Active+unexpired — Diary capsules are excluded from the pool AND the
+/// hybrid channels, so the graph channel must not resurrect them into
+/// normal recall through an edge.
+#[tokio::test(flavor = "multi_thread")]
+async fn hydration_excludes_diary_capsules() {
+    let dir = tempdir().unwrap();
+    let store = Arc::new(Store::open(&dir.path().join("g2c.lance")).await.unwrap());
+    let seed = capsule("seed", "the lance write path lesson everyone recalls");
+    let mut journal = capsule("journal", "private diary entry about the day");
+    journal.capability_capsule_type = CapabilityCapsuleType::Diary;
+    for c in [&seed, &journal] {
+        store.insert_capability_capsule(c.clone()).await.unwrap();
+    }
+    store
+        .add_edge_direct(&related_to("seed", "journal"))
+        .await
+        .unwrap();
+
+    let pool = vec![seed.clone()];
+    let hybrid = vec![(seed.clone(), 0.9_f32)];
+    let graph: &dyn GraphStore = store.as_ref();
+    let capsules: &dyn CapsuleStore = store.as_ref();
+    let got = rank_with_hybrid_and_graph(pool, hybrid, &query(), graph, None, Some(capsules))
+        .await
+        .unwrap();
+    assert!(
+        !got.iter().any(|m| m.capability_capsule_id == "journal"),
+        "diary content must never leak into recall via hydration"
+    );
+}
+
+/// Audit 2026-07-03 #3: the pool drops versions superseded by an Active
+/// successor (version-chain dedup); ingest writes an active
+/// `supersedes` edge new→old, so WITHOUT the same filter the graph
+/// channel deterministically resurrects every replaced fact whose
+/// successor ranks top-5.
+#[tokio::test(flavor = "multi_thread")]
+async fn hydration_does_not_resurrect_superseded_versions() {
+    let dir = tempdir().unwrap();
+    let store = Arc::new(Store::open(&dir.path().join("g2d.lance")).await.unwrap());
+    let old = capsule("old", "the stale fact everyone should forget");
+    let mut new = capsule("new", "the corrected lance write path lesson");
+    new.supersedes_capability_capsule_id = Some("old".into());
+    for c in [&old, &new] {
+        store.insert_capability_capsule(c.clone()).await.unwrap();
+    }
+    // The lineage edge ingest mints on supersede — confidence-less.
+    store
+        .add_edge_direct(&GraphEdge {
+            from_node_id: "capability_capsule:new".into(),
+            to_node_id: "capability_capsule:old".into(),
+            relation: "supersedes".into(),
+            valid_from: "00000000000000000002".into(),
+            valid_to: None,
+            confidence: None,
+            extractor: None,
+            strength: None,
+            stability: None,
+            last_activated: None,
+            access_count: None,
+        })
+        .await
+        .unwrap();
+
+    // The pool already deduped `old` away; only the graph knows it.
+    let pool = vec![new.clone()];
+    let hybrid = vec![(new.clone(), 0.9_f32)];
+    let graph: &dyn GraphStore = store.as_ref();
+    let capsules: &dyn CapsuleStore = store.as_ref();
+    let got = rank_with_hybrid_and_graph(pool, hybrid, &query(), graph, None, Some(capsules))
+        .await
+        .unwrap();
+    assert!(
+        !got.iter().any(|m| m.capability_capsule_id == "old"),
+        "hydration must not resurrect a version superseded by an Active successor"
+    );
+}
+
+/// Audit 2026-07-03 #5: the service resolves an omitted tenant to
+/// "local" for the pool and hybrid channels — hydration must apply the
+/// SAME default instead of silently disabling the graph channel.
+#[tokio::test(flavor = "multi_thread")]
+async fn hydration_applies_the_local_tenant_default() {
+    let dir = tempdir().unwrap();
+    let store = Arc::new(Store::open(&dir.path().join("g2e.lance")).await.unwrap());
+    let seed = capsule("seed", "the lance write path lesson everyone recalls");
+    let friend = capsule("friend", "companion note that only the graph reaches");
+    for c in [&seed, &friend] {
+        store.insert_capability_capsule(c.clone()).await.unwrap();
+    }
+    store
+        .add_edge_direct(&related_to("seed", "friend"))
+        .await
+        .unwrap();
+
+    let mut q = query();
+    q.tenant = None; // caller relies on the documented "local" default
+
+    let pool = vec![seed.clone()];
+    let hybrid = vec![(seed.clone(), 0.9_f32)];
+    let graph: &dyn GraphStore = store.as_ref();
+    let capsules: &dyn CapsuleStore = store.as_ref();
+    let got = rank_with_hybrid_and_graph(pool, hybrid, &q, graph, None, Some(capsules))
+        .await
+        .unwrap();
+    assert!(
+        got.iter().any(|m| m.capability_capsule_id == "friend"),
+        "omitted tenant must default to local, not disable hydration: got {:?}",
+        got.iter()
+            .map(|m| m.capability_capsule_id.as_str())
+            .collect::<Vec<_>>()
+    );
+}

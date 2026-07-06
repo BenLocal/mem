@@ -69,7 +69,14 @@ impl ChEdgeRow {
             relation: self.relation,
             valid_from: self.valid_from,
             valid_to: opt(self.valid_to),
-            confidence: Some(self.confidence),
+            // 0.0 is the "unset" sentinel (no Nullable columns) — map it
+            // back to None so a confidence-less edge reads back like
+            // lance/pg NULL (audit 2026-07-03 ⑨: `Some(0.0)` zeroed the
+            // K9-dynamics boost of every unweighted edge). A genuine
+            // stored 0.0 is indistinguishable — documented module-header
+            // caveat; strength/stability keep the Some(0) round-trip
+            // because K9 potentiation owns their defaults.
+            confidence: (self.confidence != 0.0).then_some(self.confidence),
             extractor: opt(self.extractor),
             strength: Some(self.strength),
             stability: Some(self.stability),
@@ -353,24 +360,30 @@ impl GraphStore for ClickHouseBackend {
     async fn incident_edges_for_nodes(
         &self,
         node_ids: &[String],
-    ) -> Result<Vec<(String, String, Option<f32>)>, GraphError> {
+    ) -> Result<Vec<crate::storage::graph_store::IncidentEdge>, GraphError> {
         if node_ids.is_empty() {
             return Ok(Vec::new());
         }
         let set: HashSet<&str> = node_ids.iter().map(String::as_str).collect();
         let edges = self.ch_active_edges().await?;
         let mut out = Vec::new();
-        let mut seen: HashSet<(String, String)> = HashSet::new();
+        // NO pair-dedup (audit 2026-07-03 ⑩): lance/pg return every
+        // active row and ranking maxes over them — deduping here kept
+        // an arbitrary row's confidence/class for a pair carrying
+        // several relations.
         for e in edges {
             if set.contains(e.from_node_id.as_str()) || set.contains(e.to_node_id.as_str()) {
-                let pair = (e.from_node_id.clone(), e.to_node_id.clone());
-                if seen.insert(pair.clone()) {
-                    // CH stores confidence as a bare f32 with 0.0 standing in for
-                    // "unset" (see module header) — map 0.0 back to None so an
-                    // unweighted edge keeps full ranking weight, matching lance.
-                    let confidence = (e.confidence != 0.0).then_some(e.confidence);
-                    out.push((pair.0, pair.1, confidence));
-                }
+                // CH stores confidence as a bare f32 with 0.0 standing in
+                // for "unset" (see module header) — map 0.0 back to None so
+                // an unweighted edge keeps full ranking weight, matching
+                // lance/pg.
+                let confidence = (e.confidence != 0.0).then_some(e.confidence);
+                out.push(crate::storage::graph_store::IncidentEdge {
+                    from: e.from_node_id,
+                    to: e.to_node_id,
+                    confidence,
+                    extractor: opt(e.extractor),
+                });
             }
         }
         Ok(out)

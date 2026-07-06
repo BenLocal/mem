@@ -1618,13 +1618,13 @@ impl GraphStore for PostgresCapsuleStore {
     async fn incident_edges_for_nodes(
         &self,
         node_ids: &[String],
-    ) -> Result<Vec<(String, String, Option<f32>)>, GraphError> {
+    ) -> Result<Vec<crate::storage::graph_store::IncidentEdge>, GraphError> {
         if node_ids.is_empty() {
             return Ok(Vec::new());
         }
         let owned: Vec<String> = node_ids.to_vec();
         let rows = sqlx::query(
-            "SELECT from_node_id, to_node_id, confidence FROM graph_edges \
+            "SELECT from_node_id, to_node_id, confidence, extractor FROM graph_edges \
              WHERE (from_node_id = ANY($1) OR to_node_id = ANY($1)) AND valid_to IS NULL",
         )
         .bind(&owned)
@@ -1633,12 +1633,16 @@ impl GraphStore for PostgresCapsuleStore {
         .map_err(graph_err)?;
         rows.iter()
             .map(|r| {
-                Ok((
-                    r.try_get::<String, _>("from_node_id").map_err(graph_err)?,
-                    r.try_get::<String, _>("to_node_id").map_err(graph_err)?,
-                    r.try_get::<Option<f32>, _>("confidence")
+                Ok(crate::storage::graph_store::IncidentEdge {
+                    from: r.try_get::<String, _>("from_node_id").map_err(graph_err)?,
+                    to: r.try_get::<String, _>("to_node_id").map_err(graph_err)?,
+                    confidence: r
+                        .try_get::<Option<f32>, _>("confidence")
                         .map_err(graph_err)?,
-                ))
+                    extractor: r
+                        .try_get::<Option<String>, _>("extractor")
+                        .map_err(graph_err)?,
+                })
             })
             .collect()
     }
