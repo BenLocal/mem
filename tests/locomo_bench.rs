@@ -417,6 +417,7 @@ async fn locomo_session_recall() {
                         TENANT,
                         uuid,
                         &vec,
+                        &model,
                         0.80,
                         0.92,
                     )

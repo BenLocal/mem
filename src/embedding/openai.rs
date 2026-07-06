@@ -58,6 +58,15 @@ impl EmbeddingProvider for OpenAiEmbeddingProvider {
         self.dim
     }
 
+    /// Same asymmetric-scheme rule as the embed_anything provider
+    /// (audit 2026-07-03 ⑮): the query template is keyed on the model
+    /// name, so a Qwen3-Embedding model served through an
+    /// OpenAI-compatible endpoint gets the identical instructed query.
+    async fn embed_query(&self, text: &str) -> Result<Vec<f32>, EmbeddingError> {
+        let input = crate::embedding::provider::query_embed_input(&self.model, text);
+        self.embed_text(&input).await
+    }
+
     async fn embed_text(&self, text: &str) -> Result<Vec<f32>, EmbeddingError> {
         let mut body = serde_json::json!({
             "model": self.model,

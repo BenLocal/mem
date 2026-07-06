@@ -18,6 +18,19 @@ pub async fn run(
         poll_interval_ms = settings.worker_poll_interval_ms,
         "embedding worker started"
     );
+    // ⑬b: MEM_INGEST_LINK_THRESHOLD only validates ∈ [0,1] — a value at
+    // or above the near-dup floor silently empties the H1 band while
+    // both lanes are on. Loud misconfiguration beats zero edges.
+    if settings.ingest_link_enabled
+        && settings.neardup_enabled
+        && settings.ingest_link_threshold >= settings.neardup_threshold
+    {
+        warn!(
+            link_threshold = settings.ingest_link_threshold,
+            neardup_threshold = settings.neardup_threshold,
+            "H1 ingest-link band is EMPTY (link_threshold >= neardup_threshold) — no related_to edges will be minted"
+        );
+    }
     let mut interval = tokio::time::interval(std::time::Duration::from_millis(
         settings.worker_poll_interval_ms.max(1),
     ));
@@ -282,6 +295,7 @@ async fn post_embed(
             &job.tenant,
             &job.capability_capsule_id,
             &embeddings[0],
+            provider.model(),
             settings.neardup_threshold,
         )
         .await
@@ -310,8 +324,9 @@ async fn post_embed(
             &job.tenant,
             &job.capability_capsule_id,
             &embeddings[0],
+            provider.model(),
             settings.ingest_link_threshold,
-            settings.neardup_threshold,
+            ingest_link_upper(settings.neardup_enabled, settings.neardup_threshold),
         )
         .await
         {
@@ -344,10 +359,12 @@ async fn flag_if_near_duplicate(
     tenant: &str,
     capsule_id: &str,
     vector: &[f32],
+    model: &str,
     threshold: f32,
 ) -> Result<(), StorageError> {
     let Some((canonical_id, cosine)) =
-        cluster_canonical_near_duplicate(store, tenant, capsule_id, vector, threshold).await?
+        cluster_canonical_near_duplicate(store, tenant, capsule_id, vector, model, threshold)
+            .await?
     else {
         return Ok(());
     };
@@ -400,12 +417,29 @@ async fn flag_if_near_duplicate(
 /// sparse; only the top-K in-band neighbors by cosine get an edge.
 const INGEST_LINK_MAX_EDGES: usize = 4;
 
+/// H1 band upper bound (audit 2026-07-03 ⑬): [`neardup_threshold`,
+/// 1.0] belongs to the O2/O7(a) supersede lane ONLY while that lane is
+/// enabled. With near-dup flagging off, nothing owns the top band —
+/// capping there left a capsule's strongest semantic neighbors (cos ≥
+/// 0.92) with neither a link nor a supersede proposal, invisible to
+/// the G2 graph channel.
+pub(crate) fn ingest_link_upper(neardup_enabled: bool, neardup_threshold: f32) -> f32 {
+    if neardup_enabled {
+        neardup_threshold
+    } else {
+        f32::INFINITY
+    }
+}
+
 /// H1 (oss-memory-diff §9): zero-LLM slice of A-Mem's link network.
 /// After embedding a fresh `Active` capsule, connect it to its semantic
 /// neighborhood with `related_to` edges (`extractor="ingest_link"`,
 /// cosine riding as edge confidence). Band is [link_threshold,
-/// neardup_threshold): anything at/above the near-dup floor belongs to
-/// the O2/O7(a) supersede-proposal lane, not plain linking. Pure
+/// link_upper), where the upper bound is [`ingest_link_upper`]: the
+/// near-dup floor while the O2/O7(a) supersede lane is on (that lane
+/// owns the top band), open otherwise (audit ⑬). Neighbors whose
+/// stored vector was minted by another model are skipped (audit ⑭).
+/// Pure
 /// connectivity — no status flips, no content writes; the edges feed
 /// O4's graph boost immediately and pre-build density for a future G2
 /// third retrieval channel. Best-effort like the O2 lane: errors are
@@ -417,8 +451,9 @@ pub async fn link_related_neighbors(
     tenant: &str,
     capsule_id: &str,
     vector: &[f32],
+    model: &str,
     link_threshold: f32,
-    neardup_threshold: f32,
+    link_upper: f32,
 ) -> Result<(), StorageError> {
     const K: usize = 12;
     let candidates = store.hybrid_candidates(tenant, "", vector, K).await?;
@@ -427,6 +462,19 @@ pub async fn link_related_neighbors(
         if cand.capability_capsule_id == capsule_id {
             continue;
         }
+        // ⑭ (audit 2026-07-03): only trust vectors minted by the CURRENT
+        // model — mid-migration after a same-dim model switch, a
+        // not-yet-re-embedded neighbor's cosine is meaningless and would
+        // mint a wrong-confidence edge that persists into ranking.
+        // (Cross-dim already degrades: `cosine` returns 0 on length
+        // mismatch.)
+        match store
+            .get_capability_capsule_embedding_row(&cand.capability_capsule_id)
+            .await?
+        {
+            Some((cand_model, _, _)) if cand_model == model => {}
+            _ => continue,
+        }
         let Some(cand_vec) = store
             .get_capability_capsule_embedding_vector(&cand.capability_capsule_id)
             .await?
@@ -434,7 +482,7 @@ pub async fn link_related_neighbors(
             continue;
         };
         let c = cosine(vector, &cand_vec);
-        if c >= link_threshold && c < neardup_threshold {
+        if c >= link_threshold && c < link_upper {
             in_band.push((cand.capability_capsule_id.clone(), c));
         }
     }
@@ -499,6 +547,7 @@ async fn cluster_canonical_near_duplicate(
     tenant: &str,
     self_id: &str,
     vector: &[f32],
+    model: &str,
     threshold: f32,
 ) -> Result<Option<(String, f32)>, StorageError> {
     // K bumped from O2's 5 → 12 so a multi-member near-dup cluster is captured
@@ -509,6 +558,15 @@ async fn cluster_canonical_near_duplicate(
     for (cand, _rrf) in candidates {
         if cand.capability_capsule_id == self_id {
             continue;
+        }
+        // ⑭: same current-model guard as the H1 lane — a stale-model
+        // cosine must not drive a supersede proposal either.
+        match store
+            .get_capability_capsule_embedding_row(&cand.capability_capsule_id)
+            .await?
+        {
+            Some((cand_model, _, _)) if cand_model == model => {}
+            _ => continue,
         }
         let Some(cand_vec) = store
             .get_capability_capsule_embedding_vector(&cand.capability_capsule_id)
@@ -698,7 +756,7 @@ mod tests {
         put_embedding(&store, "orig", &v).await;
         put_embedding(&store, "dup", &v).await;
 
-        flag_if_near_duplicate(&store, "local", "dup", &v, 0.90)
+        flag_if_near_duplicate(&store, "local", "dup", &v, "fake-test", 0.90)
             .await
             .unwrap();
 
@@ -747,7 +805,7 @@ mod tests {
         let vb = vec![0.0f32, 1.0, 0.0, 0.0];
         put_embedding(&store, "b", &vb).await;
 
-        flag_if_near_duplicate(&store, "local", "b", &vb, 0.90)
+        flag_if_near_duplicate(&store, "local", "b", &vb, "fake-test", 0.90)
             .await
             .unwrap();
 
@@ -831,7 +889,7 @@ mod tests {
         put_embedding(&store, "short_near", &v).await; // cosine 1.0
         put_embedding(&store, "long_near", &[0.99f32, 0.14, 0.0, 0.0]).await; // cosine ~0.990
 
-        flag_if_near_duplicate(&store, "local", "new", &v, 0.90)
+        flag_if_near_duplicate(&store, "local", "new", &v, "fake-test", 0.90)
             .await
             .unwrap();
 
@@ -884,7 +942,7 @@ mod tests {
         put_embedding(&store, "twin", &[0.999, 0.02, 0.0, 0.0]).await; // cos ≈ 1.0 — neardup lane
         put_embedding(&store, "far", &[0.3, 0.954, 0.0, 0.0]).await; // cos ≈ 0.3 — noise
 
-        link_related_neighbors(&store, "local", "new", &v_new, 0.80, 0.92)
+        link_related_neighbors(&store, "local", "new", &v_new, "fake-test", 0.80, 0.92)
             .await
             .unwrap();
 
@@ -929,7 +987,7 @@ mod tests {
             put_embedding(&store, &id, &[*x, y, 0.0, 0.0]).await;
         }
 
-        link_related_neighbors(&store, "local", "new", &v_new, 0.80, 0.92)
+        link_related_neighbors(&store, "local", "new", &v_new, "fake-test", 0.80, 0.92)
             .await
             .unwrap();
 
@@ -954,5 +1012,100 @@ mod tests {
                 "top-cosine neighbor {kept} must be linked: {related:?}"
             );
         }
+    }
+
+    /// Audit 2026-07-03 ⑬: the near-dup floor caps the band ONLY while
+    /// the O2/O7(a) lane is on. Lane off → the bound opens, so a
+    /// cosine-0.99 twin still gets its `related_to` link instead of
+    /// falling into a dead zone nothing owns.
+    #[test]
+    fn ingest_link_upper_opens_only_when_neardup_lane_is_off() {
+        assert_eq!(ingest_link_upper(true, 0.92), 0.92);
+        assert!(ingest_link_upper(false, 0.92).is_infinite());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn band_upper_opens_when_neardup_lane_is_off() {
+        let dir = tempdir().unwrap();
+        let store = Store::open(&dir.path().join("h1open.lance")).await.unwrap();
+        for id in ["new", "twin"] {
+            store
+                .insert_capability_capsule(active_capsule(id))
+                .await
+                .unwrap();
+        }
+        let v_new = [1.0_f32, 0.0, 0.0, 0.0];
+        put_embedding(&store, "new", &v_new).await;
+        put_embedding(&store, "twin", &[0.999, 0.02, 0.0, 0.0]).await; // cos ≈ 1.0
+
+        link_related_neighbors(
+            &store,
+            "local",
+            "new",
+            &v_new,
+            "fake-test",
+            0.80,
+            ingest_link_upper(false, 0.92),
+        )
+        .await
+        .unwrap();
+
+        let edges = store
+            .neighbors_within(&memory_node_id("new"), 1, None)
+            .await
+            .unwrap();
+        assert!(
+            edges
+                .iter()
+                .any(|e| e.relation == "related_to" && e.to_node_id == memory_node_id("twin")),
+            "with the supersede lane off, the strongest neighbor must still link: {edges:?}"
+        );
+    }
+
+    /// Audit 2026-07-03 ⑭: a neighbor still carrying ANOTHER model's
+    /// vector (mid re-embed migration) must contribute no cosine — a
+    /// cross-model cosine is meaningless and its edge would persist
+    /// into ranking.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn link_skips_neighbors_embedded_by_another_model() {
+        let dir = tempdir().unwrap();
+        let store = Store::open(&dir.path().join("h1model.lance"))
+            .await
+            .unwrap();
+        for id in ["new", "kin"] {
+            store
+                .insert_capability_capsule(active_capsule(id))
+                .await
+                .unwrap();
+        }
+        let v_new = [1.0_f32, 0.0, 0.0, 0.0];
+        put_embedding(&store, "new", &v_new).await;
+        // kin is squarely in band — but its row was minted by an older model.
+        store
+            .upsert_capability_capsule_embedding_chunks(
+                "kin",
+                "local",
+                "stale-model",
+                4,
+                &[vec![0.85, 0.527, 0.0, 0.0]],
+                "h",
+                "00000000000000000001",
+                "00000000000000000002",
+            )
+            .await
+            .unwrap();
+
+        link_related_neighbors(&store, "local", "new", &v_new, "fake-test", 0.80, 0.92)
+            .await
+            .unwrap();
+
+        let edges = store
+            .neighbors_within(&memory_node_id("new"), 1, None)
+            .await
+            .unwrap();
+        assert!(
+            !edges.iter().any(|e| e.relation == "related_to"),
+            "a stale-model neighbor must not be linked: {edges:?}"
+        );
     }
 }
