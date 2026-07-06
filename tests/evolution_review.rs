@@ -274,3 +274,132 @@ async fn edit_accept_rewrites_generalize_lineage_to_successor() {
         );
     }
 }
+
+/// Audit 2026-07-03 #1: while an executed one-shot candidate awaits its
+/// review verdict, further sweeps keep detecting the same stable
+/// cluster — the executed history must suppress re-execution, or the
+/// review queue fills with duplicate placeholders.
+#[tokio::test(flavor = "multi_thread")]
+async fn executed_generalize_is_not_reproposed_while_awaiting_review() {
+    let dir = tempdir().unwrap();
+    let store = Arc::new(Store::open(&dir.path().join("evo.lance")).await.unwrap());
+    seed_generalize_cluster(&store).await;
+    let settings = generalize_only_settings(1); // gate opens immediately
+
+    let r1 = evolution_worker::sweep_once(&*store, &settings, TENANT, false)
+        .await
+        .unwrap();
+    assert_eq!(r1.executed.len(), 1, "K=1 executes on the first sweep");
+
+    for cycle in 2..=3 {
+        let r = evolution_worker::sweep_once(&*store, &settings, TENANT, false)
+            .await
+            .unwrap();
+        assert!(
+            r.executed.is_empty(),
+            "cycle {cycle} re-executed an already-executed generalize: {:?}",
+            r.executed
+        );
+    }
+    assert_eq!(
+        store.list_pending_review(TENANT).await.unwrap().len(),
+        1,
+        "exactly one placeholder may exist while the reviewer decides"
+    );
+}
+
+/// Audit 2026-07-03 ⑦: accepting a placeholder settles its candidate —
+/// the row flips `executed` → `accepted`, §11 rollback refuses it
+/// (instead of "succeeding" while the accepted successor stays live),
+/// and the settled cluster does not re-propose.
+#[tokio::test(flavor = "multi_thread")]
+async fn accept_settles_candidate_blocks_rollback_and_reproposal() {
+    let dir = tempdir().unwrap();
+    let store = Arc::new(Store::open(&dir.path().join("evo.lance")).await.unwrap());
+    let service = CapabilityCapsuleService::new(store.clone());
+    seed_generalize_cluster(&store).await;
+    let settings = generalize_only_settings(1);
+
+    let r1 = evolution_worker::sweep_once(&*store, &settings, TENANT, false)
+        .await
+        .unwrap();
+    let candidate_id = r1.executed[0].candidate_id.clone();
+    let placeholder = r1.executed[0].result_capsule_ids[0].clone();
+
+    service
+        .edit_and_accept_pending(
+            TENANT,
+            EditPendingRequest {
+                capability_capsule_id: placeholder.clone(),
+                summary: "generalized".into(),
+                content: "Reviewer-written generalization of the four lessons.".into(),
+                evidence: vec![],
+                code_refs: vec![],
+                tags: vec!["rust".into()],
+            },
+        )
+        .await
+        .unwrap();
+
+    let accepted = store
+        .list_evolution_candidates(TENANT, Some("accepted"))
+        .await
+        .unwrap();
+    assert_eq!(
+        accepted.len(),
+        1,
+        "accept must settle the candidate row to 'accepted'"
+    );
+    assert_eq!(accepted[0].candidate_id, candidate_id);
+
+    let rollback = evolution_worker::rollback_candidate(&*store, TENANT, &candidate_id).await;
+    assert!(
+        rollback.is_err(),
+        "rollback after accept must refuse — the accepted successor owns the lineage"
+    );
+
+    let r2 = evolution_worker::sweep_once(&*store, &settings, TENANT, false)
+        .await
+        .unwrap();
+    assert!(
+        r2.executed.is_empty(),
+        "a settled (accepted) cluster must not re-propose: {:?}",
+        r2.executed
+    );
+    assert!(
+        store.list_pending_review(TENANT).await.unwrap().is_empty(),
+        "no new placeholder after accept"
+    );
+}
+
+/// Audit 2026-07-03 ⑦ (plain-accept leg): `review_accept` without an
+/// edit settles the candidate the same way `review_edit_accept` does.
+#[tokio::test(flavor = "multi_thread")]
+async fn plain_accept_also_settles_the_candidate() {
+    let dir = tempdir().unwrap();
+    let store = Arc::new(Store::open(&dir.path().join("evo.lance")).await.unwrap());
+    let service = CapabilityCapsuleService::new(store.clone());
+    seed_generalize_cluster(&store).await;
+
+    let r1 = evolution_worker::sweep_once(&*store, &generalize_only_settings(1), TENANT, false)
+        .await
+        .unwrap();
+    let placeholder = r1.executed[0].result_capsule_ids[0].clone();
+
+    service.accept_pending(TENANT, &placeholder).await.unwrap();
+
+    assert_eq!(
+        store
+            .list_evolution_candidates(TENANT, Some("accepted"))
+            .await
+            .unwrap()
+            .len(),
+        1,
+        "plain accept must settle the candidate row"
+    );
+    assert!(store
+        .list_evolution_candidates(TENANT, Some("executed"))
+        .await
+        .unwrap()
+        .is_empty());
+}

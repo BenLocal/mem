@@ -359,8 +359,24 @@ pub async fn sweep_once(
     let pending = store
         .list_evolution_candidates(tenant, Some("pending"))
         .await?;
-    let executed_history = store
+    let mut executed_history = store
         .list_evolution_candidates(tenant, Some("executed"))
+        .await?;
+    // ⑦: an ACCEPTED candidate is a settled one-shot — the reviewer's
+    // accept flips `executed` → `accepted`, and suppression must
+    // survive that flip or the settled cluster re-proposes forever
+    // (its sources stay Active by design).
+    executed_history.extend(
+        store
+            .list_evolution_candidates(tenant, Some("accepted"))
+            .await?,
+    );
+    // ⑪ churn guard input: a cancelled corecall candidate remembers the
+    // batch_ts it was cancelled over (audit 2026-07-03 ⑪ — without
+    // this, one stale pair re-minted a fresh candidate row every
+    // hysteresis window forever).
+    let cancelled_history = store
+        .list_evolution_candidates(tenant, Some("cancelled"))
         .await?;
     let gate = GateSettings {
         k_cycles: settings.k_cycles,
@@ -381,6 +397,19 @@ pub async fn sweep_once(
             "merge" | "generalize" | "refine" | "split"
         ) && match_candidate(&proposal.op_kind, &proposal.member_ids, &executed_history)
             .is_some()
+        {
+            continue;
+        }
+        // ⑥ churn guard: the SAME batch_ts that already ran its full
+        // create→silence→cancel arc is not new evidence — only a FRESH
+        // batch may re-open a cancelled pair.
+        if proposal.op_kind == "corecall"
+            && cancelled_history.iter().any(|c| {
+                c.op_kind == "corecall"
+                    && c.params == proposal.params
+                    && crate::evolution::map::jaccard(&proposal.member_ids, &c.member_ids)
+                        >= crate::evolution::map::CANDIDATE_MATCH_JACCARD
+            })
         {
             continue;
         }
@@ -1005,37 +1034,45 @@ async fn execute_generalize(
 }
 
 /// ⑤ reweight-up detection (E4): a cluster of ≥2 whose recently-
-/// recalled share EXCEEDS the 0.5 floor ("recent" = `last_used_at`
-/// within one sweep interval). Recurring — the gate re-fires every
-/// signal cycle after it first opens.
+/// recalled share EXCEEDS the 0.5 floor ("recent" = `last_recalled_at`
+/// within one sweep interval — NOT `last_used_at`, which the hourly
+/// decay sweep stamps on every active row as its clock; audit
+/// 2026-07-03 #2a). Guidance capsules are excluded (curated, not
+/// evolved — ①④⑤-decay precedent; audit ⑫). Recurring — the gate
+/// re-fires every signal cycle after it first opens.
 fn detect_reweight_up(
     cluster: &[usize],
     active: &[CapabilityCapsuleRecord],
     recent_cutoff: &str,
 ) -> Option<Proposal> {
-    if cluster.len() < 2 {
+    let members: Vec<usize> = cluster
+        .iter()
+        .copied()
+        .filter(|&i| !is_guidance(&active[i].capability_capsule_type))
+        .collect();
+    if members.len() < 2 {
         return None;
     }
-    let recalled = cluster
+    let recalled = members
         .iter()
         .filter(|&&i| {
             active[i]
-                .last_used_at
+                .last_recalled_at
                 .as_deref()
                 .is_some_and(|t| t >= recent_cutoff)
         })
         .count();
-    if (recalled as f32) / (cluster.len() as f32) <= REWEIGHT_ACTIVE_SHARE_FLOOR {
+    if (recalled as f32) / (members.len() as f32) <= REWEIGHT_ACTIVE_SHARE_FLOOR {
         return None;
     }
-    let mut member_ids: Vec<String> = cluster
+    let mut member_ids: Vec<String> = members
         .iter()
         .map(|&i| active[i].capability_capsule_id.clone())
         .collect();
     member_ids.sort();
     Some(Proposal {
         op_kind: "reweight_up".to_string(),
-        members: cluster.iter().map(|&i| preview(&active[i])).collect(),
+        members: members.iter().map(|&i| preview(&active[i])).collect(),
         member_ids,
         params: "{}".to_string(),
     })
@@ -1054,7 +1091,11 @@ fn detect_reweight_decay(
         return None;
     }
     let c = &active[cluster[0]];
-    if c.last_used_at.is_some()
+    // `last_recalled_at` is the durable recall signal — `last_used_at`
+    // is the decay clock the hourly sweep advances on every row, which
+    // made this lane dead after a capsule's first hour (audit
+    // 2026-07-03 #2b).
+    if c.last_recalled_at.is_some()
         || c.decay_score > DYING_DECAY_FLOOR
         || is_guidance(&c.capability_capsule_type)
     {
@@ -1069,8 +1110,12 @@ fn detect_reweight_decay(
 }
 
 /// ⑥ co-recall detection (E4): capsules sharing one exact
-/// `last_used_at` value were stamped by the same `last_used_worker`
-/// flush — one co-recall batch (the signal source doc §4⑥ names).
+/// `last_recalled_at` value were stamped by the same
+/// `last_used_worker` flush — one co-recall batch (the signal source
+/// doc §4⑥ names). Only `bump_last_used_at` writes that column, so it
+/// is immune to the hourly decay sweep homogenizing `last_used_at`
+/// across the whole corpus (audit 2026-07-03 #2c — that shared stamp
+/// minted all-pairs Hebbian edges in small tenants).
 /// `params` carries the batch timestamp so the reconcile freshness
 /// guard can tell a NEW batch from the same one re-observed. Pairs
 /// already holding an active edge are skipped; oversized batches are
@@ -1081,7 +1126,7 @@ fn detect_corecall(
 ) -> Vec<Proposal> {
     let mut by_batch: HashMap<&str, Vec<usize>> = HashMap::new();
     for (i, c) in active.iter().enumerate() {
-        if let Some(ts) = c.last_used_at.as_deref() {
+        if let Some(ts) = c.last_recalled_at.as_deref() {
             by_batch.entry(ts).or_default().push(i);
         }
     }
@@ -1408,12 +1453,19 @@ async fn execute_corecall(
 /// edges with no evidence inside `prune_idle_cycles × interval_secs`.
 /// Idleness is measured CONSERVATIVELY against the latest of edge
 /// birth, its potentiation stamp, and EITHER endpoint's own
-/// `last_used_at` — without a per-pair co-access event log we cannot
-/// distinguish "pair co-recalled" from "members individually hot", so
-/// individually-hot pairs keep their edge (erring toward keeping a
-/// strengthening signal). Caller edges (`extractor != "evolution"`)
-/// and non-`co_recalled_with` relations (incl. `user_tunnel:*`) are
-/// never touched.
+/// `last_recalled_at` (the durable recall signal — `last_used_at` is
+/// the decay clock and is always fresh; audit 2026-07-03 #2d) —
+/// without a per-pair co-access event log we cannot distinguish "pair
+/// co-recalled" from "members individually hot", so individually-hot
+/// pairs keep their edge (erring toward keeping a strengthening
+/// signal). Edges with NO endpoint inside this sweep's scanned active
+/// set are skipped outright: `graph_edges` is tenant-less, so another
+/// tenant's (or an out-of-`scan_limit`-window) edge is invisible to
+/// this scan and we have no basis to judge its idleness (audit ⑧ —
+/// the fallback-to-edge-birth used to close other tenants' live
+/// edges). Caller edges (`extractor != "evolution"`) and
+/// non-`co_recalled_with` relations (incl. `user_tunnel:*`) are never
+/// touched.
 async fn prune_idle_corecall_edges(
     store: &dyn Backend,
     active: &[CapabilityCapsuleRecord],
@@ -1424,12 +1476,15 @@ async fn prune_idle_corecall_edges(
         now,
         u64::from(settings.prune_idle_cycles).saturating_mul(settings.interval_secs),
     );
-    let last_used: HashMap<&str, &str> = active
+    // Every scanned id is present (endpoint-ownership check); the value
+    // is its durable recall stamp when it has one.
+    let recalled_by_id: HashMap<&str, Option<&str>> = active
         .iter()
-        .filter_map(|c| {
-            c.last_used_at
-                .as_deref()
-                .map(|t| (c.capability_capsule_id.as_str(), t))
+        .map(|c| {
+            (
+                c.capability_capsule_id.as_str(),
+                c.last_recalled_at.as_deref(),
+            )
         })
         .collect();
     let mut pruned = 0usize;
@@ -1443,16 +1498,20 @@ async fn prune_idle_corecall_edges(
                 latest = t;
             }
         }
+        let mut known_endpoint = false;
         for node in [&edge.from_node_id, &edge.to_node_id] {
             if let Some(id) = node.strip_prefix("capability_capsule:") {
-                if let Some(t) = last_used.get(id) {
-                    if *t > latest {
-                        latest = t;
+                if let Some(stamp) = recalled_by_id.get(id) {
+                    known_endpoint = true;
+                    if let Some(t) = stamp {
+                        if *t > latest {
+                            latest = t;
+                        }
                     }
                 }
             }
         }
-        if latest >= cutoff.as_str() {
+        if !known_endpoint || latest >= cutoff.as_str() {
             continue;
         }
         pruned += store

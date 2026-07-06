@@ -444,3 +444,215 @@ async fn dry_run_writes_no_reweight_no_edges() {
         .unwrap()
         .is_empty());
 }
+
+/// Audit 2026-07-03 #2(a): the hourly decay sweep stamps `last_used_at`
+/// on EVERY active row (it is the decay clock, not recall evidence).
+/// ⑤ reweight-up must key on `last_recalled_at` — a decay-stamped
+/// cluster with zero real recalls earns nothing.
+#[tokio::test(flavor = "multi_thread")]
+async fn decay_sweep_stamp_is_not_recall_evidence_for_reweight_up() {
+    let dir = tempdir().unwrap();
+    let store = Arc::new(Store::open(&dir.path().join("evo.lance")).await.unwrap());
+    seed(&store, &capsule("m0", 0.7), (1.0, 0.0)).await;
+    seed(&store, &capsule("m1", 0.7), (0.999, 0.02)).await;
+    seed(&store, &capsule("m2", 0.7), (0.998, 0.04)).await;
+    // One decay tick — rate 0 so only the clock stamp moves.
+    let now = current_timestamp();
+    let now_ms: f64 = now.parse::<u64>().unwrap() as f64;
+    store
+        .apply_time_decay(0.0, now_ms, 86_400_000.0, &now)
+        .await
+        .unwrap();
+
+    let settings = dynamics_settings(2);
+    for cycle in 1..=3 {
+        let r = sweep(&store, &settings, false).await;
+        assert!(
+            !r.executed.iter().any(|e| e.op_kind == "reweight_up"),
+            "cycle {cycle}: decay-stamped cluster must not earn reweight_up"
+        );
+    }
+    assert!(
+        (record_of(&store, "m0").await.confidence - 0.7).abs() < 1e-3,
+        "confidence must not move without real recalls"
+    );
+}
+
+/// Audit 2026-07-03 #2(b): ⑤ reweight-decay keys on `last_recalled_at`
+/// (never recalled), so the orphan lane still fires after the decay
+/// sweep has stamped `last_used_at` on every row.
+#[tokio::test(flavor = "multi_thread")]
+async fn orphan_decay_fires_even_after_decay_sweep_stamp() {
+    let dir = tempdir().unwrap();
+    let store = Arc::new(Store::open(&dir.path().join("evo.lance")).await.unwrap());
+    seed(&store, &capsule("orphan", 0.7), (1.0, 0.0)).await;
+    seed(&store, &capsule("recalled", 0.7), (0.0, 1.0)).await;
+    let now = current_timestamp();
+    store
+        .bump_last_used_at(TENANT, &["recalled".into()], &now)
+        .await
+        .unwrap();
+    let now = current_timestamp();
+    let now_ms: f64 = now.parse::<u64>().unwrap() as f64;
+    store
+        .apply_time_decay(0.0, now_ms, 86_400_000.0, &now)
+        .await
+        .unwrap();
+
+    let settings = dynamics_settings(2);
+    let r1 = sweep(&store, &settings, false).await;
+    assert!(r1.executed.is_empty(), "K gate must hold on cycle 1");
+    let r2 = sweep(&store, &settings, false).await;
+    assert!(
+        r2.executed.iter().any(|e| e.op_kind == "reweight_decay"),
+        "orphan lane must survive the decay stamp: got {:?}",
+        r2.executed
+    );
+    let orphan = record_of(&store, "orphan").await;
+    assert!((orphan.decay_score - 0.05).abs() < 1e-3);
+}
+
+/// Audit 2026-07-03 #2(c): the decay sweep homogenizes `last_used_at`
+/// across the corpus — that shared stamp is NOT a co-recall batch and
+/// must never mint Hebbian edges.
+#[tokio::test(flavor = "multi_thread")]
+async fn decay_sweep_stamp_mints_no_corecall_edges() {
+    let dir = tempdir().unwrap();
+    let store = Arc::new(Store::open(&dir.path().join("evo.lance")).await.unwrap());
+    seed(&store, &capsule("a", 0.7), (1.0, 0.0)).await;
+    seed(&store, &capsule("b", 0.7), (0.0, 1.0)).await;
+    seed(&store, &capsule("c", 0.7), (0.5, 0.86)).await;
+    let now = current_timestamp();
+    let now_ms: f64 = now.parse::<u64>().unwrap() as f64;
+    store
+        .apply_time_decay(0.0, now_ms, 86_400_000.0, &now)
+        .await
+        .unwrap();
+
+    // K=1 executes anything that proposes — nothing may propose.
+    let r = sweep(&store, &dynamics_settings(1), false).await;
+    assert!(
+        !r.executed.iter().any(|e| e.op_kind == "corecall"),
+        "decay stamp executed corecall: {:?}",
+        r.executed
+    );
+    assert!(
+        active_corecall_edges(&store).await.is_empty(),
+        "no Hebbian edge may come from the decay stamp"
+    );
+}
+
+/// Audit 2026-07-03 ⑧: prune judges idleness only for edges with at
+/// least one endpoint inside THIS sweep's scanned active set. Another
+/// tenant's (or an out-of-window) edge is invisible to the scan and
+/// must be left alone — fail-safe, not fail-prune.
+#[tokio::test(flavor = "multi_thread")]
+async fn prune_skips_edges_whose_endpoints_are_outside_the_scan() {
+    let dir = tempdir().unwrap();
+    let store = Arc::new(Store::open(&dir.path().join("evo.lance")).await.unwrap());
+    seed(&store, &capsule("mine", 0.7), (1.0, 0.0)).await;
+    // Endpoints belong to another tenant — not in this sweep's map.
+    store
+        .add_edge_direct(&GraphEdge {
+            from_node_id: "capability_capsule:other_a".into(),
+            to_node_id: "capability_capsule:other_b".into(),
+            relation: "co_recalled_with".into(),
+            valid_from: "00000000000000001000".into(), // ancient
+            valid_to: None,
+            confidence: None,
+            extractor: Some("evolution".into()),
+            strength: None,
+            stability: None,
+            last_activated: None,
+            access_count: None,
+        })
+        .await
+        .unwrap();
+
+    let report = sweep(&store, &dynamics_settings(99), false).await;
+    assert_eq!(
+        report.pruned_edges, 0,
+        "foreign-endpoint edge must not be pruned"
+    );
+    assert_eq!(
+        active_corecall_edges(&store).await.len(),
+        1,
+        "the other tenant's edge must stay open"
+    );
+}
+
+/// Audit 2026-07-03 ⑫: guidance capsules (Preference / Workflow) are
+/// curated, not evolved — ⑤ reweight-up must not bump their
+/// confidence, mirroring the ①④⑤-decay exclusions.
+#[tokio::test(flavor = "multi_thread")]
+async fn reweight_up_never_touches_guidance_capsules() {
+    let dir = tempdir().unwrap();
+    let store = Arc::new(Store::open(&dir.path().join("evo.lance")).await.unwrap());
+    let mut p0 = capsule("p0", 0.7);
+    p0.capability_capsule_type = CapabilityCapsuleType::Preference;
+    let mut p1 = capsule("p1", 0.7);
+    p1.capability_capsule_type = CapabilityCapsuleType::Preference;
+    seed(&store, &p0, (1.0, 0.0)).await;
+    seed(&store, &p1, (0.999, 0.02)).await;
+    let now = current_timestamp();
+    store
+        .bump_last_used_at(TENANT, &["p0".into(), "p1".into()], &now)
+        .await
+        .unwrap();
+
+    let r = sweep(&store, &dynamics_settings(1), false).await;
+    assert!(
+        !r.executed.iter().any(|e| e.op_kind == "reweight_up"),
+        "guidance-only cluster must not earn reweight_up: {:?}",
+        r.executed
+    );
+    assert!((record_of(&store, "p0").await.confidence - 0.7).abs() < 1e-3);
+}
+
+/// Audit 2026-07-03 ⑪: a cancelled corecall candidate remembers its
+/// batch — re-detecting the SAME batch_ts after cancellation must not
+/// mint a fresh candidate row (create→cancel churn would leak one row
+/// per hysteresis window forever).
+#[tokio::test(flavor = "multi_thread")]
+async fn cancelled_corecall_does_not_churn_duplicate_candidates() {
+    let dir = tempdir().unwrap();
+    let store = Arc::new(Store::open(&dir.path().join("evo.lance")).await.unwrap());
+    seed(&store, &capsule("a", 0.7), (1.0, 0.0)).await;
+    seed(&store, &capsule("b", 0.7), (0.0, 1.0)).await;
+    let settings = dynamics_settings(2);
+    let ts = current_timestamp();
+    store
+        .bump_last_used_at(TENANT, &["a".into(), "b".into()], &ts)
+        .await
+        .unwrap();
+
+    // s1 creates the candidate; s2 holds (silence decay 0.7); s3
+    // cancels (0.49 < hysteresis 0.5).
+    for _ in 1..=3 {
+        sweep(&store, &settings, false).await;
+    }
+    let cancelled: Vec<_> = store
+        .list_evolution_candidates(TENANT, Some("cancelled"))
+        .await
+        .unwrap()
+        .into_iter()
+        .filter(|c| c.op_kind == "corecall")
+        .collect();
+    assert_eq!(cancelled.len(), 1, "the churn precondition: one cancel");
+
+    // s4/s5: the same stale batch re-detected must NOT re-enter.
+    for cycle in 4..=5 {
+        sweep(&store, &settings, false).await;
+        let pending: Vec<_> = store
+            .list_evolution_candidates(TENANT, Some("pending"))
+            .await
+            .unwrap()
+            .into_iter()
+            .filter(|c| c.op_kind == "corecall")
+            .collect();
+        assert!(
+            pending.is_empty(),
+            "cycle {cycle}: cancelled batch_ts re-minted a candidate"
+        );
+    }
+}

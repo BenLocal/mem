@@ -84,6 +84,12 @@ pub fn jaccard(a: &[String], b: &[String]) -> f64 {
 /// Find the stored candidate that a freshly-detected proposal aligns
 /// with: same `op_kind`, member Jaccard ≥ [`CANDIDATE_MATCH_JACCARD`],
 /// best Jaccard wins. Returns the index into `candidates`.
+///
+/// Status is the CALLER's concern: pass a status-filtered list
+/// (`list_evolution_candidates(_, Some("pending"))` for gate matching,
+/// `Some("executed")` for re-proposal suppression). Filtering here
+/// would silently defeat the executed-history caller (audit
+/// 2026-07-03 #1 — the suppression never matched anything).
 pub fn match_candidate(
     op_kind: &str,
     member_ids: &[String],
@@ -91,7 +97,7 @@ pub fn match_candidate(
 ) -> Option<usize> {
     let mut best: Option<(usize, f64)> = None;
     for (idx, c) in candidates.iter().enumerate() {
-        if c.op_kind != op_kind || c.status != "pending" {
+        if c.op_kind != op_kind {
             continue;
         }
         let j = jaccard(member_ids, &c.member_ids);
@@ -245,11 +251,15 @@ mod tests {
     }
 
     #[test]
-    fn match_candidate_ignores_non_pending() {
+    fn match_candidate_matches_any_status_callers_filter() {
+        // Status filtering is the caller's job (they pass a
+        // status-filtered list) — an executed row MUST match so the
+        // executed-history re-proposal suppression works (audit
+        // 2026-07-03 #1).
         let mut executed = cand("merge", &["a", "b"]);
         executed.status = "executed".into();
         let proposal: Vec<String> = ["a", "b"].iter().map(|s| s.to_string()).collect();
-        assert_eq!(match_candidate("merge", &proposal, &[executed]), None);
+        assert_eq!(match_candidate("merge", &proposal, &[executed]), Some(0));
     }
 
     // ── anti-jitter gate (E1 acceptance: 2 cycles hold, 3rd fires) ──

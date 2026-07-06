@@ -1040,14 +1040,52 @@ impl CapabilityCapsuleService {
         tenant: &str,
         capability_capsule_id: &str,
     ) -> Result<CapabilityCapsuleRecord, ServiceError> {
-        self.store
+        let original = self
+            .store
             .get_pending(tenant, capability_capsule_id)
             .await?
             .ok_or(ServiceError::NotFound)?;
-        Ok(self
+        let accepted = self
             .store
             .accept_pending(tenant, capability_capsule_id)
-            .await?)
+            .await?;
+        // ⑦: the review verdict settles the evolution candidate — see
+        // `settle_evolution_candidate`.
+        if original.source_agent == crate::worker::evolution_worker::EVOLUTION_SOURCE_AGENT {
+            self.settle_evolution_candidate(tenant, capability_capsule_id, "accepted")
+                .await?;
+        }
+        Ok(accepted)
+    }
+
+    /// Flip the evolution candidate whose execution produced
+    /// `placeholder_id` from `executed` to the review verdict's terminal
+    /// status (E3 reject → `"rejected"`, which re-opens the K gate;
+    /// audit 2026-07-03 ⑦ accept → `"accepted"`, which keeps
+    /// re-proposal suppressed AND closes §11 rollback — rolling back
+    /// after accept would re-archive the placeholder while the accepted
+    /// successor stays live, reporting a success that undid nothing).
+    async fn settle_evolution_candidate(
+        &self,
+        tenant: &str,
+        placeholder_id: &str,
+        verdict: &str,
+    ) -> Result<(), ServiceError> {
+        let executed = self
+            .store
+            .list_evolution_candidates(tenant, Some("executed"))
+            .await?;
+        for mut candidate in executed {
+            if candidate
+                .result_capsule_ids
+                .iter()
+                .any(|id| id == placeholder_id)
+            {
+                candidate.status = verdict.to_string();
+                self.store.upsert_evolution_candidate(candidate).await?;
+            }
+        }
+        Ok(())
     }
 
     pub async fn reject_pending(
@@ -1084,20 +1122,8 @@ impl CapabilityCapsuleService {
         // — but as a fresh candidate it has to re-earn the K-cycle gate
         // before another placeholder reaches the review queue.
         if original.source_agent == crate::worker::evolution_worker::EVOLUTION_SOURCE_AGENT {
-            let executed = self
-                .store
-                .list_evolution_candidates(tenant, Some("executed"))
+            self.settle_evolution_candidate(tenant, capability_capsule_id, "rejected")
                 .await?;
-            for mut candidate in executed {
-                if candidate
-                    .result_capsule_ids
-                    .iter()
-                    .any(|id| id == capability_capsule_id)
-                {
-                    candidate.status = "rejected".to_string();
-                    self.store.upsert_evolution_candidate(candidate).await?;
-                }
-            }
         }
         Ok(rejected)
     }
@@ -1263,6 +1289,10 @@ impl CapabilityCapsuleService {
                     );
                 }
             }
+            // ⑦: the review verdict settles the evolution candidate —
+            // see `settle_evolution_candidate`.
+            self.settle_evolution_candidate(tenant, &original_memory_id, "accepted")
+                .await?;
         }
 
         self.enqueue_embedding_job_for_memory(&superseding).await?;
