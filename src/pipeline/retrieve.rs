@@ -329,9 +329,12 @@ pub struct EdgeDynamicsCtx {
     pub tx: tokio::sync::mpsc::UnboundedSender<crate::worker::potentiation_worker::EdgeAccess>,
 }
 
-/// Base graph-expansion boost: a capsule reachable from an anchor in one
-/// hop gets this added to its score. K9 scales it by the connecting
-/// edge's time-decayed strength.
+/// Graph-expansion boost ceiling. On the default (I1 PPR) path it is the
+/// scale of the mass→score mapping: a node's boost is
+/// `round(GRAPH_BOOST · ppr_mass / max_seed_mass)`, capped here — a
+/// direct single-fact-edge neighbor lands ≈ half of it, multi-hop
+/// associates a few points. On the K9 dynamics path (opt-in) it is still
+/// the flat 1-hop base, scaled by the edge's time-decayed strength.
 const GRAPH_BOOST: i64 = 12;
 
 /// G2 scale for SIMILARITY-MINTED capsule↔capsule edges — the lanes
@@ -377,20 +380,19 @@ fn spread_decay(degree: usize) -> f32 {
 
 /// Build the per-capsule graph-boost map for the anchor set.
 ///
-/// Each anchor's contribution is diluted by its fanout
-/// ([`spread_decay`], O4): a 1-hop-linked capsule gets
-/// `round(GRAPH_BOOST · spread(anchor_degree))`, maxed across the
-/// anchors that reach it.
-///
-/// - **Dynamics off** (`None`, the default): one batched
-///   [`GraphStore::incident_edges_for_nodes`] query for the whole anchor
-///   set, then [`graph_boosts_from_edges`] computes degrees + boosts in
-///   Rust. Avoids one `neighbors_within` round-trip per anchor (which
-///   re-fetched a high-fanout hub's edges once per anchor).
-/// - **Dynamics on** (`Some`): still walks per anchor, because it needs
-///   each edge's time-decayed strength and enqueues every touched edge
-///   for potentiation (best-effort — a closed channel never blocks the
-///   read).
+/// - **Dynamics off** (`None`, the default): I1 PPR — fetch the 2-hop
+///   frontier ([`fetch_ppr_frontier`], one batched
+///   [`GraphStore::incident_edges_for_nodes`] per hop) and run
+///   [`ppr_boosts_from_edges`]. Multi-hop associates (capsule → shared
+///   entity → capsule) get propagated, degree-normalized mass; the old
+///   flat 1-hop boost couldn't reach them at all and its all-or-nothing
+///   scale measurably crowded organic top-5 hits (G2 LoCoMo numbers).
+/// - **Dynamics on** (`Some`, opt-in `MEM_EDGE_DYNAMICS_ENABLED`): the
+///   pre-I1 per-anchor 1-hop walk, because it needs each edge's
+///   time-decayed strength and enqueues every touched edge for
+///   potentiation (best-effort — a closed channel never blocks the
+///   read). K9 dynamics and PPR are not yet composed; the K9 posture is
+///   unchanged by I1.
 async fn compute_graph_boosts(
     graph: &dyn GraphStore,
     anchors: &[String],
@@ -399,9 +401,9 @@ async fn compute_graph_boosts(
     let anchor_set: HashSet<&str> = anchors.iter().map(|s| s.as_str()).collect();
 
     let Some(ctx) = dynamics else {
-        // Flat path: one query, all the math in Rust.
-        let edges = graph.incident_edges_for_nodes(anchors).await?;
-        return Ok(graph_boosts_from_edges(&edges, &anchor_set));
+        // I1 flat path: bounded frontier fetch + PPR, all the math in Rust.
+        let edges = fetch_ppr_frontier(graph, anchors).await?;
+        return Ok(ppr_boosts_from_edges(&edges, &anchor_set));
     };
 
     // Dynamics path: per-anchor walk (needs decayed strength + potentiation).
@@ -447,60 +449,207 @@ async fn compute_graph_boosts(
     Ok(boosts)
 }
 
-/// O4 flat-path core: derive per-capsule graph boosts from the raw
-/// `(from, to)` edges incident to the anchor set. Behaviourally identical
-/// to the per-anchor walk (just fed from one batched query): each
-/// anchor's *capsule fanout degree* dilutes the boost it confers
-/// ([`spread_decay`]), and each non-anchor capsule endpoint takes the max
-/// over the anchors that reach it. Pure for testability.
-fn graph_boosts_from_edges(
+/// I1 (oss-memory-diff §10, HippoRAG 2) — PPR damping factor `α`: each
+/// iteration a node keeps `1-α` of its personalization (seed) mass and
+/// propagates `α` along its edges. 0.5 (HippoRAG's own choice) retains
+/// seeds strongly — right for a shallow dev-memory graph where 3+ hops
+/// are usually noise.
+const PPR_DAMPING: f32 = 0.5;
+
+/// I1 — power-iteration bound. The frontier subgraph is small (≤
+/// [`PPR_MAX_FRONTIER_NODES`]); with α=0.5 the L1 delta shrinks ~2× per
+/// round, so 20 rounds is far past [`PPR_CONVERGENCE_L1`] in practice.
+const PPR_MAX_ITERATIONS: usize = 20;
+
+/// I1 — early-exit L1 threshold for the power iteration.
+const PPR_CONVERGENCE_L1: f32 = 1e-6;
+
+/// I1 — how far the PPR subgraph reaches from the anchor set. 2 hops is
+/// the multi-hop win flat boosting couldn't serve (capsule → shared
+/// entity → capsule) while staying one bounded batched query per hop.
+const PPR_FRONTIER_HOPS: usize = 2;
+
+/// I1 — frontier blowout guard: stop *expanding* (already-fetched edges
+/// are kept) once the subgraph reaches this many nodes. At the current
+/// corpus (~3k nodes) this is effectively unbounded; it exists so a
+/// future hub-dense graph can't make the read path scale with the whole
+/// graph.
+const PPR_MAX_FRONTIER_NODES: usize = 2048;
+
+/// I1 (closes oss-memory-diff §10 I1) — Personalized PageRank over the
+/// anchor neighborhood, replacing the flat 1-hop boost whose all-or-
+/// nothing shape measurably hurt multi-hop recall (G2: LoCoMo multi-hop
+/// any@5 stuck at 0.462 under every flat-boost scale).
+///
+/// Mechanics — pure, deterministic, zero-LLM:
+/// - The subgraph is undirected; an edge's transition weight is its
+///   class base ([`edge_base_boost`] / [`GRAPH_BOOST`]): fact-class
+///   edges (entity/lineage/curated — audit ⑥) carry `1.0`, similarity-
+///   minted edges carry `⅓ × minting cosine`, so dense weak evidence
+///   spreads proportionally less mass.
+/// - Seeds = the anchors present in the subgraph, uniform reset mass.
+/// - Row normalization divides a node's outflow by its total incident
+///   weight — the principled O4: a high-fanout hub splits its mass over
+///   its whole fanout, so a generic `repo:`/`project:` anchor cannot
+///   blanket-boost everything beneath it.
+/// - A node reached from several anchors *accumulates* mass (flat
+///   boosting only maxed) — HippoRAG's associativity win.
+///
+/// Boost mapping: non-anchor `capability_capsule:` nodes get
+/// `round(ceiling(node) · min(1, p(node)/max_seed_mass))` where
+/// `ceiling(node)` is the strongest [`edge_base_boost`] among the
+/// node's incident edges — [`GRAPH_BOOST`] when any fact-class edge
+/// reaches it, `CONFIDENCE_EDGE_BOOST × cosine` when only similarity
+/// edges do. The per-node ceiling is what keeps the class scale
+/// *absolute*: seed-relative normalization alone cancels it in a
+/// single-class graph, and on the H1-only LoCoMo bench graph that
+/// mapped sim neighbors to ≈`GRAPH_BOOST/2` — harder than the flat
+/// boost it replaced (measured: multi-hop any@5 0.462 → 0.385). With
+/// the ceiling, a single-fact-edge direct neighbor lands ≈
+/// `GRAPH_BOOST/2`, a sim-only neighbor stays tiebreaker-sized, a
+/// 2-hop associate gets a few points, and zero-rounded mass drops out
+/// (keeps the G2 hydration set tight).
+fn ppr_boosts_from_edges(
     edges: &[crate::storage::graph_store::IncidentEdge],
     anchor_set: &HashSet<&str>,
 ) -> HashMap<String, i64> {
-    // Pass 1: per-anchor capsule fanout degree (count edges whose *other*
-    // endpoint is a capsule — entity↔entity edges don't inflate it).
-    let mut degree: HashMap<&str, usize> = HashMap::new();
+    if edges.is_empty() {
+        return HashMap::new();
+    }
+    // Node index over every endpoint.
+    let mut index: HashMap<&str, usize> = HashMap::new();
+    let mut nodes: Vec<&str> = Vec::new();
     for e in edges {
-        for (endpoint, other) in [
-            (e.from.as_str(), e.to.as_str()),
-            (e.to.as_str(), e.from.as_str()),
-        ] {
-            if anchor_set.contains(endpoint) && other.starts_with("capability_capsule:") {
-                *degree.entry(endpoint).or_insert(0) += 1;
+        for n in [e.from.as_str(), e.to.as_str()] {
+            if !index.contains_key(n) {
+                index.insert(n, nodes.len());
+                nodes.push(n);
             }
         }
     }
-    // Pass 2: boost each non-anchor capsule endpoint by
-    // spread(degree) · class base, maxed across anchors. The class rule
-    // ([`edge_base_boost`], G2 tuning + audit ⑥): similarity-minted
-    // edges (extractor `ingest_link` / `o7_neardup_cluster`) scale by
-    // the cosine they were minted at (H1 related_to ∈ [0.80, 0.92), O2
-    // suspected_supersede ≥ 0.92) — without that every neighbor of the
-    // top hit lands the same flat boost and crowds the head of the
-    // ranking (measured: LoCoMo multi-hop any@5 -15pts). Every other
-    // edge (entity links, lineage, curated facts — confidence declared
-    // or not) keeps full weight.
-    let mut boosts: HashMap<String, i64> = HashMap::new();
+    // Weighted undirected adjacency + per-node outflow normalizer +
+    // per-node boost ceiling (strongest incident edge class).
+    let n = nodes.len();
+    let mut adj: Vec<Vec<(usize, f32)>> = vec![Vec::new(); n];
+    let mut out_weight: Vec<f32> = vec![0.0; n];
+    let mut ceiling: Vec<f32> = vec![0.0; n];
     for e in edges {
-        for (anchor, other) in [
-            (e.from.as_str(), e.to.as_str()),
-            (e.to.as_str(), e.from.as_str()),
-        ] {
-            if !anchor_set.contains(anchor) || anchor_set.contains(other) {
+        let base = edge_base_boost(e.confidence, e.extractor.as_deref());
+        let w = base / (GRAPH_BOOST as f32);
+        if w <= 0.0 {
+            continue;
+        }
+        let (i, j) = (index[e.from.as_str()], index[e.to.as_str()]);
+        if i == j {
+            continue;
+        }
+        adj[i].push((j, w));
+        adj[j].push((i, w));
+        out_weight[i] += w;
+        out_weight[j] += w;
+        ceiling[i] = ceiling[i].max(base);
+        ceiling[j] = ceiling[j].max(base);
+    }
+    // Seeds: anchors that actually appear in the subgraph, uniform mass.
+    let seeds: Vec<usize> = nodes
+        .iter()
+        .enumerate()
+        .filter(|(_, node)| anchor_set.contains(**node))
+        .map(|(i, _)| i)
+        .collect();
+    if seeds.is_empty() {
+        return HashMap::new();
+    }
+    let mut reset = vec![0.0f32; n];
+    for &s in &seeds {
+        reset[s] = 1.0 / seeds.len() as f32;
+    }
+    // Bounded power iteration: p ← (1-α)·reset + α·Wᵀp.
+    let mut p = reset.clone();
+    for _ in 0..PPR_MAX_ITERATIONS {
+        let mut next: Vec<f32> = reset.iter().map(|r| (1.0 - PPR_DAMPING) * r).collect();
+        for i in 0..n {
+            if p[i] <= 0.0 || out_weight[i] <= 0.0 {
                 continue;
             }
-            if let Some(mid) = other.strip_prefix("capability_capsule:") {
-                let d = degree.get(anchor).copied().unwrap_or(0);
-                let base = edge_base_boost(e.confidence, e.extractor.as_deref());
-                let boost = (base * spread_decay(d)).round() as i64;
-                boosts
-                    .entry(mid.to_string())
-                    .and_modify(|m| *m = (*m).max(boost))
-                    .or_insert(boost);
+            let share = PPR_DAMPING * p[i] / out_weight[i];
+            for &(j, w) in &adj[i] {
+                next[j] += share * w;
+            }
+        }
+        let delta: f32 = next.iter().zip(&p).map(|(a, b)| (a - b).abs()).sum();
+        p = next;
+        if delta < PPR_CONVERGENCE_L1 {
+            break;
+        }
+    }
+    // Scale mass to the integer boost stack, relative to the strongest seed.
+    let p_seed_max = seeds.iter().map(|&s| p[s]).fold(0.0f32, f32::max);
+    if p_seed_max <= 0.0 {
+        return HashMap::new();
+    }
+    let mut boosts: HashMap<String, i64> = HashMap::new();
+    for (i, node) in nodes.iter().enumerate() {
+        if anchor_set.contains(*node) {
+            continue;
+        }
+        if let Some(mid) = node.strip_prefix("capability_capsule:") {
+            let rel = (p[i] / p_seed_max).min(1.0);
+            let boost = (ceiling[i] * rel).round() as i64;
+            if boost > 0 {
+                boosts.insert(mid.to_string(), boost);
             }
         }
     }
     boosts
+}
+
+/// I1 — collect the PPR subgraph: every active edge within
+/// [`PPR_FRONTIER_HOPS`] hops of the anchor set, one batched
+/// [`GraphStore::incident_edges_for_nodes`] query per hop. A row
+/// incident to a node queried in an *earlier* hop already came back in
+/// that hop's batch — dropping those keeps each edge exactly once
+/// (within one batch the store returns a row once even when both
+/// endpoints are queried). Frontier growth stops at
+/// [`PPR_MAX_FRONTIER_NODES`], deterministically (`BTreeSet` order).
+async fn fetch_ppr_frontier(
+    graph: &dyn GraphStore,
+    anchors: &[String],
+) -> Result<Vec<crate::storage::graph_store::IncidentEdge>, crate::storage::GraphError> {
+    let mut queried_prev: HashSet<String> = HashSet::new();
+    let mut subgraph_nodes: HashSet<String> = anchors.iter().cloned().collect();
+    let mut frontier: Vec<String> = anchors.to_vec();
+    let mut edges: Vec<crate::storage::graph_store::IncidentEdge> = Vec::new();
+    for hop in 0..PPR_FRONTIER_HOPS {
+        if frontier.is_empty() {
+            break;
+        }
+        let batch = graph.incident_edges_for_nodes(&frontier).await?;
+        let expand = hop + 1 < PPR_FRONTIER_HOPS;
+        let mut next: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+        for e in batch {
+            if queried_prev.contains(&e.from) || queried_prev.contains(&e.to) {
+                continue;
+            }
+            if expand {
+                for node in [&e.from, &e.to] {
+                    if !subgraph_nodes.contains(node) {
+                        next.insert(node.clone());
+                    }
+                }
+            }
+            edges.push(e);
+        }
+        queried_prev.extend(frontier.drain(..));
+        for node in next {
+            if subgraph_nodes.len() >= PPR_MAX_FRONTIER_NODES {
+                break;
+            }
+            subgraph_nodes.insert(node.clone());
+            frontier.push(node);
+        }
+    }
+    Ok(edges)
 }
 
 /// O1 retrieve freshness bonus: the timestamp a capsule's freshness is credited
@@ -1474,108 +1623,6 @@ mod tests {
         assert!(spread_decay(10) < spread_decay(3));
     }
 
-    #[test]
-    fn graph_boosts_from_edges_degree_max_and_anchor_skip() {
-        use std::collections::HashSet;
-        // anchor entities: a high-fanout hub (degree 20) + a narrow one
-        // (degree 1). Capsule c1 is linked to BOTH; it must take the max
-        // (the narrow anchor's higher spread). c2 sits only under the hub.
-        // An anchor→anchor edge confers no boost.
-        let anchors: HashSet<&str> = [
-            "project:hub",
-            "module:narrow",
-            "capability_capsule:anchorcap",
-        ]
-        .into_iter()
-        .collect();
-        let e = |a: String, b: &str| crate::storage::graph_store::IncidentEdge {
-            from: a,
-            to: b.to_string(),
-            confidence: None,
-            extractor: None,
-        };
-        let mut edges: Vec<crate::storage::graph_store::IncidentEdge> = (1..=20)
-            .map(|i| e(format!("capability_capsule:c{i}"), "project:hub"))
-            .collect(); // hub fanout degree = 20
-        edges.push(e("capability_capsule:c1".into(), "module:narrow")); // narrow degree = 1
-        edges.push(e("capability_capsule:anchorcap".into(), "module:narrow")); // anchor endpoint
-        edges.reverse(); // order must not matter
-
-        let boosts = graph_boosts_from_edges(&edges, &anchors);
-
-        // c1 (under both) → max(spread(20), spread(1)) = narrow's full boost.
-        assert_eq!(
-            boosts.get("c1"),
-            Some(&GRAPH_BOOST),
-            "c1 takes the max over anchors = narrow's full boost"
-        );
-        // c2 (hub-only, degree 20) → diluted below flat.
-        let c2 = *boosts.get("c2").expect("c2 boosted under hub");
-        assert!(
-            c2 < GRAPH_BOOST && c2 > 0,
-            "c2 (hub degree 20) must dilute below flat {GRAPH_BOOST}, got {c2}"
-        );
-        // anchorcap is itself an anchor → never boosted.
-        assert_eq!(boosts.get("anchorcap"), None);
-    }
-
-    #[test]
-    fn graph_boosts_weight_by_extractor_class() {
-        use std::collections::HashSet;
-        // G2 tuning + audit 2026-07-03 ⑥: the boost class is keyed on
-        // the EXTRACTOR tag, not on confidence presence. Similarity-
-        // minted edges (H1 ingest_link, O2 o7_neardup_cluster) take the
-        // tiebreaker scale × their minting cosine; a curated edge keeps
-        // the full GRAPH_BOOST even when the caller declares a
-        // confidence — under the old is_some() rule, declaring 1.0 on a
-        // curated fact edge LOWERED its weight 3×.
-        let anchors: HashSet<&str> = ["capability_capsule:seed"].into_iter().collect();
-        let e = |to: &str, confidence: Option<f32>, extractor: Option<&str>| {
-            crate::storage::graph_store::IncidentEdge {
-                from: "capability_capsule:seed".to_string(),
-                to: to.to_string(),
-                confidence,
-                extractor: extractor.map(str::to_string),
-            }
-        };
-        let edges = vec![
-            e("capability_capsule:half", Some(0.5), Some("ingest_link")),
-            e("capability_capsule:full", None, None),
-            e("capability_capsule:curated", Some(1.0), None),
-            e(
-                "capability_capsule:neardup",
-                Some(1.0),
-                Some("o7_neardup_cluster"),
-            ),
-        ];
-        let boosts = graph_boosts_from_edges(&edges, &anchors);
-        let full = *boosts.get("full").expect("confidence-less edge boosts");
-        let half = *boosts.get("half").expect("similarity edge boosts");
-        let curated = *boosts.get("curated").expect("curated edge boosts");
-        let neardup = *boosts.get("neardup").expect("neardup edge boosts");
-        assert_eq!(
-            full, GRAPH_BOOST,
-            "confidence-less (entity/lineage) edges keep the strong scale"
-        );
-        assert_eq!(
-            curated, GRAPH_BOOST,
-            "a curated edge DECLARING confidence keeps the strong scale (audit ⑥)"
-        );
-        assert_eq!(
-            half,
-            ((CONFIDENCE_EDGE_BOOST as f32) * 0.5).round() as i64,
-            "similarity-minted edges use the tiebreaker scale × cosine"
-        );
-        assert_eq!(
-            neardup, CONFIDENCE_EDGE_BOOST,
-            "both similarity lanes are graded by extractor"
-        );
-        assert!(
-            half < full,
-            "similarity edges must never outrank curated ones"
-        );
-    }
-
     #[tokio::test(flavor = "multi_thread")]
     async fn graph_boost_dilutes_high_fanout_anchor() {
         use crate::domain::capability_capsule::GraphEdge;
@@ -1619,13 +1666,249 @@ mod tests {
         .await
         .unwrap();
 
-        // Narrow anchor (degree 1) → full flat boost.
-        assert_eq!(boosts.get("n0"), Some(&GRAPH_BOOST));
-        // High-fanout anchor (degree 20) → diluted below flat, still > 0.
-        let hub_boost = *boosts.get("h0").expect("hub capsule must be boosted");
+        // I1 PPR semantics: the narrow anchor's neighbor keeps real
+        // propagated mass; the degree-20 hub splits its mass 20 ways, so
+        // each hub capsule lands strictly below the narrow one (and may
+        // round to zero — absent from the map — entirely).
+        let narrow = boosts.get("n0").copied().unwrap_or(0);
+        let hub = boosts.get("h0").copied().unwrap_or(0);
         assert!(
-            hub_boost < GRAPH_BOOST && hub_boost > 0,
-            "degree-20 anchor must dilute below flat {GRAPH_BOOST}, got {hub_boost}",
+            narrow > 0,
+            "narrow anchor's capsule must be boosted, got {boosts:?}"
+        );
+        assert!(
+            hub < narrow,
+            "degree-20 anchor must dilute per-capsule mass below the narrow anchor's (hub={hub}, narrow={narrow})",
+        );
+    }
+
+    // ---- I1 (oss-memory-diff §10): PPR graph-boost semantics ----
+
+    fn iedge(
+        from: &str,
+        to: &str,
+        confidence: Option<f32>,
+        extractor: Option<&str>,
+    ) -> crate::storage::graph_store::IncidentEdge {
+        crate::storage::graph_store::IncidentEdge {
+            from: from.to_string(),
+            to: to.to_string(),
+            confidence,
+            extractor: extractor.map(str::to_string),
+        }
+    }
+
+    #[test]
+    fn ppr_reaches_two_hop_neighbor_via_shared_entity() {
+        use std::collections::HashSet;
+        // The multi-hop case flat boosting can never serve: anchor capsule
+        // and capsule b share an entity tag. b is 2 hops from the anchor
+        // (capsule→entity→capsule) — under 1-hop flat boosting the entity
+        // endpoint is not a capsule, so b gets nothing.
+        let anchors: HashSet<&str> = ["capability_capsule:a"].into_iter().collect();
+        let edges = vec![
+            iedge("capability_capsule:a", "entity:t", None, None),
+            iedge("capability_capsule:b", "entity:t", None, None),
+        ];
+        let boosts = ppr_boosts_from_edges(&edges, &anchors);
+        let b = boosts.get("b").copied().unwrap_or(0);
+        assert!(
+            b > 0,
+            "2-hop neighbor via shared entity must be boosted, got {boosts:?}"
+        );
+        assert!(b <= GRAPH_BOOST, "boost is capped at GRAPH_BOOST, got {b}");
+        // The anchor itself is never boosted.
+        assert_eq!(boosts.get("a"), None);
+    }
+
+    #[test]
+    fn ppr_direct_neighbor_outranks_two_hop() {
+        use std::collections::HashSet;
+        // a—b is a direct fact edge; a—t—c is a 2-hop path. Propagated
+        // mass must decay with distance: b > c > 0.
+        let anchors: HashSet<&str> = ["capability_capsule:a"].into_iter().collect();
+        let edges = vec![
+            iedge("capability_capsule:a", "capability_capsule:b", None, None),
+            iedge("capability_capsule:a", "entity:t", None, None),
+            iedge("capability_capsule:c", "entity:t", None, None),
+        ];
+        let boosts = ppr_boosts_from_edges(&edges, &anchors);
+        let b = boosts.get("b").copied().unwrap_or(0);
+        let c = boosts.get("c").copied().unwrap_or(0);
+        assert!(b > c, "direct neighbor must outrank 2-hop (b={b}, c={c})");
+        assert!(
+            c > 0,
+            "2-hop neighbor still gets propagated mass, got {boosts:?}"
+        );
+    }
+
+    #[test]
+    fn ppr_hub_splits_mass_narrow_keeps_it() {
+        use std::collections::HashSet;
+        // project:hub fans out to 20 capsules; project:narrow to 1. PPR
+        // row-normalization splits the hub's mass 20 ways — the principled
+        // O4: a generic anchor cannot blanket-boost everything under it.
+        let anchors: HashSet<&str> = ["project:hub", "project:narrow"].into_iter().collect();
+        let mut edges: Vec<crate::storage::graph_store::IncidentEdge> = (1..=20)
+            .map(|i| {
+                iedge(
+                    &format!("capability_capsule:h{i}"),
+                    "project:hub",
+                    None,
+                    None,
+                )
+            })
+            .collect();
+        edges.push(iedge("capability_capsule:n0", "project:narrow", None, None));
+        edges.reverse(); // order must not matter
+        let boosts = ppr_boosts_from_edges(&edges, &anchors);
+        let narrow = boosts.get("n0").copied().unwrap_or(0);
+        let hub = boosts.get("h1").copied().unwrap_or(0);
+        assert!(
+            narrow > 0,
+            "narrow anchor's neighbor keeps real mass, got {boosts:?}"
+        );
+        assert!(
+            narrow > hub,
+            "degree-20 hub must dilute per-neighbor mass below the narrow anchor's (narrow={narrow}, hub={hub})"
+        );
+    }
+
+    #[test]
+    fn ppr_similarity_edges_share_less_mass_than_fact_edges() {
+        use std::collections::HashSet;
+        // G2 audit ⑥ semantics survive the PPR rewrite: when a similarity-
+        // minted edge (extractor ingest_link / o7_neardup_cluster) competes
+        // with fact-class edges at the same node, it carries less transition
+        // weight — scaled by its minting cosine. A curated edge DECLARING
+        // confidence stays fact-class.
+        let anchors: HashSet<&str> = ["capability_capsule:seed"].into_iter().collect();
+        let edges = vec![
+            iedge(
+                "capability_capsule:seed",
+                "capability_capsule:sim",
+                Some(0.9),
+                Some("ingest_link"),
+            ),
+            iedge(
+                "capability_capsule:seed",
+                "capability_capsule:fact",
+                None,
+                None,
+            ),
+            iedge(
+                "capability_capsule:seed",
+                "capability_capsule:curated",
+                Some(1.0),
+                None,
+            ),
+        ];
+        let boosts = ppr_boosts_from_edges(&edges, &anchors);
+        let sim = boosts.get("sim").copied().unwrap_or(0);
+        let fact = boosts.get("fact").copied().unwrap_or(0);
+        let curated = boosts.get("curated").copied().unwrap_or(0);
+        assert!(
+            fact > 0 && curated > 0,
+            "fact-class neighbors must be boosted, got {boosts:?}"
+        );
+        assert!(
+            sim < fact,
+            "similarity-minted edges must carry less mass than fact edges (sim={sim}, fact={fact})"
+        );
+        assert_eq!(
+            curated, fact,
+            "declaring confidence on a curated edge must not demote it (audit ⑥)"
+        );
+    }
+
+    #[test]
+    fn ppr_sim_only_neighborhood_stays_tiebreaker_scale() {
+        use std::collections::HashSet;
+        // A bench-shaped graph: ONLY similarity-minted edges (H1
+        // related_to). The absolute boost must stay at the tiebreaker
+        // scale (≤ CONFIDENCE_EDGE_BOOST) — v1's seed-relative
+        // normalization cancelled the class scale in a single-class
+        // graph and hit sim neighbors HARDER than flat boosting
+        // (measured: LoCoMo multi-hop any@5 0.462 → 0.385).
+        let anchors: HashSet<&str> = ["capability_capsule:a"].into_iter().collect();
+        let edges = vec![iedge(
+            "capability_capsule:a",
+            "capability_capsule:b",
+            Some(0.9),
+            Some("ingest_link"),
+        )];
+        let boosts = ppr_boosts_from_edges(&edges, &anchors);
+        let b = boosts.get("b").copied().unwrap_or(0);
+        assert!(b > 0, "sim neighbor still gets a nudge, got {boosts:?}");
+        assert!(
+            b <= CONFIDENCE_EDGE_BOOST,
+            "a node reached only via similarity edges must stay tiebreaker-sized (got {b})"
+        );
+    }
+
+    #[test]
+    fn ppr_mass_accumulates_across_anchors_capped() {
+        use std::collections::HashSet;
+        // b is reachable from BOTH anchors, c from one. PPR mass adds up
+        // (HippoRAG's associativity win — flat boosting only maxed), and
+        // the final boost stays capped at GRAPH_BOOST.
+        let anchors: HashSet<&str> = ["capability_capsule:a1", "capability_capsule:a2"]
+            .into_iter()
+            .collect();
+        let edges = vec![
+            iedge("capability_capsule:a1", "capability_capsule:b", None, None),
+            iedge("capability_capsule:a2", "capability_capsule:b", None, None),
+            iedge("capability_capsule:a1", "capability_capsule:c", None, None),
+        ];
+        let boosts = ppr_boosts_from_edges(&edges, &anchors);
+        let b = boosts.get("b").copied().unwrap_or(0);
+        let c = boosts.get("c").copied().unwrap_or(0);
+        assert!(
+            b > c,
+            "mass from two anchors must accumulate above one anchor's (b={b}, c={c})"
+        );
+        assert!(b <= GRAPH_BOOST, "accumulated boost stays capped, got {b}");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn compute_graph_boosts_reaches_two_hops_via_entity() {
+        use crate::domain::capability_capsule::GraphEdge;
+        use crate::storage::Store;
+        use tempfile::tempdir;
+
+        let dir = tempdir().unwrap();
+        let store = Store::open(&dir.path().join("i1.lance")).await.unwrap();
+        let edge = |from: &str, to: &str| GraphEdge {
+            from_node_id: from.to_string(),
+            to_node_id: to.to_string(),
+            relation: "tagged".into(),
+            valid_from: "00000001780000000000".into(),
+            valid_to: None,
+            confidence: None,
+            extractor: None,
+            strength: None,
+            stability: None,
+            last_activated: None,
+            access_count: None,
+        };
+        // anchor —tagged→ entity:t ←tagged— b : b is 2 hops out.
+        store
+            .add_edge_direct(&edge("capability_capsule:anchor", "entity:t"))
+            .await
+            .unwrap();
+        store
+            .add_edge_direct(&edge("capability_capsule:b", "entity:t"))
+            .await
+            .unwrap();
+
+        let graph: &dyn GraphStore = &store;
+        let boosts = compute_graph_boosts(graph, &["capability_capsule:anchor".to_string()], None)
+            .await
+            .unwrap();
+        let b = boosts.get("b").copied().unwrap_or(0);
+        assert!(
+            b > 0,
+            "the graph channel must reach a 2-hop capsule via a shared entity, got {boosts:?}"
         );
     }
 }

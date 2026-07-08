@@ -503,11 +503,18 @@ instruction template (asymmetric retrieval — documents embed raw,
 queries instructed), which lifted LoCoMo any@5 0.660 → 0.700 and
 multi-hop any@5 0.462 → 0.615, and re-validated LongMemEval unchanged
 (any@5 0.860). The optional G2 graph channel (`LOCOMO_GRAPH=1`: H1
-`related_to` links + `expand_graph`) trades top-5 precision for depth
-on this corpus — measured +8pt open-domain any@5 and +4pt any@10
-against -15pt multi-hop any@5 — so the headline posture keeps it off;
-production callers opt in per request via `expand_graph`. Reproduce
-with the commands below.
+`related_to` links + `expand_graph`; scored by I1 Personalized PageRank
+— 2-hop frontier, class-weighted edges, per-node class ceiling) trades
+top-5 precision for depth on this corpus: any@5 0.700 → 0.640 and
+multi-hop any@5 0.615 → 0.385, against recall@10 0.688 → 0.703
+(re-measured 2026-07-08 under the Qwen3 query template; flat boosting
+lands within one question of PPR, and three flat scales + two PPR
+mappings all rank identically — this corpus's graph is an ANN echo, H1
+similarity links only, so any graph-on posture costs precision). The
+headline posture keeps it off; production callers opt in per request
+via `expand_graph`, where capsule→entity→capsule paths (absent from
+this bench, dominant in real mem graphs) are the case PPR serves.
+Reproduce with the commands below.
 
 ## Recall Quality Bench (transcripts)
 

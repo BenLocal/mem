@@ -8,7 +8,41 @@ are organized by feature wave (merge commit ranges on `master`).
 
 ## [Unreleased]
 
-### Fixed — 2026-07-03 audit wave: evolution signals, G2 posture, graph parity (2026-07-06)
+### Changed — I1: the G2 graph channel scores by Personalized PageRank (2026-07-08)
+
+The `expand_graph` recall channel's flat 1-hop boost is replaced by a
+bounded Personalized PageRank over the anchor neighborhood
+(`retrieve.rs::ppr_boosts_from_edges` + `fetch_ppr_frontier`, closes
+oss-memory-diff §10 I1, HippoRAG 2 lineage). Zero-LLM, pure Rust, no new
+env vars; the K9 dynamics path (opt-in) is untouched.
+
+- **2-hop reach**: the frontier covers capsule → shared-entity → capsule
+  paths — the flat boost could never reach a capsule two hops out, which
+  on the production graph (tagged/mentions_file/applies_to-dominated) is
+  the main multi-hop associativity signal.
+- **Principled hub dilution**: row normalization splits a node's mass
+  over its fanout — the exact behavior O4's `spread_decay` approximated;
+  a `repo:`/`project:` hub can no longer blanket-boost.
+- **Mass accumulates across anchors** (flat boosting only maxed).
+- **Per-node class ceiling**: a node reached only by similarity-minted
+  edges (H1 `ingest_link` / O2 `o7_neardup_cluster`) is capped at the
+  tiebreaker scale (`CONFIDENCE_EDGE_BOOST × cosine`) in *absolute*
+  terms — seed-relative normalization alone cancels the class scale in a
+  single-class graph and measurably over-boosted (first mapping: LoCoMo
+  multi-hop any@5 0.462 → 0.385).
+- **Measured honestly (LoCoMo n=50, `LOCOMO_GRAPH=1`)**: on this bench
+  the graph is an ANN echo (H1 similarity links only — the bench mints
+  no entity edges), and *any* graph-on posture costs top-5 precision vs
+  graph-off (any@5 0.700 → 0.660 flat / 0.640 PPR; multi-hop 0.615 →
+  0.462 / 0.385 — the flat-vs-PPR gap is ONE flipped question in 50, and
+  an n=10 probe ranks identically) while buying a little depth
+  (recall@10 0.688 → 0.703). Three flat boost scales and two PPR
+  mappings all land within one question — the damage is set-shaped, not
+  magnitude-shaped. The benchmark headline posture stays graph-off;
+  production callers opt in per request via `expand_graph`, where the
+  entity-mediated 2-hop paths this corpus cannot express are the case
+  PPR serves (locked by unit tests incl. a real-store two-hop
+  regression).
 
 Two parallel audit passes over the post-2026-06-30 code (E2–E5 / H1–H3 /
 Qwen3 / G2) surfaced 15 defects; all fixed with RED→GREEN regressions.
