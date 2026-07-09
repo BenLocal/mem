@@ -505,7 +505,12 @@ pub async fn sweep_once(
                     execute_merge(store, tenant, &proposal.member_ids, &active, &now).await?
                 }
                 "generalize" => {
-                    execute_generalize(store, tenant, &proposal.member_ids, &active, &now).await?
+                    execute_generalize(store, tenant, &proposal.member_ids, &active, &now, false)
+                        .await?
+                }
+                "workflow_generalize" => {
+                    execute_generalize(store, tenant, &proposal.member_ids, &active, &now, true)
+                        .await?
                 }
                 "reweight_up" => {
                     execute_reweight(
@@ -690,10 +695,10 @@ pub async fn rollback_candidate(
                 }
             }
         }
-        // ②③④ share the placeholder shape — rollback archives the
-        // placeholder and closes its lineage edges; sources were never
-        // touched by any of the three (§11).
-        "generalize" | "refine" | "split" => {
+        // ②③④ (+ the H4 workflow variant) share the placeholder shape —
+        // rollback archives the placeholder and closes its lineage
+        // edges; sources were never touched by any of them (§11).
+        "generalize" | "workflow_generalize" | "refine" | "split" => {
             let proposal =
                 candidate
                     .result_capsule_ids
@@ -859,6 +864,34 @@ fn detect_merge(
                 .map(|&i| active[i].capability_capsule_id.clone())
                 .collect();
             member_ids.sort();
+            // H4×merge-fix confluence: a PROCEDURAL SIBLING cluster
+            // (pairwise-disjoint fact anchors — N checkpoints of one
+            // ongoing effort) must never merge; measured 2026-07-09,
+            // the reranker gate cannot tell siblings from duplicates
+            // (relevance ≈ 0.94-0.99 for both). The productive op for
+            // the same signal is a WORKFLOW generalize placeholder —
+            // the cluster is literally "the same procedure, executed
+            // N times". Because a pending candidate only executes when
+            // a live proposal matches it, suppressing the merge
+            // proposal here also starves any pre-existing merge
+            // candidate over these members.
+            let member_refs: Vec<&CapabilityCapsuleRecord> =
+                members.iter().map(|&i| &active[i]).collect();
+            if is_procedural_sibling_cluster(&member_refs) {
+                if members.len() >= settings.generalize_min_n {
+                    let shared = shared_themes(&member_refs);
+                    out.push(Proposal {
+                        op_kind: "workflow_generalize".to_string(),
+                        members: members.iter().map(|&i| preview(&active[i])).collect(),
+                        member_ids,
+                        params: format!(
+                            "{{\"shared_topics\":{}}}",
+                            serde_json::to_string(&shared).unwrap_or_else(|_| "[]".to_string()),
+                        ),
+                    });
+                }
+                continue;
+            }
             out.push(Proposal {
                 op_kind: "merge".to_string(),
                 members: members.iter().map(|&i| preview(&active[i])).collect(),
@@ -1056,12 +1089,17 @@ async fn execute_merge(
 /// Execute ② generalize: insert ONE `PendingConfirmation` proposal
 /// capsule (review-backend raw material, doc §6.2) + `generalizes`
 /// lineage edges. Sources are NOT touched. Returns `[proposal_id]`.
+/// With `workflow = true` this is the H4 variant: the placeholder is a
+/// WORKFLOW-type capsule (guidance floor exemption once accepted) whose
+/// review task asks for a step-by-step procedure instead of a
+/// principle, tagged `evolution:workflow`.
 async fn execute_generalize(
     store: &dyn Backend,
     tenant: &str,
     member_ids: &[String],
     active: &[CapabilityCapsuleRecord],
     now: &str,
+    workflow: bool,
 ) -> Result<Vec<String>, StorageError> {
     let sources: Vec<&CapabilityCapsuleRecord> = active
         .iter()
@@ -1071,10 +1109,18 @@ async fn execute_generalize(
         return Ok(Vec::new());
     }
     let shared_topics: Vec<String> = shared_themes(&sources);
-    let synthesized = ReviewSynthesisBackend.synthesize(&SynthesisTask::Generalize {
-        sources: &sources,
-        shared_topics: &shared_topics,
-    });
+    let task = if workflow {
+        SynthesisTask::WorkflowGeneralize {
+            sources: &sources,
+            shared_topics: &shared_topics,
+        }
+    } else {
+        SynthesisTask::Generalize {
+            sources: &sources,
+            shared_topics: &shared_topics,
+        }
+    };
+    let synthesized = ReviewSynthesisBackend.synthesize(&task);
 
     let project = common_value(sources.iter().map(|s| s.project.clone()));
     let repo = common_value(sources.iter().map(|s| s.repo.clone()));
@@ -1082,7 +1128,11 @@ async fn execute_generalize(
     let mut record = CapabilityCapsuleRecord {
         capability_capsule_id: proposal_id.clone(),
         tenant: tenant.to_string(),
-        capability_capsule_type: CapabilityCapsuleType::Experience,
+        capability_capsule_type: if workflow {
+            CapabilityCapsuleType::Workflow
+        } else {
+            CapabilityCapsuleType::Experience
+        },
         status: CapabilityCapsuleStatus::PendingConfirmation,
         scope: sources[0].scope.clone(),
         visibility: sources[0].visibility.clone(),
@@ -1097,7 +1147,11 @@ async fn execute_generalize(
         repo,
         module: None,
         task_type: None,
-        tags: vec!["evolution:generalize".to_string()],
+        tags: vec![if workflow {
+            "evolution:workflow".to_string()
+        } else {
+            "evolution:generalize".to_string()
+        }],
         topics: shared_topics,
         // PendingConfirmation ingest default (service::default_confidence).
         confidence: 0.6,
@@ -1654,4 +1708,193 @@ fn common_value(mut iter: impl Iterator<Item = Option<String>>) -> Option<String
         }
     }
     Some(first)
+}
+
+/// H4×merge-fix confluence (docs/offline-reranker-lane.md follow-up,
+/// oss-memory-diff §9 H4): fact anchors — the concrete identifiers a
+/// capsule's story hangs on. Commit-sha-like tokens from `content` +
+/// `evidence` (7-40 lowercase hex chars containing BOTH a digit and a
+/// letter, so decimal ids/timestamps don't count; `mem_…` capsule ids
+/// are stripped first so cross-references don't mint anchors) plus
+/// `code_refs` entries verbatim.
+fn fact_anchors(c: &CapabilityCapsuleRecord) -> BTreeSet<String> {
+    use once_cell::sync::Lazy;
+    use regex::Regex;
+    static CAPSULE_ID: Lazy<Regex> =
+        Lazy::new(|| Regex::new(r"mem_[0-9a-f][0-9a-f-]*").expect("static regex"));
+    static SHA_LIKE: Lazy<Regex> =
+        Lazy::new(|| Regex::new(r"\b[0-9a-f]{7,40}\b").expect("static regex"));
+
+    let mut anchors: BTreeSet<String> = BTreeSet::new();
+    let mut scan = |text: &str| {
+        let stripped = CAPSULE_ID.replace_all(text, " ");
+        for m in SHA_LIKE.find_iter(&stripped) {
+            let tok = m.as_str();
+            // Require BOTH a digit and a hex letter — pure-decimal runs
+            // (schedule ids, timestamps) are not commit anchors.
+            if tok.bytes().any(|b| b.is_ascii_digit())
+                && tok.bytes().any(|b| (b'a'..=b'f').contains(&b))
+            {
+                anchors.insert(tok.to_string());
+            }
+        }
+    };
+    scan(&c.content);
+    for e in &c.evidence {
+        scan(e);
+    }
+    for r in &c.code_refs {
+        let r = r.trim();
+        if !r.is_empty() {
+            anchors.insert(r.to_string());
+        }
+    }
+    anchors
+}
+
+/// Procedural sibling cluster: every member carries ≥1 fact anchor and
+/// the anchor sets are pairwise near-disjoint — same procedure frame,
+/// DIFFERENT concrete executions (distinct commits / files). Merging
+/// such a cluster destroys per-execution facts; the right op is a
+/// Workflow generalize proposal. Undecidable (any member without
+/// anchors) → false: fall open to the old merge path.
+fn is_procedural_sibling_cluster(members: &[&CapabilityCapsuleRecord]) -> bool {
+    if members.len() < 2 {
+        return false;
+    }
+    let anchor_sets: Vec<BTreeSet<String>> = members.iter().map(|m| fact_anchors(m)).collect();
+    if anchor_sets.iter().any(|s| s.is_empty()) {
+        return false;
+    }
+    // Pairwise near-disjoint: overlap ratio over the SMALLER set stays
+    // ≤ 0.2 for every pair (a restatement shares its subject's anchors
+    // and fails this immediately).
+    for i in 0..anchor_sets.len() {
+        for j in (i + 1)..anchor_sets.len() {
+            let inter = anchor_sets[i].intersection(&anchor_sets[j]).count();
+            let min = anchor_sets[i].len().min(anchor_sets[j].len());
+            if (inter as f32) / (min as f32) > 0.2 {
+                return false;
+            }
+        }
+    }
+    true
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::domain::capability_capsule::{Scope, Visibility};
+
+    fn capsule_with(
+        id: &str,
+        content: &str,
+        evidence: Vec<String>,
+        code_refs: Vec<String>,
+    ) -> CapabilityCapsuleRecord {
+        CapabilityCapsuleRecord {
+            capability_capsule_id: id.into(),
+            tenant: "local".into(),
+            capability_capsule_type: CapabilityCapsuleType::Experience,
+            status: CapabilityCapsuleStatus::Active,
+            scope: Scope::Repo,
+            visibility: Visibility::Shared,
+            version: 1,
+            summary: format!("summary {id}"),
+            content: content.into(),
+            evidence,
+            code_refs,
+            project: Some("mem".into()),
+            repo: Some("mem".into()),
+            module: None,
+            task_type: None,
+            tags: vec!["rust".into(), "migration".into()],
+            topics: vec![],
+            confidence: 0.7,
+            decay_score: 0.0,
+            content_hash: format!("hash-{id}"),
+            idempotency_key: None,
+            session_id: None,
+            supersedes_capability_capsule_id: None,
+            source_agent: "test".into(),
+            created_at: "00000000000000000001".into(),
+            updated_at: "00000000000000000001".into(),
+            last_validated_at: None,
+            last_used_at: None,
+            last_recalled_at: None,
+            expires_at: None,
+        }
+    }
+
+    #[test]
+    fn fact_anchors_extracts_commit_shas_not_decimal_ids_or_capsule_refs() {
+        let c = capsule_with(
+            "a",
+            "迁移 commit 24e5cb9(xmbox-rs)踩点, 承接 [[mem_019f2285-1b11-7d03-ac20-b976de429243]], \
+             scheduleId 2072587085822431232, 又见 282b74c 与 deadbeef1",
+            vec!["commit 4465b9a on master".into()],
+            vec!["src/os/mod.rs".into()],
+        );
+        let anchors = fact_anchors(&c);
+        assert!(
+            anchors.contains("24e5cb9"),
+            "commit sha from content: {anchors:?}"
+        );
+        assert!(anchors.contains("282b74c"), "second sha: {anchors:?}");
+        assert!(
+            anchors.contains("deadbeef1"),
+            "hex word with digit: {anchors:?}"
+        );
+        assert!(
+            anchors.contains("4465b9a"),
+            "sha from evidence: {anchors:?}"
+        );
+        assert!(
+            anchors.contains("src/os/mod.rs"),
+            "code_ref verbatim: {anchors:?}"
+        );
+        assert!(
+            !anchors.iter().any(|a| a.contains("2072587085822431232")),
+            "pure-decimal ids are not anchors: {anchors:?}"
+        );
+        assert!(
+            !anchors.iter().any(|a| a.contains("019f2285")),
+            "capsule-id hex must be stripped before extraction: {anchors:?}"
+        );
+    }
+
+    #[test]
+    fn sibling_cluster_detected_when_anchors_pairwise_disjoint() {
+        // The production shape: N migration checkpoints, one commit each.
+        let a = capsule_with("a", "迁移 commit 24e5cb9 踩点: os 只读端点", vec![], vec![]);
+        let b = capsule_with(
+            "b",
+            "迁移 commit 282b74c 踩点: hashids 批次",
+            vec![],
+            vec![],
+        );
+        let c = capsule_with("c", "迁移 commit 4465b9a 踩点: os 写类", vec![], vec![]);
+        assert!(is_procedural_sibling_cluster(&[&a, &b, &c]));
+    }
+
+    #[test]
+    fn shared_anchor_cluster_is_not_sibling() {
+        // Restatements of the SAME commit — a genuine merge candidate.
+        let a = capsule_with("a", "fix in commit 24e5cb9 detailed", vec![], vec![]);
+        let b = capsule_with("b", "commit 24e5cb9 short note", vec![], vec![]);
+        assert!(!is_procedural_sibling_cluster(&[&a, &b]));
+    }
+
+    #[test]
+    fn anchorless_cluster_is_not_sibling_fail_open() {
+        // No concrete identifiers → undecidable → old merge path.
+        let a = capsule_with(
+            "a",
+            "a long and detailed lesson about lance writes",
+            vec![],
+            vec![],
+        );
+        let b = capsule_with("b", "short lance lesson", vec![], vec![]);
+        assert!(!is_procedural_sibling_cluster(&[&a, &b]));
+    }
 }

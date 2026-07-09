@@ -8,6 +8,36 @@ are organized by feature wave (merge commit ranges on `master`).
 
 ## [Unreleased]
 
+### Added — H4 workflow crystallization × sibling-cluster merge protection (2026-07-09)
+
+One structural signal fixes a measured merge false-positive AND lands H4
+(oss-memory-diff §9): `evolution_worker::{fact_anchors,
+is_procedural_sibling_cluster}` — commit-sha-like tokens (hex 7-40 with
+both a digit and a letter; `mem_…` capsule ids stripped; decimal
+ids/timestamps excluded) plus `code_refs`, pairwise near-disjoint
+(overlap/min ≤ 0.2) across every member with each member anchored.
+
+- **Merge protection (always-on, zero-LLM)**: `detect_merge` reroutes a
+  procedural sibling cluster — N checkpoints of one ongoing effort, the
+  exact shape found live (5 Java→Rust migration capsules) — away from
+  merge entirely. Because a pending candidate only executes when a live
+  proposal matches it, the rerouting also starves any pre-existing
+  in-flight merge candidate over those members. Motivation measured
+  2026-07-09: the I2 reranker gate CANNOT tell siblings from duplicates
+  (relevance 0.94-0.99 for both, no separation band under a dedup
+  instruct either); the reranker stays as the secondary gate for
+  non-sibling merges. Anchorless clusters fall open to the old path.
+- **H4 crystallization**: the same cluster (when ≥ `generalize_min_n`)
+  becomes a `workflow_generalize` proposal — `execute_generalize` grown
+  a workflow variant minting a WORKFLOW-type `PendingConfirmation`
+  placeholder (tag `evolution:workflow`, `generalizes` lineage, sources
+  untouched; guidance floor exemption once accepted) whose review task
+  asks for a reusable step-by-step procedure. §11 rollback covers the
+  new kind via the shared placeholder arm.
+
+Acceptance: `tests/evolution_workflow_generalize.rs` (reroute + starved
+in-flight candidate + anchorless fail-open) and detector unit tests.
+
 ### Added — I2 P1+P2: offline reranker lane, evolution merge veto (2026-07-09)
 
 `src/rerank/` (closes offline-reranker-lane.md P1+P2; the I2 spike's

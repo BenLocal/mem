@@ -94,6 +94,16 @@ I1 `edge_base_boost` / PPR 转移权重加一档：`RERANK_EDGE_BOOST = 8 × con
 P1+P2 一批提交（P2 是 P1 的第一个真实消费者）；P3、P4 各自独立提交。
 全程每阶段 `cargo fmt + clippy -D warnings` + 全量测试门。
 
+**P2 上线后预演负发现（2026-07-09，dogfood 首日）**：用真模型对线上唯一在飞的 merge 候选
+（5 个 Java→Rust 迁移踩点胶囊——同流程不同 commit 的姊妹簇，绝不该合并）预演打分：相关性
+框架 0.977-0.999 全放行；改去重框架 instruct 仍 0.941-0.976，且真重复对照（自身子集）0.994
+——**无分离带**。结论：0.6B reranker 的 yes/no 判别区分不了「相关姊妹」与「真重复」这根更细
+的轴（“相关 vs 无关”它极好）。同日修复：`is_procedural_sibling_cluster` 结构判定
+（fact_anchors 两两近不相交）在 `detect_merge` 处**改道**姊妹簇（merge 抑制 + H4
+workflow_generalize 占位提案，见 CHANGELOG），**always-on 零 LLM**；本 reranker 闸降级为
+非姊妹簇 merge 的次级防线（真重复过闸=高分放行，语义正确）。长文本延迟同日实测：1200 字符
+CJK 截断 ≈ 1150-1240 token → **12-14s/对**（非短文本的 0.7s），离线节奏仍可接受。
+
 **P1+P2 落地偏离（2026-07-09，以代码为权威）**：
 1. 被否决的候选置 **`cancelled`** 而非本文初稿的「打回 pending」——pending 会让同一候选每个
    K 周期重复加载模型重复否决；`cancelled` 走既有的再提案抑制（op_kind+Jaccard），簇成员

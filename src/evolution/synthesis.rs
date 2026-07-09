@@ -25,6 +25,14 @@ pub enum SynthesisTask<'a> {
         sources: &'a [&'a CapabilityCapsuleRecord],
         shared_topics: &'a [String],
     },
+    /// H4: crystallize N sibling EXECUTIONS of one procedure into one
+    /// reusable Workflow. Same review-placeholder posture as
+    /// `Generalize`; the sources are a procedural sibling cluster
+    /// (pairwise-disjoint fact anchors), not restatements.
+    WorkflowGeneralize {
+        sources: &'a [&'a CapabilityCapsuleRecord],
+        shared_topics: &'a [String],
+    },
     /// ③ (E5): revise one contradicted-but-still-valuable capsule.
     /// `conflicts` names the signals that fired (e.g. a hanging
     /// `suspected_supersede` edge, accumulated `outdated` feedback).
@@ -80,6 +88,31 @@ impl SynthesisBackend for ReviewSynthesisBackend {
                 }
                 let summary = format!(
                     "[evolution:generalize] proposal over {} capsules ({})",
+                    sources.len(),
+                    shared_topics.join("/"),
+                );
+                SynthesizedProposal { content, summary }
+            }
+            SynthesisTask::WorkflowGeneralize {
+                sources,
+                shared_topics,
+            } => {
+                let mut content = String::new();
+                content.push_str(
+                    "EVOLUTION PROPOSAL — workflow generalize (sibling executions → procedure)\n\
+                     Review task: the source capsules below are N executions of the SAME \
+                     recurring procedure (each cites different commits/files — do NOT merge \
+                     them). Read them and write ONE reusable step-by-step workflow that a \
+                     future session can follow, then accept via review_edit_accept. Sources \
+                     stay Active — the workflow complements them, it does not replace them.\n\n",
+                );
+                content.push_str(&format!("Shared topics: {}\n\n", shared_topics.join(", ")));
+                content.push_str("Source capsules (id — summary):\n");
+                for s in sources.iter() {
+                    content.push_str(&format!("- {} — {}\n", s.capability_capsule_id, s.summary,));
+                }
+                let summary = format!(
+                    "[evolution:workflow] procedure proposal over {} sibling executions ({})",
                     sources.len(),
                     shared_topics.join("/"),
                 );
