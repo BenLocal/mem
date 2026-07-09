@@ -2310,3 +2310,83 @@ emb_test!(transcript_semantic_search_pgvector, store, {
         .unwrap()
         .is_empty());
 });
+
+emb_test!(embedding_job_lease_reclaims_orphaned_processing, store, {
+    // Parity with the Lance visibility timeout (EMBEDDING_JOB_LEASE_MS,
+    // commit 81a9302): a worker crash/restart strands claimed jobs in
+    // `processing`; without a lease they are never re-claimable and the
+    // capsule silently loses semantic recall. Within the lease the job
+    // stays owned; past it, the orphan is reclaimed.
+    use mem::storage::{timestamp_add_ms, EMBEDDING_JOB_LEASE_MS};
+    let claimed_at = "00000001778000000000";
+    assert!(store
+        .try_enqueue_embedding_job(job_insert("orph", "capO", "ho"))
+        .await
+        .unwrap());
+    let first = store
+        .claim_next_n_embedding_jobs(claimed_at, 5, 5)
+        .await
+        .unwrap();
+    assert_eq!(first.len(), 1);
+    assert_eq!(first[0].job_id, "orph");
+
+    let within = timestamp_add_ms(claimed_at, EMBEDDING_JOB_LEASE_MS - 1);
+    assert!(
+        store
+            .claim_next_n_embedding_jobs(&within, 5, 5)
+            .await
+            .unwrap()
+            .is_empty(),
+        "a job within its lease must not be stolen"
+    );
+
+    let past = timestamp_add_ms(claimed_at, EMBEDDING_JOB_LEASE_MS + 1);
+    let reclaimed = store
+        .claim_next_n_embedding_jobs(&past, 5, 5)
+        .await
+        .unwrap();
+    assert_eq!(reclaimed.len(), 1, "past-lease orphan must be reclaimed");
+    assert_eq!(reclaimed[0].job_id, "orph");
+});
+
+emb_test!(transcript_embedding_job_lease_reclaims_orphans, store, {
+    // Same lease semantics for the transcript queue (the two queues are
+    // separate tables with the same claim shape).
+    use mem::storage::{timestamp_add_ms, EMBEDDING_JOB_LEASE_MS};
+    store.set_transcript_job_provider("fake-test");
+    store
+        .create_conversation_message(&conv_msg(
+            "tlease_a",
+            "tls1",
+            1,
+            0,
+            BlockType::Text,
+            "lease block",
+        ))
+        .await
+        .unwrap();
+    let claimed_at = "00000001778000000000";
+    let first = store
+        .claim_next_n_transcript_embedding_jobs(claimed_at, 5, 5)
+        .await
+        .unwrap();
+    assert_eq!(first.len(), 1);
+
+    let within = timestamp_add_ms(claimed_at, EMBEDDING_JOB_LEASE_MS - 1);
+    assert!(
+        store
+            .claim_next_n_transcript_embedding_jobs(&within, 5, 5)
+            .await
+            .unwrap()
+            .is_empty(),
+        "within-lease transcript job stays owned"
+    );
+
+    let past = timestamp_add_ms(claimed_at, EMBEDDING_JOB_LEASE_MS + 1);
+    let reclaimed = store
+        .claim_next_n_transcript_embedding_jobs(&past, 5, 5)
+        .await
+        .unwrap();
+    assert_eq!(reclaimed.len(), 1, "past-lease transcript orphan reclaimed");
+    assert_eq!(reclaimed[0].message_block_id, "tlease_a");
+});

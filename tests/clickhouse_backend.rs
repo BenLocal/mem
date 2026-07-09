@@ -801,4 +801,108 @@ mod ch {
             "neighbors_within must read the 0.0 sentinel as None"
         );
     }
+
+    /// Lease parity with Lance (EMBEDDING_JOB_LEASE_MS, commit 81a9302):
+    /// a claimed-then-orphaned `processing` job must be re-claimable once
+    /// the visibility timeout elapses — and stay owned within it.
+    #[tokio::test]
+    async fn embedding_job_lease_reclaims_orphaned_processing() {
+        use mem::storage::{timestamp_add_ms, EMBEDDING_JOB_LEASE_MS};
+        let Some(be) = ch_backend().await else { return };
+        // Unique ids: this suite shares one database across tests/runs.
+        let job_id = format!("lease_{}", uuid::Uuid::now_v7());
+        let cap = format!("cap_{job_id}");
+        let claimed_at = "00000099000000000000";
+        assert!(be
+            .try_enqueue_embedding_job(EmbeddingJobInsert {
+                job_id: job_id.clone(),
+                tenant: "t".into(),
+                capability_capsule_id: cap.clone(),
+                target_content_hash: "hl".into(),
+                provider: "fake".into(),
+                available_at: claimed_at.into(),
+                created_at: claimed_at.into(),
+                updated_at: claimed_at.into(),
+            })
+            .await
+            .unwrap());
+
+        let first = be
+            .claim_next_n_embedding_jobs(claimed_at, 5, 50)
+            .await
+            .unwrap();
+        assert!(
+            first.iter().any(|c| c.job_id == job_id),
+            "fresh job claimed: {first:?}"
+        );
+
+        let within = timestamp_add_ms(claimed_at, EMBEDDING_JOB_LEASE_MS - 1);
+        let none = be
+            .claim_next_n_embedding_jobs(&within, 5, 50)
+            .await
+            .unwrap();
+        assert!(
+            !none.iter().any(|c| c.job_id == job_id),
+            "within-lease job must not be stolen"
+        );
+
+        let past = timestamp_add_ms(claimed_at, EMBEDDING_JOB_LEASE_MS + 1);
+        let reclaimed = be.claim_next_n_embedding_jobs(&past, 5, 50).await.unwrap();
+        assert!(
+            reclaimed.iter().any(|c| c.job_id == job_id),
+            "past-lease orphan must be reclaimed: {reclaimed:?}"
+        );
+    }
+
+    /// Same lease semantics for the transcript queue.
+    #[tokio::test]
+    async fn transcript_embedding_job_lease_reclaims_orphans() {
+        use mem::storage::{timestamp_add_ms, EMBEDDING_JOB_LEASE_MS};
+        let Some(be) = ch_backend().await else { return };
+        let block_id = format!("tlease_{}", uuid::Uuid::now_v7());
+        let claimed_at = "00000099000000000000";
+        // Dedicated session id: `cmsg` pins session "pg_s", which the
+        // pagination test counts rows in — sharing it breaks that test's
+        // assertions (this suite runs against one shared database).
+        let mut msg = cmsg(
+            &block_id,
+            1,
+            claimed_at,
+            MessageRole::Assistant,
+            BlockType::Text,
+        );
+        msg.session_id = Some(format!("tlease_s_{block_id}"));
+        be.create_conversation_messages(std::slice::from_ref(&msg))
+            .await
+            .unwrap();
+
+        let first = be
+            .claim_next_n_transcript_embedding_jobs(claimed_at, 5, 200)
+            .await
+            .unwrap();
+        assert!(
+            first.iter().any(|c| c.message_block_id == block_id),
+            "fresh transcript job claimed"
+        );
+
+        let within = timestamp_add_ms(claimed_at, EMBEDDING_JOB_LEASE_MS - 1);
+        let none = be
+            .claim_next_n_transcript_embedding_jobs(&within, 5, 200)
+            .await
+            .unwrap();
+        assert!(
+            !none.iter().any(|c| c.message_block_id == block_id),
+            "within-lease transcript job stays owned"
+        );
+
+        let past = timestamp_add_ms(claimed_at, EMBEDDING_JOB_LEASE_MS + 1);
+        let reclaimed = be
+            .claim_next_n_transcript_embedding_jobs(&past, 5, 200)
+            .await
+            .unwrap();
+        assert!(
+            reclaimed.iter().any(|c| c.message_block_id == block_id),
+            "past-lease transcript orphan reclaimed"
+        );
+    }
 }

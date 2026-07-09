@@ -528,9 +528,16 @@ impl EmbeddingJobStore for PostgresCapsuleStore {
         }
         // SELECT ... FOR UPDATE SKIP LOCKED then flip to 'processing' in
         // one transaction. Eligible = pending OR (failed with retry
-        // budget AND available_at <= now). Ordered created_at ASC.
+        // budget AND available_at <= now) OR (processing past its lease —
+        // Lance parity, EMBEDDING_JOB_LEASE_MS: an orphan from a crashed
+        // worker must self-heal, else its live row blocks re-enqueue and
+        // the capsule silently loses semantic recall). Ordered created_at
+        // ASC; the claim UPDATE below stamps updated_at = now, renewing
+        // the lease for the new owner.
         let max_r = i64::from(max_retries);
         let lim = i64::try_from(n).unwrap_or(i64::MAX);
+        let lease_cutoff =
+            crate::storage::timestamp_sub_ms(now, crate::storage::EMBEDDING_JOB_LEASE_MS);
         let mut tx = self.pool().begin().await.map_err(sqlx_err)?;
         let rows = sqlx::query(
             "SELECT job_id, tenant, capability_capsule_id, target_content_hash, \
@@ -538,6 +545,7 @@ impl EmbeddingJobStore for PostgresCapsuleStore {
              FROM embedding_jobs \
              WHERE status = 'pending' \
                 OR (status = 'failed' AND attempt_count < $1 AND available_at <= $2) \
+                OR (status = 'processing' AND updated_at <= $4) \
              ORDER BY created_at ASC \
              LIMIT $3 \
              FOR UPDATE SKIP LOCKED",
@@ -545,6 +553,7 @@ impl EmbeddingJobStore for PostgresCapsuleStore {
         .bind(max_r)
         .bind(now)
         .bind(lim)
+        .bind(&lease_cutoff)
         .fetch_all(&mut *tx)
         .await
         .map_err(sqlx_err)?;
@@ -769,12 +778,16 @@ impl EmbeddingJobStore for PostgresCapsuleStore {
         }
         let max_r = i64::from(max_retries);
         let lim = i64::try_from(n).unwrap_or(i64::MAX);
+        // Same lease reclaim as the capsule queue (Lance parity).
+        let lease_cutoff =
+            crate::storage::timestamp_sub_ms(now, crate::storage::EMBEDDING_JOB_LEASE_MS);
         let mut tx = self.pool().begin().await.map_err(sqlx_err)?;
         let rows = sqlx::query(
             "SELECT job_id, tenant, message_block_id, provider, attempt_count \
              FROM transcript_embedding_jobs \
              WHERE status = 'pending' \
                 OR (status = 'failed' AND attempt_count < $1 AND available_at <= $2) \
+                OR (status = 'processing' AND updated_at <= $4) \
              ORDER BY created_at ASC \
              LIMIT $3 \
              FOR UPDATE SKIP LOCKED",
@@ -782,6 +795,7 @@ impl EmbeddingJobStore for PostgresCapsuleStore {
         .bind(max_r)
         .bind(now)
         .bind(lim)
+        .bind(&lease_cutoff)
         .fetch_all(&mut *tx)
         .await
         .map_err(sqlx_err)?;

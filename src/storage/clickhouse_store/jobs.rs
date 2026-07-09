@@ -217,16 +217,25 @@ impl EmbeddingJobStore for ClickHouseBackend {
         max_retries: u32,
         n: usize,
     ) -> Result<Vec<ClaimedEmbeddingJob>, StorageError> {
+        // Lease parity with Lance (EMBEDDING_JOB_LEASE_MS, commit
+        // 81a9302): a `processing` row whose lease elapsed is an orphan
+        // from a crashed/restarted worker — reclaim it, else the capsule
+        // silently loses semantic recall forever (try_enqueue is blocked
+        // by the live row and the claim filter never matched it).
+        let lease_cutoff =
+            crate::storage::timestamp_sub_ms(now, crate::storage::EMBEDDING_JOB_LEASE_MS);
         let rows = self
             .client
             .query(
                 "SELECT ?fields FROM embedding_jobs FINAL \
                  WHERE available_at <= ? AND (status = 'pending' \
-                 OR (status = 'failed' AND attempt_count < ?)) \
+                 OR (status = 'failed' AND attempt_count < ?) \
+                 OR (status = 'processing' AND updated_at <= ?)) \
                  ORDER BY available_at ASC LIMIT ?",
             )
             .bind(now)
             .bind(max_retries as i64)
+            .bind(&lease_cutoff)
             .bind(n as u64)
             .fetch_all::<ChJobRow>()
             .await
@@ -410,16 +419,21 @@ impl EmbeddingJobStore for ClickHouseBackend {
         max_retries: u32,
         n: usize,
     ) -> Result<Vec<ClaimedTranscriptEmbeddingJob>, StorageError> {
+        // Same lease reclaim as the capsule queue above.
+        let lease_cutoff =
+            crate::storage::timestamp_sub_ms(now, crate::storage::EMBEDDING_JOB_LEASE_MS);
         let rows = self
             .client
             .query(
                 "SELECT ?fields FROM transcript_embedding_jobs FINAL \
                  WHERE available_at <= ? AND (status = 'pending' \
-                 OR (status = 'failed' AND attempt_count < ?)) \
+                 OR (status = 'failed' AND attempt_count < ?) \
+                 OR (status = 'processing' AND updated_at <= ?)) \
                  ORDER BY available_at ASC LIMIT ?",
             )
             .bind(now)
             .bind(max_retries as i64)
+            .bind(&lease_cutoff)
             .bind(n as u64)
             .fetch_all::<ChTxJobRow>()
             .await

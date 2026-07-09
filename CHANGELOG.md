@@ -8,7 +8,23 @@ are organized by feature wave (merge commit ranges on `master`).
 
 ## [Unreleased]
 
-### Added — H4 workflow crystallization × sibling-cluster merge protection (2026-07-09)
+### Fixed — Postgres/ClickHouse embedding-queue orphan lease parity (2026-07-09)
+
+The 2026-06-23 Lance fix (commit 81a9302) gave claimed-but-orphaned
+`processing` jobs a visibility timeout (`EMBEDDING_JOB_LEASE_MS`, 5 min)
+so a worker crash/restart self-heals instead of stranding the job
+forever (its live row also blocks re-enqueue → the capsule silently
+loses semantic recall). The same fix explicitly deferred the Postgres
+parity — and ClickHouse shipped after with the same lease-less shape.
+All four claim paths (capsule + transcript × PG + CH) now carry the
+Lance disjunct `OR (status = 'processing' AND updated_at <= now −
+lease)`; the claim write stamps `updated_at = now`, renewing the lease
+for the new owner. Regressions: `tests/postgres_backend.rs` (runs in
+CI's real-postgres job) + `tests/clickhouse_backend.rs` (validated
+against a real ClickHouse 26.5 container, full suite 18/18). Test-infra
+note: the CH lease tests run on a far-future timeline — under the new
+reclaim semantics an old-timestamped orphan is claimable by CONCURRENT
+tests using wall-clock `now`, so isolation is by timeline, not ids.
 
 One structural signal fixes a measured merge false-positive AND lands H4
 (oss-memory-diff §9): `evolution_worker::{fact_anchors,
