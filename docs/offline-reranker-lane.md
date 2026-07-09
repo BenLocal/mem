@@ -86,13 +86,24 @@ I1 `edge_base_boost` / PPR 转移权重加一档：`RERANK_EDGE_BOOST = 8 × con
 
 | 阶段 | 内容 | 工作量 | 验收 |
 |---|---|---|---|
-| **P1** | `src/rerank/` trait + candle/fake provider + 单测（模板/打分/截断） | S-M | 单测全绿；spike 四对照在 candle provider 上复现分数 |
-| **P2** | `reranker_worker` + **(c) evolution merge 候选复核**（merge 执行前置闸：双向几何均值 < `MEM_RERANK_MERGE_FLOOR`(默认 0.5) 的候选打回 pending 并注记）+ `/metrics` 计数 | M | fake provider 集成测试：低分候选被否决、高分放行；`rerank_*` 计数出现 |
+| **P1** ✅ | `src/rerank/` trait + candle/fake provider + 单测（模板/打分/截断） | S-M | 单测全绿；spike 四对照在 candle provider 上复现分数 |
+| **P2** ✅ | **(c) evolution merge 候选复核**（merge 执行前置闸：双向几何均值 < `MEM_RERANK_MERGE_FLOOR`(默认 0.5) 的候选否决）+ `/metrics` 计数 | M | fake provider 集成测试：低分候选被否决、高分放行；`rerank_*` 计数出现 |
 | **P3** | **(a) 语义边铸造 backfill + 增量**（ANN 候选 → 双向打分 → `reranker_link` 边；PPR 加档位） | M | 真实实例 dogfood：铸边量/质量人工抽查；`expand_graph` 请求可见图变化 |
 | **P4** | **(b) 提案打分注记**（suspected_supersede / generalize 占位追加双向分 + 非对称性提示） | S | 评审队列 UI/agent 可见注记 |
 
 P1+P2 一批提交（P2 是 P1 的第一个真实消费者）；P3、P4 各自独立提交。
 全程每阶段 `cargo fmt + clippy -D warnings` + 全量测试门。
+
+**P1+P2 落地偏离（2026-07-09，以代码为权威）**：
+1. 被否决的候选置 **`cancelled`** 而非本文初稿的「打回 pending」——pending 会让同一候选每个
+   K 周期重复加载模型重复否决；`cancelled` 走既有的再提案抑制（op_kind+Jaccard），簇成员
+   变化后的新候选不受抑制，语义正确且零浪费。
+2. rerank 出错（模型缺失等）的姿势是 **fail-closed-HOLD**：不执行也不 cancel，候选保持
+   pending 下个 sweep 重试并告警——operator 显式开了闸，绕过坏闸执行等于闸不存在；cancel
+   则会封杀一个从未被模型打过分的候选。
+3. P2 **没有独立 `reranker_worker`**——merge 闸直接内联在 evolution sweep 的执行分支里
+   （`spawn_blocking` 包裹模型加载+打分，不占 executor），每日 K 周期 ~10 对量级无需独立
+   tick。独立 worker 推迟到 P3（边 backfill 才真正需要自己的节奏）。
 
 ## 5. 预算
 

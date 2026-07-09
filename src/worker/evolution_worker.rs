@@ -468,6 +468,38 @@ pub async fn sweep_once(
             continue;
         }
         if decision == GateDecision::Execute {
+            // I2 P2 merge veto (docs/offline-reranker-lane.md §4). Fail
+            // posture on a rerank ERROR is fail-closed-HOLD: the
+            // operator asked for the gate, so executing past a broken
+            // gate would bypass it — and cancelling would settle a
+            // candidate no model ever scored. Held candidates stay
+            // `pending` and retry next sweep.
+            if proposal.op_kind == "merge" && crate::rerank::offline_enabled() {
+                match merge_rerank_veto(&proposal.member_ids, &active).await {
+                    Ok(None) => {}
+                    Ok(Some(reason)) => {
+                        crate::metrics::metrics().inc_rerank_merge_veto();
+                        warn!(
+                            candidate_id = %candidate.candidate_id,
+                            %reason,
+                            "rerank veto: merge candidate cancelled"
+                        );
+                        candidate.status = "cancelled".to_string();
+                        report.cancelled.push(candidate.candidate_id.clone());
+                        store.upsert_evolution_candidate(candidate).await?;
+                        continue;
+                    }
+                    Err(e) => {
+                        warn!(
+                            candidate_id = %candidate.candidate_id,
+                            error = %e,
+                            "rerank veto check failed; holding merge candidate (fail-closed)"
+                        );
+                        store.upsert_evolution_candidate(candidate).await?;
+                        continue;
+                    }
+                }
+            }
             let result_ids = match proposal.op_kind.as_str() {
                 "merge" => {
                     execute_merge(store, tenant, &proposal.member_ids, &active, &now).await?
@@ -909,6 +941,75 @@ fn detect_generalize(
     })
 }
 
+/// Keep-longest merge canonical (ties → earlier `created_at`) — the
+/// single source of truth shared by [`execute_merge`] and the I2 P2
+/// rerank veto, so the gate always scores against the capsule that
+/// would actually survive.
+fn merge_survivor<'a>(members: &[&'a CapabilityCapsuleRecord]) -> &'a CapabilityCapsuleRecord {
+    members
+        .iter()
+        .copied()
+        .max_by(|a, b| {
+            a.content
+                .len()
+                .cmp(&b.content.len())
+                .then_with(|| b.created_at.cmp(&a.created_at))
+        })
+        .expect("members non-empty")
+}
+
+/// I2 P2 (docs/offline-reranker-lane.md §4): cross-encoder floor for a
+/// merge candidate. Each would-be loser is scored against the survivor
+/// in BOTH directions; a bidirectional geometric mean below
+/// `MEM_RERANK_MERGE_FLOOR` returns `Some(reason)` — same-topic but
+/// different-fact capsules (which cosine clustering happily lumps
+/// together) score low, true restatements score high. Scoring runs in
+/// `spawn_blocking` (model load + forward are seconds of CPU) and the
+/// provider is dropped when the batch is done — never resident.
+async fn merge_rerank_veto(
+    member_ids: &[String],
+    active: &[CapabilityCapsuleRecord],
+) -> Result<Option<String>, crate::rerank::RerankError> {
+    let members: Vec<&CapabilityCapsuleRecord> = active
+        .iter()
+        .filter(|c| member_ids.contains(&c.capability_capsule_id))
+        .collect();
+    if members.len() < 2 {
+        return Ok(None);
+    }
+    let survivor = merge_survivor(&members);
+    let mut pairs: Vec<(String, String)> = Vec::new();
+    let mut losers: Vec<String> = Vec::new();
+    for m in &members {
+        if m.capability_capsule_id == survivor.capability_capsule_id {
+            continue;
+        }
+        let s = crate::rerank::truncate_for_rerank(&survivor.content).to_string();
+        let l = crate::rerank::truncate_for_rerank(&m.content).to_string();
+        pairs.push((s.clone(), l.clone()));
+        pairs.push((l, s));
+        losers.push(m.capability_capsule_id.clone());
+    }
+    let n_pairs = pairs.len() as u64;
+    let scores = tokio::task::spawn_blocking(move || {
+        let provider = crate::rerank::provider_from_env()?;
+        provider.score_pairs(&pairs)
+    })
+    .await
+    .map_err(|e| crate::rerank::RerankError::Internal(format!("rerank task join: {e}")))??;
+    crate::metrics::metrics().add_rerank_pairs(n_pairs);
+    let floor = crate::rerank::merge_floor();
+    for (i, loser_id) in losers.iter().enumerate() {
+        let geo = (scores[2 * i] * scores[2 * i + 1]).max(0.0).sqrt();
+        if geo < floor {
+            return Ok(Some(format!(
+                "loser {loser_id} bidirectional score {geo:.3} < floor {floor:.2}"
+            )));
+        }
+    }
+    Ok(None)
+}
+
 /// Execute ① merge: keep-longest canonical, archive the rest
 /// (verbatim-safe status flip, NOT the dedup `Incorrect` path), write
 /// `merged_into` lineage edges. Returns `[canonical_id]`.
@@ -926,16 +1027,7 @@ async fn execute_merge(
     if members.len() < 2 {
         return Ok(Vec::new());
     }
-    let survivor = members
-        .iter()
-        .copied()
-        .max_by(|a, b| {
-            a.content
-                .len()
-                .cmp(&b.content.len())
-                .then_with(|| b.created_at.cmp(&a.created_at))
-        })
-        .expect("members non-empty");
+    let survivor = merge_survivor(&members);
     let survivor_id = survivor.capability_capsule_id.clone();
     for loser in members {
         if loser.capability_capsule_id == survivor_id {

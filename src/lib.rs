@@ -9,6 +9,7 @@ pub mod http;
 pub mod mcp;
 pub mod metrics;
 pub mod pipeline;
+pub mod rerank;
 pub mod service;
 pub mod storage;
 pub mod worker;

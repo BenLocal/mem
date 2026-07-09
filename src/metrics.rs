@@ -60,6 +60,8 @@ pub struct Metrics {
     feedback_auto_promoted: AtomicU64,
     feedback_system_reweight_up: AtomicU64,
     feedback_system_reweight_decay: AtomicU64,
+    rerank_pairs_total: AtomicU64,
+    rerank_merges_vetoed: AtomicU64,
 }
 
 impl Metrics {
@@ -131,6 +133,19 @@ impl Metrics {
         counter.fetch_add(1, Ordering::Relaxed);
     }
 
+    /// `n` (query, document) pairs were scored by the offline reranker
+    /// (I2 lane — merge veto today, edge lanes later). Fires per batch
+    /// at the scoring choke point regardless of consumer.
+    pub fn add_rerank_pairs(&self, n: u64) {
+        self.rerank_pairs_total.fetch_add(n, Ordering::Relaxed);
+    }
+
+    /// An evolution merge candidate was vetoed by the reranker floor
+    /// (I2 P2) — cancelled instead of executed.
+    pub fn inc_rerank_merge_veto(&self) {
+        self.rerank_merges_vetoed.fetch_add(1, Ordering::Relaxed);
+    }
+
     /// A lock-free point-in-time read of every counter, ready to serialise.
     pub fn snapshot(&self) -> MetricsSnapshot {
         let load = |a: &AtomicU64| a.load(Ordering::Relaxed);
@@ -151,6 +166,8 @@ impl Metrics {
             feedback_auto_promoted: load(&self.feedback_auto_promoted),
             feedback_system_reweight_up: load(&self.feedback_system_reweight_up),
             feedback_system_reweight_decay: load(&self.feedback_system_reweight_decay),
+            rerank_pairs_total: load(&self.rerank_pairs_total),
+            rerank_merges_vetoed: load(&self.rerank_merges_vetoed),
         }
     }
 }
@@ -175,6 +192,8 @@ pub struct MetricsSnapshot {
     pub feedback_auto_promoted: u64,
     pub feedback_system_reweight_up: u64,
     pub feedback_system_reweight_decay: u64,
+    pub rerank_pairs_total: u64,
+    pub rerank_merges_vetoed: u64,
 }
 
 #[cfg(test)]

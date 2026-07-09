@@ -8,6 +8,32 @@ are organized by feature wave (merge commit ranges on `master`).
 
 ## [Unreleased]
 
+### Added — I2 P1+P2: offline reranker lane, evolution merge veto (2026-07-09)
+
+`src/rerank/` (closes offline-reranker-lane.md P1+P2; the I2 spike's
+landing shape after the interactive posture measured out of budget):
+
+- **P1 — provider**: `RerankProvider` (sync by design — callers wrap in
+  `spawn_blocking`), `CandleQwen3Reranker` (Qwen3-Reranker-0.6B on the
+  candle stack already in the dep tree: chat template → one forward →
+  yes/no last-position logits → softmax P(yes); zero new native deps,
+  the candle/tokenizers crates were already pinned transitively) and a
+  deterministic `fake` provider for CI (weights are 1.19GB, never in the
+  repo). Inputs truncate to 1200 chars per side, char-boundary-safe.
+- **P2 — merge veto**: with `MEM_RERANK_OFFLINE_ENABLED=1`, evolution ①
+  merge candidates are gated before execution — each would-be loser
+  scores bidirectionally against the keep-longest survivor
+  (`merge_survivor` now shared so the gate scores what would actually
+  survive); a geometric mean below `MEM_RERANK_MERGE_FLOOR` (default
+  0.5) CANCELS the candidate (re-proposal suppression applies) instead
+  of archiving a same-topic-but-different-fact capsule. Rerank errors
+  fail-closed-HOLD (candidate stays pending, retries next sweep, loud
+  warn) — the sweep never executes past a broken gate. New counters
+  `rerank_pairs_total` / `rerank_merges_vetoed` in `/metrics`.
+  Acceptance: `tests/rerank_merge_veto.rs` (veto / clean-pass /
+  default-off phases, fake provider) + an `#[ignore]` real-model smoke
+  reproducing the spike's discrimination numbers.
+
 ### Changed — I1: the G2 graph channel scores by Personalized PageRank (2026-07-08)
 
 The `expand_graph` recall channel's flat 1-hop boost is replaced by a
