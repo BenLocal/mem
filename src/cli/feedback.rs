@@ -22,7 +22,18 @@
 //!
 //! Default kind is `applies_here`. Negative kinds (`outdated`,
 //! `incorrect`, `does_not_apply_here`) are out of scope for this hook —
-//! they require human or agent judgment, not automatic inference.
+//! they require human or agent judgment, not automatic inference. That
+//! keeps explicit negative volume near zero by design; wrongness flows
+//! through `supersede` (version chains) and never-recalled staleness
+//! through the evolution worker's `reweight_decay` lane, so the absence
+//! of explicit negative feedback is expected, not a broken loop
+//! (audits 2026-06-12 + 2026-07-13).
+//!
+//! Once per session: each pass stores a cursor under the pseudo-path
+//! `<transcript_path>#feedback` (mine-cursor store) and only credits
+//! capsules whose FIRST crediting evidence line lies beyond it, so the
+//! Stop / PreCompact hooks re-running over one growing transcript no
+//! longer re-send `applies_here` for the same capsules every pass.
 
 use anyhow::Result;
 use clap::Args;
@@ -165,6 +176,39 @@ pub struct FeedbackCounts {
     pub sent: usize,
     pub consumed: usize,
     pub failed: usize,
+    /// Capsules whose crediting evidence sits at or before the
+    /// per-transcript cursor — already credited by an earlier pass over
+    /// this (growing) transcript, so skipped this time.
+    pub deduped: usize,
+}
+
+/// Result of one transcript scan: which capsules earned crediting
+/// evidence, where, and how far the scan read.
+#[derive(Debug, Default)]
+struct ScanOutcome {
+    /// capsule id → **1-based** line number of the FIRST crediting
+    /// evidence: the earliest of (a) a `capability_capsule_get` of the id,
+    /// (b) the first assistant block whose fingerprint overlap meets
+    /// [`HIT_THRESHOLD`], or (c) the retrieval line itself under `--all` /
+    /// when the retrieved text has no usable fingerprint.
+    credited: HashMap<String, usize>,
+    /// Total lines read — the cursor watermark after this pass.
+    lines_scanned: usize,
+}
+
+impl ScanOutcome {
+    /// Ids whose first evidence is strictly after `cursor` (a 1-based
+    /// line number). Evidence at or before the cursor was visible to —
+    /// and therefore credited by — the pass that stored that cursor.
+    /// `None` (first pass / cursor fetch failure) keeps everything:
+    /// fail-open to the legacy full-credit behavior.
+    fn credited_since(&self, cursor: Option<i64>) -> HashSet<String> {
+        self.credited
+            .iter()
+            .filter(|(_, &line)| cursor.is_none_or(|c| line as i64 > c))
+            .map(|(id, _)| id.clone())
+            .collect()
+    }
 }
 
 impl FeedbackCounts {
@@ -183,12 +227,19 @@ pub async fn run(args: FeedbackFromTranscriptArgs) -> i32 {
     match run_with_counts(args).await {
         Ok(counts) => {
             if counts.nothing_to_send() {
-                println!("feedback: no consumed memories detected");
+                if counts.deduped > 0 {
+                    println!(
+                        "feedback: no new consumed memories ({} already credited by an earlier pass)",
+                        counts.deduped
+                    );
+                } else {
+                    println!("feedback: no consumed memories detected");
+                }
                 return 0;
             }
             println!(
-                "feedback: kind={} sent={}/{} failed={}",
-                counts.kind, counts.sent, counts.consumed, counts.failed,
+                "feedback: kind={} sent={}/{} failed={} deduped={}",
+                counts.kind, counts.sent, counts.consumed, counts.failed, counts.deduped,
             );
             if counts.hard_failure() {
                 1
@@ -206,18 +257,40 @@ pub async fn run(args: FeedbackFromTranscriptArgs) -> i32 {
 /// Same as [`run`] but returns typed counts to in-process callers (the
 /// hook handlers). Errors only surface for unrecoverable transcript-
 /// parse failures; per-row HTTP errors are counted in `failed`.
+///
+/// Dedup across passes: the Stop / PreCompact hooks re-run this over the
+/// same growing transcript every ~15 exchanges, which used to re-POST
+/// `applies_here` for every already-credited capsule each time (measured
+/// 2026-07-10: 491 sends over 66 distinct capsules — half the active pool
+/// pinned at confidence 1.0). Each pass now stores a cursor under the
+/// pseudo-path `<transcript_path>#feedback` in the mine-cursor store
+/// (reusing `/mine/cursors` — no new endpoint or table) and only credits
+/// capsules whose first evidence line is beyond it. Cursor read failures
+/// fail open (full credit, at worst one duplicate pass); the cursor only
+/// advances after a pass with zero send failures.
 pub async fn run_with_counts(args: FeedbackFromTranscriptArgs) -> anyhow::Result<FeedbackCounts> {
-    let consumed = scan_transcript(&args.transcript_path, args.all)?;
-    if consumed.is_empty() {
-        return Ok(FeedbackCounts {
-            kind: args.kind,
-            ..Default::default()
-        });
-    }
+    let outcome = scan_transcript(&args.transcript_path, args.all)?;
     let client = Client::new();
+    let cursor_key = format!("{}#feedback", args.transcript_path.display());
+    let cursor: Option<i64> = match client
+        .get(format!("{}/mine/cursors", args.remote.base_url))
+        .query(&[("transcript_path", cursor_key.as_str())])
+        .send()
+        .await
+    {
+        Ok(resp) if resp.status().is_success() => resp
+            .json::<Value>()
+            .await
+            .ok()
+            .and_then(|v| v.get("last_line_number").and_then(|n| n.as_i64())),
+        _ => None,
+    };
+    let to_send = outcome.credited_since(cursor);
+    let deduped = outcome.credited.len() - to_send.len();
+
     let mut sent = 0usize;
     let mut failed = 0usize;
-    for mid in &consumed {
+    for mid in &to_send {
         let body = serde_json::json!({
             "tenant": args.remote.tenant,
             "capability_capsule_id": mid,
@@ -243,11 +316,31 @@ pub async fn run_with_counts(args: FeedbackFromTranscriptArgs) -> anyhow::Result
             }
         }
     }
+    // Advance the watermark after a clean pass — including an
+    // empty-send one — so the next pass over this transcript skips
+    // everything credited (or evaluated) up to here. Best-effort, same
+    // contract as mine's cursor: a lost write only costs one duplicate
+    // pass, never correctness.
+    if failed == 0 {
+        let body = serde_json::json!({
+            "transcript_path": cursor_key,
+            "last_line_number": outcome.lines_scanned as i64,
+        });
+        if let Err(e) = client
+            .post(format!("{}/mine/cursors", args.remote.base_url))
+            .json(&body)
+            .send()
+            .await
+        {
+            eprintln!("feedback cursor advance: {e}");
+        }
+    }
     Ok(FeedbackCounts {
         kind: args.kind,
         sent,
-        consumed: consumed.len(),
+        consumed: to_send.len(),
         failed,
+        deduped,
     })
 }
 
@@ -261,7 +354,7 @@ pub async fn run_with_counts(args: FeedbackFromTranscriptArgs) -> anyhow::Result
 /// ([`is_capsule_get_tool`] — a deliberate fetch) OR its `text` reappears
 /// in a subsequent assistant `text`/`thinking` block. Crediting only
 /// *retrieved* gets (not bare inspection gets) keeps precision.
-fn scan_transcript(transcript_path: &std::path::Path, all: bool) -> Result<HashSet<String>> {
+fn scan_transcript(transcript_path: &std::path::Path, all: bool) -> Result<ScanOutcome> {
     let file = File::open(transcript_path)?;
     let reader = BufReader::new(file);
 
@@ -271,10 +364,13 @@ fn scan_transcript(transcript_path: &std::path::Path, all: bool) -> Result<HashS
     let mut assistant_corpus: Vec<(usize, String)> = Vec::new();
     // tool_use_id → line index where the search call was issued.
     let mut search_calls: HashMap<String, usize> = HashMap::new();
-    // capsule ids the agent deliberately fetched via capability_capsule_get.
-    let mut fetched: HashSet<String> = HashSet::new();
+    // capsule id → 1-based line of the FIRST deliberate
+    // capability_capsule_get fetch.
+    let mut fetched: HashMap<String, usize> = HashMap::new();
+    let mut lines_scanned = 0usize;
 
     for (line_idx, line) in reader.lines().enumerate() {
+        lines_scanned = line_idx + 1;
         let line = line?;
         let value: Value = match serde_json::from_str(&line) {
             Ok(v) => v,
@@ -349,7 +445,7 @@ fn scan_transcript(transcript_path: &std::path::Path, all: bool) -> Result<HashS
                         }
                     } else if is_capsule_get_tool(name) {
                         if let Some(cid) = item["input"]["capability_capsule_id"].as_str() {
-                            fetched.insert(cid.to_string());
+                            fetched.entry(cid.to_string()).or_insert(line_idx + 1);
                         }
                     }
                 }
@@ -420,34 +516,40 @@ fn scan_transcript(transcript_path: &std::path::Path, all: bool) -> Result<HashS
         .map(|(line, text)| (*line, fingerprint(text).into_iter().collect()))
         .collect();
 
-    let mut used: HashSet<String> = HashSet::new();
+    let mut credited: HashMap<String, usize> = HashMap::new();
     for (mid, fp, ridx) in &retrieved {
-        if used.contains(mid) {
-            continue;
-        }
         // Strong signal: the agent fetched this recalled capsule's verbatim
         // content via capability_capsule_get — credit without needing a
-        // fingerprint match.
-        if fetched.contains(mid) {
-            used.insert(mid.clone());
-            continue;
-        }
-        if all || fp.is_empty() {
-            // `--all` or no usable fingerprint → accept.
-            used.insert(mid.clone());
-            continue;
-        }
-        let consumed = assistant_fingerprints
-            .iter()
-            .filter(|(l, _)| *l > *ridx)
-            .any(|(_, fp_set)| {
-                fp.iter().filter(|t| fp_set.contains(t.as_str())).count() >= HIT_THRESHOLD
-            });
-        if consumed {
-            used.insert(mid.clone());
+        // fingerprint match. Otherwise `--all` / no usable fingerprint
+        // credit on retrieval alone; the fingerprint path credits on the
+        // FIRST assistant block after the retrieval that meets the
+        // threshold. The evidence line (1-based) is what the cursor
+        // filter in [`ScanOutcome::credited_since`] compares against.
+        let evidence: Option<usize> = if let Some(&get_line) = fetched.get(mid) {
+            Some(get_line)
+        } else if all || fp.is_empty() {
+            Some(ridx + 1)
+        } else {
+            assistant_fingerprints
+                .iter()
+                .filter(|(l, _)| *l > *ridx)
+                .find(|(_, fp_set)| {
+                    fp.iter().filter(|t| fp_set.contains(t.as_str())).count() >= HIT_THRESHOLD
+                })
+                .map(|(l, _)| l + 1)
+        };
+        // A capsule retrieved several times keeps its earliest evidence.
+        if let Some(e) = evidence {
+            credited
+                .entry(mid.clone())
+                .and_modify(|cur| *cur = (*cur).min(e))
+                .or_insert(e);
         }
     }
-    Ok(used)
+    Ok(ScanOutcome {
+        credited,
+        lines_scanned,
+    })
 }
 
 /// Extract distinctive content tokens from `text` for paraphrase-
@@ -786,9 +888,10 @@ mod tests {
 
         let consumed = scan_transcript(f.path(), false).unwrap();
         assert!(
-            consumed.contains(id),
+            consumed.credited.contains_key(id),
             "hook-attachment recall reused by a later assistant block must be \
-             credited as consumed, got {consumed:?}"
+             credited as consumed, got {:?}",
+            consumed.credited
         );
 
         // A banner with NO subsequent reuse stays uncredited (the heuristic
@@ -797,8 +900,9 @@ mod tests {
         writeln!(g, "{attachment}").unwrap();
         let unconsumed = scan_transcript(g.path(), false).unwrap();
         assert!(
-            !unconsumed.contains(id),
-            "an un-reused recalled capsule must not be credited, got {unconsumed:?}"
+            !unconsumed.credited.contains_key(id),
+            "an un-reused recalled capsule must not be credited, got {:?}",
+            unconsumed.credited
         );
     }
 
@@ -855,8 +959,9 @@ mod tests {
         writeln!(f, "{get_call}").unwrap();
         let consumed = scan_transcript(f.path(), false).unwrap();
         assert!(
-            consumed.contains(id),
-            "index banner + deliberate get must credit, got {consumed:?}"
+            consumed.credited.contains_key(id),
+            "index banner + deliberate get must credit, got {:?}",
+            consumed.credited
         );
     }
 
@@ -876,9 +981,148 @@ mod tests {
         writeln!(f, "{unrelated}").unwrap();
         let consumed = scan_transcript(f.path(), false).unwrap();
         assert!(
-            !consumed.contains(id),
-            "skimmed-and-ignored index banner must stay silent, got {consumed:?}"
+            !consumed.credited.contains_key(id),
+            "skimmed-and-ignored index banner must stay silent, got {:?}",
+            consumed.credited
         );
+    }
+
+    // ---- cursor-aware crediting (duplicate re-credit fix, 2026-07-13) ----
+    //
+    // `feedback-from-transcript` used to rescan the whole transcript on
+    // every Stop-hook pass and re-POST `applies_here` for the same capsules
+    // (measured 2026-07-10: 491 sends over 66 distinct capsules, max 19×
+    // for one capsule in a day — pinning 49% of the active pool at
+    // confidence 1.0). The fix keys crediting on the FIRST evidence line
+    // and filters against a per-transcript cursor.
+
+    /// Shared fixture: banner bullet whose distinctive tokens the
+    /// consuming assistant block reuses (same pair as the attachment
+    /// regression test above).
+    fn banner_attachment(id: &str) -> String {
+        let banner = format!(
+            "🧠 mem auto-recall — memories relevant to this prompt\n\
+             - DuckDB single-writer MVCC concurrency lock contention `[{id}]`"
+        );
+        attachment_line(&banner)
+    }
+
+    fn consuming_assistant() -> String {
+        serde_json::json!({
+            "type": "assistant",
+            "message": {"role": "assistant", "content": [{
+                "type": "text",
+                "text": "Right — DuckDB is single-writer, so MVCC concurrency and \
+                         lock contention bite when two writers share one file.",
+            }]},
+        })
+        .to_string()
+    }
+
+    fn unrelated_assistant() -> String {
+        serde_json::json!({
+            "type": "assistant",
+            "message": {"role": "assistant", "content": [{
+                "type": "text",
+                "text": "Completely unrelated reply about playwright selectors and npx caches.",
+            }]},
+        })
+        .to_string()
+    }
+
+    #[test]
+    fn scan_records_first_evidence_line_and_watermark() {
+        use std::io::Write;
+        let id = "mem_019e9999-aaaa-7bbb-8ccc-dddddddddddd";
+        // Banner L1, consuming assistant L2, identical re-consumption L3.
+        // Evidence must be the FIRST match (line 2, 1-based), and the
+        // watermark must cover the whole file (3 lines).
+        let mut f = tempfile::NamedTempFile::new().unwrap();
+        writeln!(f, "{}", banner_attachment(id)).unwrap();
+        writeln!(f, "{}", consuming_assistant()).unwrap();
+        writeln!(f, "{}", consuming_assistant()).unwrap();
+
+        let outcome = scan_transcript(f.path(), false).unwrap();
+        assert_eq!(
+            outcome.credited.get(id).copied(),
+            Some(2),
+            "first crediting evidence must be the earliest matching line, got {:?}",
+            outcome.credited
+        );
+        assert_eq!(outcome.lines_scanned, 3);
+    }
+
+    #[test]
+    fn credited_since_drops_first_evidence_at_or_before_cursor() {
+        use std::io::Write;
+        let id = "mem_019e9999-aaaa-7bbb-8ccc-dddddddddddd";
+        // Banner L1, consume L2, filler L3, re-reference L4. A cursor at 3
+        // means L2 was already credited by a previous pass — the L4
+        // re-reference must NOT re-credit (once per session).
+        let mut f = tempfile::NamedTempFile::new().unwrap();
+        writeln!(f, "{}", banner_attachment(id)).unwrap();
+        writeln!(f, "{}", consuming_assistant()).unwrap();
+        writeln!(f, "{}", unrelated_assistant()).unwrap();
+        writeln!(f, "{}", consuming_assistant()).unwrap();
+
+        let outcome = scan_transcript(f.path(), false).unwrap();
+        assert!(
+            outcome.credited_since(Some(3)).is_empty(),
+            "first evidence (L2) ≤ cursor (3) must suppress re-crediting"
+        );
+        assert!(
+            outcome.credited_since(Some(1)).contains(id),
+            "first evidence (L2) > cursor (1) must credit"
+        );
+    }
+
+    #[test]
+    fn credited_since_keeps_late_consumption_of_pre_cursor_retrieval() {
+        use std::io::Write;
+        let id = "mem_019e9999-aaaa-7bbb-8ccc-dddddddddddd";
+        // Banner L1 (before cursor), first consumption only at L3 (after
+        // cursor 2). The retrieval being old must not hide the fresh
+        // evidence — this is the edge the evidence-line rule preserves.
+        let mut f = tempfile::NamedTempFile::new().unwrap();
+        writeln!(f, "{}", banner_attachment(id)).unwrap();
+        writeln!(f, "{}", unrelated_assistant()).unwrap();
+        writeln!(f, "{}", consuming_assistant()).unwrap();
+
+        let outcome = scan_transcript(f.path(), false).unwrap();
+        assert!(
+            outcome.credited_since(Some(2)).contains(id),
+            "consumption evidence (L3) after the cursor (2) must credit even \
+             though the retrieval (L1) predates it"
+        );
+    }
+
+    #[test]
+    fn credited_since_none_keeps_everything() {
+        use std::io::Write;
+        let id = "mem_019e9999-aaaa-7bbb-8ccc-dddddddddddd";
+        let mut f = tempfile::NamedTempFile::new().unwrap();
+        writeln!(f, "{}", banner_attachment(id)).unwrap();
+        writeln!(f, "{}", consuming_assistant()).unwrap();
+
+        let outcome = scan_transcript(f.path(), false).unwrap();
+        assert!(
+            outcome.credited_since(None).contains(id),
+            "no cursor (fail-open / first run) must credit everything"
+        );
+    }
+
+    #[test]
+    fn all_mode_evidence_is_retrieval_line() {
+        use std::io::Write;
+        let id = "mem_019e9999-aaaa-7bbb-8ccc-dddddddddddd";
+        // `--all` credits on retrieval alone, so the evidence line is the
+        // banner line itself.
+        let mut f = tempfile::NamedTempFile::new().unwrap();
+        writeln!(f, "{}", banner_attachment(id)).unwrap();
+
+        let outcome = scan_transcript(f.path(), true).unwrap();
+        assert_eq!(outcome.credited.get(id).copied(), Some(1));
+        assert_eq!(outcome.lines_scanned, 1);
     }
 
     #[test]
@@ -900,8 +1144,9 @@ mod tests {
         writeln!(f, "{citing}").unwrap();
         let consumed = scan_transcript(f.path(), false).unwrap();
         assert!(
-            consumed.contains(id),
-            "assistant id citation must credit via fingerprint, got {consumed:?}"
+            consumed.credited.contains_key(id),
+            "assistant id citation must credit via fingerprint, got {:?}",
+            consumed.credited
         );
     }
 }

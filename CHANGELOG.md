@@ -8,6 +8,42 @@ are organized by feature wave (merge commit ranges on `master`).
 
 ## [Unreleased]
 
+### Fixed — feedback-from-transcript duplicate re-crediting (2026-07-13)
+
+`mem feedback-from-transcript` (run by the Stop / PreCompact hooks every
+~15 exchanges) rescanned the whole transcript each pass with no memory
+of what it had already credited, re-POSTing `applies_here` (+0.05
+confidence each) for the same capsules every pass over one growing
+session. Measured on 2026-07-10: 491 sends covering only 66 distinct
+capsules (avg 7.4×, max 19× in a day), which pinned 257 of 518 active
+capsules (49%) at the 1.0 confidence clamp — erasing the confidence
+axis's discrimination in retrieval scoring (`confidence_score`, 0–10
+integer points) and the `useful`(+0.10) vs `applies_here`(+0.05)
+distinction with it.
+
+Fix: each pass now records a per-transcript cursor under the pseudo-path
+`<transcript_path>#feedback` in the existing mine-cursor store (reuses
+`GET/POST /mine/cursors` — no new endpoint, table, or schema).
+`scan_transcript` returns each capsule's **first crediting-evidence
+line** (earliest of: `capability_capsule_get` call, first
+fingerprint-matching assistant block, or the retrieval line under
+`--all`), and only capsules whose first evidence lies beyond the cursor
+are sent — so a capsule is credited once per session, while a
+pre-cursor retrieval that is only consumed later still earns its first
+credit. Fail-open: a cursor read failure degrades to the legacy
+full-credit pass; the cursor advances only after a zero-failure pass.
+Regressions: evidence-line unit tests in `cli/feedback.rs` +
+`tests/feedback_cursor.rs` (real-socket end-to-end: second pass sends
+nothing, cursor persists).
+
+Companion audit note (no code change): explicit negative feedback
+(`outdated` / `does_not_apply_here` / `incorrect`) has been zero since
+launch — judged working-as-intended, not a broken loop. Wrongness flows
+through `supersede` version chains; never-recalled staleness through
+the evolution worker's `reweight_decay` lane (34 fires in the 3 days
+before this audit); the hook deliberately never infers negative kinds.
+Documented in the `cli/feedback.rs` module doc.
+
 ### Fixed — Postgres/ClickHouse embedding-queue orphan lease parity (2026-07-09)
 
 The 2026-06-23 Lance fix (commit 81a9302) gave claimed-but-orphaned

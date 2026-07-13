@@ -1140,6 +1140,7 @@ mod extract_tests {
             sent: 3,
             consumed: 3,
             failed: 0,
+            deduped: 0,
         };
         let v = render_hook_envelope(&mine, Some(&feedback), false);
         let msg = v["systemMessage"].as_str().unwrap();
@@ -1177,6 +1178,7 @@ mod extract_tests {
             sent: 2,
             consumed: 2,
             failed: 0,
+            deduped: 0,
         };
         let v = render_hook_envelope(&mine, Some(&feedback), false);
         let msg = v["systemMessage"].as_str().unwrap();
