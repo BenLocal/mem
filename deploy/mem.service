@@ -12,8 +12,8 @@
 #        sudo systemctl daemon-reload && sudo systemctl enable --now mem
 #        sudo systemctl status mem ; journalctl -u mem -f
 #
-# Adjust User=, paths and BIND_ADDR (in config.env) to taste. DuckDB is
-# single-writer — never run two units against the same MEM_DB_PATH.
+# Adjust User=, paths and BIND_ADDR (in config.env) to taste. The Lance
+# store is single-writer — never run two units against the same MEM_DB_PATH.
 
 [Unit]
 Description=mem — local-first memory service for multi-agent workflows

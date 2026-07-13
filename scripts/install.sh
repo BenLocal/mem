@@ -20,7 +20,7 @@ set -euo pipefail
 # ── Defaults (override via flags) ───────────────────────────────────
 INIT_SYSTEM="auto"          # auto | systemd | supervisor
 PREFIX="/usr/local"         # binary → $PREFIX/bin/mem
-DATA_DIR="/var/lib/mem"     # DuckDB + config.env + model cache
+DATA_DIR="/var/lib/mem"     # Lance datasets + config.env + model cache
 LOG_DIR="/var/log/mem"      # supervisor logs (systemd uses journald)
 SVC_USER="mem"              # service runs as this (system) user
 BIND_ADDR="127.0.0.1:3000"  # HTTP bind
@@ -169,6 +169,18 @@ setup_user_and_dirs() {
     install -d -m 0750 -o "$SVC_USER" -g "$SVC_USER" "$LOG_DIR"
 }
 
+# Dataset dir under DATA_DIR. Fresh installs get the honest `mem.lance`
+# name; a pre-route-B install whose config.env was lost keeps pointing at
+# its existing `mem.duckdb` dir (the name is historical — the contents
+# are Lance datasets either way) instead of silently starting empty.
+db_path() {
+    if [[ -e "${DATA_DIR}/mem.duckdb" ]]; then
+        echo "${DATA_DIR}/mem.duckdb"
+    else
+        echo "${DATA_DIR}/mem.lance"
+    fi
+}
+
 # ── 3. config.env (idempotent — never clobber an edited one) ─────────
 write_config_env() {
     if [[ -f "$CONFIG_ENV" ]]; then
@@ -185,8 +197,8 @@ write_config_env() {
 # EnvironmentFile= (which can mishandle surrounding quotes) and by a
 # shell 'source' under supervisor. None of the values contain spaces.
 #
-# ── Storage (DuckDB is single-writer — never point two services here) ──
-MEM_DB_PATH=${DATA_DIR}/mem.duckdb
+# ── Storage (Lance dataset dir, single-writer — never point two services here) ──
+MEM_DB_PATH=$(db_path)
 MEM_TENANT=${TENANT}
 
 # ── HTTP bind ──
@@ -321,7 +333,7 @@ cat <<EOF
 
 $(log "mem installed.")
   binary   : ${BIN_DST}
-  data dir : ${DATA_DIR}   (DB: ${DATA_DIR}/mem.duckdb)
+  data dir : ${DATA_DIR}   (DB: $(grep -m1 '^MEM_DB_PATH=' "$CONFIG_ENV" | cut -d= -f2- | grep . || db_path))
   config   : ${CONFIG_ENV}
   bind     : ${BIND_ADDR}    provider: ${PROVIDER}
   manage   : $( [[ "$INIT_SYSTEM" == systemd ]] \

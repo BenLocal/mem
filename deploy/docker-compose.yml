@@ -6,7 +6,10 @@ services:
     ports:
       - "3000:3000"
     environment:
-      MEM_DB_PATH: /data/mem.duckdb
+      # Pre-route-B volumes used /data/mem.duckdb — keep that value when
+      # upgrading an existing volume (the dir name is historical either way;
+      # the contents are Lance datasets).
+      MEM_DB_PATH: /data/mem.lance
       BIND_ADDR: 0.0.0.0:3000
     volumes:
       - mem_data:/data
