@@ -1,0 +1,44 @@
+{
+  "name": "@shibenenen/mem",
+  "version": "0.2.4",
+  "description": "Local-first Rust memory service for multi-agent workflows — prebuilt-binary installer.",
+  "bin": {
+    "mem": "bin/mem.js"
+  },
+  "scripts": {
+    "postinstall": "node install.js"
+  },
+  "files": [
+    "bin/mem.js",
+    "install.js",
+    "README.md"
+  ],
+  "os": [
+    "linux"
+  ],
+  "cpu": [
+    "x64"
+  ],
+  "engines": {
+    "node": ">=16"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/BenLocal/mem.git",
+    "directory": "packaging/npm"
+  },
+  "homepage": "https://github.com/BenLocal/mem#readme",
+  "bugs": {
+    "url": "https://github.com/BenLocal/mem/issues"
+  },
+  "license": "MIT",
+  "keywords": [
+    "mem",
+    "memory",
+    "mcp",
+    "agent",
+    "rust",
+    "embeddings",
+    "vector-search"
+  ]
+}

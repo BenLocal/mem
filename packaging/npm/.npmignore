@@ -1,0 +1,8 @@
+# The native binary is fetched at install time, never published in the tarball.
+bin/mem-*
+!bin/mem.js
+
+# Local dev noise
+node_modules/
+*.log
+.DS_Store
