@@ -253,6 +253,279 @@ pub fn parse_transcript(path: &Path) -> Result<Vec<ExtractedMemory>> {
     parse_transcript_full(path, false).map(|(mems, _blocks)| mems)
 }
 
+/// Which agent runtime produced a transcript. mem is loaded as a plugin by
+/// both Claude Code and Codex; the two write structurally different JSONL,
+/// so the miner must detect the shape before parsing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TranscriptFormat {
+    /// Claude Code: `{type: user|assistant|system, message:{content:[…]}}`.
+    ClaudeCode,
+    /// Codex `rollout-*.jsonl`: `{type, payload, timestamp}` envelopes.
+    CodexRollout,
+}
+
+/// True when a parsed JSONL line is a Codex rollout envelope — a `payload`
+/// object plus a `type` in the rollout event set. Claude Code lines never
+/// carry a top-level `payload`, so this is unambiguous.
+fn is_codex_rollout_line(v: &Value) -> bool {
+    let t = v["type"].as_str().unwrap_or("");
+    v.get("payload").is_some()
+        && matches!(
+            t,
+            "session_meta"
+                | "event_msg"
+                | "response_item"
+                | "turn_context"
+                | "world_state"
+                | "compacted"
+        )
+}
+
+/// Detect a transcript's format from its first parseable JSONL line.
+/// Defaults to `ClaudeCode` (the legacy path) on an empty / unreadable /
+/// unrecognized file, so nothing regresses for existing callers.
+fn detect_transcript_format(path: &Path) -> TranscriptFormat {
+    let file = match File::open(path) {
+        Ok(f) => f,
+        Err(_) => return TranscriptFormat::ClaudeCode,
+    };
+    for line in BufReader::new(file).lines() {
+        let line = match line {
+            Ok(l) => l,
+            Err(_) => continue,
+        };
+        let v: Value = match serde_json::from_str(&line) {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+        return if is_codex_rollout_line(&v) {
+            TranscriptFormat::CodexRollout
+        } else {
+            TranscriptFormat::ClaudeCode
+        };
+    }
+    TranscriptFormat::ClaudeCode
+}
+
+/// The `source_agent` to stamp on mined rows. Codex rollouts are always
+/// tagged `codex` regardless of the `--agent` flag: the shared
+/// `.claude-plugin` hook hardcodes `--agent claude-code` and can't be
+/// edited (Codex runs the Claude-Code plugin variant), so the runtime must
+/// be recovered from the transcript shape. Claude transcripts respect the
+/// flag (other agents may emit Claude-format JSONL under their own tag).
+pub fn effective_source_agent(format: TranscriptFormat, flag: &str) -> String {
+    match format {
+        TranscriptFormat::CodexRollout => "codex".to_string(),
+        TranscriptFormat::ClaudeCode => flag.to_string(),
+    }
+}
+
+/// Run the memory extractor over one assistant text block, pushing results
+/// into `out`. Shared by the Claude and Codex parse paths so both honour
+/// the same `<mem-save>` + O7(b) heuristic rules.
+fn extract_memories_from_assistant_text(
+    text: &str,
+    heuristic: bool,
+    session_id: &str,
+    timestamp: &str,
+    line_number: usize,
+    out: &mut Vec<ExtractedMemory>,
+) {
+    if let Some(extracted) = extract_memory(text) {
+        out.push(ExtractedMemory {
+            content: extracted,
+            session_id: session_id.to_string(),
+            timestamp: timestamp.to_string(),
+            line_number,
+            pending: false,
+        });
+    } else if heuristic {
+        // O7(b): no `<mem-save>` tag — scan for high-signal sentences. Each
+        // lands as a review-gated PendingConfirmation candidate (never Active).
+        for cand in crate::cli::heuristic_extract::heuristic_candidates(text, &[]) {
+            out.push(ExtractedMemory {
+                content: cand,
+                session_id: session_id.to_string(),
+                timestamp: timestamp.to_string(),
+                line_number,
+                pending: true,
+            });
+        }
+    }
+}
+
+/// Concatenate the `text` fields of a Codex message `content` array
+/// (`input_text` / `output_text` items). Falls back to a bare string.
+fn codex_message_text(content: &Value) -> String {
+    match content.as_array() {
+        Some(items) => items
+            .iter()
+            .filter_map(|it| it["text"].as_str())
+            .collect::<Vec<_>>()
+            .join(""),
+        None => content.as_str().unwrap_or("").to_string(),
+    }
+}
+
+/// Concatenate a Codex `reasoning.summary` array's `text` fields. Returns
+/// empty when the reasoning was encrypted / had no readable summary.
+fn codex_summary_text(summary: &Value) -> String {
+    match summary.as_array() {
+        Some(items) => items
+            .iter()
+            .filter_map(|it| it["text"].as_str())
+            .collect::<Vec<_>>()
+            .join("\n"),
+        None => String::new(),
+    }
+}
+
+/// A Codex `function_call_output.output` is usually a plain string but may
+/// be a structured value; preserve either verbatim.
+fn codex_output_text(output: &Value) -> String {
+    match output.as_str() {
+        Some(s) => s.to_string(),
+        None => serde_json::to_string(output).unwrap_or_default(),
+    }
+}
+
+/// Parse a Codex `rollout-*.jsonl` into `(memories, archive blocks)` — the
+/// same output shape as [`parse_transcript_full`]'s Claude path.
+///
+/// Each line is `{type, payload, timestamp}`; only `type=="response_item"`
+/// carries conversation content (under `payload`). The session id appears
+/// once in the leading `session_meta` line and is stamped onto every block.
+/// One `response_item` = one block (no nested content array), so
+/// `block_index` is always 0 and `line_number` disambiguates rows.
+///
+/// | payload.type          | role      | block_type   |
+/// |-----------------------|-----------|--------------|
+/// | message (user)        | user      | text         |
+/// | message (assistant)   | assistant | text         |
+/// | message (developer)   | system    | text         |
+/// | reasoning             | assistant | thinking     |
+/// | function_call         | assistant | tool_use     |
+/// | function_call_output  | user      | tool_result  |
+fn parse_codex_rollout(
+    path: &Path,
+    heuristic: bool,
+) -> Result<(Vec<ExtractedMemory>, Vec<ArchivedBlock>)> {
+    let file = File::open(path)?;
+    let reader = BufReader::new(file);
+    let mut memories = Vec::new();
+    let mut blocks = Vec::new();
+    let mut session_id = String::new();
+
+    for (line_idx, line) in reader.lines().enumerate() {
+        let line = line?;
+        let value: Value = match serde_json::from_str(&line) {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+        let line_number = line_idx + 1;
+
+        match value["type"].as_str() {
+            Some("session_meta") => {
+                if let Some(sid) = value["payload"]["session_id"].as_str() {
+                    session_id = sid.to_string();
+                }
+                continue;
+            }
+            Some("response_item") => {}
+            // event_msg / turn_context / world_state / compacted carry no
+            // minable conversation blocks.
+            _ => continue,
+        }
+
+        let timestamp = value["timestamp"].as_str().unwrap_or("").to_string();
+        let payload = &value["payload"];
+        let block = match payload["type"].as_str().unwrap_or("") {
+            "message" => {
+                let role = match payload["role"].as_str().unwrap_or("") {
+                    "user" => "user",
+                    "assistant" => "assistant",
+                    "developer" | "system" => "system",
+                    _ => continue,
+                };
+                let text = codex_message_text(&payload["content"]);
+                if role == "assistant" {
+                    extract_memories_from_assistant_text(
+                        &text,
+                        heuristic,
+                        &session_id,
+                        &timestamp,
+                        line_number,
+                        &mut memories,
+                    );
+                }
+                ArchivedBlock {
+                    session_id: session_id.clone(),
+                    timestamp,
+                    line_number,
+                    block_index: 0,
+                    message_uuid: None,
+                    role: role.to_string(),
+                    block_type: "text".to_string(),
+                    content: text,
+                    tool_name: None,
+                    tool_use_id: None,
+                    meta_json: None,
+                }
+            }
+            "reasoning" => {
+                let text = codex_summary_text(&payload["summary"]);
+                if text.is_empty() {
+                    continue;
+                }
+                ArchivedBlock {
+                    session_id: session_id.clone(),
+                    timestamp,
+                    line_number,
+                    block_index: 0,
+                    message_uuid: None,
+                    role: "assistant".to_string(),
+                    block_type: "thinking".to_string(),
+                    content: text,
+                    tool_name: None,
+                    tool_use_id: None,
+                    meta_json: None,
+                }
+            }
+            "function_call" => ArchivedBlock {
+                session_id: session_id.clone(),
+                timestamp,
+                line_number,
+                block_index: 0,
+                message_uuid: None,
+                role: "assistant".to_string(),
+                block_type: "tool_use".to_string(),
+                content: payload["arguments"].as_str().unwrap_or("").to_string(),
+                tool_name: payload["name"].as_str().map(|s| s.to_string()),
+                tool_use_id: payload["call_id"].as_str().map(|s| s.to_string()),
+                meta_json: None,
+            },
+            "function_call_output" => ArchivedBlock {
+                session_id: session_id.clone(),
+                timestamp,
+                line_number,
+                block_index: 0,
+                message_uuid: None,
+                role: "user".to_string(),
+                block_type: "tool_result".to_string(),
+                content: codex_output_text(&payload["output"]),
+                tool_name: None,
+                tool_use_id: payload["call_id"].as_str().map(|s| s.to_string()),
+                meta_json: None,
+            },
+            // Unknown payload kind: skip, don't fail the whole mine.
+            _ => continue,
+        };
+        blocks.push(block);
+    }
+
+    Ok((memories, blocks))
+}
+
 /// Parses a Claude Code JSONL transcript into both extracted memories
 /// (legacy `<mem-save>` / pattern matches) and a flat list of every
 /// block ready to be POSTed to `/transcripts/messages`.
@@ -272,6 +545,11 @@ pub fn parse_transcript_full(
     path: &Path,
     heuristic: bool,
 ) -> Result<(Vec<ExtractedMemory>, Vec<ArchivedBlock>)> {
+    // Codex writes a structurally different rollout JSONL — dispatch to its
+    // own parser. Claude Code (the default) falls through to the body below.
+    if detect_transcript_format(path) == TranscriptFormat::CodexRollout {
+        return parse_codex_rollout(path, heuristic);
+    }
     let file = File::open(path)?;
     let reader = BufReader::new(file);
     let mut memories = Vec::new();
@@ -351,28 +629,14 @@ pub fn parse_transcript_full(
             // text blocks — same condition the original code enforced.
             if role == "assistant" && block_type == "text" {
                 if let Some(text) = item["text"].as_str() {
-                    if let Some(extracted) = extract_memory(text) {
-                        memories.push(ExtractedMemory {
-                            content: extracted,
-                            session_id: session_id.clone(),
-                            timestamp: timestamp.clone(),
-                            line_number,
-                            pending: false,
-                        });
-                    } else if heuristic {
-                        // O7(b): no `<mem-save>` tag on this block — scan it for
-                        // high-signal sentences. Each lands as a review-gated
-                        // PendingConfirmation candidate (never Active).
-                        for cand in crate::cli::heuristic_extract::heuristic_candidates(text, &[]) {
-                            memories.push(ExtractedMemory {
-                                content: cand,
-                                session_id: session_id.clone(),
-                                timestamp: timestamp.clone(),
-                                line_number,
-                                pending: true,
-                            });
-                        }
-                    }
+                    extract_memories_from_assistant_text(
+                        text,
+                        heuristic,
+                        &session_id,
+                        &timestamp,
+                        line_number,
+                        &mut memories,
+                    );
                 }
             }
 
@@ -746,6 +1010,12 @@ pub async fn run_with_counts(args: MineArgs) -> anyhow::Result<MineCounts> {
     let (memories, blocks) =
         parse_transcript_full(&args.transcript_path, heuristic && llm_cfg.is_none())?;
 
+    // Source agent follows the transcript shape: a Codex rollout is tagged
+    // `codex` even though the shared hook passes `--agent claude-code`
+    // (the hook is uneditable; Codex runs the Claude-Code plugin variant).
+    let source_agent =
+        effective_source_agent(detect_transcript_format(&args.transcript_path), &args.agent);
+
     let client = reqwest::Client::new();
 
     // v3 #32 fast-skip: query the server's per-transcript cursor; if present,
@@ -879,7 +1149,7 @@ pub async fn run_with_counts(args: MineArgs) -> anyhow::Result<MineCounts> {
                 "capability_capsule_type": "experience",
                 "content": memory.content,
                 "scope": "global",
-                "source_agent": args.agent,
+                "source_agent": source_agent,
                 "idempotency_key": idempotency_key,
                 "write_mode": write_mode,
             })
@@ -949,7 +1219,7 @@ pub async fn run_with_counts(args: MineArgs) -> anyhow::Result<MineCounts> {
     // single-row endpoint's "2xx → ok" semantic.
     let block_payloads: Vec<serde_json::Value> = blocks
         .iter()
-        .map(|b| block_to_payload(b, &transcript_path_str, &args.remote.tenant, &args.agent))
+        .map(|b| block_to_payload(b, &transcript_path_str, &args.remote.tenant, &source_agent))
         .collect();
 
     let (block_sent_ok, block_sent_fail) =
@@ -1183,5 +1453,50 @@ mod extract_tests {
         let v = render_hook_envelope(&mine, Some(&feedback), false);
         let msg = v["systemMessage"].as_str().unwrap();
         assert!(msg.contains("2 feedback applied"), "got {msg}");
+    }
+}
+
+#[cfg(test)]
+mod codex_format_tests {
+    use super::*;
+
+    #[test]
+    fn detects_codex_rollout_line() {
+        let codex = serde_json::json!({"type":"session_meta","payload":{"session_id":"x"}});
+        let codex_item = serde_json::json!({"type":"response_item","payload":{"type":"message"}});
+        assert!(is_codex_rollout_line(&codex));
+        assert!(is_codex_rollout_line(&codex_item));
+    }
+
+    #[test]
+    fn claude_line_is_not_codex() {
+        // Claude Code lines carry `type: assistant` + `message`, no top-level `payload`.
+        let claude = serde_json::json!({"type":"assistant","message":{"content":[]}});
+        assert!(!is_codex_rollout_line(&claude));
+        // A payload-less line with a rollout-ish type is still not Codex.
+        let no_payload = serde_json::json!({"type":"session_meta"});
+        assert!(!is_codex_rollout_line(&no_payload));
+    }
+
+    #[test]
+    fn codex_rollout_tagged_codex_regardless_of_flag() {
+        // The shared hook passes `--agent claude-code`; a Codex rollout must
+        // override it to `codex`.
+        assert_eq!(
+            effective_source_agent(TranscriptFormat::CodexRollout, "claude-code"),
+            "codex"
+        );
+    }
+
+    #[test]
+    fn claude_respects_agent_flag() {
+        assert_eq!(
+            effective_source_agent(TranscriptFormat::ClaudeCode, "claude-code"),
+            "claude-code"
+        );
+        assert_eq!(
+            effective_source_agent(TranscriptFormat::ClaudeCode, "some-other-agent"),
+            "some-other-agent"
+        );
     }
 }

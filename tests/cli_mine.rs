@@ -101,3 +101,94 @@ fn tagged_block_is_not_double_mined_under_heuristic() {
     assert!(!mems[0].pending);
     assert_eq!(mems[0].content, "use Lance as the local store");
 }
+
+// ── Codex rollout support ──────────────────────────────────────────────
+// Codex writes `~/.codex/sessions/.../rollout-*.jsonl` with a schema that
+// differs entirely from Claude Code's: each line is
+// `{type, payload, timestamp}` where only `type=="response_item"` carries
+// conversation content, nested under `payload`. The session id lives once in
+// the leading `session_meta` line, not on every row.
+
+#[test]
+fn test_parse_codex_rollout_extracts_mem_save_tag() {
+    let rollout = r#"{"type":"session_meta","payload":{"session_id":"cx1"},"timestamp":"2026-07-16T11:00:00Z"}
+{"type":"event_msg","payload":{"type":"task_started"},"timestamp":"2026-07-16T11:00:00Z"}
+{"type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"help me"}]},"timestamp":"2026-07-16T11:00:01Z"}
+{"type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"<mem-save>codex rollout parsing works</mem-save>"}]},"timestamp":"2026-07-16T11:00:02Z"}
+"#;
+    let file = NamedTempFile::new().unwrap();
+    fs::write(file.path(), rollout).unwrap();
+
+    let memories = mem::cli::mine::parse_transcript(file.path()).unwrap();
+    assert_eq!(
+        memories.len(),
+        1,
+        "got {:?}",
+        memories.iter().map(|m| &m.content).collect::<Vec<_>>(),
+    );
+    assert_eq!(memories[0].content, "codex rollout parsing works");
+    // session id comes from the leading session_meta line, applied to every block.
+    assert_eq!(memories[0].session_id, "cx1");
+}
+
+#[test]
+fn test_codex_rollout_archives_block_kinds_with_role_mapping() {
+    let rollout = r#"{"type":"session_meta","payload":{"session_id":"cx2"},"timestamp":"2026-07-16T11:00:00Z"}
+{"type":"response_item","payload":{"type":"message","role":"developer","content":[{"type":"input_text","text":"system prompt"}]},"timestamp":"2026-07-16T11:00:01Z"}
+{"type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"do it"}]},"timestamp":"2026-07-16T11:00:02Z"}
+{"type":"response_item","payload":{"type":"reasoning","summary":[{"type":"summary_text","text":"let me think"}],"content":null},"timestamp":"2026-07-16T11:00:03Z"}
+{"type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"done"}]},"timestamp":"2026-07-16T11:00:04Z"}
+{"type":"response_item","payload":{"type":"function_call","name":"exec_command","arguments":"{\"cmd\":\"ls\"}","call_id":"c1"},"timestamp":"2026-07-16T11:00:05Z"}
+{"type":"response_item","payload":{"type":"function_call_output","call_id":"c1","output":"file1"},"timestamp":"2026-07-16T11:00:06Z"}
+"#;
+    let file = NamedTempFile::new().unwrap();
+    fs::write(file.path(), rollout).unwrap();
+
+    let (_mems, blocks) = mem::cli::mine::parse_transcript_full(file.path(), false).unwrap();
+    let kinds: Vec<(String, String)> = blocks
+        .iter()
+        .map(|b| (b.role.clone(), b.block_type.clone()))
+        .collect();
+    assert!(
+        kinds.contains(&("system".into(), "text".into())),
+        "{kinds:?}"
+    );
+    assert!(kinds.contains(&("user".into(), "text".into())), "{kinds:?}");
+    assert!(
+        kinds.contains(&("assistant".into(), "thinking".into())),
+        "{kinds:?}"
+    );
+    assert!(
+        kinds.contains(&("assistant".into(), "text".into())),
+        "{kinds:?}"
+    );
+    assert!(
+        kinds.contains(&("assistant".into(), "tool_use".into())),
+        "{kinds:?}"
+    );
+    assert!(
+        kinds.contains(&("user".into(), "tool_result".into())),
+        "{kinds:?}"
+    );
+
+    let tu = blocks.iter().find(|b| b.block_type == "tool_use").unwrap();
+    assert_eq!(tu.tool_name.as_deref(), Some("exec_command"));
+    assert_eq!(tu.tool_use_id.as_deref(), Some("c1"));
+    assert!(
+        blocks.iter().all(|b| b.session_id == "cx2"),
+        "every block inherits the session_meta session id"
+    );
+}
+
+#[test]
+fn test_claude_transcript_still_parses_after_codex_support() {
+    // Regression: adding format detection must not change the Claude path.
+    let transcript = r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"<mem-save>claude path intact</mem-save>"}]},"sessionId":"clA","timestamp":"2026-04-29T10:00:00Z"}
+"#;
+    let file = NamedTempFile::new().unwrap();
+    fs::write(file.path(), transcript).unwrap();
+    let memories = mem::cli::mine::parse_transcript(file.path()).unwrap();
+    assert_eq!(memories.len(), 1);
+    assert_eq!(memories[0].content, "claude path intact");
+    assert_eq!(memories[0].session_id, "clA");
+}
