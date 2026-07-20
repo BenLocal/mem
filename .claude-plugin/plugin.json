@@ -7,5 +7,5 @@
   "repository": "https://github.com/BenLocal/mem",
   "license": "MIT",
   "mcpServers": "./.mcp.json",
-  "keywords": ["memory", "rust", "duckdb", "tantivy", "rag", "mcp"]
+  "keywords": ["memory", "rust", "lance", "tantivy", "rag", "mcp"]
 }
