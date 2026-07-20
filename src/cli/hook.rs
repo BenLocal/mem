@@ -106,15 +106,14 @@ async fn recall_error(p: &Value, remote: &RemoteArgs) -> Value {
     if env_flag("MEM_RECALL_DISABLED") || env_flag("MEM_ERROR_RECALL_DISABLED") {
         return skip();
     }
-    if p["tool_name"].as_str() != Some("Bash") {
+    // Claude Code's shell tool is `Bash`; Codex's is `exec_command`.
+    if !matches!(p["tool_name"].as_str(), Some("Bash" | "exec_command")) {
         return skip();
     }
     if p["is_interrupt"].as_bool() == Some(true) {
         return skip();
     }
-    // PostToolUseFailure exposes the failure as a top-level `.error`
-    // string ("Exit code N\n<stderr+stdout>"); there is no tool_response.
-    let Some(sig) = error_signature(p["error"].as_str().unwrap_or("")) else {
+    let Some(sig) = error_signature(failure_error_text(p)) else {
         return skip();
     };
     // Per-session dedup: agents retry the same failing command repeatedly.
@@ -133,6 +132,21 @@ async fn recall_error(p: &Value, remote: &RemoteArgs) -> Value {
     )
     .await;
     format_error_recall(&resp)
+}
+
+/// The failure text from a PostToolUseFailure payload. Claude Code puts it
+/// in a top-level `.error` string ("Exit code N\n<stderr+stdout>"); Codex
+/// mirrors the Claude field names but may deliver it under `tool_response`
+/// (stderr / output / error) or as a bare string. Probe all so error recall
+/// fires on both runtimes.
+fn failure_error_text(p: &Value) -> &str {
+    p["error"]
+        .as_str()
+        .or_else(|| p["tool_response"]["stderr"].as_str())
+        .or_else(|| p["tool_response"]["output"].as_str())
+        .or_else(|| p["tool_response"]["error"].as_str())
+        .or_else(|| p["tool_response"].as_str())
+        .unwrap_or("")
 }
 
 /// Extract a searchable error signature from a `PostToolUseFailure`
@@ -872,6 +886,30 @@ mod tests {
     fn commit_nudge_skips_non_shell_tool() {
         let p = json!({"tool_name": "Read", "tool_input": {"file_path": "x"}});
         assert_eq!(commit_nudge(&p), json!({}));
+    }
+
+    #[test]
+    fn failure_error_text_probes_both_runtimes() {
+        // Claude Code: top-level `.error`.
+        assert_eq!(
+            failure_error_text(&json!({"error": "Exit code 1\nboom"})),
+            "Exit code 1\nboom"
+        );
+        // Codex: mirrored field names, error under tool_response.
+        assert_eq!(
+            failure_error_text(&json!({"tool_response": {"stderr": "seg fault"}})),
+            "seg fault"
+        );
+        assert_eq!(
+            failure_error_text(&json!({"tool_response": {"output": "oops"}})),
+            "oops"
+        );
+        assert_eq!(
+            failure_error_text(&json!({"tool_response": "bare error string"})),
+            "bare error string"
+        );
+        // Nothing usable → empty (→ error_signature returns None → skip).
+        assert_eq!(failure_error_text(&json!({})), "");
     }
 
     // ---- envelopes -------------------------------------------------------
