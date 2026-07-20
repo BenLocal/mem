@@ -26,7 +26,12 @@ if [ -z "$TRANSCRIPT" ] || [ ! -f "$TRANSCRIPT" ]; then
     exit 0
 fi
 
-EXCHANGE_COUNT=$(grep -c '"type":"user"' "$TRANSCRIPT" 2>/dev/null || echo 0)
+# Count user turns to throttle. `"role":"user"` matches BOTH runtimes:
+# Claude Code (`{"type":"user","message":{"role":"user",…}}`) and Codex
+# rollouts (`{"type":"response_item","payload":{"role":"user",…}}`) — where
+# the old `"type":"user"` pattern was always 0, so Codex Stop never mined.
+# Verified equal to the old count on a real Claude transcript (no regression).
+EXCHANGE_COUNT=$(grep -c '"role":"user"' "$TRANSCRIPT" 2>/dev/null || echo 0)
 # Per-session throttle — multiple sessions share `~/.mem/`, so a
 # global throttle would let one session starve another.
 LAST_SAVE_FILE="$HOME/.mem/last_save${SESSION_ID:+_$SESSION_ID}"

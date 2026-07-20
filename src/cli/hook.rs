@@ -484,18 +484,28 @@ fn format_window(w: &Value, content_cap: usize) -> String {
 // ---------------------------------------------------------------------------
 
 fn commit_nudge(p: &Value) -> Value {
-    if p["tool_name"].as_str() != Some("Bash") {
+    // Claude Code's shell tool is `Bash`; Codex's is `exec_command`. Both
+    // send Claude-compatible PostToolUse field names (tool_name / tool_input
+    // / tool_response), so the only per-runtime differences are the tool
+    // name and the command key (Codex nests it under `cmd`, Claude `command`).
+    if !matches!(p["tool_name"].as_str(), Some("Bash" | "exec_command")) {
         return skip();
     }
-    let command = p["tool_input"]["command"].as_str().unwrap_or("");
+    let command = p["tool_input"]["command"]
+        .as_str()
+        .or_else(|| p["tool_input"]["cmd"].as_str())
+        .unwrap_or("");
     if !contains_git_commit(command) || command.contains("--amend") {
         return skip();
     }
-    // Claude Code does not populate tool_response.success for Bash, so use
-    // git's `[branch sha] subject` stdout envelope as the success signal.
+    // Neither runtime populates a boolean success flag for shell tools, so
+    // use git's `[branch sha] subject` stdout envelope as the "commit
+    // landed" signal. Codex may deliver the exec output under a different
+    // key (or as a bare string), so probe stdout / output / a plain string.
     let stdout = p["tool_response"]["stdout"]
         .as_str()
         .or_else(|| p["tool_response"]["output"].as_str())
+        .or_else(|| p["tool_response"].as_str())
         .unwrap_or("");
     let Some(subject) = commit_subject(stdout) else {
         return skip();
@@ -824,6 +834,44 @@ mod tests {
         assert!(contains_git_commit("cd /x && git commit -am y"));
         assert!(!contains_git_commit("git status"));
         assert!(!contains_git_commit("git committer-config"));
+    }
+
+    #[test]
+    fn commit_nudge_fires_on_claude_bash_commit() {
+        // Regression: the Claude Code PostToolUse(Bash) path is unchanged.
+        let p = json!({
+            "tool_name": "Bash",
+            "tool_input": {"command": "git commit -m \"add feature\""},
+            "tool_response": {"stdout": "[master abc1234] add feature\n 1 file changed"},
+        });
+        let out = commit_nudge(&p);
+        assert!(
+            out.get("systemMessage").is_some(),
+            "claude bash commit should nudge, got {out}"
+        );
+    }
+
+    #[test]
+    fn commit_nudge_fires_on_codex_exec_command_commit() {
+        // Codex's shell tool is `exec_command`; the command lives in
+        // tool_input.cmd (not .command). PostToolUse field names are
+        // otherwise Claude-compatible.
+        let p = json!({
+            "tool_name": "exec_command",
+            "tool_input": {"cmd": "git commit -m \"add feature\"", "workdir": "/repo"},
+            "tool_response": {"output": "[master abc1234] add feature\n 1 file changed"},
+        });
+        let out = commit_nudge(&p);
+        assert!(
+            out.get("systemMessage").is_some(),
+            "codex exec_command commit should nudge, got {out}"
+        );
+    }
+
+    #[test]
+    fn commit_nudge_skips_non_shell_tool() {
+        let p = json!({"tool_name": "Read", "tool_input": {"file_path": "x"}});
+        assert_eq!(commit_nudge(&p), json!({}));
     }
 
     // ---- envelopes -------------------------------------------------------

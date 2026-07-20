@@ -30,7 +30,7 @@
     ],
     "PostToolUse": [
       {
-        "matcher": "Bash",
+        "matcher": "Bash|exec_command",
         "hooks": [
           { "type": "command", "command": "bash ${CLAUDE_PLUGIN_ROOT}/hooks/claude_code_post_tool_use.sh" }
         ]
