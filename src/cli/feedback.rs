@@ -354,6 +354,119 @@ pub async fn run_with_counts(args: FeedbackFromTranscriptArgs) -> anyhow::Result
 /// ([`is_capsule_get_tool`] — a deliberate fetch) OR its `text` reappears
 /// in a subsequent assistant `text`/`thinking` block. Crediting only
 /// *retrieved* gets (not bare inspection gets) keeps precision.
+/// Populate the retrieval / usage collections from ONE Codex rollout line —
+/// the Codex analog of the per-line logic inside [`scan_transcript`]:
+///
+/// - a `developer` / `user` / `system` message carrying a recall banner
+///   → `retrieved`. Codex injects the UserPromptSubmit / SessionStart
+///   `additionalContext` as a `role:"developer"` message (not a Claude
+///   `hook_additional_context` attachment). Assistant messages are NEVER
+///   treated as retrieval — they'd self-credit a session discussing mem.
+/// - assistant `message` text + `reasoning` summary → `assistant_corpus`
+///   (the "did the agent use it" signal).
+/// - a `function_call` to a capsule search/get MCP tool + its
+///   `function_call_output` → `search_calls` / `fetched` / `retrieved`.
+///   The tool name is matched by substring because Codex's MCP tool prefix
+///   differs from Claude's `mcp__…__` (and no real Codex MCP-tool data
+///   exists yet to pin the exact form).
+#[allow(clippy::too_many_arguments)]
+fn collect_codex_line(
+    value: &Value,
+    line_idx: usize,
+    all: bool,
+    retrieved: &mut Vec<(String, Vec<String>, usize)>,
+    assistant_corpus: &mut Vec<(usize, String)>,
+    search_calls: &mut HashMap<String, usize>,
+    fetched: &mut HashMap<String, usize>,
+) {
+    if value["type"].as_str() != Some("response_item") {
+        return;
+    }
+    let payload = &value["payload"];
+    match payload["type"].as_str().unwrap_or("") {
+        "message" => {
+            let text = crate::cli::mine::codex_message_text(&payload["content"]);
+            if payload["role"].as_str() == Some("assistant") {
+                assistant_corpus.push((line_idx, text));
+            } else {
+                push_codex_banner_ids(&text, all, line_idx, retrieved);
+            }
+        }
+        "reasoning" => {
+            let text = crate::cli::mine::codex_summary_text(&payload["summary"]);
+            if !text.is_empty() {
+                assistant_corpus.push((line_idx, text));
+            }
+        }
+        "function_call" => {
+            let name = payload["name"].as_str().unwrap_or("");
+            if name.contains("capability_capsule_search") {
+                if let Some(cid) = payload["call_id"].as_str() {
+                    search_calls.insert(cid.to_string(), line_idx);
+                }
+            } else if name.contains("capability_capsule_get") {
+                if let Ok(parsed) =
+                    serde_json::from_str::<Value>(payload["arguments"].as_str().unwrap_or(""))
+                {
+                    if let Some(cid) = parsed["capability_capsule_id"].as_str() {
+                        fetched.entry(cid.to_string()).or_insert(line_idx + 1);
+                    }
+                }
+            }
+        }
+        "function_call_output" => {
+            let call_id = payload["call_id"].as_str().unwrap_or("");
+            let inner = crate::cli::mine::codex_output_text(&payload["output"]);
+            if search_calls.contains_key(call_id) {
+                if let Ok(resp) = serde_json::from_str::<Value>(&inner) {
+                    for section in ["directives", "relevant_facts", "reusable_patterns"] {
+                        if let Some(arr) = resp[section].as_array() {
+                            for entry in arr {
+                                let mid = entry["capability_capsule_id"].as_str().unwrap_or("");
+                                if mid.is_empty() {
+                                    continue;
+                                }
+                                let text = entry["text"].as_str().unwrap_or("");
+                                let fp = if all { Vec::new() } else { fingerprint(text) };
+                                retrieved.push((mid.to_string(), fp, line_idx));
+                            }
+                        }
+                    }
+                }
+            } else {
+                push_codex_banner_ids(&inner, all, line_idx, retrieved);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Extract `[mem_…]` ids from every line of a banner-bearing text into
+/// `retrieved`. No-op when the text carries no recall-banner marker. Free
+/// function (not a closure) so it doesn't hold a long-lived borrow of
+/// `retrieved` that would collide with the direct pushes in
+/// [`collect_codex_line`].
+fn push_codex_banner_ids(
+    text: &str,
+    all: bool,
+    line_idx: usize,
+    retrieved: &mut Vec<(String, Vec<String>, usize)>,
+) {
+    if !(text.contains("mem auto-recall") || text.contains("related incidents/fixes")) {
+        return;
+    }
+    for ln in text.lines() {
+        let ids = extract_injected_ids(ln);
+        if ids.is_empty() {
+            continue;
+        }
+        let fp = if all { Vec::new() } else { fingerprint(ln) };
+        for id in ids {
+            retrieved.push((id, fp.clone(), line_idx));
+        }
+    }
+}
+
 fn scan_transcript(transcript_path: &std::path::Path, all: bool) -> Result<ScanOutcome> {
     let file = File::open(transcript_path)?;
     let reader = BufReader::new(file);
@@ -369,6 +482,11 @@ fn scan_transcript(transcript_path: &std::path::Path, all: bool) -> Result<ScanO
     let mut fetched: HashMap<String, usize> = HashMap::new();
     let mut lines_scanned = 0usize;
 
+    // Codex (`rollout-*.jsonl`) has a different envelope than Claude Code;
+    // detect once and route each line to the matching collector. Claude is
+    // the default (unchanged legacy path).
+    let format = crate::cli::mine::detect_transcript_format(transcript_path);
+
     for (line_idx, line) in reader.lines().enumerate() {
         lines_scanned = line_idx + 1;
         let line = line?;
@@ -376,6 +494,19 @@ fn scan_transcript(transcript_path: &std::path::Path, all: bool) -> Result<ScanO
             Ok(v) => v,
             Err(_) => continue,
         };
+
+        if format == crate::cli::mine::TranscriptFormat::CodexRollout {
+            collect_codex_line(
+                &value,
+                line_idx,
+                all,
+                &mut retrieved,
+                &mut assistant_corpus,
+                &mut search_calls,
+                &mut fetched,
+            );
+            continue;
+        }
 
         // Hook-injected recall now lands as a `type:"attachment"` line
         // with `attachment.type == "hook_additional_context"` and the
@@ -903,6 +1034,119 @@ mod tests {
             !unconsumed.credited.contains_key(id),
             "an un-reused recalled capsule must not be credited, got {:?}",
             unconsumed.credited
+        );
+    }
+
+    // ── Codex rollout feedback support ──────────────────────────────────
+    // In a Codex `rollout-*.jsonl` the recall banner (UserPromptSubmit
+    // additionalContext) is injected as a `response_item` message with
+    // `role:"developer"` — not a Claude `hook_additional_context`
+    // attachment. Capsule usage lands in `role:"assistant"` output_text /
+    // reasoning. scan_transcript must detect the Codex shape and populate
+    // the same retrieval/usage signals.
+
+    #[test]
+    fn scan_codex_rollout_credits_banner_reused_by_assistant() {
+        use std::io::Write;
+
+        let id = "mem_019e9999-aaaa-7bbb-8ccc-dddddddddddd";
+        let banner = format!(
+            "🧠 mem auto-recall — memories relevant to this prompt\n\
+             - DuckDB single-writer MVCC concurrency lock contention `[{id}]`"
+        );
+        let meta = serde_json::json!({"type":"session_meta","payload":{"session_id":"cx"},"timestamp":"t"});
+        let dev = serde_json::json!({
+            "type":"response_item",
+            "payload":{"type":"message","role":"developer","content":[{"type":"input_text","text":banner}]},
+            "timestamp":"t"
+        });
+        let asst = serde_json::json!({
+            "type":"response_item",
+            "payload":{"type":"message","role":"assistant","content":[{"type":"output_text",
+                "text":"Right — DuckDB is single-writer, so MVCC concurrency and \
+                        lock contention bite when two writers share one file."}]},
+            "timestamp":"t"
+        });
+
+        let mut f = tempfile::NamedTempFile::new().unwrap();
+        writeln!(f, "{meta}").unwrap();
+        writeln!(f, "{dev}").unwrap();
+        writeln!(f, "{asst}").unwrap();
+        let consumed = scan_transcript(f.path(), false).unwrap();
+        assert!(
+            consumed.credited.contains_key(id),
+            "codex developer-message recall reused by a later assistant block must be credited, got {:?}",
+            consumed.credited
+        );
+
+        // No reuse → not credited.
+        let mut g = tempfile::NamedTempFile::new().unwrap();
+        writeln!(g, "{meta}").unwrap();
+        writeln!(g, "{dev}").unwrap();
+        let unconsumed = scan_transcript(g.path(), false).unwrap();
+        assert!(
+            !unconsumed.credited.contains_key(id),
+            "un-reused codex recall must not be credited, got {:?}",
+            unconsumed.credited
+        );
+    }
+
+    #[test]
+    fn scan_codex_assistant_banner_is_not_retrieval() {
+        // An ASSISTANT message that merely quotes the banner text must NOT
+        // count as a retrieval (it's usage corpus, not injection) — else a
+        // Codex session discussing mem would self-credit.
+        use std::io::Write;
+        let id = "mem_019ebbbb-cccc-7ddd-8eee-ffffffffffff";
+        let asst = serde_json::json!({
+            "type":"response_item",
+            "payload":{"type":"message","role":"assistant","content":[{"type":"output_text",
+                "text":format!("as the 🧠 mem auto-recall banner showed `[{id}]`")}]},
+            "timestamp":"t"
+        });
+        let mut f = tempfile::NamedTempFile::new().unwrap();
+        writeln!(
+            f,
+            "{{\"type\":\"session_meta\",\"payload\":{{\"session_id\":\"cx\"}}}}"
+        )
+        .unwrap();
+        writeln!(f, "{asst}").unwrap();
+        let out = scan_transcript(f.path(), false).unwrap();
+        assert!(
+            !out.credited.contains_key(id),
+            "assistant self-mention of the banner must not be credited, got {:?}",
+            out.credited
+        );
+    }
+
+    #[test]
+    fn scan_codex_function_call_get_credits_strong_signal() {
+        // A codex `function_call` to a capsule-get MCP tool is a strong
+        // "the agent fetched this recalled capsule" signal — credited even
+        // without fingerprint reuse. Tool name matched loosely (Codex's MCP
+        // prefix differs from Claude's `mcp__…__`).
+        use std::io::Write;
+        let id = "mem_019ecccc-dddd-7eee-8fff-000000000000";
+        let banner = format!("🧠 mem auto-recall\n- some fact `[{id}]`");
+        let meta = serde_json::json!({"type":"session_meta","payload":{"session_id":"cx"}});
+        let dev = serde_json::json!({
+            "type":"response_item",
+            "payload":{"type":"message","role":"developer","content":[{"type":"input_text","text":banner}]}
+        });
+        let get = serde_json::json!({
+            "type":"response_item",
+            "payload":{"type":"function_call","name":"mem__capability_capsule_get",
+                "arguments":format!("{{\"capability_capsule_id\":\"{id}\"}}"),"call_id":"c1"}
+        });
+        let mut f = tempfile::NamedTempFile::new().unwrap();
+        writeln!(f, "{meta}").unwrap();
+        writeln!(f, "{dev}").unwrap();
+        writeln!(f, "{get}").unwrap();
+        let out = scan_transcript(f.path(), false).unwrap();
+        assert!(
+            out.credited.contains_key(id),
+            "a capability_capsule_get of a recalled id must credit it, got {:?}",
+            out.credited
         );
     }
 

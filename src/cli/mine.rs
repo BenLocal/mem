@@ -284,7 +284,7 @@ fn is_codex_rollout_line(v: &Value) -> bool {
 /// Detect a transcript's format from its first parseable JSONL line.
 /// Defaults to `ClaudeCode` (the legacy path) on an empty / unreadable /
 /// unrecognized file, so nothing regresses for existing callers.
-fn detect_transcript_format(path: &Path) -> TranscriptFormat {
+pub(crate) fn detect_transcript_format(path: &Path) -> TranscriptFormat {
     let file = match File::open(path) {
         Ok(f) => f,
         Err(_) => return TranscriptFormat::ClaudeCode,
@@ -356,7 +356,7 @@ fn extract_memories_from_assistant_text(
 
 /// Concatenate the `text` fields of a Codex message `content` array
 /// (`input_text` / `output_text` items). Falls back to a bare string.
-fn codex_message_text(content: &Value) -> String {
+pub(crate) fn codex_message_text(content: &Value) -> String {
     match content.as_array() {
         Some(items) => items
             .iter()
@@ -369,7 +369,7 @@ fn codex_message_text(content: &Value) -> String {
 
 /// Concatenate a Codex `reasoning.summary` array's `text` fields. Returns
 /// empty when the reasoning was encrypted / had no readable summary.
-fn codex_summary_text(summary: &Value) -> String {
+pub(crate) fn codex_summary_text(summary: &Value) -> String {
     match summary.as_array() {
         Some(items) => items
             .iter()
@@ -382,7 +382,7 @@ fn codex_summary_text(summary: &Value) -> String {
 
 /// A Codex `function_call_output.output` is usually a plain string but may
 /// be a structured value; preserve either verbatim.
-fn codex_output_text(output: &Value) -> String {
+pub(crate) fn codex_output_text(output: &Value) -> String {
     match output.as_str() {
         Some(s) => s.to_string(),
         None => serde_json::to_string(output).unwrap_or_default(),
