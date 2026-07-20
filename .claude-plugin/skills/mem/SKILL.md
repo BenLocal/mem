@@ -1,6 +1,6 @@
 ---
 name: mem
-description: Local-first Rust memory service (DuckDB + HNSW + Tantivy + MCP). Use proactively when the user mentions mem / memory / capsule / recall / remember when… / 上次怎么做的 / 之前那个 bug; when starting a non-trivial task in a known repo (search prior decisions before planning); when an error resembles a documented incident; or when a hard-won fix just landed (propose an experience capsule so the next session doesn't re-derive it).
+description: Local-first Rust memory service (Lance + Tantivy BM25 + MCP). Use proactively when the user mentions mem / memory / capsule / recall / remember when… / 上次怎么做的 / 之前那个 bug; when starting a non-trivial task in a known repo (search prior decisions before planning); when an error resembles a documented incident; or when a hard-won fix just landed (propose an experience capsule so the next session doesn't re-derive it).
 allowed-tools: Bash, Read, Grep
 ---
 
@@ -10,13 +10,13 @@ allowed-tools: Bash, Read, Grep
 
 Don't wait for the user to invoke this skill by name — load it on any of:
 
-(a) **Explicit mention** — user says mem / mem serve / mem mine / capability_capsule_ingest / capability_capsule_search / memory feedback / wake-up context / DuckDB-backed memory.
+(a) **Explicit mention** — user says mem / mem serve / mem mine / capability_capsule_ingest / capability_capsule_search / memory feedback / wake-up context / Lance-backed memory.
 
 (b) **Start of a non-trivial task in a familiar repo** — debugging, design, refactoring, "how should I do X here?". Call `capability_capsule_search` *first* to surface prior decisions, incidents, conventions, or commit-message lessons before formulating a plan. Skipping this step means re-deriving context the user already taught you.
 
 (c) **Recall intent signals** — "remember when…", "how did we handle…", "上次怎么做的", "之前那个 bug", "what was the URL / port / config for X". These are explicit recall asks; respond by querying memory before answering from training-time priors.
 
-(d) **Error / bug resembling something we've seen** — DuckDB / FK / index / embedding / hook errors are often documented incidents (e.g. `mem_019dfba4` FK retry-loop, `mem_019e05b0` DB invalidation race). Search before guessing at the cause.
+(d) **Error / bug resembling something we've seen** — Lance / index / embedding / hook / commit-conflict errors are often documented incidents. Search before guessing at the cause.
 
 (e) **About to persist a learning** — finished any non-trivial task: debugging session, fix, gotcha, design decision, API quirk, configuration choice. **Default to calling `capability_capsule_ingest` with `capability_capsule_type="experience"` and `write_mode="propose"`** — that combination writes a capsule row with `status=PendingConfirmation`, which `capability_capsule_list_pending_review` surfaces and `review_accept` / `review_edit_accept` promote into the active pool. False positives are cheap (one `review_reject` click discards them); under-proposing silently loses learnings the next session would have to re-derive. Skip only when (i) the commit is a pure typo / formatting / dependency bump, or (ii) the same fact was already captured by an earlier capsule in this session. The plain `capability_capsule_ingest` with `write_mode="auto"` (the default) writes straight into the active pool, no review gate — reserve that for facts the user **explicitly** asks to save (via `/mem:save` or "remember this exactly"). The verbatim-rule applies to both write modes: `content` is the fact source, never a refined summary.
 
@@ -24,7 +24,7 @@ Don't wait for the user to invoke this skill by name — load it on any of:
 
 # Reference: mem — local memory service
 
-`mem` is a single-binary Rust service (DuckDB + HNSW + Tantivy + r2d2 read pool) exposing both an HTTP API and an MCP server. Default base URL: `http://127.0.0.1:3000`. Default tenant: `local`. Both can be overridden via `MEM_BASE_URL` / `MEM_TENANT`.
+`mem` is a single-binary Rust service (Lance datasets read natively via the lancedb API, with an in-RAM Tantivy BM25 index) exposing both an HTTP API and an MCP server. Default base URL: `http://127.0.0.1:3000`. Default tenant: `local`. Both can be overridden via `MEM_BASE_URL` / `MEM_TENANT`.
 
 ## Proactive use policy
 
