@@ -185,6 +185,11 @@ const ALL_TABLES: &[&str] = &[
     "sessions",
     "episodes",
     "mine_cursors",
+    // Was missing here — so the vacuum sweep never compacted or pruned it.
+    // Combined with the per-candidate delete+add write amplification, that
+    // is what let it balloon to 806M / 9169 version manifests. Both are
+    // fixed now (batched writes + this line); vacuum keeps it bounded.
+    "evolution_candidates",
     // Lazy-created on first upsert; open_table fails if absent and
     // we skip without erroring.
     "capability_capsule_embeddings",
