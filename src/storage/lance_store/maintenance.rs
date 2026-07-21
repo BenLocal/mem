@@ -42,6 +42,12 @@ pub struct VacuumStats {
     pub tables_skipped: u64,
     pub fragments_removed: u64,
     pub fragments_added: u64,
+    /// Post-prune Lance version count per managed table — the bloat
+    /// early-warning signal surfaced on `GET /metrics` (via
+    /// `metrics::set_table_versions`) and `POST /admin/vacuum`. A table
+    /// climbing into the thousands is churning writes faster than the
+    /// non-aggressive prune can reclaim.
+    pub table_versions: std::collections::BTreeMap<String, u64>,
 }
 
 /// Index type to build for a managed column.
@@ -272,6 +278,13 @@ impl LanceStore {
                 agg.old_versions_removed += prune.old_versions;
             }
             agg.tables_pruned += 1;
+            // Record the post-prune version count as the bloat gauge. Best
+            // effort — a list_versions error just omits this table from the
+            // gauge, never fails the sweep.
+            if let Ok(versions) = table.list_versions().await {
+                agg.table_versions
+                    .insert((*name).to_string(), versions.len() as u64);
+            }
         }
         Ok(agg)
     }

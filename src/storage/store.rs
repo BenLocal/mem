@@ -958,6 +958,19 @@ impl Store {
         .await
     }
 
+    pub async fn complete_transcript_embedding_jobs(
+        &self,
+        job_ids: &[String],
+        now: &str,
+    ) -> Result<(), StorageError> {
+        self.commit_lance_write(
+            self.lance
+                .complete_transcript_embedding_jobs(job_ids, now)
+                .await,
+        )
+        .await
+    }
+
     pub async fn mark_transcript_embedding_job_stale(
         &self,
         job_id: &str,

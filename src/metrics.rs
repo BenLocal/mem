@@ -30,7 +30,9 @@
 use crate::domain::capability_capsule::FeedbackKind;
 use once_cell::sync::Lazy;
 use serde::Serialize;
+use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Mutex;
 
 static METRICS: Lazy<Metrics> = Lazy::new(Metrics::default);
 
@@ -62,6 +64,12 @@ pub struct Metrics {
     feedback_system_reweight_decay: AtomicU64,
     rerank_pairs_total: AtomicU64,
     rerank_merges_vetoed: AtomicU64,
+    /// Current Lance version-manifest count per managed table, refreshed by
+    /// the vacuum sweep. A gauge (overwritten, not incremented), so it needs a
+    /// lock — the only non-atomic field. Early-warning signal for version
+    /// bloat: a table climbing into the thousands is churning writes faster
+    /// than vacuum prunes (see the evolution_candidates 806M incident).
+    table_versions: Mutex<BTreeMap<String, u64>>,
 }
 
 impl Metrics {
@@ -146,6 +154,15 @@ impl Metrics {
         self.rerank_merges_vetoed.fetch_add(1, Ordering::Relaxed);
     }
 
+    /// Overwrite the per-table Lance version-count gauge (called by the vacuum
+    /// sweep each pass). A poisoned lock silently no-ops — a stale gauge must
+    /// never break the vacuum path.
+    pub fn set_table_versions(&self, counts: &BTreeMap<String, u64>) {
+        if let Ok(mut g) = self.table_versions.lock() {
+            *g = counts.clone();
+        }
+    }
+
     /// A lock-free point-in-time read of every counter, ready to serialise.
     pub fn snapshot(&self) -> MetricsSnapshot {
         let load = |a: &AtomicU64| a.load(Ordering::Relaxed);
@@ -168,6 +185,11 @@ impl Metrics {
             feedback_system_reweight_decay: load(&self.feedback_system_reweight_decay),
             rerank_pairs_total: load(&self.rerank_pairs_total),
             rerank_merges_vetoed: load(&self.rerank_merges_vetoed),
+            table_versions: self
+                .table_versions
+                .lock()
+                .map(|g| g.clone())
+                .unwrap_or_default(),
         }
     }
 }
@@ -194,6 +216,10 @@ pub struct MetricsSnapshot {
     pub feedback_system_reweight_decay: u64,
     pub rerank_pairs_total: u64,
     pub rerank_merges_vetoed: u64,
+    /// Lance version-manifest count per managed table (empty until the first
+    /// vacuum sweep populates it). Watch for a table climbing into the
+    /// thousands — that's version-history bloat brewing.
+    pub table_versions: BTreeMap<String, u64>,
 }
 
 #[cfg(test)]
@@ -265,5 +291,37 @@ mod tests {
         assert_eq!(json["capsule_ingest_total"], 0);
         // Per-kind feedback keys present.
         assert!(json.get("feedback_useful").is_some());
+    }
+
+    #[test]
+    fn table_versions_gauge_sets_overwrites_and_serialises() {
+        let m = Metrics::default();
+        assert!(m.snapshot().table_versions.is_empty());
+
+        let mut counts = BTreeMap::new();
+        counts.insert("evolution_candidates".to_string(), 2u64);
+        counts.insert("transcript_embedding_jobs".to_string(), 508u64);
+        m.set_table_versions(&counts);
+        let s = m.snapshot();
+        assert_eq!(s.table_versions.get("evolution_candidates"), Some(&2));
+        assert_eq!(
+            s.table_versions.get("transcript_embedding_jobs"),
+            Some(&508)
+        );
+
+        // Gauge semantics: a second set overwrites (not merges/accumulates).
+        let mut c2 = BTreeMap::new();
+        c2.insert("evolution_candidates".to_string(), 3u64);
+        m.set_table_versions(&c2);
+        let s = m.snapshot();
+        assert_eq!(s.table_versions.get("evolution_candidates"), Some(&3));
+        assert!(
+            !s.table_versions.contains_key("transcript_embedding_jobs"),
+            "set overwrites the whole gauge"
+        );
+
+        // Serialises as a nested object under `table_versions`.
+        let json = serde_json::to_value(m.snapshot()).unwrap();
+        assert_eq!(json["table_versions"]["evolution_candidates"], 3);
     }
 }

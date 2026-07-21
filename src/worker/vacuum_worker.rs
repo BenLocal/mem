@@ -93,9 +93,14 @@ pub async fn sweep_once(
     older_than_days: i64,
     aggressive: bool,
 ) -> Result<VacuumStats, crate::storage::StorageError> {
-    store
+    let stats = store
         .vacuum_old_versions_with(older_than_days, aggressive)
-        .await
+        .await?;
+    // Refresh the per-table version-count gauge on every sweep (hourly worker
+    // pass + each `POST /admin/vacuum`), so `GET /metrics` surfaces bloat
+    // early instead of at a disk alert.
+    crate::metrics::metrics().set_table_versions(&stats.table_versions);
+    Ok(stats)
 }
 
 #[cfg(test)]

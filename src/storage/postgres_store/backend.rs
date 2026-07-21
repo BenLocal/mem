@@ -842,6 +842,29 @@ impl EmbeddingJobStore for PostgresCapsuleStore {
         Ok(())
     }
 
+    async fn complete_transcript_embedding_jobs(
+        &self,
+        job_ids: &[String],
+        now: &str,
+    ) -> Result<(), StorageError> {
+        if job_ids.is_empty() {
+            return Ok(());
+        }
+        // One statement over the id array (`= ANY`) — Postgres has no
+        // version-manifest churn, but a single UPDATE is still cheaper than N.
+        sqlx::query(
+            "UPDATE transcript_embedding_jobs \
+             SET status = 'completed', last_error = NULL, updated_at = $2 \
+             WHERE job_id = ANY($1) AND status = 'processing'",
+        )
+        .bind(job_ids)
+        .bind(now)
+        .execute(self.pool())
+        .await
+        .map_err(sqlx_err)?;
+        Ok(())
+    }
+
     async fn mark_transcript_embedding_job_stale(
         &self,
         job_id: &str,

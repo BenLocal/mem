@@ -149,6 +149,16 @@ pub trait EmbeddingJobStore: Send + Sync {
         now: &str,
     ) -> Result<(), StorageError>;
 
+    /// Batch-complete many transcript embedding jobs in one write. The worker
+    /// flushes a whole tick's finished jobs through this so the queue table's
+    /// Lance version history doesn't balloon (one commit, not one-per-job).
+    /// Empty input is a no-op.
+    async fn complete_transcript_embedding_jobs(
+        &self,
+        job_ids: &[String],
+        now: &str,
+    ) -> Result<(), StorageError>;
+
     async fn mark_transcript_embedding_job_stale(
         &self,
         job_id: &str,
@@ -311,6 +321,14 @@ impl EmbeddingJobStore for Store {
         now: &str,
     ) -> Result<(), StorageError> {
         Store::complete_transcript_embedding_job(self, job_id, now).await
+    }
+
+    async fn complete_transcript_embedding_jobs(
+        &self,
+        job_ids: &[String],
+        now: &str,
+    ) -> Result<(), StorageError> {
+        Store::complete_transcript_embedding_jobs(self, job_ids, now).await
     }
 
     async fn mark_transcript_embedding_job_stale(

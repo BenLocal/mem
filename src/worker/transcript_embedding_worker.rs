@@ -77,9 +77,20 @@ pub async fn tick(
     let claimed = store
         .claim_next_n_transcript_embedding_jobs(&now, settings.max_retries, n)
         .await?;
+    let mut completed: Vec<String> = Vec::with_capacity(claimed.len());
     for job in claimed {
-        process_job(store, provider, settings, job).await?;
+        if let Some(job_id) = process_job(store, provider, settings, job).await? {
+            completed.push(job_id);
+        }
     }
+    // Flush the whole drain's completions in ONE batched write (no-op when
+    // nothing completed). Deferred completion means a crash after the embed
+    // but before this flush leaves the job `processing` → reclaimed after its
+    // lease and re-embedded (idempotent: the chunk upsert is keyed on
+    // message_block_id).
+    store
+        .complete_transcript_embedding_jobs(&completed, &current_timestamp())
+        .await?;
     Ok(())
 }
 
@@ -92,7 +103,7 @@ async fn process_job(
     provider: &dyn EmbeddingProvider,
     settings: &EmbeddingSettings,
     job: crate::storage::ClaimedTranscriptEmbeddingJob,
-) -> Result<(), StorageError> {
+) -> Result<Option<String>, StorageError> {
     info!(
         job_id = %job.job_id,
         tenant = %job.tenant,
@@ -111,7 +122,7 @@ async fn process_job(
                 &now,
             )
             .await?;
-        return Ok(());
+        return Ok(None);
     }
 
     let mut messages = store
@@ -130,7 +141,7 @@ async fn process_job(
                 &now,
             )
             .await?;
-        return Ok(());
+        return Ok(None);
     };
 
     // Transcript embedding source is the verbatim message content.
@@ -151,14 +162,14 @@ async fn process_job(
         Ok(v) => v,
         Err(err) => {
             record_failure(store, &job, settings, &err.to_string()).await?;
-            return Ok(());
+            return Ok(None);
         }
     };
     if results.len() != chunk_refs.len() {
         // Defensive: trait contract says "same length"; treat a breach
         // as a whole-job failure to avoid persisting a partial chunk set.
         record_failure(store, &job, settings, "provider batch length mismatch").await?;
-        return Ok(());
+        return Ok(None);
     }
 
     // Regroup per chunk; the job succeeds only if every chunk embedded
@@ -180,11 +191,11 @@ async fn process_job(
                     ),
                 )
                 .await?;
-                return Ok(());
+                return Ok(None);
             }
             Err(err) => {
                 record_failure(store, &job, settings, &err.to_string()).await?;
-                return Ok(());
+                return Ok(None);
             }
         }
     }
@@ -195,7 +206,7 @@ async fn process_job(
         .as_deref()
         != Some("processing")
     {
-        return Ok(());
+        return Ok(None);
     }
 
     let now = current_timestamp();
@@ -213,15 +224,15 @@ async fn process_job(
         )
         .await?;
 
-    store
-        .complete_transcript_embedding_job(&job.job_id, &now)
-        .await?;
+    // Completion is deferred: `tick` flushes the whole drain's finished jobs
+    // in ONE batched Lance commit (`complete_transcript_embedding_jobs`)
+    // instead of one commit per job — bounds the queue's version history.
     info!(
         job_id = %job.job_id,
         message_block_id = %job.message_block_id,
-        "transcript embedding worker completed job"
+        "transcript embedding worker embedded job (completion batched)"
     );
-    Ok(())
+    Ok(Some(job.job_id))
 }
 
 async fn record_failure(

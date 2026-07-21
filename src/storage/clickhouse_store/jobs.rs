@@ -471,6 +471,20 @@ impl EmbeddingJobStore for ClickHouseBackend {
             .await
     }
 
+    async fn complete_transcript_embedding_jobs(
+        &self,
+        job_ids: &[String],
+        now: &str,
+    ) -> Result<(), StorageError> {
+        // Non-Lance backend: no version-manifest churn to fold, so a per-job
+        // completion loop is correct and sufficient.
+        for job_id in job_ids {
+            self.ch_set_tx_job(job_id, Some("completed"), None, None, None, now)
+                .await?;
+        }
+        Ok(())
+    }
+
     async fn mark_transcript_embedding_job_stale(
         &self,
         job_id: &str,

@@ -182,33 +182,42 @@ impl LanceStore {
             .execute()
             .await
             .map_err(lancedb_err)?;
-        let mut claimed = Vec::with_capacity(rows.len());
-        for r in rows {
-            let result = table
-                .update()
-                .only_if(format!(
-                    "job_id = {job} AND (status = 'pending' \
-                     OR (status = 'failed' AND attempt_count < {max_r}) \
-                     OR (status = 'processing' AND updated_at <= {cutoff}))",
-                    job = sql_quote(&r.job_id),
-                    cutoff = sql_quote(&lease_cutoff),
-                ))
-                .column("status", "'processing'")
-                .column("updated_at", sql_quote(now))
-                .execute()
-                .await
-                .map_err(lancedb_err)?;
-            if result.rows_updated == 0 {
-                continue;
-            }
-            claimed.push(ClaimedTranscriptEmbeddingJob {
+        // Single-writer (one transcript embedding worker per serve): claim the
+        // whole eligible set in ONE guarded batch UPDATE instead of one commit
+        // per job — bounds this queue's Lance version-manifest growth (the
+        // per-job loop was the same 2N-commits-per-tick write amplification
+        // that ballooned evolution_candidates). The eligibility guard is kept
+        // verbatim on the IN-set, so an orphan-reclaim race still can't grab a
+        // live job. Because nothing else writes this table mid-tick, every
+        // pre-filtered row is still eligible at UPDATE time → all are claimed.
+        let in_list = rows
+            .iter()
+            .map(|r| sql_quote(&r.job_id))
+            .collect::<Vec<_>>()
+            .join(", ");
+        table
+            .update()
+            .only_if(format!(
+                "job_id IN ({in_list}) AND (status = 'pending' \
+                 OR (status = 'failed' AND attempt_count < {max_r}) \
+                 OR (status = 'processing' AND updated_at <= {cutoff}))",
+                cutoff = sql_quote(&lease_cutoff),
+            ))
+            .column("status", "'processing'")
+            .column("updated_at", sql_quote(now))
+            .execute()
+            .await
+            .map_err(lancedb_err)?;
+        let claimed = rows
+            .into_iter()
+            .map(|r| ClaimedTranscriptEmbeddingJob {
                 job_id: r.job_id,
                 tenant: r.tenant,
                 message_block_id: r.message_block_id,
                 provider: r.provider,
                 attempt_count: r.attempt_count,
-            });
-        }
+            })
+            .collect();
         Ok(claimed)
     }
 
@@ -229,6 +238,41 @@ impl LanceStore {
                 "job_id = {} AND status = 'processing'",
                 sql_quote(job_id),
             ))
+            .column("status", "'completed'")
+            .column("last_error", "CAST(NULL AS string)")
+            .column("updated_at", sql_quote(now))
+            .execute()
+            .await
+            .map_err(lancedb_err)?;
+        Ok(())
+    }
+
+    /// Batch-complete many jobs in ONE Lance commit (`job_id IN (...) AND
+    /// status='processing'`) instead of one-per-job — the transcript
+    /// embedding worker flushes a whole tick's finished jobs through this to
+    /// keep the queue's version history bounded. Empty input is a no-op.
+    pub async fn complete_transcript_embedding_jobs(
+        &self,
+        job_ids: &[String],
+        now: &str,
+    ) -> Result<(), StorageError> {
+        if job_ids.is_empty() {
+            return Ok(());
+        }
+        let table = self
+            .conn
+            .open_table("transcript_embedding_jobs")
+            .execute()
+            .await
+            .map_err(lancedb_err)?;
+        let in_list = job_ids
+            .iter()
+            .map(|id| sql_quote(id))
+            .collect::<Vec<_>>()
+            .join(", ");
+        table
+            .update()
+            .only_if(format!("job_id IN ({in_list}) AND status = 'processing'"))
             .column("status", "'completed'")
             .column("last_error", "CAST(NULL AS string)")
             .column("updated_at", sql_quote(now))
@@ -1971,5 +2015,52 @@ mod tests {
             Some("stale"),
             "mark_stale applies to a processing job"
         );
+    }
+
+    /// Batch claim (one commit for the whole eligible set) + batch complete
+    /// (one commit for the whole drain) — the version-churn fix for the
+    /// transcript embedding queue. Round-trips all jobs and treats an empty
+    /// batch as a no-op.
+    #[tokio::test]
+    pub async fn batch_claim_and_complete_transcript_jobs() {
+        let dir = tempdir().unwrap();
+        let repo = LanceStore::open(&dir.path().join("lance.store"))
+            .await
+            .unwrap();
+        for (i, id) in ["ta", "tb", "tc"].iter().enumerate() {
+            repo.try_enqueue_transcript_embedding_job(
+                (*id).into(),
+                "t".into(),
+                format!("mb-{i}"),
+                "fake".into(),
+                "00000001778000000000".into(),
+            )
+            .await
+            .unwrap();
+        }
+        // Batch claim: all three eligible jobs claimed in one write.
+        let claimed = repo
+            .claim_next_n_transcript_embedding_jobs("00000001778000010000", 5, 5)
+            .await
+            .unwrap();
+        assert_eq!(claimed.len(), 3, "batch claim grabs all eligible jobs");
+
+        // Empty batch complete = no-op.
+        repo.complete_transcript_embedding_jobs(&[], "00000001778000015000")
+            .await
+            .unwrap();
+
+        // Batch complete all three in one write.
+        let ids: Vec<String> = claimed.iter().map(|c| c.job_id.clone()).collect();
+        repo.complete_transcript_embedding_jobs(&ids, "00000001778000020000")
+            .await
+            .unwrap();
+        for id in ["ta", "tb", "tc"] {
+            assert_eq!(
+                transcript_job_status(&repo, id).await.as_deref(),
+                Some("completed"),
+                "job {id} must be completed by the batch"
+            );
+        }
     }
 }
