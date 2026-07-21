@@ -19,3 +19,5 @@ admin-page-*.png
 
 # Claude Code runtime state (scheduled_tasks lock, etc.)
 .claude/
+
+/docs/superpowers
