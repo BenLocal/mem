@@ -58,6 +58,15 @@ fn decode_ids(raw: &str) -> Vec<String> {
 }
 
 fn candidate_to_record_batch(c: &EvolutionCandidate) -> Result<RecordBatch, StorageError> {
+    candidates_to_record_batch(std::slice::from_ref(c))
+}
+
+/// Build one RecordBatch holding N candidate rows. Batching the write into
+/// a single Arrow batch (one `table.add`) is what lets the worker collapse a
+/// whole sweep's signal-update churn into a single Lance commit instead of
+/// two-per-candidate (delete + add) — the source of the evolution_candidates
+/// version-manifest bloat.
+fn candidates_to_record_batch(cs: &[EvolutionCandidate]) -> Result<RecordBatch, StorageError> {
     let mut candidate_id = StringBuilder::new();
     let mut tenant = StringBuilder::new();
     let mut op_kind = StringBuilder::new();
@@ -70,21 +79,23 @@ fn candidate_to_record_batch(c: &EvolutionCandidate) -> Result<RecordBatch, Stor
     let mut last_signal = StringBuilder::new();
     let mut executed = StringBuilder::new();
     let mut result_ids = StringBuilder::new();
-    candidate_id.append_value(&c.candidate_id);
-    tenant.append_value(&c.tenant);
-    op_kind.append_value(&c.op_kind);
-    member_ids.append_value(encode_ids(&c.member_ids));
-    params.append_value(&c.params);
-    evidence.append_value(c.evidence);
-    consecutive.append_value(c.consecutive_cycles);
-    status.append_value(&c.status);
-    first_proposed.append_value(&c.first_proposed_at);
-    last_signal.append_value(&c.last_signal_at);
-    match &c.executed_at {
-        Some(ts) => executed.append_value(ts),
-        None => executed.append_null(),
+    for c in cs {
+        candidate_id.append_value(&c.candidate_id);
+        tenant.append_value(&c.tenant);
+        op_kind.append_value(&c.op_kind);
+        member_ids.append_value(encode_ids(&c.member_ids));
+        params.append_value(&c.params);
+        evidence.append_value(c.evidence);
+        consecutive.append_value(c.consecutive_cycles);
+        status.append_value(&c.status);
+        first_proposed.append_value(&c.first_proposed_at);
+        last_signal.append_value(&c.last_signal_at);
+        match &c.executed_at {
+            Some(ts) => executed.append_value(ts),
+            None => executed.append_null(),
+        }
+        result_ids.append_value(encode_ids(&c.result_capsule_ids));
     }
-    result_ids.append_value(encode_ids(&c.result_capsule_ids));
     let schema = Arc::new(evolution_candidates_schema());
     RecordBatch::try_new(
         schema,
@@ -167,6 +178,39 @@ impl LanceStore {
             .await
             .map_err(lancedb_err)?;
         let batch = candidate_to_record_batch(&candidate)?;
+        table.add(batch).execute().await.map_err(lancedb_err)?;
+        Ok(())
+    }
+
+    /// Batched upsert of many candidates keyed on `candidate_id` — one
+    /// `DELETE ... IN (...)` + one multi-row `add`, i.e. **two Lance commits
+    /// total regardless of N** (vs. `2·N` from calling the single upsert in a
+    /// loop). The evolution worker uses this to flush a whole sweep's
+    /// signal-update / silence-decay churn in one shot, bounding the
+    /// evolution_candidates version-manifest growth. Empty input is a no-op.
+    pub async fn upsert_evolution_candidates(
+        &self,
+        candidates: Vec<EvolutionCandidate>,
+    ) -> Result<(), StorageError> {
+        if candidates.is_empty() {
+            return Ok(());
+        }
+        let table = self
+            .conn
+            .open_table("evolution_candidates")
+            .execute()
+            .await
+            .map_err(lancedb_err)?;
+        let in_list = candidates
+            .iter()
+            .map(|c| sql_quote(&c.candidate_id))
+            .collect::<Vec<_>>()
+            .join(", ");
+        table
+            .delete(&format!("candidate_id IN ({in_list})"))
+            .await
+            .map_err(lancedb_err)?;
+        let batch = candidates_to_record_batch(&candidates)?;
         table.add(batch).execute().await.map_err(lancedb_err)?;
         Ok(())
     }

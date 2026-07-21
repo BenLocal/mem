@@ -23,6 +23,16 @@ pub trait EvolutionCandidateStore: Send + Sync {
         candidate: EvolutionCandidate,
     ) -> Result<(), StorageError>;
 
+    /// Batched upsert keyed on `candidate_id` — persists many candidates in
+    /// a single write (two Lance commits total, not `2·N`). The evolution
+    /// worker flushes one sweep's accumulated signal updates through this to
+    /// keep the `evolution_candidates` version history from ballooning.
+    /// Empty input is a no-op.
+    async fn upsert_evolution_candidates(
+        &self,
+        candidates: Vec<EvolutionCandidate>,
+    ) -> Result<(), StorageError>;
+
     /// List candidates for `tenant`, optionally filtered by status.
     /// Lifecycle statuses: `pending` (accumulating evidence) /
     /// `executed` (operation ran; suppresses re-proposals) /
@@ -48,6 +58,14 @@ impl EvolutionCandidateStore for Store {
         // shape (it's a pass-through since route-B removed the DuckDB read
         // engine; reads are lance-native — same rationale as mine_cursors).
         self.commit_lance_write(self.lance.upsert_evolution_candidate(candidate).await)
+            .await
+    }
+
+    async fn upsert_evolution_candidates(
+        &self,
+        candidates: Vec<EvolutionCandidate>,
+    ) -> Result<(), StorageError> {
+        self.commit_lance_write(self.lance.upsert_evolution_candidates(candidates).await)
             .await
     }
 

@@ -131,6 +131,56 @@ async fn candidate_evidence_survives_restart() {
     assert_eq!(got[0].consecutive_cycles, 2);
 }
 
+#[tokio::test(flavor = "multi_thread")]
+async fn batch_upsert_writes_all_and_dedups_by_id() {
+    // The evolution worker flushes a whole sweep's candidate writes through
+    // upsert_evolution_candidates (one Lance commit, not two-per-candidate).
+    // It must: persist every row, treat an empty batch as a no-op, and
+    // replace-by-candidate_id on re-upsert (no duplicate rows).
+    let dir = tempdir().unwrap();
+    let store = Store::open(&dir.path().join("evo.lance")).await.unwrap();
+
+    // Empty → no-op.
+    store.upsert_evolution_candidates(vec![]).await.unwrap();
+    assert!(store
+        .list_evolution_candidates(TENANT, None)
+        .await
+        .unwrap()
+        .is_empty());
+
+    // Three in one batch.
+    store
+        .upsert_evolution_candidates(vec![
+            candidate("b1", "merge", &["x", "y"], 1.0),
+            candidate("b2", "refine", &["z"], 2.0),
+            candidate("b3", "split", &["w"], 3.0),
+        ])
+        .await
+        .unwrap();
+    assert_eq!(
+        store
+            .list_evolution_candidates(TENANT, None)
+            .await
+            .unwrap()
+            .len(),
+        3
+    );
+
+    // Re-upsert b2 (same id, new evidence) + a new b4: b2 replaced in place,
+    // not duplicated → total 4.
+    let mut b2 = candidate("b2", "refine", &["z"], 9.9);
+    b2.consecutive_cycles = 5;
+    store
+        .upsert_evolution_candidates(vec![b2, candidate("b4", "merge", &["q"], 4.0)])
+        .await
+        .unwrap();
+    let all = store.list_evolution_candidates(TENANT, None).await.unwrap();
+    assert_eq!(all.len(), 4, "b2 replaced in place, b4 added");
+    let got_b2 = all.iter().find(|c| c.candidate_id == "b2").unwrap();
+    assert!((got_b2.evidence - 9.9).abs() < 1e-6);
+    assert_eq!(got_b2.consecutive_cycles, 5);
+}
+
 // ───────────────────────── worker sweep ─────────────────────────
 
 fn f32_to_blob(values: &[f32]) -> Vec<u8> {

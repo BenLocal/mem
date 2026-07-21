@@ -87,6 +87,18 @@ impl EvolutionCandidateStore for ClickHouseBackend {
         Ok(())
     }
 
+    async fn upsert_evolution_candidates(
+        &self,
+        candidates: Vec<EvolutionCandidate>,
+    ) -> Result<(), StorageError> {
+        // Non-Lance backend: no version-manifest churn to fold, so a
+        // per-row upsert loop is correct and sufficient.
+        for candidate in candidates {
+            self.upsert_evolution_candidate(candidate).await?;
+        }
+        Ok(())
+    }
+
     async fn list_evolution_candidates(
         &self,
         tenant: &str,

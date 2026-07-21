@@ -385,6 +385,15 @@ pub async fn sweep_once(
     };
     let mut matched_pending = vec![false; pending.len()];
 
+    // Accumulate this sweep's non-execute candidate writes (signal updates +
+    // silence decays — the high-frequency churn) keyed on candidate_id so the
+    // final state per candidate wins, then flush them in ONE batched Lance
+    // commit at the end of the sweep instead of two-per-candidate. Executes
+    // (rare, gated) still write immediately below so a mid-sweep crash can't
+    // lose the record that an operation already ran.
+    let mut pending_writes: std::collections::HashMap<String, EvolutionCandidate> =
+        std::collections::HashMap::new();
+
     for proposal in proposals {
         // Suppress re-proposals of already-executed operations (the
         // generalize sources stay Active, so without this the same
@@ -579,7 +588,15 @@ pub async fn sweep_once(
                 result_capsule_ids: result_ids,
             });
         }
-        store.upsert_evolution_candidate(candidate).await?;
+        // Executes (rare, gated) persist immediately so a mid-sweep crash
+        // can't drop the record that an op already ran; the far more frequent
+        // Hold / signal-update writes fold into `pending_writes` and flush in
+        // one batched Lance commit after the silence loop.
+        if decision == GateDecision::Execute {
+            store.upsert_evolution_candidate(candidate).await?;
+        } else {
+            pending_writes.insert(candidate.candidate_id.clone(), candidate);
+        }
     }
 
     // 5. Silent candidates: decay evidence, reset the consecutive
@@ -595,8 +612,17 @@ pub async fn sweep_once(
             report.cancelled.push(c.candidate_id.clone());
         }
         if !dry_run {
-            store.upsert_evolution_candidate(c).await?;
+            pending_writes.insert(c.candidate_id.clone(), c);
         }
+    }
+
+    // Flush the sweep's batched signal-update / silence-decay writes in a
+    // single Lance commit (one DELETE ... IN + one multi-row add) instead of
+    // two-per-candidate — the fix for evolution_candidates version bloat.
+    if !pending_writes.is_empty() {
+        store
+            .upsert_evolution_candidates(pending_writes.into_values().collect())
+            .await?;
     }
 
     // 6. ⑥ weak-edge retirement (E4): close evolution-owned
