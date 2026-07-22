@@ -2,6 +2,8 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import { PassThrough } from "node:stream";
 import { McpStdioClient } from "./mcp-client.ts";
+import { isServeUp } from "./mem-extension.ts";
+import http from "node:http";
 
 function fakeChild() {
   const stdin = new PassThrough(); // extension writes here (requests)
@@ -85,4 +87,19 @@ test("callTool correlates concurrent out-of-order replies by id, not arrival ord
   const [firstRes, secondRes] = await Promise.all([first, second]);
   assert.equal(firstRes.content[0].text, "result-for-first");
   assert.equal(secondRes.content[0].text, "result-for-second");
+});
+
+test("isServeUp is true when /health returns 200", async () => {
+  const server = http.createServer((req, res) => {
+    if (req.url === "/health") { res.writeHead(200); res.end("ok"); }
+    else { res.writeHead(404); res.end(); }
+  });
+  await new Promise<void>((r) => server.listen(0, r));
+  const port = (server.address() as import("node:net").AddressInfo).port;
+  try {
+    assert.equal(await isServeUp(`http://127.0.0.1:${port}`), true);
+    assert.equal(await isServeUp(`http://127.0.0.1:1`), false); // nothing listening
+  } finally {
+    server.close();
+  }
 });
