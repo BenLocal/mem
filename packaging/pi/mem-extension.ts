@@ -139,6 +139,66 @@ async function runFeedback(pi: ExtensionAPI, ctx: ExtensionContext): Promise<voi
   await pi.exec("mem", ["feedback-from-transcript", file], { timeout: 30000 });
 }
 
+// One recall hit as returned in the directives/relevant_facts/reusable_patterns
+// arrays of `POST /capability_capsules/search` — see `src/domain/query.rs`
+// `DirectiveItem`/`FactItem`/`PatternItem` (all three carry `capability_capsule_id`
+// + `text` + `source_summary`; `text` is kept optional here for callers that
+// only have a narrower shape).
+type RecallHit = { capability_capsule_id: string; source_summary?: string; text?: string };
+
+// Renders the mem "index"-style auto-recall banner. COUPLING: this text is
+// round-trip-parsed by `src/cli/feedback.rs::scan_transcript` (via
+// `push_codex_banner_ids` / `extract_injected_ids`) to close the feedback
+// loop — it MUST contain the marker substring "mem auto-recall" and render
+// each hit as a `` `[mem_<id>]` `` bullet token. Mirrors the shape emitted by
+// the real Claude Code hook renderer (`cli/hook.rs::format_prompt_recall_styled`,
+// RecallStyle::Index: `- {headline}  \`[{id}]\``) so the same parser code path
+// that already round-trips the Claude Code banner also round-trips this one.
+export function buildRecallBanner(hits: RecallHit[]): string {
+  const preamble =
+    "🧠 mem auto-recall (index) — hits relevant to this prompt, headlines only. " +
+    "To USE one, `capability_capsule_get` its id FIRST for the verbatim content, " +
+    "then send feedback for it — silence freezes ranking. Ignore if irrelevant.";
+  const lines = hits.map((h) => {
+    const headline = (h.source_summary ?? h.text ?? "").split("\n")[0].slice(0, 80);
+    return `- ${headline}  \`[${h.capability_capsule_id}]\``;
+  });
+  return [preamble, ...lines].join("\n");
+}
+
+// Searches mem for capsules relevant to the upcoming prompt and renders them
+// as a recall banner. Fail-safe: any fetch error, non-ok response, or empty
+// hit set resolves to undefined so the caller can silently skip injection.
+async function recallForPrompt(prompt: string): Promise<string | undefined> {
+  const res = await fetch(`${MEM_BASE_URL}/capability_capsules/search`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({
+      query: prompt,
+      intent: "general",
+      scope_filters: [],
+      token_budget: 1200,
+      caller_agent: "pi",
+      expand_graph: false,
+      tenant: process.env.MEM_TENANT ?? "local",
+    }),
+    signal: AbortSignal.timeout(5000),
+  });
+  if (!res.ok) return undefined;
+  const body = (await res.json()) as {
+    directives?: RecallHit[];
+    relevant_facts?: RecallHit[];
+    reusable_patterns?: RecallHit[];
+  };
+  const hits = [
+    ...(body.directives ?? []),
+    ...(body.relevant_facts ?? []),
+    ...(body.reusable_patterns ?? []),
+  ];
+  if (hits.length === 0) return undefined;
+  return buildRecallBanner(hits);
+}
+
 const memExtension = (pi: ExtensionAPI): void => {
   pi.on("session_start", async (_event, _ctx: ExtensionContext) => {
     try {
@@ -147,6 +207,17 @@ const memExtension = (pi: ExtensionAPI): void => {
       try { await injectWakeUp(pi); } catch (e) { console.warn("[mem] wake-up failed:", e); }
     } catch (e) {
       console.warn("[mem] session_start setup failed:", e);
+    }
+  });
+
+  pi.on("before_agent_start", async (event, _ctx) => {
+    try {
+      const banner = await recallForPrompt(event.prompt);
+      if (!banner) return;
+      return { message: { customType: "mem-recall", content: banner, display: true } };
+    } catch (e) {
+      console.warn("[mem] auto-recall failed:", e);
+      return;
     }
   });
 

@@ -2,7 +2,7 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import { PassThrough } from "node:stream";
 import { McpStdioClient } from "./mcp-client.ts";
-import { isServeUp } from "./mem-extension.ts";
+import { isServeUp, buildRecallBanner } from "./mem-extension.ts";
 import http from "node:http";
 
 function fakeChild() {
@@ -127,4 +127,26 @@ test("isServeUp is true when /health returns 200", async () => {
   } finally {
     server.close();
   }
+});
+
+test("recall banner carries the marker and [mem_id] tokens", () => {
+  const banner = buildRecallBanner([
+    { capability_capsule_id: "mem_abc", source_summary: "pi stores sessions as jsonl" },
+  ]);
+  assert.match(banner, /mem auto-recall/);
+  assert.match(banner, /\[mem_abc\]/);
+});
+
+test("recall banner id token matches the shape src/cli/feedback.rs::extract_injected_ids parses", () => {
+  // Mirrors the real is_valid_capsule_id gate (mem_ + 8 hex + '-'), so this
+  // also proves the emitted token is one the Rust-side feedback scanner
+  // would actually credit, not just a string that looks similar.
+  const id = "mem_019e9999-aaaa-7bbb-8ccc-dddddddddddd";
+  const banner = buildRecallBanner([
+    { capability_capsule_id: id, source_summary: "DuckDB single-writer MVCC concurrency lock contention" },
+  ]);
+  assert.match(banner, /mem auto-recall/);
+  const idTokenPattern = /\[mem_[0-9a-f]{8}-[0-9a-f-]+\]/;
+  assert.match(banner, idTokenPattern);
+  assert.equal(banner.match(idTokenPattern)?.[0], `[${id}]`);
 });
