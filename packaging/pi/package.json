@@ -1,0 +1,10 @@
+{
+  "name": "@shibenenen/mem-pi",
+  "version": "0.1.0",
+  "description": "mem memory service extension for the pi coding agent",
+  "keywords": ["pi-package"],
+  "pi": {
+    "extensions": ["./mem-extension.ts"]
+  },
+  "license": "MIT"
+}
