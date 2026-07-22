@@ -99,11 +99,24 @@ function stopMcp(): void {
   }
 }
 
+async function injectWakeUp(pi: ExtensionAPI): Promise<void> {
+  const res = await pi.exec("mem", ["wake-up"], { timeout: 15000 });
+  const text = res.stdout.trim();
+  if (!text) return;
+  // Inject as context WITHOUT forcing a turn (sendUserMessage would trigger
+  // one immediately, before the user has typed).
+  pi.sendMessage(
+    { customType: "mem-wakeup", content: text, display: true },
+    { triggerTurn: false, deliverAs: "nextTurn" },
+  );
+}
+
 const memExtension = (pi: ExtensionAPI): void => {
   pi.on("session_start", async (_event, _ctx: ExtensionContext) => {
     try {
       await ensureServe(MEM_BASE_URL);
       await startMcpAndRegisterTools(pi);
+      try { await injectWakeUp(pi); } catch (e) { console.warn("[mem] wake-up failed:", e); }
     } catch (e) {
       console.warn("[mem] session_start setup failed:", e);
     }
