@@ -262,6 +262,9 @@ pub enum TranscriptFormat {
     ClaudeCode,
     /// Codex `rollout-*.jsonl`: `{type, payload, timestamp}` envelopes.
     CodexRollout,
+    /// pi session: `{type:"session",version,..}` header then
+    /// `{type:"message", message:{role, content:[…]}}` lines.
+    PiSession,
 }
 
 /// True when a parsed JSONL line is a Codex rollout envelope — a `payload`
@@ -279,6 +282,13 @@ fn is_codex_rollout_line(v: &Value) -> bool {
                 | "world_state"
                 | "compacted"
         )
+}
+
+/// True when a parsed JSONL line is a pi session header — `type=="session"`
+/// with a `version` field. pi always writes this as its first line, and
+/// neither Claude Code nor Codex uses a top-level `type:"session"` + `version`.
+fn is_pi_session_line(v: &Value) -> bool {
+    v["type"].as_str() == Some("session") && v.get("version").is_some()
 }
 
 /// Detect a transcript's format from its first parseable JSONL line.
@@ -300,6 +310,8 @@ pub(crate) fn detect_transcript_format(path: &Path) -> TranscriptFormat {
         };
         return if is_codex_rollout_line(&v) {
             TranscriptFormat::CodexRollout
+        } else if is_pi_session_line(&v) {
+            TranscriptFormat::PiSession
         } else {
             TranscriptFormat::ClaudeCode
         };
@@ -316,6 +328,7 @@ pub(crate) fn detect_transcript_format(path: &Path) -> TranscriptFormat {
 pub fn effective_source_agent(format: TranscriptFormat, flag: &str) -> String {
     match format {
         TranscriptFormat::CodexRollout => "codex".to_string(),
+        TranscriptFormat::PiSession => "pi".to_string(),
         TranscriptFormat::ClaudeCode => flag.to_string(),
     }
 }
@@ -1497,6 +1510,38 @@ mod codex_format_tests {
         assert_eq!(
             effective_source_agent(TranscriptFormat::ClaudeCode, "some-other-agent"),
             "some-other-agent"
+        );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const PI_FIXTURE: &str = r#"{"type":"session","version":3,"id":"019f8771-aaaa-bbbb","timestamp":"2026-07-22T01:29:20.291Z","cwd":"/repo"}
+{"type":"model_change","id":"m1","parentId":null,"timestamp":"2026-07-22T01:29:20.354Z","provider":"p","modelId":"x"}
+{"type":"message","id":"u1","parentId":"m1","timestamp":"2026-07-22T01:29:36.855Z","message":{"role":"user","content":[{"type":"text","text":"how does pi store sessions"}],"timestamp":1784683776846}}
+{"type":"message","id":"a1","parentId":"u1","timestamp":"2026-07-22T01:29:40.000Z","message":{"role":"assistant","content":[{"type":"text","text":"<mem-save>pi persists sessions as JSONL under ~/.pi/agent/sessions</mem-save>"}],"timestamp":1784683780000}}
+"#;
+
+    fn write_pi_fixture(dir: &std::path::Path) -> std::path::PathBuf {
+        let p = dir.join("pi-session.jsonl");
+        std::fs::write(&p, PI_FIXTURE).unwrap();
+        p
+    }
+
+    #[test]
+    fn detects_pi_session_format() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = write_pi_fixture(dir.path());
+        assert_eq!(detect_transcript_format(&p), TranscriptFormat::PiSession);
+    }
+
+    #[test]
+    fn pi_source_agent_is_pi_regardless_of_flag() {
+        assert_eq!(
+            effective_source_agent(TranscriptFormat::PiSession, "claude-code"),
+            "pi"
         );
     }
 }
