@@ -22,6 +22,7 @@ This is **Plan 2 of 2** (spec: `docs/superpowers/specs/2026-07-22-mem-pi-extensi
   - `ctx.sessionManager.getSessionFile(): string` — current session JSONL path (may be undefined for `--no-session`). Also `getCwd()`, `getSessionId()`.
 - **All handlers are fail-safe**: wrap every mem call in try/catch; a mem failure must `console.warn` and return, never throw out of a pi handler (would disrupt the user's session).
 - Files live in `packaging/pi/` (mirrors `packaging/npm/`). No build step — pi strips types at load.
+- **Test runner (environment fact, discovered during execution):** the default `node` on PATH is v20.19.2, which lacks `--experimental-strip-types` (needs Node ≥22.6). Run all `.ts` unit tests with the Node 24 binary explicitly: `/root/.nvm/versions/node/v24.16.0/bin/node --test packaging/pi/<file>.test.ts` (Node 24 strips TS types natively). pi itself still runs on v20.19.2 and loads the extension via its own internal type-stripping — that path is unaffected; only standalone `node --test` needs Node 24.
 - No real client/company names anywhere.
 - **`mem serve` singleton rule** (CLAUDE.md): one `mem serve` per Lance dir. This extension enforces "start only if `/health` is down".
 
