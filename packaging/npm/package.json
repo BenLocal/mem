@@ -1,6 +1,6 @@
 {
   "name": "@shibenenen/mem",
-  "version": "0.2.4",
+  "version": "0.2.5",
   "description": "Local-first Rust memory service for multi-agent workflows — prebuilt-binary installer.",
   "bin": {
     "mem": "bin/mem.js"
