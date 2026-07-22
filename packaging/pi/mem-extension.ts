@@ -25,6 +25,7 @@ async function ensureServe(baseUrl: string): Promise<void> {
     return;
   }
   const child = spawn("mem", ["serve"], { detached: true, stdio: "ignore", env: process.env });
+  child.on("error", (e) => console.warn("[mem] mem serve spawn error:", e));
   child.unref();
   servePid = child.pid;
   serveStartedByUs = true;
@@ -58,6 +59,12 @@ async function startMcpAndRegisterTools(pi: ExtensionAPI): Promise<void> {
     env: { ...process.env, MEM_BASE_URL },
   });
   mcpChild = child;
+  // Attach BEFORE anything else can let an async 'error' event (most
+  // commonly ENOENT — `mem` not on PATH) fire unhandled, which would
+  // otherwise crash the whole pi host process instead of just degrading
+  // this extension's tool registration.
+  child.on("error", (e) => console.warn("[mem] mem mcp spawn error:", e));
+  child.on("exit", () => mcpClient?.dispose(new Error("mem mcp exited")));
   if (!child.stdin || !child.stdout) throw new Error("mem mcp: no stdio pipes");
 
   const client = new McpStdioClient({ stdin: child.stdin, stdout: child.stdout });

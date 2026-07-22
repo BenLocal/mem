@@ -23,10 +23,27 @@ export class McpStdioClient {
   private buf = "";
 
   private child: { stdin: Writable; stdout: Readable };
+  private closed = false;
+  private closedErr: Error | undefined;
 
   constructor(child: { stdin: Writable; stdout: Readable }) {
     this.child = child;
     this.child.stdout.on("data", (chunk: Buffer) => this.onData(chunk));
+  }
+
+  /**
+   * Reject every pending request with `err`, clear the pending map, and mark
+   * the client closed so any subsequent request()/callTool() rejects
+   * immediately instead of hanging forever. Call this when the underlying
+   * child process exits/errors so in-flight (and future) calls fail fast
+   * rather than waiting on a reply that will never arrive.
+   */
+  dispose(err: Error): void {
+    if (this.closed) return;
+    this.closed = true;
+    this.closedErr = err;
+    for (const p of this.pending.values()) p.reject(err);
+    this.pending.clear();
   }
 
   private onData(chunk: Buffer): void {
@@ -52,6 +69,7 @@ export class McpStdioClient {
   }
 
   private request(method: string, params?: unknown): Promise<unknown> {
+    if (this.closed) return Promise.reject(this.closedErr ?? new Error("mcp client closed"));
     const id = this.nextId++;
     const line = JSON.stringify({ jsonrpc: "2.0", id, method, params }) + "\n";
     return new Promise((resolve, reject) => {

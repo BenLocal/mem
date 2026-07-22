@@ -89,6 +89,31 @@ test("callTool correlates concurrent out-of-order replies by id, not arrival ord
   assert.equal(secondRes.content[0].text, "result-for-second");
 });
 
+test("dispose() rejects a pending request with the given error", async () => {
+  const child = fakeChild();
+  const client = new McpStdioClient(child);
+
+  // Fire a call but never let the fake child reply — the request is left
+  // pending exactly like it would be if the real `mem mcp` child died
+  // mid-flight (exited/crashed) before answering.
+  const pending = client.callTool("capability_capsule_search", { query: "x" });
+
+  const boom = new Error("boom");
+  client.dispose(boom);
+
+  await assert.rejects(pending, (e: unknown) => {
+    assert.equal(e, boom);
+    return true;
+  });
+
+  // Closed client rejects any further calls immediately too, rather than
+  // hanging forever waiting on a reply that will never come.
+  await assert.rejects(client.callTool("capability_capsule_search", { query: "y" }), (e: unknown) => {
+    assert.equal(e, boom);
+    return true;
+  });
+});
+
 test("isServeUp is true when /health returns 200", async () => {
   const server = http.createServer((req, res) => {
     if (req.url === "/health") { res.writeHead(200); res.end("ok"); }
