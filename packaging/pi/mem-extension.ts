@@ -111,6 +111,34 @@ async function injectWakeUp(pi: ExtensionAPI): Promise<void> {
   );
 }
 
+// Returns the active session's JSONL path, or undefined for an ephemeral
+// (--no-session) session — undefined-safe against a missing/throwing
+// sessionManager.
+function sessionFileOf(ctx: ExtensionContext): string | undefined {
+  try {
+    return ctx.sessionManager.getSessionFile();
+  } catch {
+    return undefined;
+  }
+}
+
+// Mines the current session's transcript into mem (Plan 1's pi-format
+// parser tags rows source_agent="pi"). No-op for ephemeral sessions.
+async function runMine(pi: ExtensionAPI, ctx: ExtensionContext): Promise<void> {
+  const file = sessionFileOf(ctx);
+  if (!file) return; // --no-session ephemeral: nothing to mine
+  await pi.exec("mem", ["mine", file], { timeout: 60000 });
+}
+
+// Scans the current session's transcript and posts applies_here feedback
+// for memories referenced in subsequent assistant blocks. No-op for
+// ephemeral sessions.
+async function runFeedback(pi: ExtensionAPI, ctx: ExtensionContext): Promise<void> {
+  const file = sessionFileOf(ctx);
+  if (!file) return;
+  await pi.exec("mem", ["feedback-from-transcript", file], { timeout: 30000 });
+}
+
 const memExtension = (pi: ExtensionAPI): void => {
   pi.on("session_start", async (_event, _ctx: ExtensionContext) => {
     try {
@@ -122,7 +150,16 @@ const memExtension = (pi: ExtensionAPI): void => {
     }
   });
 
-  pi.on("session_shutdown", (_event, _ctx: ExtensionContext) => {
+  pi.on("agent_end", async (_event, ctx) => {
+    try { await runFeedback(pi, ctx); } catch (e) { console.warn("[mem] feedback failed:", e); }
+  });
+
+  pi.on("session_before_compact", async (_event, ctx) => {
+    try { await runMine(pi, ctx); } catch (e) { console.warn("[mem] mine (pre-compact) failed:", e); }
+  });
+
+  pi.on("session_shutdown", async (_event, ctx) => {
+    try { await runMine(pi, ctx); } catch (e) { console.warn("[mem] mine (shutdown) failed:", e); }
     stopMcp();
     stopServe();
   });
