@@ -486,6 +486,18 @@ fn collect_pi_line(
     search_calls: &mut HashMap<String, usize>,
     fetched: &mut HashMap<String, usize>,
 ) {
+    if value["type"].as_str() == Some("custom_message") {
+        // pi persists extension-injected recall/wake-up as a top-level
+        // `custom_message` with a bare-string `content`. The recall banner
+        // carries the `mem auto-recall` marker + `[mem_…]` tokens; run it
+        // through the same banner-id extractor used for user/system text.
+        // push_codex_banner_ids no-ops when the marker is absent (e.g. the
+        // wake-up custom_message), so this is safe for all custom_message kinds.
+        if let Some(text) = value["content"].as_str() {
+            push_codex_banner_ids(text, all, line_idx, retrieved);
+        }
+        return;
+    }
     if value["type"].as_str() != Some("message") {
         return;
     }
@@ -1244,10 +1256,17 @@ mod tests {
 
     #[test]
     fn scan_pi_transcript_credits_banner_reused_by_assistant() {
-        // A pi user message carrying an injected recall banner, followed by
-        // an assistant message that reuses the retrieved text — mirrors
-        // `scan_codex_rollout_credits_banner_reused_by_assistant` but with
-        // pi's `{type:"message", message:{role, content:[…]}}` envelope.
+        // pi persists an extension-injected recall banner as a TOP-LEVEL
+        // `custom_message` line with a bare-string `content` — NOT a
+        // `type:"message"` with `message.content[]`. Verified against a real
+        // on-disk session: `{"type":"custom_message","customType":"mem-recall",
+        // "content":"..."}`. This is the actual shape
+        // `before_agent_start`'s `{message:{customType:"mem-recall",...}}`
+        // return value gets written as (see packaging/pi/mem-extension.ts
+        // `buildRecallBanner` / `pi.on("before_agent_start", ...)`).
+        //
+        // Followed by an assistant message that reuses the retrieved text —
+        // mirrors `scan_codex_rollout_credits_banner_reused_by_assistant`.
         use std::io::Write;
 
         let id = "mem_019e9999-aaaa-7bbb-8ccc-dddddddddddd";
@@ -1258,9 +1277,8 @@ mod tests {
         let session = serde_json::json!({
             "type":"session","version":3,"id":"sess-1","timestamp":"t","cwd":"/r"
         });
-        let user = serde_json::json!({
-            "type":"message","id":"u1",
-            "message":{"role":"user","content":[{"type":"text","text":banner}]}
+        let recall = serde_json::json!({
+            "type":"custom_message","customType":"mem-recall","content":banner
         });
         let asst = serde_json::json!({
             "type":"message","id":"a1",
@@ -1271,19 +1289,19 @@ mod tests {
 
         let mut f = tempfile::NamedTempFile::new().unwrap();
         writeln!(f, "{session}").unwrap();
-        writeln!(f, "{user}").unwrap();
+        writeln!(f, "{recall}").unwrap();
         writeln!(f, "{asst}").unwrap();
         let consumed = scan_transcript(f.path(), false).unwrap();
         assert!(
             consumed.credited.contains_key(id),
-            "pi user-message recall reused by a later assistant block must be credited, got {:?}",
+            "pi custom_message recall reused by a later assistant block must be credited, got {:?}",
             consumed.credited
         );
 
         // No reuse → not credited.
         let mut g = tempfile::NamedTempFile::new().unwrap();
         writeln!(g, "{session}").unwrap();
-        writeln!(g, "{user}").unwrap();
+        writeln!(g, "{recall}").unwrap();
         let unconsumed = scan_transcript(g.path(), false).unwrap();
         assert!(
             !unconsumed.credited.contains_key(id),

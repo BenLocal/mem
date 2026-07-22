@@ -5,10 +5,22 @@ import { McpStdioClient, type McpCallResult } from "./mcp-client.ts";
 export const MEM_BASE_URL = process.env.MEM_BASE_URL ?? "http://127.0.0.1:3000";
 
 let servePid: number | undefined;
+// Write-once: only the spawn branch of `ensureServe` may set this to `true`.
+// A later session's health-hit reuse branch must never clear it back to
+// `false` — that would let a later session's "serve was already up" finding
+// clobber the ownership flag set by the session that actually spawned it,
+// causing `stopServe` to skip killing a process it owns.
 let serveStartedByUs = false;
 
 let mcpChild: ReturnType<typeof spawn> | undefined;
 let mcpClient: McpStdioClient | undefined;
+// Guards `pi.registerTool` so tools are registered exactly once per process.
+// pi re-fires `session_start` on reload/newSession/switchSession; registering
+// again would duplicate every tool. The registered `execute` closures forward
+// to the module-level `mcpClient` read at call time, so a reload that spawns
+// a fresh mcp child (via `startMcpAndRegisterTools`'s `stopMcp()` + respawn)
+// is picked up by the already-registered tools without re-registering.
+let toolsRegistered = false;
 
 export async function isServeUp(baseUrl: string): Promise<boolean> {
   try {
@@ -21,7 +33,9 @@ export async function isServeUp(baseUrl: string): Promise<boolean> {
 
 async function ensureServe(baseUrl: string): Promise<void> {
   if (await isServeUp(baseUrl)) {
-    serveStartedByUs = false;
+    // Reuse branch: serve is already up (possibly spawned by an earlier
+    // session in this same pi process). Do NOT touch `serveStartedByUs`
+    // here — see the write-once note at its declaration.
     return;
   }
   const child = spawn("mem", ["serve"], { detached: true, stdio: "ignore", env: process.env });
@@ -54,6 +68,12 @@ function mapResult(r: McpCallResult): { content: McpCallResult["content"]; detai
 }
 
 async function startMcpAndRegisterTools(pi: ExtensionAPI): Promise<void> {
+  // Idempotent teardown FIRST: pi re-fires `session_start` on reload/
+  // newSession/switchSession, and without this a re-fire would spawn a new
+  // `mem mcp` child while the previous one (and its client) leaked, never
+  // killed.
+  stopMcp();
+
   const child = spawn("mem", ["mcp"], {
     stdio: ["pipe", "pipe", "ignore"],
     env: { ...process.env, MEM_BASE_URL },
@@ -72,31 +92,47 @@ async function startMcpAndRegisterTools(pi: ExtensionAPI): Promise<void> {
   await client.initialize();
   const tools = await client.listTools();
 
-  for (const tool of tools) {
-    pi.registerTool({
-      name: tool.name,
-      label: tool.name,
-      description: tool.description ?? tool.name,
-      parameters: tool.inputSchema as never,
-      execute: async (_toolCallId, params) => {
-        const res = await client.callTool(tool.name, params);
-        if (res.isError) {
-          const text = (res.content ?? []).map((c) => c.text ?? "").join("\n") || "mem tool error";
-          throw new Error(text);
-        }
-        return mapResult(res) as never;
-      },
-    });
+  // Register tools only ONCE per process. Each `execute` reads the
+  // module-level `mcpClient` at CALL time (not the `client` captured here),
+  // so after a reload respawns the child above, already-registered tools
+  // transparently pick up the fresh client without re-registering.
+  if (!toolsRegistered) {
+    for (const tool of tools) {
+      pi.registerTool({
+        name: tool.name,
+        label: tool.name,
+        description: tool.description ?? tool.name,
+        parameters: tool.inputSchema as never,
+        execute: async (_toolCallId, params) => {
+          if (!mcpClient) throw new Error("mem mcp not connected");
+          const res = await mcpClient.callTool(tool.name, params);
+          if (res.isError) {
+            const text = (res.content ?? []).map((c) => c.text ?? "").join("\n") || "mem tool error";
+            throw new Error(text);
+          }
+          return mapResult(res) as never;
+        },
+      });
+    }
+    toolsRegistered = true;
+    console.warn(`[mem] registered ${tools.length} tools via mem mcp`);
+  } else {
+    console.warn(`[mem] mem mcp reconnected (${tools.length} tools already registered)`);
   }
-  console.warn(`[mem] registered ${tools.length} tools via mem mcp`);
 }
 
+// Kills the mem mcp child (if any) and disposes its client. Idempotent —
+// safe to call when nothing is running. Deliberately does NOT reset
+// `toolsRegistered`: tools stay registered in pi across a reload: they
+// forward to the module-level `mcpClient`, which this function clears and
+// `startMcpAndRegisterTools` refreshes on the next call.
 function stopMcp(): void {
   if (mcpChild) {
     try { mcpChild.kill("SIGTERM"); } catch { /* gone */ }
     mcpChild = undefined;
-    mcpClient = undefined;
   }
+  mcpClient?.dispose(new Error("mem mcp stopped"));
+  mcpClient = undefined;
 }
 
 async function injectWakeUp(pi: ExtensionAPI): Promise<void> {
