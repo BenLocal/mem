@@ -1,10 +1,21 @@
 {
-  "name": "@shibenenen/mem-pi",
+  "name": "@shibenenen/pi-mem",
   "version": "0.1.0",
   "description": "mem memory service extension for the pi coding agent",
   "keywords": ["pi-package"],
+  "type": "module",
   "pi": {
     "extensions": ["./mem-extension.ts"]
+  },
+  "scripts": {
+    "check": "tsc --noEmit",
+    "test": "node --import tsx --test *.test.ts"
+  },
+  "devDependencies": {
+    "@earendil-works/pi-coding-agent": "^0.74.2",
+    "@types/node": "^20.19.0",
+    "tsx": "^4.19.0",
+    "typescript": "^5.9.0"
   },
   "license": "MIT"
 }

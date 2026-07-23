@@ -87,7 +87,7 @@ export class McpStdioClient {
     await this.request("initialize", {
       protocolVersion: "2024-11-05",
       capabilities: {},
-      clientInfo: { name: "mem-pi", version: "0.1.0" },
+      clientInfo: { name: "pi-mem", version: "0.1.0" },
     });
   }
 
