@@ -467,6 +467,97 @@ fn push_codex_banner_ids(
     }
 }
 
+/// pi analog of [`collect_codex_line`]. One `{"type":"message", message:{role,
+/// content:[…]}}` line; `content[]` blocks are Anthropic-shaped.
+/// - user/system `text` block with a recall banner → `retrieved`.
+/// - assistant `text` block → `assistant_corpus` (the "did the agent use it"
+///   signal). Assistant text is NEVER treated as retrieval (would self-credit
+///   a session that merely discussed mem).
+/// - `tool_use` to a capsule search/get tool + its `tool_result` →
+///   `search_calls` / `fetched` / `retrieved`. Tool name matched by substring
+///   (pi's MCP tool prefix differs from Claude's `mcp__…__`).
+#[allow(clippy::too_many_arguments)]
+fn collect_pi_line(
+    value: &Value,
+    line_idx: usize,
+    all: bool,
+    retrieved: &mut Vec<(String, Vec<String>, usize)>,
+    assistant_corpus: &mut Vec<(usize, String)>,
+    search_calls: &mut HashMap<String, usize>,
+    fetched: &mut HashMap<String, usize>,
+) {
+    if value["type"].as_str() == Some("custom_message") {
+        // pi persists extension-injected recall/wake-up as a top-level
+        // `custom_message` with a bare-string `content`. The recall banner
+        // carries the `mem auto-recall` marker + `[mem_…]` tokens; run it
+        // through the same banner-id extractor used for user/system text.
+        // push_codex_banner_ids no-ops when the marker is absent (e.g. the
+        // wake-up custom_message), so this is safe for all custom_message kinds.
+        if let Some(text) = value["content"].as_str() {
+            push_codex_banner_ids(text, all, line_idx, retrieved);
+        }
+        return;
+    }
+    if value["type"].as_str() != Some("message") {
+        return;
+    }
+    let msg = &value["message"];
+    let role = msg["role"].as_str().unwrap_or("");
+    let content = match msg["content"].as_array() {
+        Some(arr) => arr,
+        None => return,
+    };
+
+    for item in content {
+        match item["type"].as_str().unwrap_or("") {
+            "text" => {
+                let text = item["text"].as_str().unwrap_or("");
+                if role == "assistant" {
+                    assistant_corpus.push((line_idx, text.to_string()));
+                } else {
+                    push_codex_banner_ids(text, all, line_idx, retrieved);
+                }
+            }
+            "tool_use" => {
+                let name = item["name"].as_str().unwrap_or("");
+                if name.contains("capability_capsule_search") {
+                    if let Some(cid) = item["id"].as_str() {
+                        search_calls.insert(cid.to_string(), line_idx);
+                    }
+                } else if name.contains("capability_capsule_get") {
+                    if let Some(cid) = item["input"]["capability_capsule_id"].as_str() {
+                        fetched.entry(cid.to_string()).or_insert(line_idx + 1);
+                    }
+                }
+            }
+            "tool_result" => {
+                let call_id = item["tool_use_id"].as_str().unwrap_or("");
+                let inner = crate::cli::mine::codex_output_text(&item["content"]);
+                if search_calls.contains_key(call_id) {
+                    if let Ok(resp) = serde_json::from_str::<Value>(&inner) {
+                        for section in ["directives", "relevant_facts", "reusable_patterns"] {
+                            if let Some(arr) = resp[section].as_array() {
+                                for entry in arr {
+                                    let mid = entry["capability_capsule_id"].as_str().unwrap_or("");
+                                    if mid.is_empty() {
+                                        continue;
+                                    }
+                                    let text = entry["text"].as_str().unwrap_or("");
+                                    let fp = if all { Vec::new() } else { fingerprint(text) };
+                                    retrieved.push((mid.to_string(), fp, line_idx));
+                                }
+                            }
+                        }
+                    }
+                } else {
+                    push_codex_banner_ids(&inner, all, line_idx, retrieved);
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
 fn scan_transcript(transcript_path: &std::path::Path, all: bool) -> Result<ScanOutcome> {
     let file = File::open(transcript_path)?;
     let reader = BufReader::new(file);
@@ -497,6 +588,19 @@ fn scan_transcript(transcript_path: &std::path::Path, all: bool) -> Result<ScanO
 
         if format == crate::cli::mine::TranscriptFormat::CodexRollout {
             collect_codex_line(
+                &value,
+                line_idx,
+                all,
+                &mut retrieved,
+                &mut assistant_corpus,
+                &mut search_calls,
+                &mut fetched,
+            );
+            continue;
+        }
+
+        if format == crate::cli::mine::TranscriptFormat::PiSession {
+            collect_pi_line(
                 &value,
                 line_idx,
                 all,
@@ -1147,6 +1251,62 @@ mod tests {
             out.credited.contains_key(id),
             "a capability_capsule_get of a recalled id must credit it, got {:?}",
             out.credited
+        );
+    }
+
+    #[test]
+    fn scan_pi_transcript_credits_banner_reused_by_assistant() {
+        // pi persists an extension-injected recall banner as a TOP-LEVEL
+        // `custom_message` line with a bare-string `content` — NOT a
+        // `type:"message"` with `message.content[]`. Verified against a real
+        // on-disk session: `{"type":"custom_message","customType":"mem-recall",
+        // "content":"..."}`. This is the actual shape
+        // `before_agent_start`'s `{message:{customType:"mem-recall",...}}`
+        // return value gets written as (see packaging/pi/mem-extension.ts
+        // `buildRecallBanner` / `pi.on("before_agent_start", ...)`).
+        //
+        // Followed by an assistant message that reuses the retrieved text —
+        // mirrors `scan_codex_rollout_credits_banner_reused_by_assistant`.
+        use std::io::Write;
+
+        let id = "mem_019e9999-aaaa-7bbb-8ccc-dddddddddddd";
+        let banner = format!(
+            "🧠 mem auto-recall — memories relevant to this prompt\n\
+             - DuckDB single-writer MVCC concurrency lock contention `[{id}]`"
+        );
+        let session = serde_json::json!({
+            "type":"session","version":3,"id":"sess-1","timestamp":"t","cwd":"/r"
+        });
+        let recall = serde_json::json!({
+            "type":"custom_message","customType":"mem-recall","content":banner
+        });
+        let asst = serde_json::json!({
+            "type":"message","id":"a1",
+            "message":{"role":"assistant","content":[{"type":"text",
+                "text":"Right — DuckDB is single-writer, so MVCC concurrency and \
+                        lock contention bite when two writers share one file."}]}
+        });
+
+        let mut f = tempfile::NamedTempFile::new().unwrap();
+        writeln!(f, "{session}").unwrap();
+        writeln!(f, "{recall}").unwrap();
+        writeln!(f, "{asst}").unwrap();
+        let consumed = scan_transcript(f.path(), false).unwrap();
+        assert!(
+            consumed.credited.contains_key(id),
+            "pi custom_message recall reused by a later assistant block must be credited, got {:?}",
+            consumed.credited
+        );
+
+        // No reuse → not credited.
+        let mut g = tempfile::NamedTempFile::new().unwrap();
+        writeln!(g, "{session}").unwrap();
+        writeln!(g, "{recall}").unwrap();
+        let unconsumed = scan_transcript(g.path(), false).unwrap();
+        assert!(
+            !unconsumed.credited.contains_key(id),
+            "un-reused pi recall must not be credited, got {:?}",
+            unconsumed.credited
         );
     }
 

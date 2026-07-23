@@ -96,3 +96,14 @@ jieba-rs = "0.9"
 
 [dev-dependencies]
 rand = "0.10"
+
+# Trim test-profile debuginfo. Linking the ~47 `cargo test` integration
+# binaries against the full lance/arrow/candle dependency tree is the
+# slowest, most memory-heavy step of a local test run, and debuginfo is the
+# bulk of that link cost. `line-tables-only` keeps backtraces (file:line in
+# panics) while dropping the rest — a large local link-time/memory win with
+# zero effect on test results. CI goes further to `debug = 0` via a job-level
+# `CARGO_PROFILE_TEST_DEBUG=0` env (see .github/workflows/ci.yml), which takes
+# precedence over this profile key, so CI's leaner setting is unchanged.
+[profile.test]
+debug = "line-tables-only"

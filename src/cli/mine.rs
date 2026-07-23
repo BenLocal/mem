@@ -262,6 +262,9 @@ pub enum TranscriptFormat {
     ClaudeCode,
     /// Codex `rollout-*.jsonl`: `{type, payload, timestamp}` envelopes.
     CodexRollout,
+    /// pi session: `{type:"session",version,..}` header then
+    /// `{type:"message", message:{role, content:[…]}}` lines.
+    PiSession,
 }
 
 /// True when a parsed JSONL line is a Codex rollout envelope — a `payload`
@@ -279,6 +282,13 @@ fn is_codex_rollout_line(v: &Value) -> bool {
                 | "world_state"
                 | "compacted"
         )
+}
+
+/// True when a parsed JSONL line is a pi session header — `type=="session"`
+/// with a `version` field. pi always writes this as its first line, and
+/// neither Claude Code nor Codex uses a top-level `type:"session"` + `version`.
+fn is_pi_session_line(v: &Value) -> bool {
+    v["type"].as_str() == Some("session") && v.get("version").is_some()
 }
 
 /// Detect a transcript's format from its first parseable JSONL line.
@@ -300,6 +310,8 @@ pub(crate) fn detect_transcript_format(path: &Path) -> TranscriptFormat {
         };
         return if is_codex_rollout_line(&v) {
             TranscriptFormat::CodexRollout
+        } else if is_pi_session_line(&v) {
+            TranscriptFormat::PiSession
         } else {
             TranscriptFormat::ClaudeCode
         };
@@ -316,6 +328,7 @@ pub(crate) fn detect_transcript_format(path: &Path) -> TranscriptFormat {
 pub fn effective_source_agent(format: TranscriptFormat, flag: &str) -> String {
     match format {
         TranscriptFormat::CodexRollout => "codex".to_string(),
+        TranscriptFormat::PiSession => "pi".to_string(),
         TranscriptFormat::ClaudeCode => flag.to_string(),
     }
 }
@@ -526,6 +539,158 @@ fn parse_codex_rollout(
     Ok((memories, blocks))
 }
 
+/// Parse a pi session JSONL into `(memories, archive blocks)` — same output
+/// shape as the Claude path. The leading `{"type":"session","id":..}` line
+/// supplies the session id; each `{"type":"message", message:{role, content}}`
+/// line is one message whose `content[]` blocks are Anthropic-shaped (text /
+/// thinking / tool_use / tool_result), so block handling mirrors the Claude
+/// parser. pi's per-line `id` is a stable message uuid (never reminted).
+fn parse_pi_session(
+    path: &Path,
+    heuristic: bool,
+) -> Result<(Vec<ExtractedMemory>, Vec<ArchivedBlock>)> {
+    let file = File::open(path)?;
+    let reader = BufReader::new(file);
+    let mut memories = Vec::new();
+    let mut blocks = Vec::new();
+    let mut session_id = String::new();
+
+    for (line_idx, line) in reader.lines().enumerate() {
+        let line = line?;
+        let value: Value = match serde_json::from_str(&line) {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+        let line_number = line_idx + 1;
+
+        match value["type"].as_str() {
+            Some("session") => {
+                if let Some(sid) = value["id"].as_str() {
+                    session_id = sid.to_string();
+                }
+                continue;
+            }
+            Some("message") => {}
+            // model_change / thinking_level_change / anything else: no blocks.
+            _ => continue,
+        }
+
+        let msg = &value["message"];
+        let role = match msg["role"].as_str() {
+            Some(r @ ("user" | "assistant" | "system")) => r,
+            _ => continue,
+        };
+        let timestamp = value["timestamp"].as_str().unwrap_or("").to_string();
+        let message_uuid = value["id"].as_str().map(|s| s.to_string());
+
+        // pi content is always an array of blocks. Accept a bare string
+        // defensively (mirror the Claude parser's string-shape fallback).
+        let raw_content = &msg["content"];
+        let owned_array;
+        let content_array: &Vec<Value> = if let Some(arr) = raw_content.as_array() {
+            arr
+        } else if let Some(s) = raw_content.as_str() {
+            owned_array = vec![serde_json::json!({"type": "text", "text": s})];
+            &owned_array
+        } else {
+            continue;
+        };
+
+        for (block_idx, item) in content_array.iter().enumerate() {
+            let block_type = item["type"].as_str().unwrap_or("");
+
+            if role == "assistant" && block_type == "text" {
+                if let Some(text) = item["text"].as_str() {
+                    extract_memories_from_assistant_text(
+                        text,
+                        heuristic,
+                        &session_id,
+                        &timestamp,
+                        line_number,
+                        &mut memories,
+                    );
+                }
+            }
+
+            let archived = match block_type {
+                "text" => Some(ArchivedBlock {
+                    session_id: session_id.clone(),
+                    timestamp: timestamp.clone(),
+                    line_number,
+                    block_index: block_idx,
+                    message_uuid: message_uuid.clone(),
+                    role: role.to_string(),
+                    block_type: "text".to_string(),
+                    content: item["text"].as_str().unwrap_or("").to_string(),
+                    tool_name: None,
+                    tool_use_id: None,
+                    meta_json: None,
+                }),
+                "thinking" => Some(ArchivedBlock {
+                    session_id: session_id.clone(),
+                    timestamp: timestamp.clone(),
+                    line_number,
+                    block_index: block_idx,
+                    message_uuid: message_uuid.clone(),
+                    role: role.to_string(),
+                    block_type: "thinking".to_string(),
+                    content: item["thinking"].as_str().unwrap_or("").to_string(),
+                    tool_name: None,
+                    tool_use_id: None,
+                    meta_json: None,
+                }),
+                "tool_use" => Some(ArchivedBlock {
+                    session_id: session_id.clone(),
+                    timestamp: timestamp.clone(),
+                    line_number,
+                    block_index: block_idx,
+                    message_uuid: message_uuid.clone(),
+                    role: role.to_string(),
+                    block_type: "tool_use".to_string(),
+                    content: item["input"].to_string(),
+                    tool_name: item["name"].as_str().map(|s| s.to_string()),
+                    tool_use_id: item["id"].as_str().map(|s| s.to_string()),
+                    meta_json: None,
+                }),
+                "tool_result" => Some(ArchivedBlock {
+                    session_id: session_id.clone(),
+                    timestamp: timestamp.clone(),
+                    line_number,
+                    block_index: block_idx,
+                    message_uuid: message_uuid.clone(),
+                    role: role.to_string(),
+                    block_type: "tool_result".to_string(),
+                    content: pi_tool_result_text(&item["content"]),
+                    tool_name: None,
+                    tool_use_id: item["tool_use_id"].as_str().map(|s| s.to_string()),
+                    meta_json: None,
+                }),
+                _ => None,
+            };
+            if let Some(b) = archived {
+                blocks.push(b);
+            }
+        }
+    }
+
+    Ok((memories, blocks))
+}
+
+/// A pi `tool_result` block's `content` is usually a string but may be an
+/// array of `{type:"text", text}` items (Anthropic tool-result shape).
+/// Concatenate either verbatim.
+fn pi_tool_result_text(content: &Value) -> String {
+    match content {
+        Value::String(s) => s.clone(),
+        Value::Array(items) => items
+            .iter()
+            .filter_map(|it| it["text"].as_str())
+            .collect::<Vec<_>>()
+            .join(""),
+        other => other.to_string(),
+    }
+}
+
 /// Parses a Claude Code JSONL transcript into both extracted memories
 /// (legacy `<mem-save>` / pattern matches) and a flat list of every
 /// block ready to be POSTed to `/transcripts/messages`.
@@ -549,6 +714,9 @@ pub fn parse_transcript_full(
     // own parser. Claude Code (the default) falls through to the body below.
     if detect_transcript_format(path) == TranscriptFormat::CodexRollout {
         return parse_codex_rollout(path, heuristic);
+    }
+    if detect_transcript_format(path) == TranscriptFormat::PiSession {
+        return parse_pi_session(path, heuristic);
     }
     let file = File::open(path)?;
     let reader = BufReader::new(file);
@@ -1498,5 +1666,65 @@ mod codex_format_tests {
             effective_source_agent(TranscriptFormat::ClaudeCode, "some-other-agent"),
             "some-other-agent"
         );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const PI_FIXTURE: &str = r#"{"type":"session","version":3,"id":"019f8771-aaaa-bbbb","timestamp":"2026-07-22T01:29:20.291Z","cwd":"/repo"}
+{"type":"model_change","id":"m1","parentId":null,"timestamp":"2026-07-22T01:29:20.354Z","provider":"p","modelId":"x"}
+{"type":"message","id":"u1","parentId":"m1","timestamp":"2026-07-22T01:29:36.855Z","message":{"role":"user","content":[{"type":"text","text":"how does pi store sessions"}],"timestamp":1784683776846}}
+{"type":"message","id":"a1","parentId":"u1","timestamp":"2026-07-22T01:29:40.000Z","message":{"role":"assistant","content":[{"type":"text","text":"<mem-save>pi persists sessions as JSONL under ~/.pi/agent/sessions</mem-save>"}],"timestamp":1784683780000}}
+"#;
+
+    fn write_pi_fixture(dir: &std::path::Path) -> std::path::PathBuf {
+        let p = dir.join("pi-session.jsonl");
+        std::fs::write(&p, PI_FIXTURE).unwrap();
+        p
+    }
+
+    #[test]
+    fn detects_pi_session_format() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = write_pi_fixture(dir.path());
+        assert_eq!(detect_transcript_format(&p), TranscriptFormat::PiSession);
+    }
+
+    #[test]
+    fn pi_source_agent_is_pi_regardless_of_flag() {
+        assert_eq!(
+            effective_source_agent(TranscriptFormat::PiSession, "claude-code"),
+            "pi"
+        );
+    }
+
+    #[test]
+    fn parse_pi_session_extracts_memory_and_blocks() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = write_pi_fixture(dir.path());
+        let (mems, blocks) = parse_transcript_full(&p, false).unwrap();
+
+        // The assistant <mem-save> is extracted.
+        assert_eq!(mems.len(), 1, "one mem-save memory");
+        assert!(mems[0].content.contains("pi persists sessions"));
+        assert!(!mems[0].pending);
+
+        // Two message lines → two text blocks (user + assistant); the
+        // session/model_change lines produce none.
+        assert_eq!(blocks.len(), 2, "user + assistant text blocks");
+        let user = &blocks[0];
+        assert_eq!(user.role, "user");
+        assert_eq!(user.block_type, "text");
+        assert_eq!(user.content, "how does pi store sessions");
+        // session_id comes from the leading {"type":"session","id":..} line.
+        assert_eq!(user.session_id, "019f8771-aaaa-bbbb");
+        // message_uuid is pi's stable per-line id (NOT reminted).
+        assert_eq!(user.message_uuid.as_deref(), Some("u1"));
+
+        let asst = &blocks[1];
+        assert_eq!(asst.role, "assistant");
+        assert_eq!(asst.message_uuid.as_deref(), Some("a1"));
     }
 }

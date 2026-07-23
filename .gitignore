@@ -11,6 +11,11 @@ target/
 # Worktrees
 .worktrees/
 
+# Local-only Cargo build tuning (e.g. mold linker). Machine-specific —
+# CI runners lack mold/clang, so this must never be committed. See the
+# file's own header for rationale.
+.cargo/
+
 # Recall bench fixtures (gitignored — real transcripts may be sensitive)
 bench-fixtures/
 target/bench-out/
