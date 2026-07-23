@@ -23,3 +23,5 @@ target/bench-out/
 admin-page-*.png
 
 /docs/superpowers
+# pi coding-agent local runtime dir (created by `pi -e` smoke tests in-repo)
+.pi/
