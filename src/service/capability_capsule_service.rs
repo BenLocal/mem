@@ -1701,11 +1701,32 @@ impl CapabilityCapsuleService {
         // intent signals score against the broader pool.
         const HYBRID_K: usize = 48;
         let pool_fut = self.store.search_candidates(tenant);
+        // Query embedding under the semantic-channel deadline (same knob as
+        // the ANN seam in `hybrid_candidates_compose`): a stalled embed —
+        // model hiccup, CPU squeeze — degrades this search to BM25-only
+        // (empty vec ⇒ `has_vec=false` downstream) instead of blowing the
+        // caller's budget. See `storage::store::recall_semantic_timeout`.
         let query_vec_fut = async {
             let Some(provider) = self.embedding_search_provider.as_ref() else {
                 return Vec::new();
             };
-            provider.embed_query(&query.query).await.unwrap_or_default()
+            let embed = async { provider.embed_query(&query.query).await.unwrap_or_default() };
+            match crate::storage::store::with_deadline(
+                embed,
+                crate::storage::store::recall_semantic_timeout(),
+            )
+            .await
+            {
+                Some(vec) => vec,
+                None => {
+                    tracing::warn!(
+                        "query embedding exceeded MEM_RECALL_SEMANTIC_TIMEOUT_MS; \
+                         degrading this search to BM25-only recall"
+                    );
+                    crate::metrics::metrics().inc_recall_semantic_timeout();
+                    Vec::new()
+                }
+            }
         };
         let (pool_res, query_vec) = tokio::join!(pool_fut, query_vec_fut);
         let pool = pool_res.map_err(ServiceError::Storage)?;

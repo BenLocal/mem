@@ -669,9 +669,28 @@ impl Store {
         } else {
             Vec::new()
         };
+        // Semantic-channel deadline: the lance ANN task can queue for
+        // seconds behind IVF index-build tasks in lance's global FIFO
+        // compute pool (see [`recall_semantic_timeout`]). On elapse,
+        // degrade to BM25-only fusion instead of stalling the search
+        // past the caller's budget.
         let ann = if has_vec {
-            self.ann_candidate_ids(tenant, query_embedding, oversample)
-                .await?
+            match with_deadline(
+                self.ann_candidate_ids(tenant, query_embedding, oversample),
+                recall_semantic_timeout(),
+            )
+            .await
+            {
+                Some(res) => res?,
+                None => {
+                    tracing::warn!(
+                        "capsule ANN exceeded MEM_RECALL_SEMANTIC_TIMEOUT_MS; \
+                         degrading this search to BM25-only recall"
+                    );
+                    crate::metrics::metrics().inc_recall_semantic_timeout();
+                    Vec::new()
+                }
+            }
         } else {
             Vec::new()
         };
@@ -1990,5 +2009,105 @@ mod tests {
         // Empty batch is a no-op (does not panic, does not refresh
         // when there is nothing to write).
         store.insert_capability_capsules(&[]).await.unwrap();
+    }
+}
+
+/// Live-read deadline for the **semantic recall channel** (query embedding +
+/// lance vector ANN) of capsule search: `MEM_RECALL_SEMANTIC_TIMEOUT_MS`,
+/// default 1500 ms, `0` disables. Read live (tunes without restart, same
+/// convention as `MEM_RECALL_PER_SOURCE_CAP`); invalid values fall back to
+/// the default.
+///
+/// Why this exists: lance schedules query-side KNN compute (`spawn_cpu` in
+/// `lance::io::exec::knn`) and IVF index-build compute (`spawn_cpu` in
+/// `lance::index::vector::ivf::builder`) onto the SAME global FIFO pool
+/// ("lance-cpu", one per process). During an IVF rebuild of the ~100k-row
+/// transcript embedding table (delta-triggered in the hourly vacuum sweep,
+/// or `POST /admin/reindex`), a search's ANN task queues behind hundreds of
+/// build tasks — measured capsule search 0.4s → 3–5s for the whole ~90s
+/// build, with process CPU near-idle (queueing, not core saturation; capping
+/// the pool via `LANCE_CPU_THREADS` measurably did NOT help, and plain lance
+/// table scans stay sub-millisecond throughout). That spike is what tipped
+/// pi's 5s `before_agent_start` auto-recall into `TimeoutError`.
+///
+/// The deadline converts that stall into a bounded degrade: BM25 (in-RAM
+/// Tantivy, never touches the lance-cpu pool) + lexical/scope/graph signals
+/// still rank, so recall returns fast with slightly reduced quality instead
+/// of blowing past the caller's timeout with nothing. Same philosophy as the
+/// transcript search soft-degrade.
+pub fn recall_semantic_timeout() -> Option<std::time::Duration> {
+    semantic_timeout_from(
+        std::env::var("MEM_RECALL_SEMANTIC_TIMEOUT_MS")
+            .ok()
+            .as_deref(),
+    )
+}
+
+/// Pure parse half of [`recall_semantic_timeout`], split out for tests.
+fn semantic_timeout_from(raw: Option<&str>) -> Option<std::time::Duration> {
+    const DEFAULT_MS: u64 = 1_500;
+    let ms = raw
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(DEFAULT_MS);
+    (ms > 0).then(|| std::time::Duration::from_millis(ms))
+}
+
+/// Await `fut` under an optional deadline: `Some(output)` when it completes
+/// in time (or no deadline is set), `None` when the deadline elapses first.
+/// The timed-out future is dropped — for a lance query that cancels it at
+/// its next await point; a task already queued in the lance-cpu pool may
+/// still run to completion there, which is harmless wasted work.
+pub async fn with_deadline<F: std::future::Future>(
+    fut: F,
+    deadline: Option<std::time::Duration>,
+) -> Option<F::Output> {
+    match deadline {
+        Some(d) => tokio::time::timeout(d, fut).await.ok(),
+        None => Some(fut.await),
+    }
+}
+
+#[cfg(test)]
+mod semantic_deadline_tests {
+    use super::{semantic_timeout_from, with_deadline};
+    use std::time::Duration;
+
+    #[test]
+    fn timeout_knob_default_disable_and_invalid() {
+        // Unset → default 1500ms.
+        assert_eq!(
+            semantic_timeout_from(None),
+            Some(Duration::from_millis(1500))
+        );
+        // Explicit value honored.
+        assert_eq!(
+            semantic_timeout_from(Some("250")),
+            Some(Duration::from_millis(250))
+        );
+        // `0` disables the deadline entirely.
+        assert_eq!(semantic_timeout_from(Some("0")), None);
+        // Invalid falls back to the default (repo-wide env-knob convention).
+        assert_eq!(
+            semantic_timeout_from(Some("abc")),
+            Some(Duration::from_millis(1500))
+        );
+    }
+
+    #[tokio::test]
+    async fn with_deadline_passes_through_a_completing_future() {
+        assert_eq!(
+            with_deadline(async { 5u8 }, Some(Duration::from_secs(5))).await,
+            Some(5)
+        );
+        // No deadline → plain await.
+        assert_eq!(with_deadline(async { 7u8 }, None).await, Some(7));
+    }
+
+    #[tokio::test]
+    async fn with_deadline_returns_none_when_future_outlives_deadline() {
+        // A never-completing future models the queued lance ANN task stuck
+        // behind IVF-build tasks in the lance-cpu FIFO pool.
+        let r = with_deadline(std::future::pending::<u8>(), Some(Duration::from_millis(5))).await;
+        assert_eq!(r, None);
     }
 }

@@ -442,13 +442,26 @@ impl TranscriptService {
                 // hits already gathered above. Mirrors the capsule search side
                 // (`unwrap_or_default()` on the same call) and the ANN
                 // soft-degrade immediately below.
-                let q_vec = match provider.embed_query(query).await {
-                    Ok(v) => Some(v),
-                    Err(e) => {
+                let q_vec = match crate::storage::store::with_deadline(
+                    provider.embed_query(query),
+                    crate::storage::store::recall_semantic_timeout(),
+                )
+                .await
+                {
+                    Some(Ok(v)) => Some(v),
+                    Some(Err(e)) => {
                         warn!(
                             error = %e,
                             "transcript query embed failed; serving BM25-only results for this query"
                         );
+                        None
+                    }
+                    None => {
+                        warn!(
+                            "transcript query embed exceeded MEM_RECALL_SEMANTIC_TIMEOUT_MS; \
+                             serving BM25-only results for this query"
+                        );
+                        crate::metrics::metrics().inc_recall_semantic_timeout();
                         None
                     }
                 };
@@ -472,10 +485,30 @@ impl TranscriptService {
                     // burst of failing queries can't stampede. If the rebuild, a
                     // concurrent rebuild, or the retry still can't serve ANN,
                     // soft-degrade to the always-on BM25 channel rather than 500.
-                    let mut sem_result = self
-                        .store
-                        .semantic_search_transcripts(tenant, &q_vec, oversample)
-                        .await;
+                    // Slow ≠ broken: the ANN task can also queue for seconds
+                    // behind IVF index-BUILD tasks in lance's global FIFO
+                    // compute pool (`storage::store::recall_semantic_timeout`
+                    // has the full story). A deadline elapse degrades to
+                    // BM25-only WITHOUT the self-heal below — a queued scan is
+                    // not a stale-index error, and force-reindexing would pile
+                    // MORE build work onto the very pool that's busy.
+                    let mut sem_result = match crate::storage::store::with_deadline(
+                        self.store
+                            .semantic_search_transcripts(tenant, &q_vec, oversample),
+                        crate::storage::store::recall_semantic_timeout(),
+                    )
+                    .await
+                    {
+                        Some(res) => res,
+                        None => {
+                            warn!(
+                                "transcript ANN exceeded MEM_RECALL_SEMANTIC_TIMEOUT_MS; \
+                                 serving BM25-only results for this query"
+                            );
+                            crate::metrics::metrics().inc_recall_semantic_timeout();
+                            Ok(Vec::new())
+                        }
+                    };
                     if sem_result.is_err() {
                         // Self-heal only if BOTH the cooldown has elapsed (no
                         // rapid-sequential rebuild storm when a reindex can't fix

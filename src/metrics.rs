@@ -64,6 +64,7 @@ pub struct Metrics {
     feedback_system_reweight_decay: AtomicU64,
     rerank_pairs_total: AtomicU64,
     rerank_merges_vetoed: AtomicU64,
+    recall_semantic_timeouts: AtomicU64,
     /// Current Lance version-manifest count per managed table, refreshed by
     /// the vacuum sweep. A gauge (overwritten, not incremented), so it needs a
     /// lock — the only non-atomic field. Early-warning signal for version
@@ -154,6 +155,16 @@ impl Metrics {
         self.rerank_merges_vetoed.fetch_add(1, Ordering::Relaxed);
     }
 
+    /// One capsule-search semantic channel (query embed or lance ANN) hit
+    /// the `MEM_RECALL_SEMANTIC_TIMEOUT_MS` deadline and the search degraded
+    /// to BM25-only recall. Single cross-seam counter (redaction_hits
+    /// precedent) — the question is "is the degrade firing at all"; the two
+    /// seams' warn! lines tell them apart when it is.
+    pub fn inc_recall_semantic_timeout(&self) {
+        self.recall_semantic_timeouts
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
     /// Overwrite the per-table Lance version-count gauge (called by the vacuum
     /// sweep each pass). A poisoned lock silently no-ops — a stale gauge must
     /// never break the vacuum path.
@@ -185,6 +196,7 @@ impl Metrics {
             feedback_system_reweight_decay: load(&self.feedback_system_reweight_decay),
             rerank_pairs_total: load(&self.rerank_pairs_total),
             rerank_merges_vetoed: load(&self.rerank_merges_vetoed),
+            recall_semantic_timeouts: load(&self.recall_semantic_timeouts),
             table_versions: self
                 .table_versions
                 .lock()
@@ -216,6 +228,7 @@ pub struct MetricsSnapshot {
     pub feedback_system_reweight_decay: u64,
     pub rerank_pairs_total: u64,
     pub rerank_merges_vetoed: u64,
+    pub recall_semantic_timeouts: u64,
     /// Lance version-manifest count per managed table (empty until the first
     /// vacuum sweep populates it). Watch for a table climbing into the
     /// thousands — that's version-history bloat brewing.
