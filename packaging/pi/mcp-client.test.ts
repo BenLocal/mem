@@ -1,7 +1,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { PassThrough } from "node:stream";
-import { McpStdioClient } from "./mcp-client.ts";
+import { McpStdioClient, ReconnectingMcp } from "./mcp-client.ts";
 import { isServeUp, buildRecallBanner } from "./mem-extension.ts";
 import http from "node:http";
 
@@ -9,6 +9,22 @@ function fakeChild() {
   const stdin = new PassThrough(); // extension writes here (requests)
   const stdout = new PassThrough(); // extension reads here (replies)
   return { stdin, stdout };
+}
+
+// Builds an McpStdioClient over a fake child whose server tags every
+// tools/call reply with `tag`, so a test can tell which underlying connection
+// answered. Returns the client (already listening); caller drives it.
+function taggedClient(tag: string): McpStdioClient {
+  const child = fakeChild();
+  child.stdin.on("data", (buf: Buffer) => {
+    for (const line of buf.toString("utf8").split("\n")) {
+      if (!line.trim()) continue;
+      const req = JSON.parse(line);
+      const result = req.method === "tools/call" ? { content: [{ type: "text", text: tag }] } : {};
+      child.stdout.write(JSON.stringify({ jsonrpc: "2.0", id: req.id, result }) + "\n");
+    }
+  });
+  return new McpStdioClient(child);
 }
 
 test("listTools returns the tools from a tools/list reply", async () => {
@@ -112,6 +128,67 @@ test("dispose() rejects a pending request with the given error", async () => {
     assert.equal(e, boom);
     return true;
   });
+});
+
+test("ReconnectingMcp reconnects after the current client is disposed (child exit)", async () => {
+  // Regression: when the spawned `mem mcp` child exits mid-session, its client
+  // is disposed and — before this fix — every subsequent tool call rejected
+  // with "mem mcp exited" for the rest of the session, with no respawn. The
+  // reconnecting wrapper must detect the dead client and reconnect on the next
+  // call so mem stays usable without a session reload.
+  let connects = 0;
+  const clients: McpStdioClient[] = [];
+  const connect = async (): Promise<McpStdioClient> => {
+    connects++;
+    const client = taggedClient(`conn-${connects}`);
+    clients.push(client);
+    return client;
+  };
+  const mcp = new ReconnectingMcp(connect);
+
+  const r1 = await mcp.call("capability_capsule_search", { query: "a" });
+  assert.equal(r1.content[0].text, "conn-1");
+  assert.equal(connects, 1);
+
+  // Simulate the real `child.on("exit")` handler disposing the live client.
+  clients[0].dispose(new Error("mem mcp exited"));
+
+  const r2 = await mcp.call("capability_capsule_search", { query: "b" });
+  assert.equal(r2.content[0].text, "conn-2"); // answered by a FRESH connection
+  assert.equal(connects, 2);
+});
+
+test("ReconnectingMcp reuses a healthy client across calls (connects once)", async () => {
+  let connects = 0;
+  const connect = async (): Promise<McpStdioClient> => {
+    connects++;
+    return taggedClient(`conn-${connects}`);
+  };
+  const mcp = new ReconnectingMcp(connect);
+
+  await mcp.call("capability_capsule_search", { query: "a" });
+  await mcp.call("capability_capsule_search", { query: "b" });
+  assert.equal(connects, 1); // a live client is not re-spawned
+});
+
+test("ReconnectingMcp shares a single in-flight connect across concurrent calls", async () => {
+  let connects = 0;
+  const connect = async (): Promise<McpStdioClient> => {
+    connects++;
+    await new Promise((r) => setTimeout(r, 10)); // widen the race window
+    return taggedClient(`conn-${connects}`);
+  };
+  const mcp = new ReconnectingMcp(connect);
+
+  // Two calls fired before the first connect resolves must not each spawn a
+  // child — they share the one in-flight connection.
+  const [a, b] = await Promise.all([
+    mcp.call("capability_capsule_search", { query: "a" }),
+    mcp.call("capability_capsule_search", { query: "b" }),
+  ]);
+  assert.equal(a.content[0].text, "conn-1");
+  assert.equal(b.content[0].text, "conn-1");
+  assert.equal(connects, 1);
 });
 
 test("isServeUp is true when /health returns 200", async () => {
