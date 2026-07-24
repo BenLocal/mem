@@ -98,6 +98,12 @@ pub struct LanceStore {
     /// Whether the transcript FTS index has been populated at least once
     /// (lazy-build latch — mirrors `fts_built`).
     transcript_fts_built: Arc<std::sync::atomic::AtomicBool>,
+    /// Source-table Lance `version()` at the last capsule/transcript FTS
+    /// rebuild driven by `ensure_query_indexes`. `0` = never indexed. Lets an
+    /// idle maintenance sweep skip the redundant full Tantivy rebuild when the
+    /// corpus is unchanged — see `maintenance::fts_needs_rebuild`.
+    capsule_fts_indexed_version: Arc<std::sync::atomic::AtomicU64>,
+    transcript_fts_indexed_version: Arc<std::sync::atomic::AtomicU64>,
 }
 
 impl LanceStore {
@@ -191,6 +197,8 @@ impl LanceStore {
             fts_built: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             transcript_fts: Arc::new(crate::storage::fts::FtsIndex::new()?),
             transcript_fts_built: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            capsule_fts_indexed_version: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            transcript_fts_indexed_version: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         })
     }
 

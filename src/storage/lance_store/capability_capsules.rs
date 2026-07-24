@@ -2192,6 +2192,50 @@ mod tests {
         assert!(wrong_tenant.is_none());
     }
 
+    /// `ensure_query_indexes` must skip the (CPU-bound) Tantivy FTS rebuild
+    /// when the source table is unchanged since the last pass, and rebuild
+    /// only the bucket whose source actually changed. This is the
+    /// reindex↔read-contention fix — an idle hourly sweep no longer spikes
+    /// `/capability_capsules/search` latency (which tips pi's 5s auto-recall).
+    #[tokio::test]
+    pub async fn ensure_query_indexes_skips_fts_rebuild_when_corpus_unchanged() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("lance.store");
+        let repo = LanceStore::open(&path).await.unwrap();
+
+        repo.insert_capability_capsule(fixture("mem_fts_1", "tenant-a"))
+            .await
+            .unwrap();
+
+        // First pass builds both FTS buckets (capsule + transcript). The tiny
+        // corpus is below MIN_ROWS_TO_INDEX, so no vector/scalar index is
+        // built — `indexes_rebuilt` is exactly the FTS count.
+        let first = repo.ensure_query_indexes().await.unwrap();
+        assert_eq!(
+            first.indexes_rebuilt, 2,
+            "both FTS buckets built on the first pass"
+        );
+
+        // Second pass, no writes in between: source Lance versions unchanged →
+        // both FTS rebuilds skipped.
+        let second = repo.ensure_query_indexes().await.unwrap();
+        assert_eq!(
+            second.indexes_rebuilt, 0,
+            "an unchanged corpus rebuilds no FTS bucket"
+        );
+
+        // A write to capability_capsules bumps only its version → capsule FTS
+        // rebuilds; transcript FTS still skipped (per-source-table gating).
+        repo.insert_capability_capsule(fixture("mem_fts_2", "tenant-a"))
+            .await
+            .unwrap();
+        let third = repo.ensure_query_indexes().await.unwrap();
+        assert_eq!(
+            third.indexes_rebuilt, 1,
+            "only the changed bucket (capsule FTS) rebuilds"
+        );
+    }
+
     // The previous `lancedb_filter_methods_round_trip` test that
     // lived here was deleted along with the lance-side filter
     // readers (`list_capability_capsules_for_tenant`, `get_pending`,

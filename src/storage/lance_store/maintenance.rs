@@ -163,6 +163,28 @@ fn decide_index_action(row_count: usize, unindexed: Option<usize>, force: bool) 
     }
 }
 
+/// Pure policy: rebuild an FTS bucket only when forced, or when its source
+/// Lance table advanced past the version we last indexed.
+///
+/// The Tantivy capsule/transcript BM25 indexes are full-rebuilt from their
+/// source table (`capability_capsules` / `conversation_messages`). Before this
+/// gate they rebuilt on *every* `ensure_query_indexes` pass (hourly via the
+/// vacuum worker) regardless of change — a full transcript rebuild burns CPU
+/// for a few seconds and, colliding with concurrent `/capability_capsules/search`,
+/// pushed recall latency from ~0.4s to 3–5s (contending for cores, not a lock:
+/// `FtsIndex::rebuild` builds off to the side and only swaps under the write
+/// lock). That is what tips pi's 5s `before_agent_start` auto-recall over.
+///
+/// A source table's Lance `version()` is stable while the corpus is unchanged
+/// — an idle-period vacuum is a no-op that creates no new version — so gating
+/// on it skips the redundant rebuild during idle while still rebuilding
+/// promptly after any write. `last_indexed == 0` is the "never indexed"
+/// sentinel (real Lance versions are ≥1); `!=` (not `>`) so a table recreated
+/// at a lower version never wrongly skips.
+fn fts_needs_rebuild(current_version: u64, last_indexed: u64, force: bool) -> bool {
+    force || current_version != last_indexed
+}
+
 /// Outcome of one [`LanceStore::ensure_query_indexes`] pass.
 #[derive(Debug, Default, Clone, serde::Serialize)]
 pub struct IndexMaintenanceStats {
@@ -389,29 +411,81 @@ impl LanceStore {
                 IndexAction::Skip => unreachable!("skip handled above"),
             }
         }
-        // Rebuild the Tantivy capsule + transcript BM25 indexes from the
-        // live corpus (startup full-rebuild strategy — see
-        // `crate::storage::fts`). Unlike the lance IVF/scalar indexes there's
-        // no per-table delta tracking — the rebuild is cheap (<1s at real
-        // scale) and a full rebuild is the whole design. The Tantivy index
-        // backs the only BM25 read path (`bm25_candidate_ids` /
-        // `bm25_transcript_candidates`); the eager rebuild here keeps it
-        // fresh, and if it's ever skipped both readers still lazy-build on
-        // first query (the `*_fts_built` latch), so the index is never
-        // missing. This is what makes the "seed → rebuild_query_indexes →
-        // query" test flow cover the capsule_fts AND transcript_fts buckets;
-        // each counts as one rebuilt index in the stats.
-        self.rebuild_capsule_fts().await?;
-        agg.indexes_rebuilt += 1;
-        self.rebuild_transcript_fts().await?;
-        agg.indexes_rebuilt += 1;
+        // Rebuild the Tantivy capsule + transcript BM25 indexes from the live
+        // corpus (startup full-rebuild strategy — see `crate::storage::fts`),
+        // but only when the source table changed since we last indexed it (or
+        // `force`). The rebuild is CPU-bound and, run every hourly sweep
+        // regardless of change, was the dominant reindex↔read contention (see
+        // [`fts_needs_rebuild`]); gating on the source Lance `version()` skips
+        // it during idle. If ever skipped, both BM25 readers still lazy-build
+        // on first query (the `*_fts_built` latch), so the index is never
+        // missing. Each actual rebuild counts as one rebuilt index in the
+        // stats; a skipped bucket counts as one skipped table. Read the
+        // version BEFORE rebuilding and store it AFTER success — a write
+        // landing in between just triggers one extra (never-stale) rebuild.
+        let capsule_ver = self.table_version("capability_capsules").await?;
+        if fts_needs_rebuild(
+            capsule_ver,
+            self.capsule_fts_indexed_version
+                .load(std::sync::atomic::Ordering::SeqCst),
+            force,
+        ) {
+            self.rebuild_capsule_fts().await?;
+            self.capsule_fts_indexed_version
+                .store(capsule_ver, std::sync::atomic::Ordering::SeqCst);
+            agg.indexes_rebuilt += 1;
+        } else {
+            agg.tables_skipped += 1;
+        }
+        let transcript_ver = self.table_version("conversation_messages").await?;
+        if fts_needs_rebuild(
+            transcript_ver,
+            self.transcript_fts_indexed_version
+                .load(std::sync::atomic::Ordering::SeqCst),
+            force,
+        ) {
+            self.rebuild_transcript_fts().await?;
+            self.transcript_fts_indexed_version
+                .store(transcript_ver, std::sync::atomic::Ordering::SeqCst);
+            agg.indexes_rebuilt += 1;
+        } else {
+            agg.tables_skipped += 1;
+        }
         Ok(agg)
+    }
+
+    /// Current Lance `version()` of a managed table — a cheap manifest read
+    /// used to gate FTS rebuilds (see [`fts_needs_rebuild`]). A `TableNotFound`
+    /// (lazy/absent table) maps to `0`, the "never indexed" sentinel, so a
+    /// later create advances past it and triggers the first build.
+    async fn table_version(&self, name: &str) -> Result<u64, StorageError> {
+        match self.conn.open_table(name).execute().await {
+            Ok(t) => t.version().await.map_err(lancedb_err),
+            Err(lancedb::Error::TableNotFound { .. }) => Ok(0),
+            Err(e) => Err(lancedb_err(e)),
+        }
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn fts_rebuild_gated_on_source_version() {
+        // Never indexed yet (sentinel 0) → must build, even at version 1.
+        assert!(fts_needs_rebuild(1, 0, false));
+        // Source unchanged since the last index → skip the redundant rebuild.
+        // This is the idle-sweep win: a no-op vacuum leaves the version stable.
+        assert!(!fts_needs_rebuild(42, 42, false));
+        // Corpus advanced (new writes bumped the Lance version) → rebuild.
+        assert!(fts_needs_rebuild(43, 42, false));
+        // `force` (POST /admin/reindex) always rebuilds, unchanged or not.
+        assert!(fts_needs_rebuild(42, 42, true));
+        // Table recreated → version reset below last-indexed → still rebuild
+        // (`!=`, not `>`), so a lower version never wrongly skips.
+        assert!(fts_needs_rebuild(1, 500, false));
+    }
 
     #[test]
     fn tiny_tables_are_skipped() {
