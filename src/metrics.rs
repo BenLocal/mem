@@ -65,6 +65,7 @@ pub struct Metrics {
     rerank_pairs_total: AtomicU64,
     rerank_merges_vetoed: AtomicU64,
     recall_semantic_timeouts: AtomicU64,
+    recall_semantic_skips: AtomicU64,
     /// Current Lance version-manifest count per managed table, refreshed by
     /// the vacuum sweep. A gauge (overwritten, not incremented), so it needs a
     /// lock — the only non-atomic field. Early-warning signal for version
@@ -165,6 +166,15 @@ impl Metrics {
             .fetch_add(1, Ordering::Relaxed);
     }
 
+    /// A search PREEMPTIVELY skipped its semantic channel because an index
+    /// build was in flight (`storage::index_build_in_flight`) — the diffuse
+    /// build-window slowdown can't be bounded per-leg, so the pipelines don't
+    /// even start the embed. Distinct from `recall_semantic_timeouts` (waited
+    /// and got cut) so the two degrade modes stay separable in /metrics.
+    pub fn inc_recall_semantic_skip(&self) {
+        self.recall_semantic_skips.fetch_add(1, Ordering::Relaxed);
+    }
+
     /// Overwrite the per-table Lance version-count gauge (called by the vacuum
     /// sweep each pass). A poisoned lock silently no-ops — a stale gauge must
     /// never break the vacuum path.
@@ -197,6 +207,7 @@ impl Metrics {
             rerank_pairs_total: load(&self.rerank_pairs_total),
             rerank_merges_vetoed: load(&self.rerank_merges_vetoed),
             recall_semantic_timeouts: load(&self.recall_semantic_timeouts),
+            recall_semantic_skips: load(&self.recall_semantic_skips),
             table_versions: self
                 .table_versions
                 .lock()
@@ -229,6 +240,7 @@ pub struct MetricsSnapshot {
     pub rerank_pairs_total: u64,
     pub rerank_merges_vetoed: u64,
     pub recall_semantic_timeouts: u64,
+    pub recall_semantic_skips: u64,
     /// Lance version-manifest count per managed table (empty until the first
     /// vacuum sweep populates it). Watch for a table climbing into the
     /// thousands — that's version-history bloat brewing.

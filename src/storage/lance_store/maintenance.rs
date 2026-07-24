@@ -163,6 +163,49 @@ fn decide_index_action(row_count: usize, unindexed: Option<usize>, force: bool) 
     }
 }
 
+/// Process-wide "an index build is in flight" flag, read by the search
+/// pipelines to PREEMPTIVELY skip the semantic channel (query embed + lance
+/// ANN) while `ensure_query_indexes_inner` runs.
+///
+/// Why skipping beats waiting: during an IVF/FTS rebuild the slowdown on the
+/// query path is DIFFUSE — embed, ANN, and hydrate each degrade a little
+/// (none past the per-leg `MEM_RECALL_SEMANTIC_TIMEOUT_MS` deadline) but the
+/// sum reaches 3–5s, occasionally past pi's 5s recall budget (measured
+/// 2026-07-24: build-window searches 2.9–5.1s with ZERO deadline elapses).
+/// No per-leg deadline can bound that sum; skipping the semantic legs
+/// entirely during the (~1–2 min/day) build windows pins recall at plain
+/// BM25 speed (~0.5s) deterministically. The per-leg deadline stays as the
+/// guard for NON-build slowness (a stalled model, ambient CPU squeeze).
+static INDEX_BUILD_IN_FLIGHT: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// True while any `ensure_query_indexes` / `rebuild_query_indexes` pass is
+/// running in this process (hourly vacuum sweep, `POST /admin/reindex`, or
+/// the transcript ANN self-heal).
+pub fn index_build_in_flight() -> bool {
+    INDEX_BUILD_IN_FLIGHT.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// RAII scope for [`INDEX_BUILD_IN_FLIGHT`] — set on construction, cleared on
+/// drop (including unwind), so an erroring build can never leave the flag
+/// stuck and permanently degrade recall. Concurrent builds are already
+/// serialized upstream (one vacuum worker; the transcript self-heal holds its
+/// own ReindexGuard), so a plain store (not a nesting counter) is enough.
+struct IndexBuildGuard;
+
+impl IndexBuildGuard {
+    fn set() -> Self {
+        INDEX_BUILD_IN_FLIGHT.store(true, std::sync::atomic::Ordering::Relaxed);
+        IndexBuildGuard
+    }
+}
+
+impl Drop for IndexBuildGuard {
+    fn drop(&mut self) {
+        INDEX_BUILD_IN_FLIGHT.store(false, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
 /// Pure policy: rebuild an FTS bucket only when forced, or when its source
 /// Lance table advanced past the version we last indexed.
 ///
@@ -344,6 +387,10 @@ impl LanceStore {
         &self,
         force: bool,
     ) -> Result<IndexMaintenanceStats, StorageError> {
+        // Published for the whole pass — the search pipelines preemptively
+        // skip their semantic channel while this is set (see
+        // [`index_build_in_flight`]). RAII: clears on every exit path.
+        let _build_guard = IndexBuildGuard::set();
         let mut agg = IndexMaintenanceStats::default();
         for (table_name, column, kind) in MANAGED_INDEXES {
             let table = match self.conn.open_table(*table_name).execute().await {
@@ -470,6 +517,19 @@ impl LanceStore {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn index_build_flag_is_raii_scoped() {
+        assert!(!index_build_in_flight(), "flag must start clear");
+        {
+            let _guard = IndexBuildGuard::set();
+            assert!(
+                index_build_in_flight(),
+                "flag must be visible while a build is in flight"
+            );
+        }
+        assert!(!index_build_in_flight(), "flag must clear on guard drop");
+    }
 
     #[test]
     fn fts_rebuild_gated_on_source_version() {

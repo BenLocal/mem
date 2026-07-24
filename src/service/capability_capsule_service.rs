@@ -1710,6 +1710,17 @@ impl CapabilityCapsuleService {
             let Some(provider) = self.embedding_search_provider.as_ref() else {
                 return Vec::new();
             };
+            // Preemptive skip while an index build is in flight: the build
+            // slows the whole semantic path diffusely (no single leg trips
+            // the deadline, but the sum reaches 3-5s), so don't even start
+            // the embed — empty vec ⇒ BM25-only, deterministically fast.
+            if crate::storage::index_build_in_flight() {
+                tracing::warn!(
+                    "index build in flight; skipping semantic channel for this search (BM25-only)"
+                );
+                crate::metrics::metrics().inc_recall_semantic_skip();
+                return Vec::new();
+            }
             let embed = async { provider.embed_query(&query.query).await.unwrap_or_default() };
             match crate::storage::store::with_deadline(
                 embed,

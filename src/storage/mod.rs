@@ -52,7 +52,7 @@ pub use embedding_vector_store::EmbeddingVectorStore;
 pub use entity_registry::EntityRegistry;
 pub use evolution_candidate_store::{EvolutionCandidate, EvolutionCandidateStore};
 pub use graph_store::GraphStore;
-pub use lance_store::{IndexMaintenanceStats, VacuumStats};
+pub use lance_store::{index_build_in_flight, IndexMaintenanceStats, VacuumStats};
 pub use maintenance_store::MaintenanceStore;
 pub use mine_cursor_store::{MineCursor, MineCursorStore};
 pub use postgres_store::PostgresCapsuleStore;

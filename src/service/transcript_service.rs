@@ -442,27 +442,39 @@ impl TranscriptService {
                 // hits already gathered above. Mirrors the capsule search side
                 // (`unwrap_or_default()` on the same call) and the ANN
                 // soft-degrade immediately below.
-                let q_vec = match crate::storage::store::with_deadline(
-                    provider.embed_query(query),
-                    crate::storage::store::recall_semantic_timeout(),
-                )
-                .await
-                {
-                    Some(Ok(v)) => Some(v),
-                    Some(Err(e)) => {
-                        warn!(
-                            error = %e,
-                            "transcript query embed failed; serving BM25-only results for this query"
-                        );
-                        None
-                    }
-                    None => {
-                        warn!(
-                            "transcript query embed exceeded MEM_RECALL_SEMANTIC_TIMEOUT_MS; \
+                // Preemptive skip while an index build is in flight — same
+                // rationale as the capsule search seam: the build-window
+                // slowdown is diffuse and can't be bounded per-leg, so don't
+                // start the semantic channel at all (BM25-only, fast).
+                let q_vec = if crate::storage::index_build_in_flight() {
+                    warn!(
+                        "index build in flight; skipping transcript semantic channel for this query (BM25-only)"
+                    );
+                    crate::metrics::metrics().inc_recall_semantic_skip();
+                    None
+                } else {
+                    match crate::storage::store::with_deadline(
+                        provider.embed_query(query),
+                        crate::storage::store::recall_semantic_timeout(),
+                    )
+                    .await
+                    {
+                        Some(Ok(v)) => Some(v),
+                        Some(Err(e)) => {
+                            warn!(
+                                error = %e,
+                                "transcript query embed failed; serving BM25-only results for this query"
+                            );
+                            None
+                        }
+                        None => {
+                            warn!(
+                                "transcript query embed exceeded MEM_RECALL_SEMANTIC_TIMEOUT_MS; \
                              serving BM25-only results for this query"
-                        );
-                        crate::metrics::metrics().inc_recall_semantic_timeout();
-                        None
+                            );
+                            crate::metrics::metrics().inc_recall_semantic_timeout();
+                            None
+                        }
                     }
                 };
                 embed_ms = t.elapsed().as_millis();
