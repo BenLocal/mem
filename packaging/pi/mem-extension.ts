@@ -1,8 +1,17 @@
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { spawn } from "node:child_process";
 import { McpStdioClient, ReconnectingMcp, type McpCallResult } from "./mcp-client.ts";
+import { createLogger, errText } from "./log.ts";
 
 export const MEM_BASE_URL = process.env.MEM_BASE_URL ?? "http://127.0.0.1:3000";
+
+// Latest ctx seen by any event handler, refreshed on every event so the logger
+// always reaches the live UI (a reload/switchSession hands out a new ctx).
+// Module-level because the serve/mcp helpers below and the detached child
+// `error` handlers run outside any handler's scope and still must not print
+// to stderr — see log.ts for why bare console output corrupts pi's TUI.
+let latestCtx: ExtensionContext | undefined;
+const log = createLogger(() => latestCtx);
 
 let servePid: number | undefined;
 // Write-once: only the spawn branch of `ensureServe` may set this to `true`.
@@ -43,7 +52,7 @@ async function ensureServe(baseUrl: string): Promise<void> {
     return;
   }
   const child = spawn("mem", ["serve"], { detached: true, stdio: "ignore", env: process.env });
-  child.on("error", (e) => console.warn("[mem] mem serve spawn error:", e));
+  child.on("error", (e) => log(`mem serve spawn error: ${errText(e)}`, "error"));
   child.unref();
   servePid = child.pid;
   serveStartedByUs = true;
@@ -52,7 +61,7 @@ async function ensureServe(baseUrl: string): Promise<void> {
     if (await isServeUp(baseUrl)) return;
     await new Promise((r) => setTimeout(r, 200));
   }
-  console.warn("[mem] serve did not become healthy within 10s");
+  log("serve did not become healthy within 10s", "warning");
 }
 
 function stopServe(): void {
@@ -85,7 +94,7 @@ async function connectMcp(): Promise<McpStdioClient> {
   // commonly ENOENT — `mem` not on PATH) fire unhandled, which would
   // otherwise crash the whole pi host process instead of just degrading
   // this extension's tool registration.
-  child.on("error", (e) => console.warn("[mem] mem mcp spawn error:", e));
+  child.on("error", (e) => log(`mem mcp spawn error: ${errText(e)}`, "error"));
   if (!child.stdin || !child.stdout) throw new Error("mem mcp: no stdio pipes");
 
   const client = new McpStdioClient({ stdin: child.stdin, stdout: child.stdout });
@@ -132,9 +141,9 @@ async function startMcpAndRegisterTools(pi: ExtensionAPI): Promise<void> {
       });
     }
     toolsRegistered = true;
-    console.warn(`[mem] registered ${tools.length} tools via mem mcp`);
+    log(`registered ${tools.length} tools via mem mcp`);
   } else {
-    console.warn(`[mem] mem mcp reconnected (${tools.length} tools already registered)`);
+    log(`mem mcp reconnected (${tools.length} tools already registered)`);
   }
 }
 
@@ -253,39 +262,49 @@ async function recallForPrompt(prompt: string): Promise<string | undefined> {
 }
 
 const memExtension = (pi: ExtensionAPI): void => {
-  pi.on("session_start", async (_event, _ctx: ExtensionContext) => {
+  // `session_start` is the first event, so the helpers it awaits (ensureServe /
+  // startMcpAndRegisterTools) already log through the UI rather than stderr.
+  pi.on("session_start", async (_event, ctx: ExtensionContext) => {
+    latestCtx = ctx;
     try {
       await ensureServe(MEM_BASE_URL);
       await startMcpAndRegisterTools(pi);
-      try { await injectWakeUp(pi); } catch (e) { console.warn("[mem] wake-up failed:", e); }
+      try { await injectWakeUp(pi); } catch (e) { log(`wake-up failed: ${errText(e)}`, "warning"); }
     } catch (e) {
-      console.warn("[mem] session_start setup failed:", e);
+      log(`session_start setup failed: ${errText(e)}`, "error");
     }
   });
 
-  pi.on("before_agent_start", async (event, _ctx) => {
+  pi.on("before_agent_start", async (event, ctx) => {
+    latestCtx = ctx;
     try {
       const banner = await recallForPrompt(event.prompt);
       if (!banner) return;
       return { message: { customType: "mem-recall", content: banner, display: true } };
     } catch (e) {
-      console.warn("[mem] auto-recall failed:", e);
+      log(`auto-recall failed: ${errText(e)}`, "warning");
       return;
     }
   });
 
   pi.on("agent_end", async (_event, ctx) => {
-    try { await runFeedback(pi, ctx); } catch (e) { console.warn("[mem] feedback failed:", e); }
+    latestCtx = ctx;
+    try { await runFeedback(pi, ctx); } catch (e) { log(`feedback failed: ${errText(e)}`, "warning"); }
   });
 
   pi.on("session_before_compact", async (_event, ctx) => {
-    try { await runMine(pi, ctx); } catch (e) { console.warn("[mem] mine (pre-compact) failed:", e); }
+    latestCtx = ctx;
+    try { await runMine(pi, ctx); } catch (e) { log(`mine (pre-compact) failed: ${errText(e)}`, "warning"); }
   });
 
   pi.on("session_shutdown", async (_event, ctx) => {
-    try { await runMine(pi, ctx); } catch (e) { console.warn("[mem] mine (shutdown) failed:", e); }
+    latestCtx = ctx;
+    try { await runMine(pi, ctx); } catch (e) { log(`mine (shutdown) failed: ${errText(e)}`, "warning"); }
     stopMcp();
     stopServe();
+    // The runner tears down after this handler; reading a stale ctx would throw
+    // (the logger swallows it, but clearing keeps the fallback path honest).
+    latestCtx = undefined;
   });
 };
 

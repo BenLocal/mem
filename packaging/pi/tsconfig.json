@@ -12,5 +12,5 @@
     "forceConsistentCasingInFileNames": true,
     "types": ["node"]
   },
-  "include": ["mem-extension.ts", "mcp-client.ts", "mcp-client.test.ts"]
+  "include": ["mem-extension.ts", "mcp-client.ts", "mcp-client.test.ts", "log.ts", "log.test.ts"]
 }
