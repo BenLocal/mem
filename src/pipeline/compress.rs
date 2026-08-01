@@ -1,7 +1,7 @@
 use tiktoken_rs::{o200k_base_singleton, CoreBPE};
 
 use crate::domain::{
-    capability_capsule::{CapabilityCapsuleRecord, CapabilityCapsuleType},
+    capability_capsule::{CapabilityCapsuleRecord, CapabilityCapsuleStatus, CapabilityCapsuleType},
     query::{
         ConversationHighlight, ConversationSnippet, DirectiveItem, FactItem, PatternItem,
         SearchCapabilityCapsuleResponse,
@@ -66,7 +66,11 @@ pub fn compress(
                     source_summary: compress_text(&memory.summary, patterns_budget / 2 + 8),
                 });
             }
-            Section::Workflow if suggested_workflow.is_none() && workflow_budget > 0 => {
+            Section::Workflow
+                if suggested_workflow.is_none()
+                    && workflow_budget > 0
+                    && is_authoritative_workflow(memory) =>
+            {
                 suggested_workflow = Some(WorkflowOutline {
                     capability_capsule_id: memory.capability_capsule_id.clone(),
                     goal: compress_text(workflow_goal(memory), workflow_budget / 3 + 8),
@@ -85,6 +89,24 @@ pub fn compress(
         suggested_workflow,
         recent_conversations: Vec::new(),
     }
+}
+
+/// Only an `Active` capsule may fill the `suggested_workflow` slot.
+///
+/// That slot's contract is "a procedure the agent should follow", which a
+/// pending *proposal* does not satisfy. The concrete defect this closes: the
+/// H4 `evolution:workflow` review placeholder is a Workflow-typed
+/// `PendingConfirmation` row whose body is reviewer instructions ("Review
+/// task: … write ONE reusable step-by-step workflow"). `retrieve.rs` only
+/// penalises pending rows by 4 points rather than excluding them, so in a
+/// scope whose sole Workflow capsule was that placeholder, the review form
+/// itself was served to agents as their suggested workflow.
+///
+/// Deliberately scoped to this slot only — `directives` / `relevant_facts` /
+/// `reusable_patterns` still admit pending rows, where the score penalty's
+/// "weak signal" semantics are the right behaviour.
+fn is_authoritative_workflow(memory: &CapabilityCapsuleRecord) -> bool {
+    matches!(memory.status, CapabilityCapsuleStatus::Active)
 }
 
 fn classify(memory: &CapabilityCapsuleRecord) -> Section {

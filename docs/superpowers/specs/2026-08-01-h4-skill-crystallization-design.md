@@ -1,7 +1,7 @@
 # H4 Skill 结晶 —— 从占位符到可复用流程
 
 **日期**：2026-08-01
-**状态**：设计已定稿，待实现
+**状态**：✅ 已实现（`src/cli/crystallize.rs` + `compress.rs` 污染修复 + `tests/crystallize.rs`）
 **路线图**：H4（`docs/oss-memory-diff.md` §9）、I5 收口行；`docs/evolution-worker.md` §6.2 Phase 2
 
 ---
@@ -135,6 +135,10 @@ reqwest client 沿用 O7(c) 的 `.no_proxy()`（内网网关调用不能走环�
 真正会复发的是**同一流程的簇长大**：迁移继续 → 第 6、7 条踩点进来 → 新 member 集 → `executed`-history 抑制不匹配（member_ids 变了）→ 新候选、新占位符。
 
 处理：CLI 结晶前查是否存在已 accept 的 Workflow 胶囊，其 `evidence` 与当前候选 members 的重叠率超过阈值。有则把新流程 **supersede** 到旧的上（走 mem 已有的版本链，检索自动排旧版），而不是并列两条。零新机制。
+
+> **⚠️ 落地偏离（实现期发现，以代码为权威）**：本节原写「走 mem 已有的版本链」——**做不到**。`supersedes_capability_capsule_id` 是**单值**字段，而 `edit_and_accept_pending` 已经把它花掉了：successor 的该字段固定指向它自己的**占位符**（`service::superseding_active_version`，`capability_capsule_service.rs:1394`）。一行不可能同时 supersede 两个对象。
+>
+> 实际落地：检测逻辑不变，但「延续」关系改记成一条 `supersedes` **图边**（`POST /graph/edges`，`supersedes` 是既有谓词，graph_stats 里已有 36 条）。代价要说清——**图边不会让检索隐藏旧流程**（那是版本链的能力）。所以旧流程是否退休变成显式运维动作，`render_report` 会在输出里点名提示。若将来需要真正的自动退休，得先给 review 面补「修改他胶囊」动作类型（`docs/evolution-worker.md` E5 已挂着的同一个缺口）。
 
 重叠率定义取 **`|A ∩ B| / min(|A|, |B|)`，阈值 0.5** —— 与 `is_procedural_sibling_cluster` 判定锚点不相交时用的 `overlap/min ≤ 0.2` 同一个度量口径，保持全模块一致。用 `min` 而非并集（Jaccard）是因为簇长大的典型形态是「旧 5 条 ⊂ 新 7 条」：Jaccard = 5/7 ≈ 0.71 尚可，但若长到 12 条则 Jaccard = 5/12 ≈ 0.42 会跌破阈值、错判成两条独立流程；`min` 口径下始终是 5/5 = 1.0，正确识别为同一流程的延续。
 

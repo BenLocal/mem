@@ -8,6 +8,64 @@ are organized by feature wave (merge commit ranges on `master`).
 
 ## [Unreleased]
 
+### Added — H4 skill crystallization: `mem crystallize` (2026-08-01)
+
+H4 was marked ✅ but only its **detection** half had landed:
+`is_procedural_sibling_cluster` recognised "N executions of one
+procedure" and `execute_generalize(workflow=true)` minted a Workflow-typed
+`PendingConfirmation` placeholder — whose body was a reviewer instruction
+("Review task: … write ONE reusable step-by-step workflow"). The
+crystallization itself was a human's job; `ReviewSynthesisBackend`
+performs no generation by design.
+
+`src/cli/crystallize.rs` closes it (spec
+`docs/superpowers/specs/2026-08-01-h4-skill-crystallization-design.md`):
+
+- **A one-shot CLI, not the worker.** `docs/evolution-worker.md` §5
+  principle 5 keeps the resident process LLM-free in every phase, and
+  §6.2's `local`/`api` synthesis backends stay deliberately unimplemented
+  (`config.rs` rejects them at parse time — that rejection is unchanged).
+  Generation therefore lives outside the sweep, behind an explicit
+  invocation.
+- **Fail-safe by construction**, the O7(c) `llm_extract` posture: (1) not
+  running the subcommand is zero behavior; (2) `LlmExtractConfig::from_env`
+  → `None` when `LLM_API_BASE`/`LLM_MODEL` are unset, so the run exits
+  having read and written nothing; (3) a synthesis error is per-candidate
+  and non-destructive — the placeholder stays in the review queue.
+- **Dry-run by default.** §6.2 forbids generated content reaching `Active`
+  unseen; `--accept` is that gate (the `dry_run` posture used by
+  `/reviews/{evolution,idle_archive,auto_promote}`).
+- **Pure HTTP client, zero new endpoints.** `mem serve` is the single
+  Lance writer (evolution E2/E3 lesson), so the CLI drives the existing
+  `GET /reviews/pending`, `GET /capability_capsules/{id}` and
+  `POST /reviews/pending/edit_accept`.
+- **A growing cluster supersedes rather than forks.** Overlap is
+  `|A ∩ B| / min(|A|, |B|)` ≥ 0.5 — the same `overlap/min` metric
+  `is_procedural_sibling_cluster` uses. `min` not Jaccard because the
+  real shape is "old 5 ⊂ new 12", where Jaccard reads 0.42 and would
+  wrongly mint a parallel workflow.
+
+### Fixed — pending proposals served as `suggested_workflow` (2026-08-01)
+
+`retrieve.rs` penalises `PendingConfirmation` rows by 4 points but does
+not exclude them, and `compress.rs` filled the `suggested_workflow` slot
+from the top-ranked Workflow-typed capsule. In a scope whose only
+Workflow capsule was an H4 placeholder, agents were therefore served the
+**review form itself** as their suggested workflow — reproduced live on
+`mem_019fa7fc-…`, whose rendered `steps` were "EVOLUTION PROPOSAL — …",
+"Review task: …", "Shared topics: …".
+
+`compress::is_authoritative_workflow` now requires `Active` for that slot
+only. The `directives` / `relevant_facts` / `reusable_patterns` sections
+still admit pending rows, where the score penalty's "weak signal"
+semantics are correct.
+
+Acceptance: `tests/crystallize.rs` (dry-run writes nothing; accept path
+shape; dead gateway and unparseable reply both leave the placeholder
+untouched; growing cluster supersedes; unrelated cluster does not; slot
+skips pending but still serves Active) plus in-module unit tests for the
+pure logic.
+
 ### Fixed — feedback-from-transcript duplicate re-crediting (2026-07-13)
 
 `mem feedback-from-transcript` (run by the Stop / PreCompact hooks every

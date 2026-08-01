@@ -1,4 +1,5 @@
 pub mod common;
+pub mod crystallize;
 pub mod feedback;
 pub mod heuristic_extract;
 pub mod hook;

@@ -53,6 +53,11 @@ enum Command {
     /// (any → any across Lance / Postgres / ClickHouse). Rebuilds embeddings
     /// on the target. See README «mem sync».
     Sync(mem::cli::sync::SyncArgs),
+    /// H4 — distil `evolution:workflow` review placeholders (N sibling
+    /// executions of one procedure) into reusable Workflow capsules via the
+    /// LLM gateway. Dry-run by default; `--accept` writes. Inert unless
+    /// `LLM_API_BASE` + `LLM_MODEL` are set.
+    Crystallize(mem::cli::crystallize::CrystallizeArgs),
 }
 
 fn main() -> error::Result<()> {
@@ -95,6 +100,10 @@ async fn async_main() -> error::Result<()> {
         }
         Command::Mine(args) => {
             let code = mem::cli::mine::run(args).await;
+            std::process::exit(code);
+        }
+        Command::Crystallize(args) => {
+            let code = mem::cli::crystallize::run(args).await;
             std::process::exit(code);
         }
         Command::Import(source) => {
