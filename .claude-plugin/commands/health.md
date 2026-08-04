@@ -1,6 +1,6 @@
 ---
 description: Verify mem serve is reachable on MEM_BASE_URL and report basic counts.
-allowed-tools: Bash
+allowed-tools: Bash, mcp__mem__mem_health
 ---
 
 Check that the local `mem serve` process is reachable, and report a quick liveness summary.
@@ -13,7 +13,7 @@ Procedure:
    ```bash
    curl -sS -o /dev/null -w "HTTP %{http_code}\n" "$MEM_BASE_URL/capability_capsules/search" \
      -H 'content-type: application/json' \
-     -d '{"tenant":"'"${MEM_TENANT:-local}"'","query":"ping","limit":1}'
+     -d '{"tenant":"'"${MEM_TENANT:-local}"'","query":"ping","intent":"debugging","scope_filters":[],"token_budget":200,"caller_agent":"mem-health","expand_graph":false}'
    ```
 
 3. If the call returns 200, also call the MCP `mcp__mem__mem_health` tool for a richer status (provider, sidecar state).

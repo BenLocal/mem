@@ -96,6 +96,7 @@ jieba-rs = "0.9"
 
 [dev-dependencies]
 rand = "0.10"
+serde_yaml_ng = "0.10"
 
 # Trim test-profile debuginfo. Linking the ~47 `cargo test` integration
 # binaries against the full lance/arrow/candle dependency tree is the

@@ -28,9 +28,23 @@ fn mcp_runtime_does_not_scale_threads_with_cpu_count() {
         .expect("spawn mem mcp");
     let mut child = ChildGuard(child);
     let task_dir = format!("/proc/{}/task", child.0.id());
-    let started = Instant::now();
+    let startup_deadline = Instant::now() + Duration::from_secs(10);
     let mut max_threads = 0;
-    while started.elapsed() < Duration::from_secs(1) {
+    while max_threads < 9 && Instant::now() < startup_deadline {
+        assert_eq!(child.0.try_wait().expect("poll mem mcp"), None);
+        let count = std::fs::read_dir(&task_dir)
+            .expect("read mem mcp task directory")
+            .count();
+        max_threads = max_threads.max(count);
+        thread::sleep(Duration::from_millis(20));
+    }
+    assert!(
+        max_threads >= 9,
+        "mem mcp runtime did not start eight async workers within ten seconds; got {max_threads} threads"
+    );
+
+    let sampling_started = Instant::now();
+    while sampling_started.elapsed() < Duration::from_secs(1) {
         assert_eq!(child.0.try_wait().expect("poll mem mcp"), None);
         let count = std::fs::read_dir(&task_dir)
             .expect("read mem mcp task directory")

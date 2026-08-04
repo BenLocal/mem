@@ -48,7 +48,7 @@ Verbatim rule applies in both: `content` is the fact source, never a refined sum
 
 ```bash
 curl -sS "$MEM_BASE_URL"/capability_capsules/search -H 'content-type: application/json' \
-  -d '{"tenant":"local","query":"ping","limit":1}' | head -c 200
+  -d '{"tenant":"local","query":"ping","intent":"debugging","scope_filters":[],"token_budget":200,"caller_agent":"mem-health","expand_graph":false}' | head -c 200
 ```
 
 If the service is down, start it from the repo:

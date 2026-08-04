@@ -1,6 +1,6 @@
 ---
 description: Send a feedback signal for a capsule — moves confidence / decay / status per the kind. Use after you've read AND actually used (or rejected) a retrieved capsule.
-argument-hint: "<capability_capsule_id> <kind>"  · kind ∈ {useful | applies_here | outdated | does_not_apply_here | incorrect}
+argument-hint: '<capability_capsule_id> <kind> · kind ∈ {useful | applies_here | outdated | does_not_apply_here | incorrect}'
 allowed-tools: mcp__mem__capability_capsule_feedback
 ---
 
