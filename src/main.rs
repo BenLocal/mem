@@ -69,28 +69,35 @@ fn main() -> error::Result<()> {
     // where this no-ops (decay still works, just lazily).
     let _ = tikv_jemalloc_ctl::background_thread::write(true);
 
-    // Build the runtime explicitly instead of `#[tokio::main]` so we can
-    // cap `max_blocking_threads`. tokio's default is 512; on a many-core
-    // box mem's heavy `spawn_blocking` load (local embedding inference is
-    // blocking) balloons the blocking pool toward that ceiling. A long-
-    // lived `mem serve` was holding 500-800 `tokio-rt-worker` threads
-    // (~11 GB RSS) with periodic CPU spikes — confirmed via `kernel_clone`
-    // tracing. A large blocking pool buys no throughput for the inference
-    // workload; it just piles up idle thread stacks. 32 is plenty for the
-    // embedding inference load.
-    let runtime = tokio::runtime::Builder::new_multi_thread()
-        .enable_all()
-        .max_blocking_threads(32)
-        .build()?;
-    runtime.block_on(async_main())
-}
-
-async fn async_main() -> error::Result<()> {
     let cli = Cli::parse();
     let command = cli.command.unwrap_or(Command::Serve);
+    let is_mcp = matches!(&command, Command::Mcp);
 
-    init_tracing(matches!(command, Command::Mcp));
+    init_tracing(is_mcp);
 
+    // Build the runtime explicitly instead of `#[tokio::main]` so we can
+    // tune the two long-running modes independently. `mem mcp` is an I/O
+    // forwarder and many Codex agents may each launch one, so letting Tokio
+    // scale its worker count to host CPU count multiplies idle threads. Keep
+    // it multi-threaded but fixed at eight workers. `mem serve` retains its
+    // CPU-scaled worker count and larger blocking pool for local embedding
+    // inference and background workers.
+    let runtime = if is_mcp {
+        tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(8)
+            .max_blocking_threads(4)
+            .enable_all()
+            .build()?
+    } else {
+        tokio::runtime::Builder::new_multi_thread()
+            .max_blocking_threads(32)
+            .enable_all()
+            .build()?
+    };
+    runtime.block_on(async_main(command))
+}
+
+async fn async_main(command: Command) -> error::Result<()> {
     match command {
         Command::Serve => mem::cli::serve::run().await,
         Command::Mcp => mem::cli::mcp::run().await,
