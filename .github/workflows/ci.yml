@@ -32,7 +32,7 @@ jobs:
           large-packages: true
           docker-images: true
           swap-storage: true
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
@@ -96,7 +96,7 @@ jobs:
           large-packages: true
           docker-images: true
           swap-storage: true
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy
@@ -149,7 +149,7 @@ jobs:
           large-packages: true
           docker-images: true
           swap-storage: true
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy
@@ -169,7 +169,7 @@ jobs:
   rust-cross:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
         with:
