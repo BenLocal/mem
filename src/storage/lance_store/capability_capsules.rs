@@ -104,7 +104,7 @@ impl LanceStore {
         let batches: Vec<RecordBatch> = stream
             .try_collect()
             .await
-            .map_err(|e| StorageError::InvalidInput(format!("lancedb stream: {e}")))?;
+            .map_err(|e| StorageError::backend("lancedb stream", e))?;
         let mut out = Vec::new();
         for b in &batches {
             out.extend(record_batch_to_capability_capsules(b)?);
@@ -513,7 +513,7 @@ impl LanceStore {
         let batches: Vec<RecordBatch> = stream
             .try_collect()
             .await
-            .map_err(|e| StorageError::InvalidInput(format!("lancedb stream: {e}")))?;
+            .map_err(|e| StorageError::backend("lancedb stream", e))?;
 
         const TABLE: &str = "capability_capsule_embeddings";
         // (capability_capsule_id, _distance) for rows in this tenant. Other
@@ -584,7 +584,7 @@ impl LanceStore {
         let fts = self.fts.clone();
         tokio::task::spawn_blocking(move || fts.rebuild(&docs))
             .await
-            .map_err(|e| StorageError::InvalidInput(format!("fts rebuild join: {e}")))??;
+            .map_err(|e| StorageError::backend("fts rebuild task", e))??;
         self.fts_built
             .store(true, std::sync::atomic::Ordering::SeqCst);
         Ok(())
@@ -623,7 +623,7 @@ impl LanceStore {
         let query_text = query_text.to_string();
         tokio::task::spawn_blocking(move || fts.bm25(&tenant, &query_text, k))
             .await
-            .map_err(|e| StorageError::InvalidInput(format!("fts query join: {e}")))?
+            .map_err(|e| StorageError::backend("fts query task", e))?
     }
 
     /// Route-B bucket "stats": native lancedb-Rust equivalent of
@@ -931,7 +931,7 @@ impl LanceStore {
         let batches: Vec<RecordBatch> = stream
             .try_collect()
             .await
-            .map_err(|e| StorageError::InvalidInput(format!("lancedb stream: {e}")))?;
+            .map_err(|e| StorageError::backend("lancedb stream", e))?;
         let mut out = Vec::new();
         for b in &batches {
             out.extend(record_batch_to_embedding_job_rows(b)?);
@@ -1013,6 +1013,11 @@ impl LanceStore {
         if inserts.is_empty() {
             return Ok(());
         }
+        let _lifecycle_guard = self.capsule_lifecycle_gate.read().await;
+        for insert in inserts {
+            self.require_capsule_parent(&insert.tenant, &insert.capability_capsule_id)
+                .await?;
+        }
         let table = self
             .conn
             .open_table("embedding_jobs")
@@ -1044,6 +1049,9 @@ impl LanceStore {
         &self,
         insert: EmbeddingJobInsert,
     ) -> Result<bool, StorageError> {
+        let _lifecycle_guard = self.capsule_lifecycle_gate.read().await;
+        self.require_capsule_parent(&insert.tenant, &insert.capability_capsule_id)
+            .await?;
         // Idempotency check: if any live (pending/processing) row already
         // covers this (tenant, capability_capsule_id, target_content_hash, provider)
         // tuple, decline the enqueue. LanceDB has no transactions so the
@@ -1067,6 +1075,54 @@ impl LanceStore {
             .await
             .map_err(lancedb_err)?;
         if live > 0 {
+            return Ok(false);
+        }
+        let row = EmbeddingJobRow {
+            job_id: insert.job_id,
+            tenant: insert.tenant,
+            capability_capsule_id: insert.capability_capsule_id,
+            target_content_hash: insert.target_content_hash,
+            provider: insert.provider,
+            status: "pending".to_string(),
+            attempt_count: 0,
+            last_error: None,
+            available_at: insert.available_at,
+            created_at: insert.created_at,
+            updated_at: insert.updated_at,
+        };
+        let batch = embedding_job_row_to_record_batch(&row)?;
+        table.add(batch).execute().await.map_err(lancedb_err)?;
+        Ok(true)
+    }
+
+    pub async fn ensure_embedding_job(
+        &self,
+        insert: EmbeddingJobInsert,
+    ) -> Result<bool, StorageError> {
+        // Exclusive with live/admin enqueue and hard delete so the tuple probe
+        // and insert form one process-local critical section. The deployment
+        // invariant permits only one `mem serve` writer per Lance dataset.
+        let _lifecycle_guard = self.capsule_lifecycle_gate.write().await;
+        self.require_capsule_parent(&insert.tenant, &insert.capability_capsule_id)
+            .await?;
+        let table = self
+            .conn
+            .open_table("embedding_jobs")
+            .execute()
+            .await
+            .map_err(lancedb_err)?;
+        let existing = table
+            .count_rows(Some(format!(
+                "tenant = {} AND capability_capsule_id = {} AND target_content_hash = {} \
+                 AND provider = {}",
+                sql_quote(&insert.tenant),
+                sql_quote(&insert.capability_capsule_id),
+                sql_quote(&insert.target_content_hash),
+                sql_quote(&insert.provider),
+            )))
+            .await
+            .map_err(lancedb_err)?;
+        if existing > 0 {
             return Ok(false);
         }
         let row = EmbeddingJobRow {
@@ -1189,6 +1245,9 @@ impl LanceStore {
         source_updated_at: &str,
         now: &str,
     ) -> Result<(), StorageError> {
+        let _lifecycle_guard = self.capsule_lifecycle_gate.read().await;
+        self.require_capsule_parent(tenant, capability_capsule_id)
+            .await?;
         let dim_i32 = i32::try_from(embedding_dim)
             .map_err(|_| StorageError::InvalidData("embedding_dim does not fit in i32"))?;
         let vector = decode_f32_blob(embedding_blob, embedding_dim as usize)
@@ -1244,6 +1303,9 @@ impl LanceStore {
         if vectors.is_empty() {
             return Ok(());
         }
+        let _lifecycle_guard = self.capsule_lifecycle_gate.read().await;
+        self.require_capsule_parent(tenant, capability_capsule_id)
+            .await?;
         let dim_i32 = i32::try_from(embedding_dim)
             .map_err(|_| StorageError::InvalidData("embedding_dim does not fit in i32"))?;
         ensure_capability_capsule_embeddings_table(&self.conn, dim_i32).await?;
@@ -1530,7 +1592,7 @@ impl LanceStore {
         let batches: Vec<RecordBatch> = stream
             .try_collect()
             .await
-            .map_err(|e| StorageError::InvalidInput(format!("lancedb stream: {e}")))?;
+            .map_err(|e| StorageError::backend("lancedb stream", e))?;
         for batch in &batches {
             let mems = record_batch_to_capability_capsules(batch)?;
             if let Some(m) = mems.into_iter().next() {
@@ -1556,6 +1618,51 @@ impl LanceStore {
             .await
     }
 
+    /// Atomically commit one review verdict. The pending predicate is part of
+    /// the Lance UPDATE, so competing reviewers cannot both overwrite the
+    /// row after separately observing it as pending.
+    pub async fn transition_pending_status(
+        &self,
+        tenant: &str,
+        capability_capsule_id: &str,
+        status: CapabilityCapsuleStatus,
+    ) -> Result<CapabilityCapsuleRecord, StorageError> {
+        crate::storage::capsule_store::validate_pending_verdict(&status)?;
+        let table = self
+            .conn
+            .open_table("capability_capsules")
+            .execute()
+            .await
+            .map_err(lancedb_err)?;
+        let now = crate::storage::current_timestamp();
+        let result = table
+            .update()
+            .only_if(format!(
+                "tenant = {} AND capability_capsule_id = {} AND status = 'pending_confirmation'",
+                sql_quote(tenant),
+                sql_quote(capability_capsule_id),
+            ))
+            .column("status", sql_quote(&enum_to_str(&status)?))
+            .column("updated_at", sql_quote(&now))
+            .execute()
+            .await
+            .map_err(lancedb_err)?;
+        if result.rows_updated == 0 {
+            return match self
+                .get_capability_capsule_for_tenant(tenant, capability_capsule_id)
+                .await?
+            {
+                Some(_) => Err(StorageError::Conflict("review conflict")),
+                None => Err(StorageError::InvalidData("memory not found")),
+            };
+        }
+        self.get_capability_capsule_for_tenant(tenant, capability_capsule_id)
+            .await?
+            .ok_or(StorageError::InvalidData(
+                "memory missing after status update",
+            ))
+    }
+
     pub async fn replace_pending_with_successor(
         &self,
         tenant: &str,
@@ -1577,10 +1684,10 @@ impl LanceStore {
             .await
             .map_err(lancedb_err)?;
         let now = crate::storage::current_timestamp();
-        table
+        let result = table
             .update()
             .only_if(format!(
-                "tenant = {} AND capability_capsule_id = {}",
+                "tenant = {} AND capability_capsule_id = {} AND status = 'pending_confirmation'",
                 sql_quote(tenant),
                 sql_quote(original_memory_id),
             ))
@@ -1589,6 +1696,15 @@ impl LanceStore {
             .execute()
             .await
             .map_err(lancedb_err)?;
+        if result.rows_updated == 0 {
+            return match self
+                .get_capability_capsule_for_tenant(tenant, original_memory_id)
+                .await?
+            {
+                Some(_) => Err(StorageError::Conflict("review conflict")),
+                None => Err(StorageError::InvalidData("memory not found")),
+            };
+        }
         let batch = capability_capsules_to_record_batch(std::slice::from_ref(&successor))?;
         table.add(batch).execute().await.map_err(lancedb_err)?;
         Ok(successor)
@@ -1599,21 +1715,15 @@ impl LanceStore {
         memory: &CapabilityCapsuleRecord,
         feedback: FeedbackEvent,
     ) -> Result<CapabilityCapsuleRecord, StorageError> {
+        crate::storage::capsule_store::validate_feedback_target(memory, &feedback)?;
+        let _lifecycle_guard = self.capsule_lifecycle_gate.read().await;
+        self.require_capsule_parent(&memory.tenant, &memory.capability_capsule_id)
+            .await?;
         let kind =
             crate::domain::capability_capsule::FeedbackKind::from_db_str(&feedback.feedback_kind)
                 .ok_or(StorageError::InvalidData("invalid feedback kind"))?;
         let status_after = kind.status_after();
         let updated_at = feedback.created_at.clone();
-        let mut updated = memory.clone();
-        updated.updated_at = updated_at.clone();
-        updated.confidence = (updated.confidence + kind.confidence_delta()).clamp(0.0, 1.0);
-        updated.decay_score = (updated.decay_score + kind.decay_delta()).clamp(0.0, 1.0);
-        if let Some(ref s) = status_after {
-            updated.status = s.clone();
-        }
-        if kind.marks_validated() {
-            updated.last_validated_at = Some(updated_at.clone());
-        }
 
         // Always log the event first — independent of the parent UPDATE
         // succeeding, the audit trail is preserved. (Mirrors the DuckDB
@@ -1646,8 +1756,9 @@ impl LanceStore {
         let mut update = mem_table
             .update()
             .only_if(format!(
-                "capability_capsule_id = {}",
-                sql_quote(&updated.capability_capsule_id)
+                "tenant = {} AND capability_capsule_id = {}",
+                sql_quote(&memory.tenant),
+                sql_quote(&memory.capability_capsule_id),
             ))
             .column(
                 "confidence",
@@ -1657,15 +1768,24 @@ impl LanceStore {
                 "decay_score",
                 format!("least(1.0, decay_score + {})", kind.decay_delta()),
             )
-            .column("updated_at", sql_quote(&updated.updated_at));
+            .column("updated_at", sql_quote(&updated_at));
         if let Some(s) = status_after {
             update = update.column("status", sql_quote(&enum_to_str(&s)?));
         }
         if kind.marks_validated() {
             update = update.column("last_validated_at", sql_quote(&updated_at));
         }
-        update.execute().await.map_err(lancedb_err)?;
-        Ok(updated)
+        let result = update.execute().await.map_err(lancedb_err)?;
+        if result.rows_updated != 1 {
+            return Err(StorageError::InvalidData(
+                "memory missing during feedback apply",
+            ));
+        }
+        self.get_capability_capsule_for_tenant(&memory.tenant, &memory.capability_capsule_id)
+            .await?
+            .ok_or(StorageError::InvalidData(
+                "memory missing after feedback apply",
+            ))
     }
 
     pub async fn list_feedback_for_memory(
@@ -1690,7 +1810,7 @@ impl LanceStore {
         let batches: Vec<RecordBatch> = stream
             .try_collect()
             .await
-            .map_err(|e| StorageError::InvalidInput(format!("lancedb stream: {e}")))?;
+            .map_err(|e| StorageError::backend("lancedb stream", e))?;
         let mut out = Vec::new();
         for b in &batches {
             out.extend(record_batch_to_feedback_events(b)?);
@@ -1732,36 +1852,54 @@ impl LanceStore {
     /// Hard-delete a capsule + its satellite rows in 4 dependent
     /// tables. Order:
     ///
-    /// 1. `capability_capsules` row (also serves as
-    ///    existence-check — `InvalidData("memory not found")` when
-    ///    the row isn't there, no satellite work attempted).
+    /// 1. Verify the tenant-scoped parent exists.
     /// 2. `feedback_events` rows referencing this capsule_id.
     /// 3. `embedding_jobs` rows referencing this capsule_id.
     /// 4. `capability_capsule_embeddings` row (one per capsule).
-    /// 5. `graph_edges` rows where this capsule is the FROM node —
+    /// 5. Incident `graph_edges` rows —
     ///    these are *closed* (`valid_to = now`) rather than deleted,
     ///    preserving the time-travel graph history per the
-    ///    `valid_from / valid_to` schema. Forward-facing edges
-    ///    pointing AT this capsule from elsewhere are NOT
-    ///    auto-handled (no `to_node_id`-rooted close helper today);
-    ///    they survive as dangling pointers — accepted as the
-    ///    cheaper trade-off vs. running a tenant-wide scan on every
-    ///    hard-delete.
+    ///    `valid_from / valid_to` schema. Both outgoing and incoming
+    ///    active edges are closed.
+    /// 6. Delete the parent only after every satellite step succeeds.
     ///
     /// **Atomicity contract** (same as
     /// `CapsuleStore::replace_pending_with_successor`,
-    /// `CapsuleStore::apply_feedback` — Phase 5 pain #4): LanceDB has
-    /// no cross-table transaction, so a crash between steps 1 and 5
-    /// leaves the capsule gone but one or more satellite tables
-    /// still holding orphans. Re-running the call is safe — every
-    /// cascade helper is idempotent (delete-from-empty-set is a
-    /// no-op + step 1 returns NotFound) so the caller can retry
-    /// until it returns NotFound to confirm clean state.
+    /// `CapsuleStore::apply_feedback` — Phase 5 pain #4): LanceDB has no
+    /// cross-table transaction, so a failure between steps 2
+    /// and 5 may leave some satellites already cleaned. The parent remains as
+    /// the tenant authorization anchor; re-running the call safely repeats the
+    /// idempotent helpers and then deletes the parent.
     pub async fn delete_capability_capsule_hard(
         &self,
         tenant: &str,
         capability_capsule_id: &str,
     ) -> Result<(), StorageError> {
+        let _lifecycle_guard = self.capsule_lifecycle_gate.write().await;
+        // Satellite tables are keyed only by capsule id. Never guess their
+        // owner after the parent is gone: the tenant-scoped parent is the
+        // authorization anchor for every cascade step.
+        if self
+            .get_capability_capsule_for_tenant(tenant, capability_capsule_id)
+            .await?
+            .is_none()
+        {
+            return Err(StorageError::NotFound("capability capsule"));
+        }
+
+        // Cascade. Each helper is idempotent on empty-set inputs.
+        // Errors propagate while the parent remains available for an
+        // authorized retry.
+        self.delete_feedback_events_by_capability_capsule_id(capability_capsule_id)
+            .await?;
+        self.delete_embedding_jobs_by_capability_capsule_id(capability_capsule_id)
+            .await?;
+        self.delete_capability_capsule_embedding(capability_capsule_id)
+            .await?;
+        self.close_edges_for_capability_capsule(capability_capsule_id)
+            .await
+            .map_err(|e| StorageError::backend("graph edge cleanup", e))?;
+
         let table = self
             .conn
             .open_table("capability_capsules")
@@ -1777,22 +1915,30 @@ impl LanceStore {
             .await
             .map_err(lancedb_err)?;
         if result.num_deleted_rows == 0 {
-            return Err(StorageError::InvalidData("memory not found"));
+            Err(StorageError::NotFound("capability capsule"))
+        } else {
+            self.deleted_capsule_ids
+                .write()
+                .expect("deleted_capsule_ids lock poisoned")
+                .insert(capability_capsule_id.to_owned());
+            Ok(())
         }
-        // Cascade. Each helper is idempotent on empty-set inputs.
-        // Errors propagate so the caller observes partial-state
-        // failures; per the atomicity contract, retry of the same
-        // hard-delete call after a cascade failure is safe.
-        self.delete_feedback_events_by_capability_capsule_id(capability_capsule_id)
-            .await?;
-        self.delete_embedding_jobs_by_capability_capsule_id(capability_capsule_id)
-            .await?;
-        self.delete_capability_capsule_embedding(capability_capsule_id)
-            .await?;
-        self.close_edges_for_capability_capsule(capability_capsule_id)
-            .await
-            .map_err(|e| StorageError::InvalidInput(format!("close edges: {e}")))?;
-        Ok(())
+    }
+
+    async fn require_capsule_parent(
+        &self,
+        tenant: &str,
+        capability_capsule_id: &str,
+    ) -> Result<(), StorageError> {
+        if self
+            .get_capability_capsule_for_tenant(tenant, capability_capsule_id)
+            .await?
+            .is_some()
+        {
+            Ok(())
+        } else {
+            Err(StorageError::NotFound("capability capsule"))
+        }
     }
 
     pub async fn get_capability_capsule(
@@ -1930,7 +2076,7 @@ impl LanceStore {
         let batches: Vec<RecordBatch> = stream
             .try_collect()
             .await
-            .map_err(|e| StorageError::InvalidInput(format!("lancedb stream: {e}")))?;
+            .map_err(|e| StorageError::backend("lancedb stream", e))?;
         for b in &batches {
             if b.num_rows() == 0 {
                 continue;
@@ -1986,7 +2132,7 @@ impl LanceStore {
         let batches: Vec<RecordBatch> = stream
             .try_collect()
             .await
-            .map_err(|e| StorageError::InvalidInput(format!("lancedb stream: {e}")))?;
+            .map_err(|e| StorageError::backend("lancedb stream", e))?;
         for b in &batches {
             if b.num_rows() == 0 {
                 continue;
@@ -2048,7 +2194,7 @@ impl LanceStore {
         let batches: Vec<RecordBatch> = stream
             .try_collect()
             .await
-            .map_err(|e| StorageError::InvalidInput(format!("lancedb stream: {e}")))?;
+            .map_err(|e| StorageError::backend("lancedb stream", e))?;
         let mut out = Vec::new();
         for b in &batches {
             if b.num_rows() == 0 {
@@ -2261,7 +2407,8 @@ mod tests {
         p.status = CapabilityCapsuleStatus::PendingConfirmation;
         let mut q = fixture("mem_q", "tenant");
         q.status = CapabilityCapsuleStatus::PendingConfirmation;
-        let r = fixture("mem_r", "tenant");
+        let mut r = fixture("mem_r", "tenant");
+        r.status = CapabilityCapsuleStatus::PendingConfirmation;
         let s = fixture("mem_s", "tenant");
         for m in [&p, &q, &r, &s] {
             repo.insert_capability_capsule(m.clone()).await.unwrap();
@@ -2287,7 +2434,7 @@ mod tests {
         // covered by the `list_pending_review` bucket in
         // `tests/parity_golden.rs`.)
 
-        // replace_pending_with_successor: archive r, insert successor
+        // replace_pending_with_successor: reject pending r, insert successor
         let mut succ = fixture("mem_r_v2", "tenant");
         succ.supersedes_capability_capsule_id = Some("mem_r".into());
         succ.version = 2;
@@ -2329,7 +2476,7 @@ mod tests {
             .await
             .unwrap_err();
         assert!(
-            matches!(err, StorageError::InvalidData("memory not found")),
+            matches!(err, StorageError::NotFound("capability capsule")),
             "expected NotFound-equivalent, got {err:?}",
         );
     }
@@ -2457,18 +2604,19 @@ mod tests {
         // `useful` = +0.10 confidence, +0 decay. Applied to the STALE snapshot
         // (0.5/0.5) the old absolute write stored 0.6/0.5 — clobbering the
         // concurrent 0.7/0.9. The additive fix must land 0.8/0.9 instead.
-        repo.apply_feedback(
-            &memory,
-            FeedbackEvent {
-                feedback_id: "fb_lu".into(),
-                capability_capsule_id: "mem_lu".into(),
-                feedback_kind: "useful".into(),
-                created_at: "2026-06-30T00:00:00Z".into(),
-                note: None,
-            },
-        )
-        .await
-        .unwrap();
+        let returned = repo
+            .apply_feedback(
+                &memory,
+                FeedbackEvent {
+                    feedback_id: "fb_lu".into(),
+                    capability_capsule_id: "mem_lu".into(),
+                    feedback_kind: "useful".into(),
+                    created_at: "2026-06-30T00:00:00Z".into(),
+                    note: None,
+                },
+            )
+            .await
+            .unwrap();
 
         let stored = repo
             .get_capability_capsule_for_tenant("tenant", "mem_lu")
@@ -2484,6 +2632,10 @@ mod tests {
             (stored.decay_score - 0.9).abs() < 1e-4,
             "decay must stay live(0.9)+0=0.9 (not clobbered to snapshot 0.5), got {}",
             stored.decay_score
+        );
+        assert_eq!(
+            returned, stored,
+            "feedback response must reflect the committed live row"
         );
     }
 
@@ -2679,6 +2831,49 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(zero, 0);
+    }
+
+    #[tokio::test]
+    pub async fn ensure_embedding_job_treats_completed_job_as_ingest_receipt() {
+        let dir = tempdir().unwrap();
+        let repo = LanceStore::open(&dir.path().join("lance.store"))
+            .await
+            .unwrap();
+        repo.insert_capability_capsule(fixture("mem_receipt", "tenant-a"))
+            .await
+            .unwrap();
+        let insert = EmbeddingJobInsert {
+            job_id: "job_receipt_1".into(),
+            tenant: "tenant-a".into(),
+            capability_capsule_id: "mem_receipt".into(),
+            target_content_hash: "hash_receipt".into(),
+            provider: "fake-test".into(),
+            available_at: "00000001778000000000".into(),
+            created_at: "00000001778000000000".into(),
+            updated_at: "00000001778000000000".into(),
+        };
+        assert!(repo.ensure_embedding_job(insert.clone()).await.unwrap());
+        let claimed = repo
+            .claim_next_n_embedding_jobs("00000001778000000001", 3, 1)
+            .await
+            .unwrap();
+        assert_eq!(claimed.len(), 1);
+        repo.complete_embedding_job("job_receipt_1", "00000001778000000001")
+            .await
+            .unwrap();
+
+        let mut replay = insert;
+        replay.job_id = "job_receipt_2".into();
+        replay.updated_at = "00000001778000000002".into();
+        assert!(!repo.ensure_embedding_job(replay).await.unwrap());
+
+        let jobs = repo
+            .list_embedding_jobs("tenant-a", None, Some("mem_receipt"), 10)
+            .await
+            .unwrap();
+        assert_eq!(jobs.len(), 1);
+        assert_eq!(jobs[0].job_id, "job_receipt_1");
+        assert_eq!(jobs[0].status, "completed");
     }
 
     /// Failure-path finalizers must not clobber a job that is no longer the

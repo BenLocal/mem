@@ -44,7 +44,7 @@ impl LanceStore {
         let batches: Vec<RecordBatch> = stream
             .try_collect()
             .await
-            .map_err(|e| StorageError::InvalidInput(format!("lancedb stream: {e}")))?;
+            .map_err(|e| StorageError::backend("lancedb stream", e))?;
         let mut out = Vec::new();
         for b in &batches {
             out.extend(record_batch_to_transcript_embedding_job_rows(b)?);
@@ -538,7 +538,7 @@ impl LanceStore {
         let batches: Vec<RecordBatch> = stream
             .try_collect()
             .await
-            .map_err(|e| StorageError::InvalidInput(format!("lancedb stream: {e}")))?;
+            .map_err(|e| StorageError::backend("lancedb stream", e))?;
         let mut out = Vec::new();
         for b in &batches {
             out.extend(record_batch_to_conversation_messages(b)?);
@@ -777,10 +777,11 @@ impl LanceStore {
     /// `DuckDbQuery::list_conversation_messages_in_range`: cross-session range
     /// scan over the half-open `[time_from, time_to)` window (each bound
     /// optional), optionally narrowed by `role` / `block_type`, ordered
-    /// chronologically and paginated by the same composite cursor as
-    /// [`Self::get_conversation_messages_by_session_paged`]. Null-session
-    /// blocks are excluded (anchored to a conversation). LanceDB has no
-    /// `ORDER BY`, so cursor + ordering + N+1 slice run in Rust.
+    /// chronologically and paginated by `(created_at, line_number,
+    /// block_index, message_block_id)`. The final id makes cross-session ties
+    /// deterministic. Null-session blocks are excluded (anchored to a
+    /// conversation). LanceDB has no `ORDER BY`, so cursor + ordering + N+1
+    /// slice run in Rust.
     #[allow(clippy::too_many_arguments)]
     pub async fn list_conversation_messages_in_range(
         &self,
@@ -789,7 +790,7 @@ impl LanceStore {
         time_to: Option<&str>,
         role: Option<&str>,
         block_type: Option<&str>,
-        cursor: Option<(&str, i64, i64)>,
+        cursor: Option<(&str, i64, i64, Option<&str>)>,
         limit: usize,
     ) -> Result<(Vec<ConversationMessage>, bool), StorageError> {
         let lim = i64::try_from(limit).unwrap_or(64);
@@ -812,10 +813,12 @@ impl LanceStore {
         let mut rows = self
             .query_conversation_messages(clauses.join(" AND "))
             .await?;
-        if let Some((cur_at, cur_line, cur_idx)) = cursor {
-            rows.retain(|m| cursor_after(m, cur_at, cur_line, cur_idx));
+        if let Some((cur_at, cur_line, cur_idx, cur_id)) = cursor {
+            rows.retain(|m| range_cursor_after(m, cur_at, cur_line, cur_idx, cur_id));
         }
-        rows.sort_by(chrono_asc);
+        rows.sort_by(|a, b| {
+            chrono_asc(a, b).then_with(|| a.message_block_id.cmp(&b.message_block_id))
+        });
         let fetch = lim.saturating_add(1) as usize;
         let has_more = rows.len() >= fetch;
         rows.truncate(lim.max(0) as usize);
@@ -962,6 +965,23 @@ fn chrono_desc(a: &ConversationMessage, b: &ConversationMessage) -> std::cmp::Or
 /// under chronological ASC ordering).
 fn cursor_after(m: &ConversationMessage, cur_at: &str, cur_line: i64, cur_idx: i64) -> bool {
     tuple_gt(m, cur_at, cur_line, cur_idx)
+}
+
+/// Cross-session cursor comparison. New cursors include `message_block_id`
+/// and therefore form a total order even when the chronological tuple ties.
+/// A legacy cursor without the id preserves the old strict-tuple semantics.
+fn range_cursor_after(
+    m: &ConversationMessage,
+    cur_at: &str,
+    cur_line: i64,
+    cur_idx: i64,
+    cur_id: Option<&str>,
+) -> bool {
+    tuple_gt(m, cur_at, cur_line, cur_idx)
+        || (cur_id.is_some_and(|id| m.message_block_id.as_str() > id)
+            && m.created_at == cur_at
+            && m.line_number as i64 == cur_line
+            && m.block_index as i64 == cur_idx)
 }
 
 /// `m`'s `(created_at, line_number, block_index)` tuple `>` `(at, line, idx)`.
@@ -1318,7 +1338,7 @@ impl LanceStore {
         let batches: Vec<RecordBatch> = stream
             .try_collect()
             .await
-            .map_err(|e| StorageError::InvalidInput(format!("lancedb stream: {e}")))?;
+            .map_err(|e| StorageError::backend("lancedb stream", e))?;
 
         // CHUNK-COLLAPSE: GROUP BY message_block_id keeping MIN(_distance).
         // A message embedded as N chunk vectors yields N rows here; we fold
@@ -1415,9 +1435,7 @@ impl LanceStore {
         let fts = self.transcript_fts.clone();
         tokio::task::spawn_blocking(move || fts.rebuild(&docs))
             .await
-            .map_err(|e| {
-                StorageError::InvalidInput(format!("transcript fts rebuild join: {e}"))
-            })??;
+            .map_err(|e| StorageError::backend("transcript fts rebuild task", e))??;
         self.transcript_fts_built
             .store(true, std::sync::atomic::Ordering::SeqCst);
         Ok(())
@@ -1470,9 +1488,7 @@ impl LanceStore {
             let query_owned = query.to_string();
             tokio::task::spawn_blocking(move || fts.bm25(&tenant_owned, &query_owned, k))
                 .await
-                .map_err(|e| {
-                    StorageError::InvalidInput(format!("transcript fts query join: {e}"))
-                })??
+                .map_err(|e| StorageError::backend("transcript fts query task", e))??
         };
         if ranked.is_empty() {
             return Ok(Vec::new());

@@ -26,6 +26,7 @@
 //! by Lance. BM25/FTS is a separate in-RAM Tantivy subsystem
 //! (`crate::storage::fts`), not a Lance index.
 
+use std::collections::HashSet;
 use std::path::Path;
 use std::sync::Arc;
 
@@ -71,6 +72,17 @@ use crate::storage::{FeedbackEvent, StorageError};
 pub struct LanceStore {
     /// LanceDB connection.
     conn: Arc<Connection>,
+    /// Coordinates hard-delete with writes that can create capsule satellite
+    /// rows. The dataset open lock already enforces one writer process; this
+    /// clone-shared in-process gate closes the remaining async task race.
+    /// Satellite creators take a read guard and revalidate the parent inside
+    /// it; hard-delete holds the write guard through parent-last cleanup.
+    capsule_lifecycle_gate: Arc<tokio::sync::RwLock<()>>,
+    /// Capsule ids hard-deleted by this writer process. Active graph writes
+    /// consult this set while holding the lifecycle read guard, preventing a
+    /// stale task from recreating a dangling edge after delete. IDs are never
+    /// reusable, so retaining them for the process lifetime is intentional.
+    deleted_capsule_ids: Arc<std::sync::RwLock<HashSet<String>>>,
     /// Embedding-provider id for `transcript_embedding_jobs.provider`
     /// rows enqueued by [`Self::create_conversation_message`]. Set
     /// once at startup via [`Self::set_transcript_job_provider`]; if
@@ -192,6 +204,8 @@ impl LanceStore {
 
         Ok(Self {
             conn: Arc::new(conn),
+            capsule_lifecycle_gate: Arc::new(tokio::sync::RwLock::new(())),
+            deleted_capsule_ids: Arc::new(std::sync::RwLock::new(HashSet::new())),
             transcript_job_provider: Arc::new(std::sync::RwLock::new(None)),
             fts: Arc::new(crate::storage::fts::FtsIndex::new()?),
             fts_built: Arc::new(std::sync::atomic::AtomicBool::new(false)),
@@ -227,11 +241,11 @@ impl LanceStore {
     }
 }
 
-/// Map a `lancedb::Error` into our generic [`StorageError`]. We lose the
-/// rich variant info but the upper layers don't care — they only branch
-/// on `NotFound` vs everything-else.
+/// Map a `lancedb::Error` into an internal backend failure. The source is
+/// retained for diagnostics and commit-conflict classification, while HTTP
+/// responses expose only the stable internal-error envelope.
 pub(super) fn lancedb_err(e: lancedb::Error) -> StorageError {
-    StorageError::InvalidInput(format!("lancedb: {e}"))
+    StorageError::backend("lancedb", e)
 }
 
 /// Typed column accessor shared by every `record_batch_to_*` parser.
@@ -702,7 +716,7 @@ pub(super) fn feedback_events_to_record_batch(
         Arc::new(note.finish()),
     ];
     RecordBatch::try_new(schema, columns)
-        .map_err(|e| StorageError::InvalidInput(format!("feedback record batch: {e}")))
+        .map_err(|e| StorageError::backend("feedback record batch", e))
 }
 
 pub(super) fn record_batch_to_feedback_events(
@@ -816,9 +830,8 @@ pub(super) fn capability_capsule_embedding_to_record_batch(
         Arc::new(created_b.finish()),
         Arc::new(updated_b.finish()),
     ];
-    RecordBatch::try_new(schema, columns).map_err(|e| {
-        StorageError::InvalidInput(format!("capability_capsule_embedding record batch: {e}"))
-    })
+    RecordBatch::try_new(schema, columns)
+        .map_err(|e| StorageError::backend("capability capsule embedding record batch", e))
 }
 
 /// Arrow schema for `conversation_message_embeddings`. Mirrors
@@ -891,9 +904,8 @@ pub(super) fn conversation_message_embedding_to_record_batch(
         Arc::new(created_b.finish()),
         Arc::new(updated_b.finish()),
     ];
-    RecordBatch::try_new(schema, columns).map_err(|e| {
-        StorageError::InvalidInput(format!("conversation_message_embedding record batch: {e}"))
-    })
+    RecordBatch::try_new(schema, columns)
+        .map_err(|e| StorageError::backend("conversation message embedding record batch", e))
 }
 
 /// Internal row representation for `embedding_jobs`. Mirrors DuckDB's
@@ -985,7 +997,7 @@ pub(super) fn embedding_job_rows_to_record_batch(
         Arc::new(updated_at.finish()),
     ];
     RecordBatch::try_new(Arc::new(embedding_jobs_schema()), columns)
-        .map_err(|e| StorageError::InvalidInput(format!("embedding_job record batch: {e}")))
+        .map_err(|e| StorageError::backend("embedding job record batch", e))
 }
 
 pub(super) fn record_batch_to_embedding_job_rows(
@@ -1109,9 +1121,8 @@ pub(super) fn transcript_embedding_job_rows_to_record_batch(
         Arc::new(created_at.finish()),
         Arc::new(updated_at.finish()),
     ];
-    RecordBatch::try_new(Arc::new(transcript_embedding_jobs_schema()), columns).map_err(|e| {
-        StorageError::InvalidInput(format!("transcript_embedding_job record batch: {e}"))
-    })
+    RecordBatch::try_new(Arc::new(transcript_embedding_jobs_schema()), columns)
+        .map_err(|e| StorageError::backend("transcript embedding job record batch", e))
 }
 
 pub(super) fn record_batch_to_transcript_embedding_job_rows(
@@ -1233,7 +1244,7 @@ pub(super) fn graph_edge_to_record_batch(edge: &GraphEdge) -> Result<RecordBatch
         Arc::new(access_count.finish()),
     ];
     RecordBatch::try_new(Arc::new(graph_edges_schema()), columns)
-        .map_err(|e| StorageError::InvalidInput(format!("graph_edge record batch: {e}")))
+        .map_err(|e| StorageError::backend("graph edge record batch", e))
 }
 
 /// Arrow schema for `entities`. Mirrors DuckDB 1:1 (5 cols, scalar).
@@ -1266,7 +1277,7 @@ pub(super) fn entity_to_record_batch(entity: &Entity) -> Result<RecordBatch, Sto
         Arc::new(created_at.finish()),
     ];
     RecordBatch::try_new(Arc::new(entities_schema()), columns)
-        .map_err(|e| StorageError::InvalidInput(format!("entity record batch: {e}")))
+        .map_err(|e| StorageError::backend("entity record batch", e))
 }
 
 /// Arrow schema for `entity_aliases`. Composite "PK" = (tenant,
@@ -1302,7 +1313,7 @@ pub(super) fn entity_alias_to_record_batch(
         Arc::new(created_at.finish()),
     ];
     RecordBatch::try_new(Arc::new(entity_aliases_schema()), columns)
-        .map_err(|e| StorageError::InvalidInput(format!("entity_alias record batch: {e}")))
+        .map_err(|e| StorageError::backend("entity alias record batch", e))
 }
 
 /// Arrow schema for `conversation_messages` (transcript-block archive).
@@ -1409,7 +1420,7 @@ pub(super) fn conversation_messages_to_record_batch(
         Arc::new(meta_json.finish()),
     ];
     RecordBatch::try_new(Arc::new(conversation_messages_schema()), columns)
-        .map_err(|e| StorageError::InvalidInput(format!("conversation_message record batch: {e}")))
+        .map_err(|e| StorageError::backend("conversation message record batch", e))
 }
 
 pub(super) fn record_batch_to_conversation_messages(
@@ -1649,7 +1660,7 @@ pub(super) fn capability_capsules_to_record_batch(
         Arc::new(expires_at.finish()),
     ];
     RecordBatch::try_new(schema, columns)
-        .map_err(|e| StorageError::InvalidInput(format!("memories record batch: {e}")))
+        .map_err(|e| StorageError::backend("capability capsule record batch", e))
 }
 
 /// Inverse of `capability_capsules_to_record_batch`: parse a Lance query result into
@@ -1757,4 +1768,24 @@ pub(super) fn record_batch_to_capability_capsules(
 /// to escape an embedded quote.
 pub(super) fn sql_quote(s: &str) -> String {
     format!("'{}'", s.replace('\'', "''"))
+}
+
+#[cfg(test)]
+mod backend_error_tests {
+    use super::*;
+
+    #[test]
+    fn lancedb_driver_errors_are_internal_backend_failures() {
+        let error = lancedb_err(lancedb::Error::InvalidInput {
+            message: "private dataset path".to_owned(),
+        });
+        assert!(matches!(
+            &error,
+            StorageError::Backend {
+                backend: "lancedb",
+                ..
+            }
+        ));
+        assert_eq!(error.to_string(), "storage backend failure (lancedb)");
+    }
 }

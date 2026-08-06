@@ -74,10 +74,9 @@ fn episode_to_record_batch(e: &EpisodeRecord) -> Result<RecordBatch, StorageErro
     created_at.append_value(&e.created_at);
     updated_at.append_value(&e.updated_at);
     match &e.workflow_candidate {
-        Some(c) => workflow_candidate.append_value(
-            serde_json::to_string(c)
-                .map_err(|err| StorageError::InvalidInput(format!("workflow_candidate: {err}")))?,
-        ),
+        Some(c) => {
+            workflow_candidate.append_value(serde_json::to_string(c).map_err(StorageError::Serde)?)
+        }
         None => workflow_candidate.append_null(),
     }
 
@@ -104,7 +103,7 @@ fn episode_to_record_batch(e: &EpisodeRecord) -> Result<RecordBatch, StorageErro
             Arc::new(workflow_candidate.finish()),
         ],
     )
-    .map_err(|e| StorageError::InvalidInput(format!("arrow batch: {e}")))
+    .map_err(|e| StorageError::backend("arrow record batch", e))
 }
 
 fn record_batch_to_episodes(batch: &RecordBatch) -> Result<Vec<EpisodeRecord>, StorageError> {
@@ -152,7 +151,7 @@ fn record_batch_to_episodes(batch: &RecordBatch) -> Result<Vec<EpisodeRecord>, S
         } else {
             Some(
                 serde_json::from_str::<WorkflowCandidate>(workflow_candidate.value(i))
-                    .map_err(|e| StorageError::InvalidInput(format!("workflow_candidate: {e}")))?,
+                    .map_err(StorageError::Serde)?,
             )
         };
         out.push(EpisodeRecord {
@@ -216,7 +215,7 @@ impl LanceStore {
         let batches: Vec<RecordBatch> = stream
             .try_collect()
             .await
-            .map_err(|e| StorageError::InvalidInput(format!("lancedb stream: {e}")))?;
+            .map_err(|e| StorageError::backend("lancedb stream", e))?;
         let mut out = Vec::new();
         for b in &batches {
             out.extend(record_batch_to_episodes(b)?);

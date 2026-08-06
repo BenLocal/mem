@@ -12,8 +12,7 @@
 //!   trait is intentionally narrow to keep the validation tractable.
 //! - **Mostly no defaults**. Methods are required per backend, with one
 //!   exception: `accept_pending` / `reject_pending` are default wrappers
-//!   over the single `set_capsule_status` transition primitive (so a
-//!   backend implements one status setter, not three). Other candidate
+//!   over the atomic `transition_pending_status` compare-and-set. Other candidate
 //!   defaults (e.g. deriving `list_pending_review` from
 //!   `list_for_tenant` + a status filter) stay hand-written — the
 //!   in-memory backend is small enough that explicit is clearer.
@@ -34,6 +33,34 @@ use crate::domain::capability_capsule::{
 };
 use crate::storage::types::{FeedbackEvent, StorageError};
 use crate::storage::Store;
+
+pub(crate) fn validate_pending_verdict(
+    status: &CapabilityCapsuleStatus,
+) -> Result<(), StorageError> {
+    if matches!(
+        status,
+        CapabilityCapsuleStatus::Active | CapabilityCapsuleStatus::Rejected
+    ) {
+        Ok(())
+    } else {
+        Err(StorageError::InvalidInput(
+            "pending review verdict must be active or rejected".to_owned(),
+        ))
+    }
+}
+
+pub(crate) fn validate_feedback_target(
+    memory: &CapabilityCapsuleRecord,
+    feedback: &FeedbackEvent,
+) -> Result<(), StorageError> {
+    if memory.capability_capsule_id == feedback.capability_capsule_id {
+        Ok(())
+    } else {
+        Err(StorageError::InvalidInput(
+            "feedback target does not match capsule".to_owned(),
+        ))
+    }
+}
 
 /// Backend-agnostic capsule CRUD + lifecycle. Phase 2 validation
 /// surface — see module docs.
@@ -108,14 +135,10 @@ pub trait CapsuleStore: Send + Sync {
         ids: &[&str],
     ) -> Result<Vec<CapabilityCapsuleRecord>, StorageError>;
 
-    /// Set a capsule's `status` and return the updated row. The single
-    /// status-transition primitive — `accept_pending` (→ Active),
-    /// `reject_pending` (→ Rejected) and O2 near-dup review flagging
-    /// (→ PendingConfirmation) are all thin callers of this. The write
-    /// is **unconditional** on the current status (callers that need a
-    /// from-guard read first), matching the historical
-    /// accept/reject behaviour. Errors `NotFound` when `(tenant, id)`
-    /// has no row.
+    /// Unconditionally set a capsule's status and return the updated row.
+    /// Worker lifecycle changes and
+    /// O2 near-dup review flagging use this primitive; reviewer accept/reject
+    /// must use [`Self::transition_pending_status`] instead.
     async fn set_capsule_status(
         &self,
         tenant: &str,
@@ -123,14 +146,26 @@ pub trait CapsuleStore: Send + Sync {
         status: CapabilityCapsuleStatus,
     ) -> Result<CapabilityCapsuleRecord, StorageError>;
 
-    /// `→ Active` transition (review accept). Default wrapper over
-    /// [`Self::set_capsule_status`].
+    /// Atomically move a review row from `PendingConfirmation` to one terminal
+    /// verdict. A row that exists but is no longer pending returns
+    /// [`StorageError::Conflict`]. This compare-and-set is the commit point for
+    /// review side effects: callers must not settle evolution candidates or
+    /// rewrite graph edges unless it succeeds.
+    async fn transition_pending_status(
+        &self,
+        tenant: &str,
+        capability_capsule_id: &str,
+        status: CapabilityCapsuleStatus,
+    ) -> Result<CapabilityCapsuleRecord, StorageError>;
+
+    /// `→ Active` transition (review accept). Default wrapper over the atomic
+    /// pending compare-and-set.
     async fn accept_pending(
         &self,
         tenant: &str,
         capability_capsule_id: &str,
     ) -> Result<CapabilityCapsuleRecord, StorageError> {
-        self.set_capsule_status(
+        self.transition_pending_status(
             tenant,
             capability_capsule_id,
             CapabilityCapsuleStatus::Active,
@@ -138,14 +173,14 @@ pub trait CapsuleStore: Send + Sync {
         .await
     }
 
-    /// `→ Rejected` transition (review reject). Default wrapper over
-    /// [`Self::set_capsule_status`].
+    /// `→ Rejected` transition (review reject). Default wrapper over the atomic
+    /// pending compare-and-set.
     async fn reject_pending(
         &self,
         tenant: &str,
         capability_capsule_id: &str,
     ) -> Result<CapabilityCapsuleRecord, StorageError> {
-        self.set_capsule_status(
+        self.transition_pending_status(
             tenant,
             capability_capsule_id,
             CapabilityCapsuleStatus::Rejected,
@@ -223,7 +258,7 @@ pub trait CapsuleStore: Send + Sync {
     /// MUST cascade to remove dependent rows in `feedback_events`,
     /// `embedding_jobs`, and `capability_capsule_embeddings` so the
     /// caller does not have to choreograph satellite cleanup. Graph
-    /// edges where this capsule is the FROM node SHOULD be **closed**
+    /// edges incident to this capsule SHOULD be **closed**
     /// (`valid_to = now`) rather than deleted, preserving the
     /// time-travel `graph_edges.valid_from / valid_to` semantics.
     ///
@@ -231,12 +266,12 @@ pub trait CapsuleStore: Send + Sync {
     /// shape as [`Self::replace_pending_with_successor`] and
     /// [`Self::apply_feedback`]: backends that have transactions
     /// (Postgres) MAY wrap the cascade in `BEGIN/COMMIT`; Lance
-    /// cannot. Callers MUST be prepared for partial-state failures
-    /// (capsule row gone, one or more satellite tables still
-    /// carrying orphans) and SHOULD retry on cascade errors — every
-    /// cascade helper is idempotent on empty-set inputs.
+    /// cannot. Non-transactional implementations MUST retain the parent until
+    /// all idempotent satellite steps succeed. A partial failure may therefore
+    /// leave some satellites already cleaned while the parent remains; callers
+    /// SHOULD retry the same tenant-scoped operation.
     ///
-    /// Returns `Err(InvalidData("memory not found"))` when the
+    /// Returns a not-found error when the
     /// capsule row doesn't exist (no cascade attempted in that case).
     async fn delete_capability_capsule_hard(
         &self,
@@ -391,6 +426,15 @@ impl CapsuleStore for Store {
         status: CapabilityCapsuleStatus,
     ) -> Result<CapabilityCapsuleRecord, StorageError> {
         Store::set_capsule_status(self, tenant, capability_capsule_id, status).await
+    }
+
+    async fn transition_pending_status(
+        &self,
+        tenant: &str,
+        capability_capsule_id: &str,
+        status: CapabilityCapsuleStatus,
+    ) -> Result<CapabilityCapsuleRecord, StorageError> {
+        Store::transition_pending_status(self, tenant, capability_capsule_id, status).await
     }
 
     async fn replace_pending_with_successor(
@@ -665,14 +709,48 @@ impl CapsuleStore for InMemoryCapsuleStore {
         status: CapabilityCapsuleStatus,
     ) -> Result<CapabilityCapsuleRecord, StorageError> {
         self.with_state(|s| {
-            let r = s
+            let current = s
                 .capsules
-                .get_mut(capability_capsule_id)
+                .get(capability_capsule_id)
                 .filter(|r| r.tenant == tenant)
+                .cloned()
                 .ok_or(StorageError::InvalidData("memory not found"))?;
-            r.status = status;
-            r.updated_at = crate::storage::current_timestamp();
-            Ok(r.clone())
+            let updated = CapabilityCapsuleRecord {
+                status,
+                updated_at: crate::storage::current_timestamp(),
+                ..current
+            };
+            s.capsules
+                .insert(capability_capsule_id.to_owned(), updated.clone());
+            Ok(updated)
+        })
+    }
+
+    async fn transition_pending_status(
+        &self,
+        tenant: &str,
+        capability_capsule_id: &str,
+        status: CapabilityCapsuleStatus,
+    ) -> Result<CapabilityCapsuleRecord, StorageError> {
+        validate_pending_verdict(&status)?;
+        self.with_state(|s| {
+            let current = s
+                .capsules
+                .get(capability_capsule_id)
+                .filter(|r| r.tenant == tenant)
+                .cloned()
+                .ok_or(StorageError::InvalidData("memory not found"))?;
+            if current.status != CapabilityCapsuleStatus::PendingConfirmation {
+                return Err(StorageError::Conflict("review conflict"));
+            }
+            let updated = CapabilityCapsuleRecord {
+                status,
+                updated_at: crate::storage::current_timestamp(),
+                ..current
+            };
+            s.capsules
+                .insert(capability_capsule_id.to_owned(), updated.clone());
+            Ok(updated)
         })
     }
 
@@ -687,11 +765,19 @@ impl CapsuleStore for InMemoryCapsuleStore {
             // successor. Same non-atomic shape as the Lance backend.
             let original = s
                 .capsules
-                .get_mut(original_memory_id)
+                .get(original_memory_id)
                 .filter(|r| r.tenant == tenant)
+                .cloned()
                 .ok_or(StorageError::InvalidData("memory not found"))?;
-            original.status = CapabilityCapsuleStatus::Rejected;
-            original.updated_at = crate::storage::current_timestamp();
+            if original.status != CapabilityCapsuleStatus::PendingConfirmation {
+                return Err(StorageError::Conflict("review conflict"));
+            }
+            let rejected = CapabilityCapsuleRecord {
+                status: CapabilityCapsuleStatus::Rejected,
+                updated_at: crate::storage::current_timestamp(),
+                ..original
+            };
+            s.capsules.insert(original_memory_id.to_owned(), rejected);
             s.capsules
                 .insert(successor.capability_capsule_id.clone(), successor.clone());
             Ok(successor)
@@ -703,6 +789,7 @@ impl CapsuleStore for InMemoryCapsuleStore {
         memory: &CapabilityCapsuleRecord,
         feedback: FeedbackEvent,
     ) -> Result<CapabilityCapsuleRecord, StorageError> {
+        validate_feedback_target(memory, &feedback)?;
         // String→kind parsing lives on the domain enum (since the
         // Phase 2 side-findings fix); both backends share it.
         let kind =
@@ -710,22 +797,32 @@ impl CapsuleStore for InMemoryCapsuleStore {
                 .ok_or(StorageError::InvalidData("invalid feedback kind"))?;
 
         self.with_state(|s| {
-            // Always log the event (audit), even if the row is missing.
-            s.feedback.push(feedback.clone());
-            let r = s
+            let current = s
                 .capsules
-                .get_mut(&memory.capability_capsule_id)
+                .get(&memory.capability_capsule_id)
+                .filter(|record| record.tenant == memory.tenant)
+                .cloned()
                 .ok_or(StorageError::InvalidData("memory not found"))?;
-            r.confidence = (r.confidence + kind.confidence_delta()).clamp(0.0, 1.0);
-            r.decay_score = (r.decay_score + kind.decay_delta()).clamp(0.0, 1.0);
+            s.feedback.push(feedback.clone());
+            let mut status = current.status.clone();
             if let Some(s_after) = kind.status_after() {
-                r.status = s_after;
+                status = s_after;
             }
-            if kind.marks_validated() {
-                r.last_validated_at = Some(feedback.created_at.clone());
-            }
-            r.updated_at = feedback.created_at.clone();
-            Ok(r.clone())
+            let updated = CapabilityCapsuleRecord {
+                confidence: (current.confidence + kind.confidence_delta()).clamp(0.0, 1.0),
+                decay_score: (current.decay_score + kind.decay_delta()).clamp(0.0, 1.0),
+                status,
+                last_validated_at: if kind.marks_validated() {
+                    Some(feedback.created_at.clone())
+                } else {
+                    current.last_validated_at.clone()
+                },
+                updated_at: feedback.created_at.clone(),
+                ..current
+            };
+            s.capsules
+                .insert(memory.capability_capsule_id.clone(), updated.clone());
+            Ok(updated)
         })
     }
 

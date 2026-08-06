@@ -55,7 +55,7 @@ fn session_to_record_batch(s: &Session) -> Result<RecordBatch, StorageError> {
             Arc::new(memory_count.finish()),
         ],
     )
-    .map_err(|e| StorageError::InvalidInput(format!("arrow batch: {e}")))
+    .map_err(|e| StorageError::backend("arrow record batch", e))
 }
 
 fn record_batch_to_sessions(batch: &RecordBatch) -> Result<Vec<Session>, StorageError> {
@@ -110,8 +110,68 @@ impl LanceStore {
         table
             .update()
             .only_if(format!("session_id = {}", sql_quote(session_id)))
-            .column("last_seen_at", sql_quote(last_seen_at))
+            .column(
+                "last_seen_at",
+                format!("greatest(last_seen_at, {})", sql_quote(last_seen_at)),
+            )
             .column("memory_count", "memory_count + 1")
+            .execute()
+            .await
+            .map_err(lancedb_err)?;
+        Ok(())
+    }
+
+    pub async fn reconcile_session_after_ingest(
+        &self,
+        session_id: &str,
+        capability_capsule_id: &str,
+        occurred_at: &str,
+    ) -> Result<(), StorageError> {
+        let memories = self
+            .conn
+            .open_table("capability_capsules")
+            .execute()
+            .await
+            .map_err(lancedb_err)?;
+        let receipt_filter = format!(
+            "session_id = {} AND capability_capsule_id = {}",
+            sql_quote(session_id),
+            sql_quote(capability_capsule_id),
+        );
+        if memories
+            .count_rows(Some(receipt_filter))
+            .await
+            .map_err(lancedb_err)?
+            == 0
+        {
+            return Err(StorageError::InvalidData("ingest session receipt missing"));
+        }
+        let persisted_count = memories
+            .count_rows(Some(format!("session_id = {}", sql_quote(session_id))))
+            .await
+            .map_err(lancedb_err)?;
+
+        let sessions = self
+            .conn
+            .open_table("sessions")
+            .execute()
+            .await
+            .map_err(lancedb_err)?;
+        let persisted_count = u32::try_from(persisted_count).unwrap_or(u32::MAX);
+        sessions
+            .update()
+            .only_if(format!("session_id = {}", sql_quote(session_id)))
+            // Compute max against the live row inside the Lance update. Two
+            // reconciles can arrive in either order without a stale absolute
+            // write moving either aggregate backwards.
+            .column(
+                "last_seen_at",
+                format!("greatest(last_seen_at, {})", sql_quote(occurred_at)),
+            )
+            .column(
+                "memory_count",
+                format!("greatest(memory_count, {persisted_count})"),
+            )
             .execute()
             .await
             .map_err(lancedb_err)?;
@@ -142,7 +202,7 @@ impl LanceStore {
         let batches: Vec<RecordBatch> = stream
             .try_collect()
             .await
-            .map_err(|e| StorageError::InvalidInput(format!("lancedb stream: {e}")))?;
+            .map_err(|e| StorageError::backend("lancedb stream", e))?;
         let mut sessions = Vec::new();
         for b in &batches {
             sessions.extend(record_batch_to_sessions(b)?);
@@ -199,5 +259,65 @@ impl LanceStore {
             .await
             .map_err(lancedb_err)?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::domain::capability_capsule::CapabilityCapsuleRecord;
+    use tempfile::tempdir;
+
+    fn capsule(id: &str, session_id: &str) -> CapabilityCapsuleRecord {
+        CapabilityCapsuleRecord {
+            capability_capsule_id: id.to_string(),
+            tenant: "tenant-a".into(),
+            content: format!("content for {id}"),
+            summary: format!("summary for {id}"),
+            content_hash: format!("hash-{id}"),
+            idempotency_key: Some(format!("idem-{id}")),
+            session_id: Some(session_id.to_string()),
+            source_agent: "session-recovery-test".into(),
+            created_at: "00000001778000000001".into(),
+            updated_at: "00000001778000000001".into(),
+            ..CapabilityCapsuleRecord::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn reconcile_session_after_ingest_is_idempotent_and_counts_batch_rows() {
+        let dir = tempdir().unwrap();
+        let repo = LanceStore::open(&dir.path().join("sessions.lance"))
+            .await
+            .unwrap();
+        repo.open_session(
+            "session-a",
+            "tenant-a",
+            "session-recovery-test",
+            "00000001778000000000",
+        )
+        .await
+        .unwrap();
+        repo.insert_capability_capsules_batch(&[
+            capsule("mem_session_1", "session-a"),
+            capsule("mem_session_2", "session-a"),
+        ])
+        .await
+        .unwrap();
+
+        repo.reconcile_session_after_ingest("session-a", "mem_session_1", "00000001778000000002")
+            .await
+            .unwrap();
+        repo.reconcile_session_after_ingest("session-a", "mem_session_1", "00000001778000000001")
+            .await
+            .unwrap();
+
+        let session = repo
+            .latest_active_session("tenant-a", "session-recovery-test")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(session.memory_count, 2);
+        assert_eq!(session.last_seen_at, "00000001778000000002");
     }
 }

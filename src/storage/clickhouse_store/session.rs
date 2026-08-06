@@ -161,13 +161,69 @@ impl SessionStore for ClickHouseBackend {
         session_id: &str,
         last_active_at: &str,
     ) -> Result<(), StorageError> {
-        let Some(mut row) = self.ch_session_by_id(session_id).await? else {
-            return Ok(());
-        };
-        row.last_seen_at = last_active_at.to_owned();
-        row.memory_count = row.memory_count.saturating_add(1);
-        row.row_version = now_version();
-        self.ch_write_session(row).await
+        self.client
+            .query(
+                "ALTER TABLE sessions UPDATE \
+                 last_seen_at = greatest(last_seen_at, ?), \
+                 memory_count = toUInt32(least(toUInt64(memory_count) + 1, 4294967295)) \
+                 WHERE session_id = ? SETTINGS mutations_sync = 1",
+            )
+            .bind(last_active_at)
+            .bind(session_id)
+            .execute()
+            .await
+            .map_err(ch_err)?;
+        Ok(())
+    }
+
+    async fn reconcile_session_after_ingest(
+        &self,
+        session_id: &str,
+        capability_capsule_id: &str,
+        occurred_at: &str,
+    ) -> Result<(), StorageError> {
+        let _lifecycle_guard = self.capsule_lifecycle_gate.read().await;
+        let receipt: Vec<u64> = self
+            .client
+            .query(
+                "SELECT count() FROM capability_capsules FINAL \
+                 WHERE session_id = ? AND capability_capsule_id = ?",
+            )
+            .bind(session_id)
+            .bind(capability_capsule_id)
+            .fetch_all::<u64>()
+            .await
+            .map_err(ch_err)?;
+        if receipt.first().copied().unwrap_or(0) == 0 {
+            return Err(StorageError::InvalidData("ingest session receipt missing"));
+        }
+        let persisted_count: Vec<u64> = self
+            .client
+            .query("SELECT count() FROM capability_capsules FINAL WHERE session_id = ?")
+            .bind(session_id)
+            .fetch_all::<u64>()
+            .await
+            .map_err(ch_err)?;
+        let persisted_count =
+            u32::try_from(persisted_count.first().copied().unwrap_or(0)).unwrap_or(u32::MAX);
+        // A synchronous, commutative mutation keeps both aggregates monotonic
+        // even when different processes reconcile an older and a newer ingest
+        // concurrently. Client-side read/modify/reinsert can lose the newer
+        // value when its stale absolute row_version lands last.
+        self.client
+            .query(
+                "ALTER TABLE sessions UPDATE \
+                 last_seen_at = greatest(last_seen_at, ?), \
+                 memory_count = greatest(memory_count, toUInt32(?)) \
+                 WHERE session_id = ? SETTINGS mutations_sync = 1",
+            )
+            .bind(occurred_at)
+            .bind(persisted_count)
+            .bind(session_id)
+            .execute()
+            .await
+            .map_err(ch_err)?;
+        Ok(())
     }
 
     async fn open_session(
@@ -205,12 +261,17 @@ impl SessionStore for ClickHouseBackend {
     }
 
     async fn close_session(&self, session_id: &str, ended_at: &str) -> Result<(), StorageError> {
-        let Some(mut row) = self.ch_session_by_id(session_id).await? else {
-            return Ok(());
-        };
-        row.ended_at = ended_at.to_owned();
-        row.row_version = now_version();
-        self.ch_write_session(row).await
+        self.client
+            .query(
+                "ALTER TABLE sessions UPDATE ended_at = ? \
+                 WHERE session_id = ? SETTINGS mutations_sync = 1",
+            )
+            .bind(ended_at)
+            .bind(session_id)
+            .execute()
+            .await
+            .map_err(ch_err)?;
+        Ok(())
     }
 
     async fn latest_active_session(

@@ -135,7 +135,7 @@ impl LanceStore {
         let batches: Vec<RecordBatch> = stream
             .try_collect()
             .await
-            .map_err(|e| StorageError::InvalidInput(format!("lancedb stream: {e}")))?;
+            .map_err(|e| StorageError::backend("lancedb stream", e))?;
         for b in &batches {
             if b.num_rows() == 0 {
                 continue;
@@ -188,7 +188,7 @@ impl LanceStore {
         let batches: Vec<RecordBatch> = stream
             .try_collect()
             .await
-            .map_err(|e| StorageError::InvalidInput(format!("lancedb stream: {e}")))?;
+            .map_err(|e| StorageError::backend("lancedb stream", e))?;
         let mut entity: Option<Entity> = None;
         for b in &batches {
             if b.num_rows() == 0 {
@@ -200,9 +200,8 @@ impl LanceStore {
             let kind = parse_col::<StringArray>(b, ENTITIES, "kind")?;
             let created_at = parse_col::<StringArray>(b, ENTITIES, "created_at")?;
             let kind_str = kind.value(0);
-            let parsed_kind = EntityKind::from_db_str(kind_str).ok_or_else(|| {
-                StorageError::InvalidInput(format!("invalid entity kind {kind_str:?}"))
-            })?;
+            let parsed_kind = EntityKind::from_db_str(kind_str)
+                .ok_or(StorageError::InvalidData("invalid stored entity kind"))?;
             entity = Some(Entity {
                 entity_id: entity_id_col.value(0).to_string(),
                 tenant: tenant_col.value(0).to_string(),
@@ -236,7 +235,7 @@ impl LanceStore {
         let batches: Vec<RecordBatch> = stream
             .try_collect()
             .await
-            .map_err(|e| StorageError::InvalidInput(format!("lancedb stream: {e}")))?;
+            .map_err(|e| StorageError::backend("lancedb stream", e))?;
         // (created_at, alias_text) tuples so the Rust sort reproduces the
         // DuckDB `ORDER BY created_at ASC, alias_text ASC`.
         let mut rows: Vec<(String, String)> = Vec::new();
@@ -301,7 +300,7 @@ impl LanceStore {
         let batches: Vec<RecordBatch> = stream
             .try_collect()
             .await
-            .map_err(|e| StorageError::InvalidInput(format!("lancedb stream: {e}")))?;
+            .map_err(|e| StorageError::backend("lancedb stream", e))?;
 
         let mut out: Vec<Entity> = Vec::new();
         for b in &batches {
@@ -322,9 +321,8 @@ impl LanceStore {
                     }
                 }
                 let kind_str = kind.value(i);
-                let parsed_kind = EntityKind::from_db_str(kind_str).ok_or_else(|| {
-                    StorageError::InvalidInput(format!("invalid entity kind {kind_str:?}"))
-                })?;
+                let parsed_kind = EntityKind::from_db_str(kind_str)
+                    .ok_or(StorageError::InvalidData("invalid stored entity kind"))?;
                 out.push(Entity {
                     entity_id: entity_id.value(i).to_string(),
                     tenant: tenant_col.value(i).to_string(),

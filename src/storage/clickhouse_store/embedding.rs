@@ -135,8 +135,10 @@ impl EmbeddingVectorStore for ClickHouseBackend {
         source_updated_at: &str,
         now: &str,
     ) -> Result<(), StorageError> {
+        let _lifecycle_guard = self.capsule_lifecycle_gate.read().await;
+        self.reject_deleted_capsule(capability_capsule_id)?;
         let vector = decode_f32_blob(embedding_blob, embedding_dim as usize)
-            .map_err(|e| StorageError::InvalidInput(format!("embedding blob decode: {e}")))?;
+            .map_err(|_| StorageError::InvalidData("invalid embedding blob"))?;
         let row = ChCapsuleEmbeddingRow {
             capability_capsule_id: capability_capsule_id.to_owned(),
             tenant: tenant.to_owned(),
@@ -167,6 +169,8 @@ impl EmbeddingVectorStore for ClickHouseBackend {
         if vectors.is_empty() {
             return Ok(());
         }
+        let _lifecycle_guard = self.capsule_lifecycle_gate.read().await;
+        self.reject_deleted_capsule(capability_capsule_id)?;
         let rv = now_version();
         let rows: Vec<ChCapsuleEmbeddingRow> = vectors
             .iter()
@@ -282,7 +286,7 @@ impl EmbeddingVectorStore for ClickHouseBackend {
         now: &str,
     ) -> Result<(), StorageError> {
         let vector = decode_f32_blob(embedding_blob, embedding_dim as usize)
-            .map_err(|e| StorageError::InvalidInput(format!("embedding blob decode: {e}")))?;
+            .map_err(|_| StorageError::InvalidData("invalid embedding blob"))?;
         let row = ChMsgEmbeddingRow {
             message_block_id: message_block_id.to_owned(),
             tenant: tenant.to_owned(),

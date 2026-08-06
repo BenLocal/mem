@@ -287,13 +287,10 @@ impl PostgresCapsuleStore {
     }
 }
 
-/// Map sqlx errors to `StorageError`. sqlx has rich error variants
-/// (decode / database / pool / column-not-found) — Phase 4 spike
-/// flattens to `InvalidInput` with a string. Future cleanup can
-/// add a `StorageError::Backend(Box<dyn Error>)` variant per doc
-/// §3.3 if richer surfacing is needed.
+/// Map sqlx errors to an internal backend failure while retaining the source
+/// for server-side diagnostics.
 pub(crate) fn sqlx_err(e: sqlx::Error) -> StorageError {
-    StorageError::InvalidInput(format!("postgres: {e}"))
+    StorageError::backend("postgres", e)
 }
 
 /// Parse a `TEXT[]` column from a row. sqlx maps PG arrays to
@@ -677,6 +674,43 @@ impl CapsuleStore for PostgresCapsuleStore {
             ))
     }
 
+    async fn transition_pending_status(
+        &self,
+        tenant: &str,
+        capability_capsule_id: &str,
+        status: CapabilityCapsuleStatus,
+    ) -> Result<CapabilityCapsuleRecord, StorageError> {
+        crate::storage::capsule_store::validate_pending_verdict(&status)?;
+        let now = crate::storage::current_timestamp();
+        let rows_affected = sqlx::query(
+            "UPDATE capability_capsules SET status = $1, updated_at = $2 \
+             WHERE tenant = $3 AND capability_capsule_id = $4 \
+               AND status = 'pending_confirmation'",
+        )
+        .bind(enum_to_str(&status)?)
+        .bind(&now)
+        .bind(tenant)
+        .bind(capability_capsule_id)
+        .execute(&self.pool)
+        .await
+        .map_err(sqlx_err)?
+        .rows_affected();
+        if rows_affected == 0 {
+            return match self
+                .get_capability_capsule_for_tenant(tenant, capability_capsule_id)
+                .await?
+            {
+                Some(_) => Err(StorageError::Conflict("review conflict")),
+                None => Err(StorageError::InvalidData("memory not found")),
+            };
+        }
+        self.get_capability_capsule_for_tenant(tenant, capability_capsule_id)
+            .await?
+            .ok_or(StorageError::InvalidData(
+                "memory missing after status update",
+            ))
+    }
+
     async fn replace_pending_with_successor(
         &self,
         tenant: &str,
@@ -694,7 +728,8 @@ impl CapsuleStore for PostgresCapsuleStore {
 
         let rows_affected = sqlx::query(
             "UPDATE capability_capsules SET status = 'rejected', updated_at = $1 \
-             WHERE tenant = $2 AND capability_capsule_id = $3",
+             WHERE tenant = $2 AND capability_capsule_id = $3 \
+               AND status = 'pending_confirmation'",
         )
         .bind(&now)
         .bind(tenant)
@@ -704,7 +739,14 @@ impl CapsuleStore for PostgresCapsuleStore {
         .map_err(sqlx_err)?
         .rows_affected();
         if rows_affected == 0 {
-            return Err(StorageError::InvalidData("memory not found"));
+            tx.rollback().await.map_err(sqlx_err)?;
+            return match self
+                .get_capability_capsule_for_tenant(tenant, original_memory_id)
+                .await?
+            {
+                Some(_) => Err(StorageError::Conflict("review conflict")),
+                None => Err(StorageError::InvalidData("memory not found")),
+            };
         }
 
         sqlx::query(
@@ -759,6 +801,7 @@ impl CapsuleStore for PostgresCapsuleStore {
         memory: &CapabilityCapsuleRecord,
         feedback: FeedbackEvent,
     ) -> Result<CapabilityCapsuleRecord, StorageError> {
+        crate::storage::capsule_store::validate_feedback_target(memory, &feedback)?;
         let kind = FeedbackKind::from_db_str(&feedback.feedback_kind)
             .ok_or(StorageError::InvalidData("invalid feedback kind"))?;
 
@@ -793,8 +836,6 @@ impl CapsuleStore for PostgresCapsuleStore {
         // updating. The `::TEXT` casts on the optional params give
         // Postgres an explicit type so a NULL bind doesn't trip
         // "could not determine data type of parameter".
-        let new_confidence = (memory.confidence + kind.confidence_delta()).clamp(0.0, 1.0);
-        let new_decay = (memory.decay_score + kind.decay_delta()).clamp(0.0, 1.0);
         let new_status: Option<String> = match kind.status_after() {
             Some(s) => Some(enum_to_str(&s)?),
             None => None,
@@ -802,24 +843,32 @@ impl CapsuleStore for PostgresCapsuleStore {
         let new_validated_at: Option<String> =
             kind.marks_validated().then(|| feedback.created_at.clone());
 
-        sqlx::query(
+        let rows_affected = sqlx::query(
             "UPDATE capability_capsules SET \
-                confidence = $1, \
-                decay_score = $2, \
+                confidence = LEAST(1.0, confidence + $1), \
+                decay_score = LEAST(1.0, decay_score + $2), \
                 updated_at = $3, \
                 status = COALESCE($4::TEXT, status), \
                 last_validated_at = COALESCE($5::TEXT, last_validated_at) \
-             WHERE capability_capsule_id = $6",
+             WHERE capability_capsule_id = $6 AND tenant = $7",
         )
-        .bind(new_confidence)
-        .bind(new_decay)
+        .bind(kind.confidence_delta())
+        .bind(kind.decay_delta())
         .bind(&feedback.created_at)
         .bind(new_status)
         .bind(new_validated_at)
         .bind(&memory.capability_capsule_id)
+        .bind(&memory.tenant)
         .execute(&mut *tx)
         .await
-        .map_err(sqlx_err)?;
+        .map_err(sqlx_err)?
+        .rows_affected();
+        if rows_affected != 1 {
+            tx.rollback().await.map_err(sqlx_err)?;
+            return Err(StorageError::InvalidData(
+                "memory missing during feedback apply",
+            ));
+        }
         tx.commit().await.map_err(sqlx_err)?;
 
         // Return the updated row by re-fetching. The Lance backend
@@ -1078,5 +1127,23 @@ impl CapsuleStore for PostgresCapsuleStore {
             out.pop();
         }
         Ok((out, has_more))
+    }
+}
+
+#[cfg(test)]
+mod backend_error_tests {
+    use super::*;
+
+    #[test]
+    fn postgres_driver_errors_are_internal_backend_failures() {
+        let error = sqlx_err(sqlx::Error::Protocol("private query detail".to_owned()));
+        assert!(matches!(
+            &error,
+            StorageError::Backend {
+                backend: "postgres",
+                ..
+            }
+        ));
+        assert_eq!(error.to_string(), "storage backend failure (postgres)");
     }
 }

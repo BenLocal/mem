@@ -36,6 +36,13 @@ pub trait EmbeddingJobStore: Send + Sync {
         insert: EmbeddingJobInsert,
     ) -> Result<bool, StorageError>;
 
+    /// Ensure the durable ingest receipt exists for the full
+    /// `(tenant, capsule, content_hash, provider)` tuple. Unlike
+    /// [`Self::try_enqueue_embedding_job`], every historical status counts as
+    /// materialized: replaying an ingest must not create a second job after
+    /// the first one already completed or permanently failed.
+    async fn ensure_embedding_job(&self, insert: EmbeddingJobInsert) -> Result<bool, StorageError>;
+
     /// Multi-row variant — caller guarantees no live job exists
     /// for the inputs (typically run right after a fresh
     /// `insert_capability_capsules`). No-op when empty.
@@ -195,6 +202,10 @@ impl EmbeddingJobStore for Store {
         insert: EmbeddingJobInsert,
     ) -> Result<bool, StorageError> {
         Store::try_enqueue_embedding_job(self, insert).await
+    }
+
+    async fn ensure_embedding_job(&self, insert: EmbeddingJobInsert) -> Result<bool, StorageError> {
+        Store::ensure_embedding_job(self, insert).await
     }
 
     async fn enqueue_embedding_jobs(

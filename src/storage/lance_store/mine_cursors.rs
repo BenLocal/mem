@@ -50,7 +50,7 @@ fn mine_cursor_to_record_batch(c: &MineCursor) -> Result<RecordBatch, StorageErr
             Arc::new(updated.finish()),
         ],
     )
-    .map_err(|e| StorageError::InvalidInput(format!("arrow batch: {e}")))
+    .map_err(|e| StorageError::backend("arrow record batch", e))
 }
 
 fn record_batch_to_mine_cursors(batch: &RecordBatch) -> Result<Vec<MineCursor>, StorageError> {
@@ -92,7 +92,7 @@ impl LanceStore {
         let batches: Vec<RecordBatch> = stream
             .try_collect()
             .await
-            .map_err(|e| StorageError::InvalidInput(format!("lancedb stream: {e}")))?;
+            .map_err(|e| StorageError::backend("lancedb stream", e))?;
         for b in &batches {
             let rows = record_batch_to_mine_cursors(b)?;
             if let Some(row) = rows.into_iter().next() {

@@ -249,7 +249,9 @@ impl TranscriptService {
     /// for `tenant` whose `created_at` falls in `[time_from, time_to)`
     /// (each bound optional), narrowed by `role` / `block_type` when
     /// provided. Page size capped at 1000; the same composite cursor
-    /// as [`Self::get_by_session_paged`] paginates.
+    /// as [`Self::get_by_session_paged`] plus `message_block_id` as a final
+    /// cross-session tie-breaker paginates. Legacy three-field cursors are
+    /// still accepted and retain their former strict-tuple resume behavior.
     ///
     /// Both bounds being `None` scans the whole tenant archive; the
     /// limit + cursor still bound a single response so callers can
@@ -262,7 +264,7 @@ impl TranscriptService {
         time_to: Option<&str>,
         role: Option<&str>,
         block_type: Option<&str>,
-        cursor: Option<(&str, i64, i64)>,
+        cursor: Option<(&str, i64, i64, Option<&str>)>,
         limit: usize,
     ) -> Result<(Vec<ConversationMessage>, bool), StorageError> {
         let limit = limit.clamp(1, 1000);

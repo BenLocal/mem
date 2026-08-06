@@ -33,6 +33,37 @@ impl From<GraphError> for AppError {
     }
 }
 
+fn internal_error_context(error: &anyhow::Error) -> (&'static str, Option<&'static str>) {
+    let storage_error = error.downcast_ref::<StorageError>().or_else(|| {
+        error
+            .downcast_ref::<ServiceError>()
+            .and_then(|service_error| match service_error {
+                ServiceError::Storage(storage_error) => Some(storage_error),
+                _ => None,
+            })
+    });
+    match storage_error {
+        Some(StorageError::Backend { backend, .. }) => ("storage_backend", Some(*backend)),
+        Some(_) => ("storage_internal", None),
+        None if error.downcast_ref::<GraphError>().is_some() => ("graph_internal", None),
+        None => ("internal", None),
+    }
+}
+
+fn internal_server_error(error: &anyhow::Error) -> Response {
+    let (error_kind, backend) = internal_error_context(error);
+    tracing::error!(
+        error_kind,
+        backend = backend.unwrap_or("none"),
+        "request failed with an internal error"
+    );
+    (
+        StatusCode::INTERNAL_SERVER_ERROR,
+        Json(json!({ "error": "internal server error" })),
+    )
+        .into_response()
+}
+
 impl IntoResponse for AppError {
     fn into_response(self) -> Response {
         // Service-layer errors first (memory pipeline). NotFound carries a
@@ -50,11 +81,10 @@ impl IntoResponse for AppError {
                 ServiceError::Storage(StorageError::RateLimited(msg)) => {
                     (StatusCode::TOO_MANY_REQUESTS, Json(json!({ "error": msg }))).into_response()
                 }
-                _ => (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    Json(json!({ "error": self.0.to_string() })),
-                )
-                    .into_response(),
+                ServiceError::Storage(StorageError::Conflict(msg)) => {
+                    (StatusCode::CONFLICT, Json(json!({ "error": msg }))).into_response()
+                }
+                _ => internal_server_error(&self.0),
             };
         }
         // Bare StorageError (transcript routes go through this path — they
@@ -69,6 +99,9 @@ impl IntoResponse for AppError {
         if let Some(StorageError::RateLimited(msg)) = self.0.downcast_ref::<StorageError>() {
             return (StatusCode::TOO_MANY_REQUESTS, Json(json!({ "error": msg }))).into_response();
         }
+        if let Some(StorageError::Conflict(msg)) = self.0.downcast_ref::<StorageError>() {
+            return (StatusCode::CONFLICT, Json(json!({ "error": msg }))).into_response();
+        }
         // Graph-layer caller validation (K12: inverted bitemporal
         // interval) is a client error, not a backend fault → 400.
         if let Some(GraphError::InvalidInput(msg)) = self.0.downcast_ref::<GraphError>() {
@@ -81,16 +114,20 @@ impl IntoResponse for AppError {
             )
                 .into_response();
         }
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(json!({ "error": self.0.to_string() })),
-        )
-            .into_response()
+        internal_server_error(&self.0)
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use axum::{
+        body::{to_bytes, Body},
+        http::Request,
+        routing::get,
+        Router,
+    };
+    use tower::ServiceExt;
+
     use super::*;
 
     fn status_of(err: AppError) -> StatusCode {
@@ -129,6 +166,12 @@ mod tests {
     }
 
     #[test]
+    fn review_conflict_maps_to_409() {
+        let err = StorageError::Conflict("review conflict");
+        assert_eq!(status_of(AppError::from(err)), StatusCode::CONFLICT);
+    }
+
+    #[test]
     fn storage_not_found_is_500_neutral() {
         // Internal-consistency miss → 500 (not 404) with a neutral body, by
         // design (must not leak the looked-up id).
@@ -136,5 +179,53 @@ mod tests {
             status_of(AppError::from(StorageError::NotFound("capsule"))),
             StatusCode::INTERNAL_SERVER_ERROR
         );
+    }
+
+    #[tokio::test]
+    async fn internal_storage_errors_are_neutral_500s() {
+        const PRIVATE_DETAIL: &str = "postgres://db.internal/private_table";
+
+        async fn bare_error() -> std::result::Result<(), AppError> {
+            Err(StorageError::backend("postgres", std::io::Error::other(PRIVATE_DETAIL)).into())
+        }
+
+        async fn service_error() -> std::result::Result<(), AppError> {
+            Err(ServiceError::Storage(StorageError::backend(
+                "postgres",
+                std::io::Error::other(PRIVATE_DETAIL),
+            ))
+            .into())
+        }
+
+        let app = Router::new()
+            .route("/bare", get(bare_error))
+            .route("/service", get(service_error));
+        for uri in ["/bare", "/service"] {
+            let response = app
+                .clone()
+                .oneshot(Request::get(uri).body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+            let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+            assert_eq!(
+                serde_json::from_slice::<serde_json::Value>(&body).unwrap(),
+                json!({ "error": "internal server error" })
+            );
+            assert!(!String::from_utf8_lossy(&body).contains(PRIVATE_DETAIL));
+        }
+    }
+
+    #[test]
+    fn internal_error_log_context_excludes_backend_source() {
+        const PRIVATE_DETAIL: &str = "postgres://db.internal/private_table";
+        let error = AppError::from(StorageError::backend(
+            "postgres",
+            std::io::Error::other(PRIVATE_DETAIL),
+        ));
+
+        let context = internal_error_context(&error.0);
+        assert_eq!(context, ("storage_backend", Some("postgres")));
+        assert!(!format!("{context:?}").contains(PRIVATE_DETAIL));
     }
 }

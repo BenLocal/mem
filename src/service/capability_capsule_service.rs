@@ -111,6 +111,52 @@ pub struct ProfileResponse {
     pub entities: Vec<crate::domain::Entity>,
 }
 
+/// Materializes the derived state that follows the durable capsule write.
+/// Keeping this boundary narrow makes the commit point explicit and lets the
+/// ingest path replay each step after a partial failure.
+#[async_trait::async_trait]
+trait IngestSideEffects: Send + Sync {
+    async fn sync_memory_edges(&self, edges: &[GraphEdge], now: &str) -> Result<(), ServiceError>;
+
+    async fn ensure_embedding_job(&self, insert: EmbeddingJobInsert) -> Result<(), ServiceError>;
+
+    async fn reconcile_session_after_ingest(
+        &self,
+        session_id: &str,
+        capability_capsule_id: &str,
+        occurred_at: &str,
+    ) -> Result<(), ServiceError>;
+}
+
+struct BackendIngestSideEffects {
+    store: Arc<dyn Backend>,
+}
+
+#[async_trait::async_trait]
+impl IngestSideEffects for BackendIngestSideEffects {
+    async fn sync_memory_edges(&self, edges: &[GraphEdge], now: &str) -> Result<(), ServiceError> {
+        self.store.sync_memory_edges(edges, now).await?;
+        Ok(())
+    }
+
+    async fn ensure_embedding_job(&self, insert: EmbeddingJobInsert) -> Result<(), ServiceError> {
+        self.store.ensure_embedding_job(insert).await?;
+        Ok(())
+    }
+
+    async fn reconcile_session_after_ingest(
+        &self,
+        session_id: &str,
+        capability_capsule_id: &str,
+        occurred_at: &str,
+    ) -> Result<(), ServiceError> {
+        self.store
+            .reconcile_session_after_ingest(session_id, capability_capsule_id, occurred_at)
+            .await?;
+        Ok(())
+    }
+}
+
 #[derive(Clone)]
 pub struct CapabilityCapsuleService {
     /// Shared storage handle. Phase 5: erased to `Arc<dyn Backend>`
@@ -121,6 +167,7 @@ pub struct CapabilityCapsuleService {
     /// on the `GraphStore` sub-trait — passed to the pipeline via
     /// trait upcasting (`&*self.store as &dyn GraphRead`).
     store: Arc<dyn Backend>,
+    ingest_side_effects: Arc<dyn IngestSideEffects>,
     /// Value stored on `embedding_jobs.provider` (e.g. `fake`, `openai`).
     embedding_job_provider: String,
     /// When set, search runs hybrid lexical + semantic retrieval.
@@ -161,8 +208,12 @@ impl CapabilityCapsuleService {
     /// `"fake"` (legacy compat); search provider is `None` (BM25-only
     /// recall). Use [`Self::with_providers`] to override.
     pub fn new(store: Arc<dyn Backend>) -> Self {
+        let ingest_side_effects = Arc::new(BackendIngestSideEffects {
+            store: store.clone(),
+        });
         Self {
             store,
+            ingest_side_effects,
             embedding_job_provider: "fake".to_string(),
             embedding_search_provider: None,
             transcript_service: None,
@@ -221,8 +272,12 @@ impl CapabilityCapsuleService {
         store: Arc<dyn Backend>,
         settings: &crate::config::EmbeddingSettings,
     ) -> Self {
+        let ingest_side_effects = Arc::new(BackendIngestSideEffects {
+            store: store.clone(),
+        });
         Self {
             store,
+            ingest_side_effects,
             embedding_job_provider: settings.job_provider_id().to_string(),
             embedding_search_provider: None,
             transcript_service: None,
@@ -241,8 +296,12 @@ impl CapabilityCapsuleService {
         embedding_job_provider: String,
         embedding_search_provider: Option<Arc<dyn EmbeddingProvider>>,
     ) -> Self {
+        let ingest_side_effects = Arc::new(BackendIngestSideEffects {
+            store: store.clone(),
+        });
         Self {
             store,
+            ingest_side_effects,
             embedding_job_provider,
             embedding_search_provider,
             transcript_service: None,
@@ -258,6 +317,12 @@ impl CapabilityCapsuleService {
     /// this isn't called.
     pub fn with_ingest_settings(mut self, settings: crate::config::IngestSettings) -> Self {
         self.ingest_settings = settings;
+        self
+    }
+
+    #[cfg(test)]
+    fn with_ingest_side_effects(mut self, side_effects: Arc<dyn IngestSideEffects>) -> Self {
+        self.ingest_side_effects = side_effects;
         self
     }
 
@@ -344,6 +409,7 @@ impl CapabilityCapsuleService {
             .find_by_idempotency_or_hash(&request.tenant, &request.idempotency_key, &content_hash)
             .await?
         {
+            self.materialize_ingest_side_effects(&existing).await?;
             return Ok(existing.into());
         }
 
@@ -425,14 +491,7 @@ impl CapabilityCapsuleService {
 
         let stored = self.store.insert_capability_capsule(memory).await?;
         crate::metrics::metrics().inc_capsule_ingest();
-        let drafts = crate::pipeline::ingest::extract_graph_edge_drafts(&stored);
-        let edges = resolve_drafts_to_edges(drafts, &*self.store, &stored.tenant, &now).await?;
-        self.store.sync_memory_edges(&edges, &now).await?;
-        self.enqueue_embedding_job_for_memory(&stored).await?;
-        self.store
-            .touch_session(&session_id, &now)
-            .await
-            .map_err(ServiceError::Storage)?;
+        self.materialize_ingest_side_effects(&stored).await?;
         Ok(stored.into())
     }
 
@@ -457,18 +516,26 @@ impl CapabilityCapsuleService {
         //    cheap relative to the per-row writes we used to do.
         let mut outcomes: Vec<Option<BatchIngestItem>> = vec![None; requests.len()];
         let mut to_insert: Vec<CapabilityCapsuleRecord> = Vec::new();
-        let mut session_ids: Vec<String> = Vec::new();
+        let mut committed: Vec<CapabilityCapsuleRecord> = Vec::new();
+        let mut committed_ids = HashSet::new();
         // Dedup items against earlier items in THIS batch (the storage probe only
         // sees already-committed rows, none of which this batch has inserted yet).
         let mut dedup = BatchDedup::default();
 
         for (idx, request) in requests.into_iter().enumerate() {
             match self.prepare_one(request, &now, &mut dedup).await {
-                Ok(PreparedIngest::Existing(resp)) => {
+                Ok(PreparedIngest::Committed(record)) => {
+                    outcomes[idx] = Some(BatchIngestItem::Ok {
+                        response: (*record).clone().into(),
+                    });
+                    if committed_ids.insert(record.capability_capsule_id.clone()) {
+                        committed.push(*record);
+                    }
+                }
+                Ok(PreparedIngest::Duplicate(resp)) => {
                     outcomes[idx] = Some(BatchIngestItem::Ok { response: resp });
                 }
-                Ok(PreparedIngest::New { record, session_id }) => {
-                    session_ids.push(session_id);
+                Ok(PreparedIngest::New { record }) => {
                     to_insert.push(*record);
                 }
                 Err(e) => {
@@ -485,48 +552,14 @@ impl CapabilityCapsuleService {
             for _ in &to_insert {
                 crate::metrics::metrics().inc_capsule_ingest();
             }
-
-            // Collect graph edges across all new rows; resolve through
-            // the entity registry; flush in one sync_memory_edges call.
-            let mut all_edges: Vec<GraphEdge> = Vec::new();
-            for stored in &to_insert {
-                let drafts = crate::pipeline::ingest::extract_graph_edge_drafts(stored);
-                let edges =
-                    resolve_drafts_to_edges(drafts, &*self.store, &stored.tenant, &now).await?;
-                all_edges.extend(edges);
-            }
-            self.store.sync_memory_edges(&all_edges, &now).await?;
-
-            // One bulk enqueue for embedding jobs.
-            let inserts: Vec<EmbeddingJobInsert> = to_insert
-                .iter()
-                .map(|m| EmbeddingJobInsert {
-                    job_id: next_embedding_job_id(),
-                    tenant: m.tenant.clone(),
-                    capability_capsule_id: m.capability_capsule_id.clone(),
-                    target_content_hash: m.content_hash.clone(),
-                    provider: self.embedding_job_provider.clone(),
-                    available_at: now.clone(),
-                    created_at: now.clone(),
-                    updated_at: now.clone(),
-                })
-                .collect();
-            self.store.enqueue_embedding_jobs(&inserts).await?;
-
-            // Touch each distinct session once. `resolve_session` already
-            // either re-uses an open session or opened a fresh one for
-            // each item — `touch_session` only updates `last_active_at`,
-            // so dedup is purely an I/O reduction.
-            let mut unique_sessions = session_ids.clone();
-            unique_sessions.sort();
-            unique_sessions.dedup();
-            for sid in &unique_sessions {
-                self.store
-                    .touch_session(sid, &now)
-                    .await
-                    .map_err(ServiceError::Storage)?;
-            }
         }
+
+        // The capsule rows above are the commit point. Materialize both newly
+        // inserted rows and pre-existing idempotency hits so retrying a batch
+        // rolls every previously committed row forward after a phase-2 error.
+        committed.extend(to_insert.iter().cloned());
+        self.materialize_ingest_side_effects_batch(&committed)
+            .await?;
 
         // ── Phase 3: stitch outcomes.
         let mut new_iter = to_insert.into_iter();
@@ -567,7 +600,7 @@ impl CapabilityCapsuleService {
             .find_by_idempotency_or_hash(&request.tenant, &request.idempotency_key, &content_hash)
             .await?
         {
-            return Ok(PreparedIngest::Existing(existing.into()));
+            return Ok(PreparedIngest::Committed(Box::new(existing)));
         }
         // No committed row matched; check earlier items in this same batch before
         // reserving a slot, so intra-batch duplicates resolve to one row.
@@ -576,7 +609,7 @@ impl CapabilityCapsuleService {
             request.idempotency_key.as_deref(),
             &content_hash,
         ) {
-            return Ok(PreparedIngest::Existing(hit.clone()));
+            return Ok(PreparedIngest::Duplicate(hit.clone()));
         }
 
         let status = initial_status(&request.capability_capsule_type, &request.write_mode);
@@ -658,7 +691,6 @@ impl CapabilityCapsuleService {
         dedup.register(&record, response);
         Ok(PreparedIngest::New {
             record: Box::new(record),
-            session_id,
         })
     }
 
@@ -853,32 +885,25 @@ impl CapabilityCapsuleService {
     /// Hard-delete a memory. **Irreversible.** Backs
     /// `DELETE /capability_capsules/{id}` from the admin web page.
     ///
-    /// Order:
-    ///   1. Verify the row exists for this tenant (clean 404 if not).
-    ///   2. Issue `LanceStore::delete_capability_capsule_hard` — drops the
-    ///      `capability_capsules` row.
-    ///
-    /// **Cascade caveat**: the storage-layer call leaves a TODO for
-    /// cascade-deleting from `capability_capsule_embeddings`,
-    /// `embedding_jobs`, `feedback_events`, and `graph_edges`. Lance is
-    /// the authoritative source of truth for capsule existence; orphan
-    /// rows in those satellite tables don't surface in queries that
-    /// JOIN against the parent capsule (which is the read path for
-    /// every public surface). Closing that TODO is tracked separately.
+    /// The storage operation owns both the tenant-scoped existence check and
+    /// the cascade. Lance keeps the parent until every idempotent satellite
+    /// step succeeds, so a retry retains the same tenant authorization anchor.
     pub async fn delete_capability_capsule_hard(
         &self,
         tenant: &str,
         capability_capsule_id: &str,
     ) -> Result<(), ServiceError> {
-        self.store
-            .get_capability_capsule_for_tenant(tenant, capability_capsule_id)
-            .await?
-            .ok_or(ServiceError::NotFound)?;
-
-        self.store
+        match self
+            .store
             .delete_capability_capsule_hard(tenant, capability_capsule_id)
-            .await?;
-        Ok(())
+            .await
+        {
+            Ok(()) => Ok(()),
+            Err(StorageError::NotFound(_)) | Err(StorageError::InvalidData("memory not found")) => {
+                Err(ServiceError::NotFound)
+            }
+            Err(error) => Err(ServiceError::Storage(error)),
+        }
     }
 
     pub async fn get_capability_capsule(
@@ -1041,10 +1066,8 @@ impl CapabilityCapsuleService {
         capability_capsule_id: &str,
     ) -> Result<CapabilityCapsuleRecord, ServiceError> {
         let original = self
-            .store
-            .get_pending(tenant, capability_capsule_id)
-            .await?
-            .ok_or(ServiceError::NotFound)?;
+            .pending_for_review(tenant, capability_capsule_id)
+            .await?;
         let accepted = self
             .store
             .accept_pending(tenant, capability_capsule_id)
@@ -1088,16 +1111,43 @@ impl CapabilityCapsuleService {
         Ok(())
     }
 
+    /// Read the review input while preserving the distinction between a
+    /// missing id and a verdict that another reviewer already committed.
+    /// The backend compare-and-set remains authoritative; this helper covers
+    /// late arrivals that observe the row only after the winner committed.
+    async fn pending_for_review(
+        &self,
+        tenant: &str,
+        capability_capsule_id: &str,
+    ) -> Result<CapabilityCapsuleRecord, ServiceError> {
+        if let Some(pending) = self
+            .store
+            .get_pending(tenant, capability_capsule_id)
+            .await?
+        {
+            return Ok(pending);
+        }
+        if self
+            .store
+            .get_capability_capsule_for_tenant(tenant, capability_capsule_id)
+            .await?
+            .is_some()
+        {
+            return Err(ServiceError::Storage(StorageError::Conflict(
+                "review conflict",
+            )));
+        }
+        Err(ServiceError::NotFound)
+    }
+
     pub async fn reject_pending(
         &self,
         tenant: &str,
         capability_capsule_id: &str,
     ) -> Result<CapabilityCapsuleRecord, ServiceError> {
         let original = self
-            .store
-            .get_pending(tenant, capability_capsule_id)
-            .await?
-            .ok_or(ServiceError::NotFound)?;
+            .pending_for_review(tenant, capability_capsule_id)
+            .await?;
         let rejected = self
             .store
             .reject_pending(tenant, capability_capsule_id)
@@ -1234,11 +1284,7 @@ impl CapabilityCapsuleService {
         patch: EditPendingRequest,
     ) -> Result<EditPendingResponse, ServiceError> {
         let original_memory_id = patch.capability_capsule_id.clone();
-        let original = self
-            .store
-            .get_pending(tenant, &original_memory_id)
-            .await?
-            .ok_or(ServiceError::NotFound)?;
+        let original = self.pending_for_review(tenant, &original_memory_id).await?;
 
         let superseding = self
             .store
@@ -1797,18 +1843,117 @@ impl CapabilityCapsuleService {
         &self,
         memory: &CapabilityCapsuleRecord,
     ) -> Result<(), ServiceError> {
-        let now = current_timestamp();
-        let insert = EmbeddingJobInsert {
-            job_id: next_embedding_job_id(),
+        self.ingest_side_effects
+            .ensure_embedding_job(self.embedding_job_insert(memory))
+            .await?;
+        Ok(())
+    }
+
+    fn embedding_job_insert(&self, memory: &CapabilityCapsuleRecord) -> EmbeddingJobInsert {
+        let receipt_key = format!(
+            "{}\0{}\0{}\0{}",
+            memory.tenant,
+            memory.capability_capsule_id,
+            memory.content_hash,
+            self.embedding_job_provider,
+        );
+        EmbeddingJobInsert {
+            // Stable across retries and processes. ClickHouse cannot enforce a
+            // unique tuple constraint, but its ReplacingMergeTree is keyed by
+            // job_id, so identical ingest receipts converge under FINAL.
+            job_id: format!(
+                "ej_ingest_{}",
+                crate::service::embedding_helpers::sha2_hex(&receipt_key)
+            ),
             tenant: memory.tenant.clone(),
             capability_capsule_id: memory.capability_capsule_id.clone(),
             target_content_hash: memory.content_hash.clone(),
             provider: self.embedding_job_provider.clone(),
-            available_at: now.clone(),
-            created_at: now.clone(),
-            updated_at: now,
-        };
-        self.store.try_enqueue_embedding_job(insert).await?;
+            available_at: memory.created_at.clone(),
+            created_at: memory.created_at.clone(),
+            updated_at: memory.created_at.clone(),
+        }
+    }
+
+    async fn materialize_ingest_side_effects(
+        &self,
+        memory: &CapabilityCapsuleRecord,
+    ) -> Result<(), ServiceError> {
+        let drafts = crate::pipeline::ingest::extract_graph_edge_drafts(memory);
+        let edges =
+            resolve_drafts_to_edges(drafts, &*self.store, &memory.tenant, &memory.created_at)
+                .await?;
+        self.ingest_side_effects
+            .sync_memory_edges(&edges, &memory.created_at)
+            .await?;
+        self.enqueue_embedding_job_for_memory(memory).await?;
+        if let Some(session_id) = memory.session_id.as_deref() {
+            self.ingest_side_effects
+                .reconcile_session_after_ingest(
+                    session_id,
+                    &memory.capability_capsule_id,
+                    &memory.created_at,
+                )
+                .await?;
+        }
+        Ok(())
+    }
+
+    async fn materialize_ingest_side_effects_batch(
+        &self,
+        memories: &[CapabilityCapsuleRecord],
+    ) -> Result<(), ServiceError> {
+        if memories.is_empty() {
+            return Ok(());
+        }
+
+        let mut edges_by_timestamp: std::collections::BTreeMap<String, Vec<GraphEdge>> =
+            std::collections::BTreeMap::new();
+        for memory in memories {
+            let drafts = crate::pipeline::ingest::extract_graph_edge_drafts(memory);
+            let edges =
+                resolve_drafts_to_edges(drafts, &*self.store, &memory.tenant, &memory.created_at)
+                    .await?;
+            edges_by_timestamp
+                .entry(memory.created_at.clone())
+                .or_default()
+                .extend(edges);
+        }
+        for (timestamp, edges) in edges_by_timestamp {
+            self.ingest_side_effects
+                .sync_memory_edges(&edges, &timestamp)
+                .await?;
+        }
+
+        for memory in memories {
+            self.ingest_side_effects
+                .ensure_embedding_job(self.embedding_job_insert(memory))
+                .await?;
+        }
+
+        let mut sessions: std::collections::BTreeMap<String, (String, String)> =
+            std::collections::BTreeMap::new();
+        for memory in memories {
+            let Some(session_id) = memory.session_id.as_ref() else {
+                continue;
+            };
+            let candidate = (
+                memory.capability_capsule_id.clone(),
+                memory.created_at.clone(),
+            );
+            match sessions.get_mut(session_id) {
+                Some(existing) if existing.1 < candidate.1 => *existing = candidate,
+                None => {
+                    sessions.insert(session_id.clone(), candidate);
+                }
+                _ => {}
+            }
+        }
+        for (session_id, (capability_capsule_id, occurred_at)) in sessions {
+            self.ingest_side_effects
+                .reconcile_session_after_ingest(&session_id, &capability_capsule_id, &occurred_at)
+                .await?;
+        }
         Ok(())
     }
 }
@@ -2009,16 +2154,17 @@ fn next_memory_id() -> String {
     format!("mem_{}", uuid::Uuid::now_v7())
 }
 
-/// Result of `CapabilityCapsuleService::prepare_one` — either an early
-/// dedup hit (existing row) or a fresh record ready to be flushed in
-/// the batch insert. The `New` variant boxes the record because
+/// Result of `CapabilityCapsuleService::prepare_one`: a committed storage hit
+/// that needs reconciliation, an intra-batch duplicate already covered by an
+/// earlier item, or a fresh record ready for the batch insert. Record-carrying
+/// variants are boxed because
 /// `CapabilityCapsuleRecord` is large (~512 B); without the box clippy
 /// flags `large_enum_variant`.
 enum PreparedIngest {
-    Existing(IngestCapabilityCapsuleResponse),
+    Committed(Box<CapabilityCapsuleRecord>),
+    Duplicate(IngestCapabilityCapsuleResponse),
     New {
         record: Box<CapabilityCapsuleRecord>,
-        session_id: String,
     },
 }
 
@@ -2069,6 +2215,243 @@ impl BatchDedup {
         self.by_hash.insert(
             (record.tenant.clone(), record.content_hash.clone()),
             response,
+        );
+    }
+}
+
+#[cfg(test)]
+mod ingest_recovery_tests {
+    use super::*;
+    use crate::domain::capability_capsule::{CapabilityCapsuleType, Scope, Visibility, WriteMode};
+    use crate::storage::Store;
+
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum FailureStage {
+        Graph,
+        Embedding,
+        Session,
+    }
+
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum FailureTiming {
+        BeforeCommit,
+        AfterCommit,
+    }
+
+    #[derive(Default)]
+    struct FailGraphOnceSideEffects {
+        fail_once: Mutex<Option<(FailureStage, FailureTiming)>>,
+        graph_edges: Mutex<HashSet<(String, String, String)>>,
+        embedding_jobs: Mutex<HashSet<(String, String, String, String)>>,
+        embedding_job_ids: Mutex<HashSet<String>>,
+        session_capsules: Mutex<HashSet<(String, String)>>,
+    }
+
+    impl FailGraphOnceSideEffects {
+        fn armed(stage: FailureStage, timing: FailureTiming) -> Self {
+            Self {
+                fail_once: Mutex::new(Some((stage, timing))),
+                ..Self::default()
+            }
+        }
+
+        fn maybe_fail(
+            &self,
+            stage: FailureStage,
+            timing: FailureTiming,
+        ) -> Result<(), ServiceError> {
+            let mut fail_once = self.fail_once.lock().unwrap();
+            if *fail_once == Some((stage, timing)) {
+                *fail_once = None;
+                return Err(ServiceError::Storage(StorageError::InvalidData(
+                    "injected ingest side-effect failure",
+                )));
+            }
+            Ok(())
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl IngestSideEffects for FailGraphOnceSideEffects {
+        async fn sync_memory_edges(
+            &self,
+            edges: &[GraphEdge],
+            _now: &str,
+        ) -> Result<(), ServiceError> {
+            self.maybe_fail(FailureStage::Graph, FailureTiming::BeforeCommit)?;
+            self.graph_edges
+                .lock()
+                .unwrap()
+                .extend(edges.iter().map(|edge| {
+                    (
+                        edge.from_node_id.clone(),
+                        edge.relation.clone(),
+                        edge.to_node_id.clone(),
+                    )
+                }));
+            self.maybe_fail(FailureStage::Graph, FailureTiming::AfterCommit)?;
+            Ok(())
+        }
+
+        async fn ensure_embedding_job(
+            &self,
+            insert: EmbeddingJobInsert,
+        ) -> Result<(), ServiceError> {
+            self.maybe_fail(FailureStage::Embedding, FailureTiming::BeforeCommit)?;
+            self.embedding_job_ids
+                .lock()
+                .unwrap()
+                .insert(insert.job_id.clone());
+            self.embedding_jobs.lock().unwrap().insert((
+                insert.tenant,
+                insert.capability_capsule_id,
+                insert.target_content_hash,
+                insert.provider,
+            ));
+            self.maybe_fail(FailureStage::Embedding, FailureTiming::AfterCommit)?;
+            Ok(())
+        }
+
+        async fn reconcile_session_after_ingest(
+            &self,
+            session_id: &str,
+            capability_capsule_id: &str,
+            _occurred_at: &str,
+        ) -> Result<(), ServiceError> {
+            self.maybe_fail(FailureStage::Session, FailureTiming::BeforeCommit)?;
+            self.session_capsules
+                .lock()
+                .unwrap()
+                .insert((session_id.to_string(), capability_capsule_id.to_string()));
+            self.maybe_fail(FailureStage::Session, FailureTiming::AfterCommit)?;
+            Ok(())
+        }
+    }
+
+    fn request(idempotency_key: &str, content: &str) -> IngestCapabilityCapsuleRequest {
+        IngestCapabilityCapsuleRequest {
+            tenant: "local".into(),
+            capability_capsule_type: CapabilityCapsuleType::Experience,
+            content: content.into(),
+            summary: None,
+            evidence: vec![],
+            code_refs: vec![],
+            scope: Scope::Project,
+            visibility: Visibility::Shared,
+            project: Some("mem".into()),
+            repo: Some("mem".into()),
+            module: None,
+            task_type: None,
+            tags: vec![],
+            topics: vec![],
+            source_agent: "ingest-recovery-test".into(),
+            idempotency_key: Some(idempotency_key.into()),
+            write_mode: WriteMode::Auto,
+            supersedes_capability_capsule_id: None,
+            expires_at: None,
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn idempotent_retry_repairs_each_side_effect_failure() {
+        for timing in [FailureTiming::BeforeCommit, FailureTiming::AfterCommit] {
+            for stage in [
+                FailureStage::Graph,
+                FailureStage::Embedding,
+                FailureStage::Session,
+            ] {
+                let dir = tempfile::tempdir().unwrap();
+                let store = Arc::new(
+                    Store::open(dir.path().join("recovery.lance"))
+                        .await
+                        .unwrap(),
+                );
+                let side_effects = Arc::new(FailGraphOnceSideEffects::armed(stage, timing));
+                let service = CapabilityCapsuleService::new(store.clone())
+                    .with_ingest_side_effects(side_effects.clone());
+                let request = request(
+                    &format!("ingest-recovery-{stage:?}-{timing:?}"),
+                    &format!("retry must repair the {stage:?} {timing:?} side effect"),
+                );
+                let content_hash = compute_content_hash(&request);
+
+                let first = service.ingest(request.clone()).await;
+                assert!(
+                    first.is_err(),
+                    "injected {stage:?} {timing:?} failure must escape"
+                );
+                let committed = store
+                    .find_by_idempotency_or_hash(
+                        &request.tenant,
+                        &request.idempotency_key,
+                        &content_hash,
+                    )
+                    .await
+                    .unwrap()
+                    .expect("capsule is the durable commit point");
+
+                let retried = service.ingest(request).await.unwrap();
+
+                assert_eq!(
+                    retried.capability_capsule_id,
+                    committed.capability_capsule_id
+                );
+                assert!(!side_effects.graph_edges.lock().unwrap().is_empty());
+                assert_eq!(side_effects.embedding_jobs.lock().unwrap().len(), 1);
+                assert_eq!(side_effects.embedding_job_ids.lock().unwrap().len(), 1);
+                assert_eq!(side_effects.session_capsules.lock().unwrap().len(), 1);
+            }
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn batch_retry_repairs_all_committed_rows_after_side_effect_failure() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(
+            Store::open(dir.path().join("batch-recovery.lance"))
+                .await
+                .unwrap(),
+        );
+        let side_effects = Arc::new(FailGraphOnceSideEffects::armed(
+            FailureStage::Graph,
+            FailureTiming::BeforeCommit,
+        ));
+        let service = CapabilityCapsuleService::new(store.clone())
+            .with_ingest_side_effects(side_effects.clone());
+        let requests = vec![
+            request("batch-recovery-1", "first batch recovery capsule"),
+            request("batch-recovery-2", "second batch recovery capsule"),
+        ];
+
+        let first = service.ingest_batch(requests.clone()).await;
+        assert!(first.is_err(), "injected batch graph failure must escape");
+        let committed = store
+            .list_capability_capsules_for_tenant("local")
+            .await
+            .unwrap();
+        assert_eq!(committed.len(), 2, "both capsule rows committed first");
+        let expected_ids: HashSet<String> = committed
+            .iter()
+            .map(|record| record.capability_capsule_id.clone())
+            .collect();
+
+        let retried = service.ingest_batch(requests).await.unwrap();
+        let actual_ids: HashSet<String> = retried
+            .into_iter()
+            .map(|item| match item {
+                BatchIngestItem::Ok { response } => response.capability_capsule_id,
+                BatchIngestItem::Err { error } => panic!("unexpected retry error: {error}"),
+            })
+            .collect();
+
+        assert_eq!(actual_ids, expected_ids);
+        assert!(!side_effects.graph_edges.lock().unwrap().is_empty());
+        assert_eq!(side_effects.embedding_jobs.lock().unwrap().len(), 2);
+        assert_eq!(side_effects.embedding_job_ids.lock().unwrap().len(), 2);
+        assert_eq!(
+            side_effects.session_capsules.lock().unwrap().len(),
+            1,
+            "one idempotent reconciliation covers the shared session"
         );
     }
 }

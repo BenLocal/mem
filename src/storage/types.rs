@@ -84,8 +84,9 @@ pub struct ContextWindow {
 /// data-validation flavors plus a `NotFound(&'static str)` for
 /// internal-consistency lookup misses.
 ///
-/// Lance-side errors flow through `InvalidInput(String)` via
-/// `lancedb_err`.
+/// Backend/driver failures retain their source for internal diagnostics but
+/// have a stable `Display` string so they cannot accidentally expose database
+/// details through an API error body.
 #[derive(Debug, Error)]
 pub enum StorageError {
     #[error("io error: {0}")]
@@ -96,12 +97,23 @@ pub enum StorageError {
     InvalidData(&'static str),
     #[error("invalid input: {0}")]
     InvalidInput(String),
+    #[error("storage backend failure ({backend})")]
+    Backend {
+        backend: &'static str,
+        #[source]
+        source: Box<dyn std::error::Error + Send + Sync>,
+    },
     /// A client/operator-policy rate limit was hit (e.g. the per-session
     /// ingest cap). A *client* condition, not a backend fault — maps to HTTP
     /// 429 in `error.rs`, distinct from `InvalidInput`'s 400 so a caller /
     /// proxy can tell "slow down and retry" from "your request was malformed".
     #[error("rate limited: {0}")]
     RateLimited(String),
+    /// A compare-and-set lifecycle transition lost a race. Unlike
+    /// `InvalidInput`, retrying the same request cannot make it valid; callers
+    /// should refresh the resource and surface HTTP 409.
+    #[error("conflict: {0}")]
+    Conflict(&'static str),
     #[error("vector index error: {0}")]
     VectorIndex(String),
     /// Internal-consistency lookup miss (e.g. an id returned by a
@@ -110,6 +122,18 @@ pub enum StorageError {
     /// runtime ids.
     #[error("not found: {0}")]
     NotFound(&'static str),
+}
+
+impl StorageError {
+    pub(crate) fn backend<E>(backend: &'static str, source: E) -> Self
+    where
+        E: std::error::Error + Send + Sync + 'static,
+    {
+        Self::Backend {
+            backend,
+            source: Box::new(source),
+        }
+    }
 }
 
 #[derive(Debug, Error)]

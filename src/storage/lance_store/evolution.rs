@@ -114,7 +114,7 @@ fn candidates_to_record_batch(cs: &[EvolutionCandidate]) -> Result<RecordBatch, 
             Arc::new(result_ids.finish()),
         ],
     )
-    .map_err(|e| StorageError::InvalidInput(format!("arrow batch: {e}")))
+    .map_err(|e| StorageError::backend("arrow record batch", e))
 }
 
 fn record_batch_to_candidates(
@@ -241,7 +241,7 @@ impl LanceStore {
         let batches: Vec<RecordBatch> = stream
             .try_collect()
             .await
-            .map_err(|e| StorageError::InvalidInput(format!("lancedb stream: {e}")))?;
+            .map_err(|e| StorageError::backend("lancedb stream", e))?;
         let mut out = Vec::new();
         for b in &batches {
             out.extend(record_batch_to_candidates(b)?);

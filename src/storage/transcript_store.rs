@@ -79,8 +79,9 @@ pub trait TranscriptStore: Send + Sync {
 
     // ── Cross-session reads ─────────────────────────────────────────
 
-    /// Time-range query across sessions for a tenant. Same cursor
-    /// shape as the per-session paged variant.
+    /// Time-range query across sessions for a tenant. The cursor extends the
+    /// per-session tuple with an optional `message_block_id` final tie-breaker.
+    /// `None` preserves the legacy three-field cursor contract.
     #[allow(clippy::too_many_arguments)]
     async fn list_conversation_messages_in_range(
         &self,
@@ -89,7 +90,7 @@ pub trait TranscriptStore: Send + Sync {
         time_to: Option<&str>,
         role: Option<&str>,
         block_type: Option<&str>,
-        cursor: Option<(&str, i64, i64)>,
+        cursor: Option<(&str, i64, i64, Option<&str>)>,
         limit: usize,
     ) -> Result<(Vec<ConversationMessage>, bool), StorageError>;
 
@@ -209,7 +210,7 @@ impl TranscriptStore for Store {
         time_to: Option<&str>,
         role: Option<&str>,
         block_type: Option<&str>,
-        cursor: Option<(&str, i64, i64)>,
+        cursor: Option<(&str, i64, i64, Option<&str>)>,
         limit: usize,
     ) -> Result<(Vec<ConversationMessage>, bool), StorageError> {
         Store::list_conversation_messages_in_range(

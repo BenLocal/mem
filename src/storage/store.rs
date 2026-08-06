@@ -160,6 +160,16 @@ impl Store {
             .await
     }
 
+    /// Ingest-recovery variant: any historical row for the full tuple is a
+    /// durable receipt, regardless of status.
+    pub async fn ensure_embedding_job(
+        &self,
+        insert: EmbeddingJobInsert,
+    ) -> Result<bool, StorageError> {
+        self.commit_lance_write(self.lance.ensure_embedding_job(insert).await)
+            .await
+    }
+
     /// Multi-row variant of [`Self::try_enqueue_embedding_job`]. Skips the
     /// per-row `(tenant, capability_capsule_id, target_content_hash,
     /// provider)` idempotency probe that the single-row form runs — the
@@ -379,6 +389,22 @@ impl Store {
         self.commit_lance_write(
             self.lance
                 .set_capsule_status(tenant, capability_capsule_id, status)
+                .await,
+        )
+        .await
+    }
+
+    /// Review-only compare-and-set. Unlike `set_capsule_status`, this refuses
+    /// to overwrite a verdict that another reviewer already committed.
+    pub async fn transition_pending_status(
+        &self,
+        tenant: &str,
+        capability_capsule_id: &str,
+        status: crate::domain::capability_capsule::CapabilityCapsuleStatus,
+    ) -> Result<CapabilityCapsuleRecord, StorageError> {
+        self.commit_lance_write(
+            self.lance
+                .transition_pending_status(tenant, capability_capsule_id, status)
                 .await,
         )
         .await
@@ -884,6 +910,20 @@ impl Store {
             .await
     }
 
+    pub async fn reconcile_session_after_ingest(
+        &self,
+        session_id: &str,
+        capability_capsule_id: &str,
+        occurred_at: &str,
+    ) -> Result<(), StorageError> {
+        self.commit_lance_write(
+            self.lance
+                .reconcile_session_after_ingest(session_id, capability_capsule_id, occurred_at)
+                .await,
+        )
+        .await
+    }
+
     pub async fn open_session(
         &self,
         session_id: &str,
@@ -1188,7 +1228,7 @@ impl Store {
         time_to: Option<&str>,
         role: Option<&str>,
         block_type: Option<&str>,
-        cursor: Option<(&str, i64, i64)>,
+        cursor: Option<(&str, i64, i64, Option<&str>)>,
         limit: usize,
     ) -> Result<(Vec<ConversationMessage>, bool), StorageError> {
         self.lance

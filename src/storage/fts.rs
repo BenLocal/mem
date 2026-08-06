@@ -64,8 +64,11 @@ const JIEBA: &str = "jieba";
 /// Map any tantivy error into the crate's generic [`StorageError`]. We
 /// drop the rich variant info — upper layers only branch on coarse
 /// error classes — but keep the message for logs.
-fn fts_err(e: impl std::fmt::Display) -> StorageError {
-    StorageError::InvalidInput(format!("tantivy fts: {e}"))
+fn fts_err<E>(e: E) -> StorageError
+where
+    E: std::error::Error + Send + Sync + 'static,
+{
+    StorageError::backend("tantivy fts", e)
 }
 
 /// A corpus row as the FTS index needs it: the opaque `id` to return
@@ -246,7 +249,7 @@ impl FtsIndex {
             .index
             .tokenizers()
             .get(JIEBA)
-            .ok_or_else(|| StorageError::InvalidInput("fts: jieba tokenizer missing".into()))?;
+            .ok_or(StorageError::InvalidData("fts tokenizer missing"))?;
         let terms = Self::split_terms(&analyzer, query_text);
         if terms.is_empty() {
             return Ok(Vec::new());

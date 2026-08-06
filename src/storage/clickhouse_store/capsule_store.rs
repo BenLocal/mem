@@ -13,7 +13,10 @@
 //! optimisation noted in the doc). Optional columns are `String` with `''`
 //! standing in for `None` (no `Nullable`).
 
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::{
+    sync::atomic::{AtomicU64, Ordering},
+    time::{SystemTime, UNIX_EPOCH},
+};
 
 use async_trait::async_trait;
 use clickhouse::Row;
@@ -24,7 +27,6 @@ use crate::domain::capability_capsule::{
     CapabilityCapsuleRecord, CapabilityCapsuleStatus, CapsuleStats, FeedbackKind, FeedbackSummary,
 };
 use crate::storage::capsule_store::CapsuleStore;
-use crate::storage::graph_store::GraphStore;
 use crate::storage::time::current_timestamp;
 use crate::storage::types::{FeedbackEvent, StorageError};
 
@@ -32,7 +34,7 @@ use crate::storage::types::{FeedbackEvent, StorageError};
 
 /// Map a clickhouse-rs error into the shared [`StorageError`].
 pub(super) fn ch_err(e: clickhouse::error::Error) -> StorageError {
-    StorageError::InvalidInput(format!("clickhouse: {e}"))
+    StorageError::backend("clickhouse", e)
 }
 
 /// `''` ⇒ `None`, else `Some(s)` — the empty-string-as-absent convention
@@ -45,15 +47,22 @@ pub(super) fn opt(s: String) -> Option<String> {
     }
 }
 
-/// A monotonically-increasing-ish `row_version` for ReplacingMergeTree.
-/// Wall-clock ms; two writes inside the same ms collide (a known scaffold
-/// caveat — see the pain inventory; a per-process `AtomicU64` would harden
-/// it). Never run, so the collision window is theoretical here.
+/// Monotonic process-local `row_version` for ReplacingMergeTree. Nanosecond
+/// wall time keeps independently running writers ordered in practice; the
+/// atomic floor makes same-process calls strictly unique even when the clock
+/// resolution is coarser than one nanosecond.
 pub(super) fn now_version() -> u64 {
-    SystemTime::now()
+    static LAST: AtomicU64 = AtomicU64::new(0);
+    let wall = SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_millis() as u64)
-        .unwrap_or(0)
+        .map(|d| u64::try_from(d.as_nanos()).unwrap_or(u64::MAX - 1))
+        .unwrap_or(0);
+    let previous = LAST
+        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |last| {
+            Some(wall.max(last.saturating_add(1)))
+        })
+        .unwrap_or_else(|last| last);
+    wall.max(previous.saturating_add(1))
 }
 
 /// Serialize a snake_case serde enum to its string form for a CH column.
@@ -113,6 +122,7 @@ pub(super) struct ChCapsuleRow {
     last_used_at: String,
     last_recalled_at: String,
     expires_at: String,
+    review_token: String,
     row_version: u64,
 }
 
@@ -152,6 +162,7 @@ impl ChCapsuleRow {
             last_used_at: r.last_used_at.clone().unwrap_or_default(),
             last_recalled_at: r.last_recalled_at.clone().unwrap_or_default(),
             expires_at: r.expires_at.clone().unwrap_or_default(),
+            review_token: String::new(),
             row_version: now_version(),
         }
     }
@@ -258,7 +269,7 @@ impl ClickHouseBackend {
 
     /// Latest version of `(tenant, id)` (FINAL = merge-on-read keep-latest),
     /// or `None`. Cross-tenant variant passes `tenant = None`.
-    async fn latest(
+    pub(super) async fn latest(
         &self,
         tenant: Option<&str>,
         id: &str,
@@ -298,6 +309,8 @@ impl CapsuleStore for ClickHouseBackend {
         &self,
         memory: CapabilityCapsuleRecord,
     ) -> Result<CapabilityCapsuleRecord, StorageError> {
+        let _lifecycle_guard = self.capsule_lifecycle_gate.read().await;
+        self.reject_deleted_capsule(&memory.capability_capsule_id)?;
         self.insert_capsule_rows(&[ChCapsuleRow::from_record(&memory)])
             .await?;
         Ok(memory)
@@ -307,6 +320,10 @@ impl CapsuleStore for ClickHouseBackend {
         &self,
         memories: &[CapabilityCapsuleRecord],
     ) -> Result<(), StorageError> {
+        let _lifecycle_guard = self.capsule_lifecycle_gate.read().await;
+        for memory in memories {
+            self.reject_deleted_capsule(&memory.capability_capsule_id)?;
+        }
         let rows: Vec<ChCapsuleRow> = memories.iter().map(ChCapsuleRow::from_record).collect();
         self.insert_capsule_rows(&rows).await
     }
@@ -429,6 +446,8 @@ impl CapsuleStore for ClickHouseBackend {
         capability_capsule_id: &str,
         status: CapabilityCapsuleStatus,
     ) -> Result<CapabilityCapsuleRecord, StorageError> {
+        let _lifecycle_guard = self.capsule_lifecycle_gate.read().await;
+        self.reject_deleted_capsule(capability_capsule_id)?;
         let mut rec = self
             .latest(Some(tenant), capability_capsule_id)
             .await?
@@ -440,21 +459,37 @@ impl CapsuleStore for ClickHouseBackend {
         Ok(rec)
     }
 
+    async fn transition_pending_status(
+        &self,
+        tenant: &str,
+        capability_capsule_id: &str,
+        status: CapabilityCapsuleStatus,
+    ) -> Result<CapabilityCapsuleRecord, StorageError> {
+        let _lifecycle_guard = self.capsule_lifecycle_gate.read().await;
+        self.reject_deleted_capsule(capability_capsule_id)?;
+        self.commit_pending_verdict(tenant, capability_capsule_id, &status)
+            .await
+    }
+
     async fn replace_pending_with_successor(
         &self,
         tenant: &str,
         original_memory_id: &str,
         successor: CapabilityCapsuleRecord,
     ) -> Result<CapabilityCapsuleRecord, StorageError> {
-        // Trait contract: original ends `Rejected`. Two non-atomic writes
-        // (CH has no transactions — clickhouse-backend.md §4c / Pain #4):
-        // mark old Rejected, then insert the successor.
-        if let Some(mut original) = self.latest(Some(tenant), original_memory_id).await? {
-            original.status = CapabilityCapsuleStatus::Rejected;
-            original.updated_at = current_timestamp();
-            self.insert_capsule_rows(&[ChCapsuleRow::from_record(&original)])
-                .await?;
-        }
+        let _lifecycle_guard = self.capsule_lifecycle_gate.read().await;
+        self.reject_deleted_capsule(original_memory_id)?;
+        self.reject_deleted_capsule(&successor.capability_capsule_id)?;
+        // The verdict claim is a synchronous conditional mutation. The
+        // successor insert remains a second write (ClickHouse has no
+        // cross-row transaction), but a competing reviewer cannot also mint a
+        // successor after losing the pending compare-and-set.
+        self.commit_pending_verdict(
+            tenant,
+            original_memory_id,
+            &CapabilityCapsuleStatus::Rejected,
+        )
+        .await?;
         self.insert_capsule_rows(&[ChCapsuleRow::from_record(&successor)])
             .await?;
         Ok(successor)
@@ -465,8 +500,20 @@ impl CapsuleStore for ClickHouseBackend {
         memory: &CapabilityCapsuleRecord,
         feedback: FeedbackEvent,
     ) -> Result<CapabilityCapsuleRecord, StorageError> {
-        // Non-atomic (Pain #4): audit insert, then a versioned capsule
-        // re-insert applying the kind's deltas.
+        crate::storage::capsule_store::validate_feedback_target(memory, &feedback)?;
+        let _lifecycle_guard = self.capsule_lifecycle_gate.read().await;
+        self.reject_deleted_capsule(&memory.capability_capsule_id)?;
+        if self
+            .latest(Some(&memory.tenant), &memory.capability_capsule_id)
+            .await?
+            .is_none()
+        {
+            return Err(StorageError::NotFound("capability capsule"));
+        }
+        // Non-atomic (Pain #4): audit insert, then a synchronous additive
+        // mutation applying the kind's deltas.
+        let kind = parse_feedback_kind(&feedback.feedback_kind)
+            .ok_or(StorageError::InvalidData("invalid feedback kind"))?;
         let fb_row = ChFeedbackRow {
             feedback_id: feedback.feedback_id.clone(),
             capability_capsule_id: feedback.capability_capsule_id.clone(),
@@ -481,19 +528,8 @@ impl CapsuleStore for ClickHouseBackend {
             .map_err(ch_err)?;
         insert.write(&fb_row).await.map_err(ch_err)?;
         insert.end().await.map_err(ch_err)?;
-
-        let mut rec = memory.clone();
-        if let Some(kind) = parse_feedback_kind(&feedback.feedback_kind) {
-            rec.confidence = (rec.confidence + kind.confidence_delta()).clamp(0.0, 1.0);
-            rec.decay_score = (rec.decay_score + kind.decay_delta()).clamp(0.0, 1.0);
-            if let Some(next) = kind.status_after() {
-                rec.status = next;
-            }
-        }
-        rec.updated_at = current_timestamp();
-        self.insert_capsule_rows(&[ChCapsuleRow::from_record(&rec)])
-            .await?;
-        Ok(rec)
+        self.apply_feedback_delta(memory, kind, &feedback.created_at)
+            .await
     }
 
     async fn delete_capability_capsule_hard(
@@ -501,43 +537,8 @@ impl CapsuleStore for ClickHouseBackend {
         tenant: &str,
         capability_capsule_id: &str,
     ) -> Result<(), StorageError> {
-        // Hard delete = async `ALTER … DELETE` mutation (rare admin path —
-        // clickhouse-backend.md §4b). P1 cascades to the two in-scope
-        // tables; the embedding / job satellites land with their tables in
-        // P3 (see pain inventory).
-        if self
-            .latest(Some(tenant), capability_capsule_id)
-            .await?
-            .is_none()
-        {
-            return Err(StorageError::InvalidData("memory not found"));
-        }
-        self.client
-            .query(
-                "ALTER TABLE capability_capsules DELETE \
-                 WHERE tenant = ? AND capability_capsule_id = ?",
-            )
-            .bind(tenant)
-            .bind(capability_capsule_id)
-            .execute()
+        self.hard_delete_capsule(tenant, capability_capsule_id)
             .await
-            .map_err(ch_err)?;
-        self.client
-            .query("ALTER TABLE feedback_events DELETE WHERE capability_capsule_id = ?")
-            .bind(capability_capsule_id)
-            .execute()
-            .await
-            .map_err(ch_err)?;
-        // Close active graph edges INCIDENT to this capsule node — outgoing AND
-        // incoming — so a hard-delete doesn't leave dangling
-        // `capability_capsule:<id>` edges in active reads. The helper closes both
-        // directions (`from_node_id = ? OR to_node_id = ?`), matching the
-        // lance/postgres cascade. CH has no transactions, so this is a separate
-        // async ALTER mutation like the deletes above.
-        self.close_edges_for_capability_capsule(capability_capsule_id)
-            .await
-            .map_err(|e| StorageError::InvalidInput(format!("close edges: {e}")))?;
-        Ok(())
     }
 
     async fn list_feedback_for_memory(
@@ -745,5 +746,25 @@ impl CapsuleStore for ClickHouseBackend {
         let has_more = records.len() > limit;
         records.truncate(limit);
         Ok((records, has_more))
+    }
+}
+
+#[cfg(test)]
+mod backend_error_tests {
+    use super::*;
+
+    #[test]
+    fn clickhouse_driver_errors_are_internal_backend_failures() {
+        let error = ch_err(clickhouse::error::Error::Custom(
+            "private query detail".to_owned(),
+        ));
+        assert!(matches!(
+            &error,
+            StorageError::Backend {
+                backend: "clickhouse",
+                ..
+            }
+        ));
+        assert_eq!(error.to_string(), "storage backend failure (clickhouse)");
     }
 }

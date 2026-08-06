@@ -106,6 +106,52 @@ async fn reject_pending_transitions_status(backend: Arc<dyn CapsuleStore>) {
     assert_eq!(updated.status, CapabilityCapsuleStatus::Rejected);
 }
 
+async fn concurrent_review_verdict_allows_exactly_one_winner(backend: Arc<dyn CapsuleStore>) {
+    backend
+        .insert_capability_capsule(fixture(
+            "review-race",
+            CapabilityCapsuleStatus::PendingConfirmation,
+        ))
+        .await
+        .unwrap();
+
+    let accept = backend.accept_pending("t", "review-race");
+    let reject = backend.reject_pending("t", "review-race");
+    let (accept, reject) = tokio::join!(accept, reject);
+
+    let winners = usize::from(accept.is_ok()) + usize::from(reject.is_ok());
+    assert_eq!(winners, 1, "exactly one concurrent verdict must commit");
+    let loser = accept.err().or_else(|| reject.err()).unwrap();
+    assert!(
+        loser.to_string().contains("review conflict"),
+        "losing verdict must return a recognizable review conflict: {loser}"
+    );
+}
+
+async fn pending_transition_rejects_non_verdict_status(backend: Arc<dyn CapsuleStore>) {
+    backend
+        .insert_capability_capsule(fixture(
+            "invalid-verdict",
+            CapabilityCapsuleStatus::PendingConfirmation,
+        ))
+        .await
+        .unwrap();
+    let error = backend
+        .transition_pending_status("t", "invalid-verdict", CapabilityCapsuleStatus::Provisional)
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains("active or rejected"));
+    assert_eq!(
+        backend
+            .get_capability_capsule_for_tenant("t", "invalid-verdict")
+            .await
+            .unwrap()
+            .unwrap()
+            .status,
+        CapabilityCapsuleStatus::PendingConfirmation
+    );
+}
+
 async fn list_pending_review_filters_status(backend: Arc<dyn CapsuleStore>) {
     backend
         .insert_capability_capsule(fixture("p1", CapabilityCapsuleStatus::PendingConfirmation))
@@ -192,6 +238,36 @@ async fn apply_feedback_incorrect_archives(backend: Arc<dyn CapsuleStore>) {
     };
     let updated = backend.apply_feedback(&original, event).await.unwrap();
     assert_eq!(updated.status, CapabilityCapsuleStatus::Archived);
+}
+
+async fn apply_feedback_rejects_mismatched_target(backend: Arc<dyn CapsuleStore>) {
+    let original = fixture("feedback-parent", CapabilityCapsuleStatus::Active);
+    backend
+        .insert_capability_capsule(original.clone())
+        .await
+        .unwrap();
+    let error = backend
+        .apply_feedback(
+            &original,
+            FeedbackEvent {
+                feedback_id: "feedback-mismatch".into(),
+                capability_capsule_id: "different-capsule".into(),
+                feedback_kind: FeedbackKind::Useful.as_str().to_string(),
+                created_at: current_timestamp(),
+                note: None,
+            },
+        )
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains("target does not match"));
+    assert_eq!(
+        backend
+            .feedback_summary("different-capsule")
+            .await
+            .unwrap()
+            .total,
+        0
+    );
 }
 
 async fn feedback_summary_counts_auto_promoted(backend: Arc<dyn CapsuleStore>) {
@@ -372,6 +448,40 @@ async fn replace_pending_with_successor_chains(backend: Arc<dyn CapsuleStore>) {
     assert_eq!(v2.supersedes_capability_capsule_id.as_deref(), Some("v1"));
 }
 
+async fn concurrent_edit_accept_mints_one_successor(backend: Arc<dyn CapsuleStore>) {
+    backend
+        .insert_capability_capsule(fixture(
+            "edit-race-v1",
+            CapabilityCapsuleStatus::PendingConfirmation,
+        ))
+        .await
+        .unwrap();
+    let mut left = fixture("edit-race-left", CapabilityCapsuleStatus::Active);
+    left.version = 2;
+    left.supersedes_capability_capsule_id = Some("edit-race-v1".into());
+    let mut right = fixture("edit-race-right", CapabilityCapsuleStatus::Active);
+    right.version = 2;
+    right.supersedes_capability_capsule_id = Some("edit-race-v1".into());
+
+    let left_call = backend.replace_pending_with_successor("t", "edit-race-v1", left);
+    let right_call = backend.replace_pending_with_successor("t", "edit-race-v1", right);
+    let (left_result, right_result) = tokio::join!(left_call, right_call);
+
+    let winners = usize::from(left_result.is_ok()) + usize::from(right_result.is_ok());
+    assert_eq!(winners, 1, "exactly one edit-accept may mint a successor");
+    let loser = left_result.err().or_else(|| right_result.err()).unwrap();
+    assert!(loser.to_string().contains("review conflict"));
+    let active = backend
+        .list_capability_capsules_for_tenant("t")
+        .await
+        .unwrap();
+    let successors = active
+        .iter()
+        .filter(|row| row.supersedes_capability_capsule_id.as_deref() == Some("edit-race-v1"))
+        .count();
+    assert_eq!(successors, 1, "losing edit-accept must not insert a row");
+}
+
 // ── Test fanout: one #[tokio::test] per (scenario, backend) pair ────
 
 macro_rules! parity {
@@ -398,14 +508,18 @@ parity!(insert_and_get_round_trip);
 parity!(get_for_other_tenant_returns_none);
 parity!(accept_pending_transitions_status);
 parity!(reject_pending_transitions_status);
+parity!(concurrent_review_verdict_allows_exactly_one_winner);
+parity!(pending_transition_rejects_non_verdict_status);
 parity!(list_pending_review_filters_status);
 parity!(find_by_idempotency_dedups_on_key);
 parity!(find_by_idempotency_dedups_on_hash);
 parity!(apply_feedback_useful_raises_confidence);
 parity!(apply_feedback_incorrect_archives);
+parity!(apply_feedback_rejects_mismatched_target);
 parity!(feedback_summary_counts_auto_promoted);
 parity!(delete_hard_removes_row);
 parity!(delete_hard_cascades_feedback_events);
 parity!(fetch_by_ids_returns_only_requested);
 parity!(fetch_by_ids_empty_short_circuits);
 parity!(replace_pending_with_successor_chains);
+parity!(concurrent_edit_accept_mints_one_successor);

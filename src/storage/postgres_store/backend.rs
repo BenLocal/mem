@@ -446,6 +446,19 @@ impl EmbeddingJobStore for PostgresCapsuleStore {
         // Mirrors the Lance count→insert window; PG gives us a real
         // transaction so the probe + insert are atomic.
         let mut tx = self.pool().begin().await.map_err(sqlx_err)?;
+        let parent: Option<i64> = sqlx::query_scalar(
+            "SELECT 1 FROM capability_capsules \
+             WHERE tenant = $1 AND capability_capsule_id = $2 FOR UPDATE",
+        )
+        .bind(&insert.tenant)
+        .bind(&insert.capability_capsule_id)
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(sqlx_err)?;
+        if parent.is_none() {
+            tx.rollback().await.map_err(sqlx_err)?;
+            return Err(StorageError::InvalidData("embedding job parent missing"));
+        }
         let live: i64 = sqlx::query_scalar(
             "SELECT count(*) FROM embedding_jobs \
              WHERE tenant = $1 AND capability_capsule_id = $2 \
@@ -460,6 +473,62 @@ impl EmbeddingJobStore for PostgresCapsuleStore {
         .await
         .map_err(sqlx_err)?;
         if live > 0 {
+            tx.rollback().await.map_err(sqlx_err)?;
+            return Ok(false);
+        }
+        sqlx::query(
+            "INSERT INTO embedding_jobs (job_id, tenant, capability_capsule_id, \
+                target_content_hash, provider, status, attempt_count, last_error, \
+                available_at, created_at, updated_at) \
+             VALUES ($1, $2, $3, $4, $5, 'pending', 0, NULL, $6, $7, $8)",
+        )
+        .bind(&insert.job_id)
+        .bind(&insert.tenant)
+        .bind(&insert.capability_capsule_id)
+        .bind(&insert.target_content_hash)
+        .bind(&insert.provider)
+        .bind(&insert.available_at)
+        .bind(&insert.created_at)
+        .bind(&insert.updated_at)
+        .execute(&mut *tx)
+        .await
+        .map_err(sqlx_err)?;
+        tx.commit().await.map_err(sqlx_err)?;
+        Ok(true)
+    }
+
+    async fn ensure_embedding_job(&self, insert: EmbeddingJobInsert) -> Result<bool, StorageError> {
+        let mut tx = self.pool().begin().await.map_err(sqlx_err)?;
+        // Serialize ingest reconciliation for one capsule. A plain
+        // count-then-insert transaction under READ COMMITTED still permits two
+        // concurrent replays to observe zero; the durable parent row is the
+        // natural lock key and exists before this phase starts.
+        let parent: Option<i64> = sqlx::query_scalar(
+            "SELECT 1 FROM capability_capsules \
+             WHERE tenant = $1 AND capability_capsule_id = $2 FOR UPDATE",
+        )
+        .bind(&insert.tenant)
+        .bind(&insert.capability_capsule_id)
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(sqlx_err)?;
+        if parent.is_none() {
+            tx.rollback().await.map_err(sqlx_err)?;
+            return Err(StorageError::InvalidData("embedding job parent missing"));
+        }
+        let existing: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM embedding_jobs \
+             WHERE tenant = $1 AND capability_capsule_id = $2 \
+               AND target_content_hash = $3 AND provider = $4",
+        )
+        .bind(&insert.tenant)
+        .bind(&insert.capability_capsule_id)
+        .bind(&insert.target_content_hash)
+        .bind(&insert.provider)
+        .fetch_one(&mut *tx)
+        .await
+        .map_err(sqlx_err)?;
+        if existing > 0 {
             tx.rollback().await.map_err(sqlx_err)?;
             return Ok(false);
         }
@@ -1711,7 +1780,8 @@ impl GraphStore for PostgresCapsuleStore {
                 "INSERT INTO graph_edges (from_node_id, to_node_id, relation, valid_from, \
                     valid_to, confidence, extractor, strength, stability, last_activated, \
                     access_count) \
-                 VALUES ($1, $2, $3, $4, NULL, $5, $6, $7, $8, $9, $10)",
+                 VALUES ($1, $2, $3, $4, NULL, $5, $6, $7, $8, $9, $10) \
+                 ON CONFLICT (from_node_id, to_node_id, relation, valid_from) DO NOTHING",
             )
             .bind(&edge.from_node_id)
             .bind(&edge.to_node_id)
@@ -2217,17 +2287,17 @@ impl TranscriptStore for PostgresCapsuleStore {
         time_to: Option<&str>,
         role: Option<&str>,
         block_type: Option<&str>,
-        cursor: Option<(&str, i64, i64)>,
+        cursor: Option<(&str, i64, i64, Option<&str>)>,
         limit: usize,
     ) -> Result<(Vec<ConversationMessage>, bool), StorageError> {
         // Cross-session range scan: session_id IS NOT NULL, half-open
-        // [time_from, time_to), same composite cursor + filters as the
-        // per-session paged read.
+        // [time_from, time_to), with message_block_id as the final cursor /
+        // ordering key so ties across sessions cannot be skipped.
         let lim = i64::try_from(limit).unwrap_or(64);
         let fetch = lim.saturating_add(1);
-        let (cur_at, cur_line, cur_idx) = match cursor {
-            Some((s, l, b)) => (Some(s), Some(l), Some(b)),
-            None => (None, None, None),
+        let (cur_at, cur_line, cur_idx, cur_id) = match cursor {
+            Some((s, l, b, id)) => (Some(s), Some(l), Some(b), id),
+            None => (None, None, None, None),
         };
         let sql = format!(
             "SELECT {CONVERSATION_COLS} FROM conversation_messages \
@@ -2239,9 +2309,11 @@ impl TranscriptStore for PostgresCapsuleStore {
                AND ($6::TEXT IS NULL OR ( \
                     created_at > $6 \
                  OR (created_at = $6 AND line_number > $7) \
-                 OR (created_at = $6 AND line_number = $7 AND block_index > $8))) \
-             ORDER BY created_at ASC, line_number ASC, block_index ASC \
-             LIMIT $9"
+                 OR (created_at = $6 AND line_number = $7 AND block_index > $8) \
+                 OR (created_at = $6 AND line_number = $7 AND block_index = $8 \
+                     AND $9::TEXT IS NOT NULL AND message_block_id > $9))) \
+             ORDER BY created_at ASC, line_number ASC, block_index ASC, message_block_id ASC \
+             LIMIT $10"
         );
         let mut out = sqlx::query(&sql)
             .bind(tenant)
@@ -2252,6 +2324,7 @@ impl TranscriptStore for PostgresCapsuleStore {
             .bind(cur_at)
             .bind(cur_line)
             .bind(cur_idx)
+            .bind(cur_id)
             .bind(fetch)
             .fetch_all(self.pool())
             .await
@@ -2750,7 +2823,8 @@ impl SessionStore for PostgresCapsuleStore {
         // (Lance only_if `session_id =`). Silent no-op if the row is
         // missing — `rows_affected == 0` is not an error.
         sqlx::query(
-            "UPDATE sessions SET last_seen_at = $1, memory_count = memory_count + 1 \
+            "UPDATE sessions SET last_seen_at = GREATEST(last_seen_at, $1), \
+             memory_count = memory_count + 1 \
              WHERE session_id = $2",
         )
         .bind(last_active_at)
@@ -2758,6 +2832,48 @@ impl SessionStore for PostgresCapsuleStore {
         .execute(self.pool())
         .await
         .map_err(sqlx_err)?;
+        Ok(())
+    }
+
+    async fn reconcile_session_after_ingest(
+        &self,
+        session_id: &str,
+        capability_capsule_id: &str,
+        occurred_at: &str,
+    ) -> Result<(), StorageError> {
+        let mut tx = self.pool().begin().await.map_err(sqlx_err)?;
+        let receipt: bool = sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM capability_capsules \
+             WHERE session_id = $1 AND capability_capsule_id = $2)",
+        )
+        .bind(session_id)
+        .bind(capability_capsule_id)
+        .fetch_one(&mut *tx)
+        .await
+        .map_err(sqlx_err)?;
+        if !receipt {
+            tx.rollback().await.map_err(sqlx_err)?;
+            return Err(StorageError::InvalidData("ingest session receipt missing"));
+        }
+        let persisted_count: i64 =
+            sqlx::query_scalar("SELECT count(*) FROM capability_capsules WHERE session_id = $1")
+                .bind(session_id)
+                .fetch_one(&mut *tx)
+                .await
+                .map_err(sqlx_err)?;
+        sqlx::query(
+            "UPDATE sessions \
+             SET last_seen_at = GREATEST(last_seen_at, $1), \
+                 memory_count = GREATEST(memory_count, $2) \
+             WHERE session_id = $3",
+        )
+        .bind(occurred_at)
+        .bind(persisted_count)
+        .bind(session_id)
+        .execute(&mut *tx)
+        .await
+        .map_err(sqlx_err)?;
+        tx.commit().await.map_err(sqlx_err)?;
         Ok(())
     }
 
@@ -2836,10 +2952,7 @@ impl SessionStore for PostgresCapsuleStore {
         // column (same as the Lance backend). scope / visibility serialize
         // to their snake_case wire form.
         let workflow_json: Option<String> = match &episode.workflow_candidate {
-            Some(c) => Some(
-                serde_json::to_string(c)
-                    .map_err(|e| StorageError::InvalidInput(format!("workflow_candidate: {e}")))?,
-            ),
+            Some(c) => Some(serde_json::to_string(c).map_err(StorageError::Serde)?),
             None => None,
         };
         sqlx::query(
@@ -2925,10 +3038,9 @@ fn pg_row_to_episode(row: &sqlx::postgres::PgRow) -> Result<EpisodeRecord, Stora
     let workflow_raw: Option<String> = row.try_get("workflow_candidate").map_err(sqlx_err)?;
     let workflow_candidate = match workflow_raw {
         None => None,
-        Some(raw) => Some(
-            serde_json::from_str::<WorkflowCandidate>(&raw)
-                .map_err(|e| StorageError::InvalidInput(format!("workflow_candidate: {e}")))?,
-        ),
+        Some(raw) => {
+            Some(serde_json::from_str::<WorkflowCandidate>(&raw).map_err(StorageError::Serde)?)
+        }
     };
     Ok(EpisodeRecord {
         episode_id: row.try_get("episode_id").map_err(sqlx_err)?,

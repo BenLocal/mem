@@ -98,6 +98,14 @@ impl LanceStore {
         if edges.is_empty() {
             return Ok(());
         }
+        // The existence probe and append must be one process-local critical
+        // section; otherwise simultaneous recovery calls can both append the
+        // same active triple. One `mem serve` writer per Lance dataset is a
+        // project invariant, so this closes the remaining writer race.
+        let _lifecycle_guard = self.capsule_lifecycle_gate.write().await;
+        for edge in edges {
+            self.reject_deleted_capsule_endpoints(edge)?;
+        }
         let table = self
             .conn
             .open_table("graph_edges")
@@ -106,9 +114,8 @@ impl LanceStore {
             .map_err(|e| GraphError::Backend(e.to_string()))?;
         // Idempotent insert: skip rows where an active edge with the
         // same (from, to, relation) already exists. LanceDB has no
-        // transactions; a concurrent writer could race the existence
-        // check, but mem serve is single-instance per DB so this is
-        // safe in practice (same posture as embedding_jobs enqueue).
+        // transactions; the lifecycle write guard serializes this probe and
+        // append with other process-local graph/lifecycle mutations.
         for edge in edges {
             let exists = table
                 .count_rows(Some(format!(
@@ -161,6 +168,10 @@ impl LanceStore {
     /// Returns `true` if the edge was actually written, `false` if
     /// the idempotency check found a duplicate.
     pub async fn add_edge_direct(&self, edge: &GraphEdge) -> Result<bool, GraphError> {
+        let _lifecycle_guard = self.capsule_lifecycle_gate.read().await;
+        if edge.valid_to.is_none() {
+            self.reject_deleted_capsule_endpoints(edge)?;
+        }
         // K12 (closes mempalace-diff-v4 K12): reject an inverted
         // bitemporal interval. An edge whose `valid_to` precedes its
         // `valid_from` can never satisfy the recall filter
@@ -202,6 +213,24 @@ impl LanceStore {
             .await
             .map_err(|e| GraphError::Backend(e.to_string()))?;
         Ok(true)
+    }
+
+    fn reject_deleted_capsule_endpoints(&self, edge: &GraphEdge) -> Result<(), GraphError> {
+        let deleted = self
+            .deleted_capsule_ids
+            .read()
+            .expect("deleted_capsule_ids lock poisoned");
+        for node_id in [&edge.from_node_id, &edge.to_node_id] {
+            let Some(capsule_id) = node_id.strip_prefix("capability_capsule:") else {
+                continue;
+            };
+            if deleted.contains(capsule_id) {
+                return Err(GraphError::InvalidInput(format!(
+                    "active graph edge references deleted capsule {capsule_id}"
+                )));
+            }
+        }
+        Ok(())
     }
 
     /// Invalidate (close) one active edge identified by the

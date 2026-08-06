@@ -43,6 +43,7 @@ CREATE TABLE IF NOT EXISTS capability_capsules
     last_used_at                     String,
     last_recalled_at                 String,
     expires_at                       String,
+    review_token                     String,
     row_version                      UInt64
 )
 ENGINE = ReplacingMergeTree(row_version)

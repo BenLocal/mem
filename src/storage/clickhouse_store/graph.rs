@@ -119,6 +119,17 @@ impl ClickHouseBackend {
         insert.end().await.map_err(ch_gerr)?;
         Ok(())
     }
+
+    fn reject_deleted_edge_endpoints(&self, edge: &GraphEdge) -> Result<(), GraphError> {
+        for node_id in [&edge.from_node_id, &edge.to_node_id] {
+            let Some(capsule_id) = node_id.strip_prefix("capability_capsule:") else {
+                continue;
+            };
+            self.reject_deleted_capsule(capsule_id)
+                .map_err(GraphError::from)?;
+        }
+        Ok(())
+    }
 }
 
 /// Iterative BFS over an in-memory active-edge set, following edges incident
@@ -390,27 +401,48 @@ impl GraphStore for ClickHouseBackend {
     }
 
     async fn sync_memory_edges(&self, edges: &[GraphEdge], now: &str) -> Result<(), GraphError> {
-        // Close any currently-active edge for each (from, relation, to) by
-        // re-inserting it with valid_to = now, then insert the new active row.
+        let _lifecycle_guard = self.capsule_lifecycle_gate.read().await;
+        for edge in edges {
+            self.reject_deleted_edge_endpoints(edge)?;
+        }
+        let mut seen = std::collections::HashSet::new();
+        let mut missing = Vec::new();
         for e in edges {
-            self.client
+            let key = (
+                e.from_node_id.clone(),
+                e.relation.clone(),
+                e.to_node_id.clone(),
+            );
+            if !seen.insert(key) {
+                continue;
+            }
+            let existing: Vec<u64> = self
+                .client
                 .query(
-                    "ALTER TABLE graph_edges UPDATE valid_to = ? \
+                    "SELECT count() FROM graph_edges FINAL \
                      WHERE valid_to = '' AND from_node_id = ? AND relation = ? AND to_node_id = ?",
                 )
-                .bind(now)
                 .bind(&e.from_node_id)
                 .bind(&e.relation)
                 .bind(&e.to_node_id)
-                .execute()
+                .fetch_all::<u64>()
                 .await
                 .map_err(ch_gerr)?;
+            if existing.first().copied().unwrap_or(0) == 0 {
+                let mut active = e.clone();
+                active.valid_from = now.to_owned();
+                active.valid_to = None;
+                missing.push(ChEdgeRow::from_edge(&active));
+            }
         }
-        let rows: Vec<ChEdgeRow> = edges.iter().map(ChEdgeRow::from_edge).collect();
-        self.ch_write_edges(&rows).await
+        self.ch_write_edges(&missing).await
     }
 
     async fn add_edge_direct(&self, edge: &GraphEdge) -> Result<bool, GraphError> {
+        let _lifecycle_guard = self.capsule_lifecycle_gate.read().await;
+        if edge.valid_to.is_none() {
+            self.reject_deleted_edge_endpoints(edge)?;
+        }
         self.ch_write_edges(std::slice::from_ref(&ChEdgeRow::from_edge(edge)))
             .await?;
         Ok(true)

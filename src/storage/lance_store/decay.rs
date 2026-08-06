@@ -49,12 +49,19 @@ const COMMIT_RETRY_MAX_ATTEMPTS: u32 = 3;
 /// (`Commit conflict ...` / `Retryable commit conflict ...`) or the
 /// retry-budget-exhausted `TooMuchWriteContention` (`Too many
 /// concurrent writers ...` / `Attempted N retries`). Matched on the
-/// rendered message because it crosses the `lancedb::Error` →
-/// [`StorageError`] boundary as an opaque `InvalidInput` string.
+/// rendered source message because it crosses the `lancedb::Error` →
+/// [`StorageError`] boundary as an opaque backend error.
 /// Requires a "commit"/"conflict"/"contention" marker so an unrelated
 /// error (e.g. a binder/"not found") is never retried.
 fn is_lance_commit_conflict(err: &StorageError) -> bool {
-    let m = err.to_string().to_lowercase();
+    let StorageError::Backend {
+        backend: "lancedb",
+        source,
+    } = err
+    else {
+        return false;
+    };
+    let m = source.to_string().to_lowercase();
     m.contains("commit conflict")
         || m.contains("conflict")
         || m.contains("write contention")
@@ -268,20 +275,26 @@ mod tests {
     /// when lance's *internal* retry budget is exhausted under sustained
     /// contention (the outer safety net this module adds catches it).
     fn conflict_err() -> StorageError {
-        StorageError::InvalidInput(
-            "lancedb: Too many concurrent writers. Attempted 10 retries., \
+        StorageError::backend(
+            "lancedb",
+            std::io::Error::other(
+                "lancedb: Too many concurrent writers. Attempted 10 retries., \
              /x/dataset/write/retry.rs:130"
-                .to_string(),
+                    .to_string(),
+            ),
         )
     }
 
     /// The retryable-commit-conflict variant lance renders before it
     /// exhausts its internal budget — also retryable here.
     fn retryable_conflict_err() -> StorageError {
-        StorageError::InvalidInput(
-            "lancedb: Commit conflict for version 42: concurrent writer advanced \
+        StorageError::backend(
+            "lancedb",
+            std::io::Error::other(
+                "lancedb: Commit conflict for version 42: concurrent writer advanced \
              the dataset"
-                .to_string(),
+                    .to_string(),
+            ),
         )
     }
 
@@ -291,13 +304,15 @@ mod tests {
         assert!(is_lance_commit_conflict(&conflict_err()));
         // The optimistic-concurrency commit-conflict family → retryable.
         assert!(is_lance_commit_conflict(&retryable_conflict_err()));
-        assert!(is_lance_commit_conflict(&StorageError::InvalidInput(
-            "lancedb: Retryable commit conflict for version 7: ...".into()
+        assert!(is_lance_commit_conflict(&StorageError::backend(
+            "lancedb",
+            std::io::Error::other("lancedb: Retryable commit conflict for version 7: ...")
         )));
         // Benign errors must NOT be retried — even one mentioning
         // "not found" that is unrelated to a commit.
-        assert!(!is_lance_commit_conflict(&StorageError::InvalidInput(
-            "lancedb: column \"foo\" not found".into()
+        assert!(!is_lance_commit_conflict(&StorageError::backend(
+            "lancedb",
+            std::io::Error::other("lancedb: column \"foo\" not found")
         )));
         assert!(!is_lance_commit_conflict(&StorageError::NotFound(
             "capsule"

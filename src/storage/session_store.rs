@@ -28,6 +28,17 @@ pub trait SessionStore: Send + Sync {
         last_active_at: &str,
     ) -> Result<(), StorageError>;
 
+    /// Reconcile the session aggregate after a capsule has already committed.
+    /// Replays are idempotent: `memory_count` advances to at least the number
+    /// of persisted capsules in the session, never by a blind `+ 1`, and
+    /// `last_seen_at` never moves backwards.
+    async fn reconcile_session_after_ingest(
+        &self,
+        session_id: &str,
+        capability_capsule_id: &str,
+        occurred_at: &str,
+    ) -> Result<(), StorageError>;
+
     /// Open a new session row. `now` becomes both `started_at` and
     /// `last_seen_at`.
     async fn open_session(
@@ -69,6 +80,16 @@ impl SessionStore for Store {
         last_active_at: &str,
     ) -> Result<(), StorageError> {
         Store::touch_session(self, session_id, last_active_at).await
+    }
+
+    async fn reconcile_session_after_ingest(
+        &self,
+        session_id: &str,
+        capability_capsule_id: &str,
+        occurred_at: &str,
+    ) -> Result<(), StorageError> {
+        Store::reconcile_session_after_ingest(self, session_id, capability_capsule_id, occurred_at)
+            .await
     }
 
     async fn open_session(

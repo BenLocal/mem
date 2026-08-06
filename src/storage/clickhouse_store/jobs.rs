@@ -52,6 +52,17 @@ struct ChTxJobRow {
     row_version: u64,
 }
 
+fn initial_job_row_version(job_id: &str) -> u64 {
+    if job_id.starts_with("ej_ingest_") {
+        // Deterministic ingest receipts may be inserted by two processes. Keep
+        // every initial pending copy below all real state transitions so a
+        // delayed initial insert can never win FINAL over completed/failed.
+        0
+    } else {
+        now_version()
+    }
+}
+
 impl ClickHouseBackend {
     async fn ch_job(&self, job_id: &str) -> Result<Option<ChJobRow>, StorageError> {
         let rows = self
@@ -88,9 +99,11 @@ impl ClickHouseBackend {
         available_at: Option<&str>,
         now: &str,
     ) -> Result<(), StorageError> {
+        let _lifecycle_guard = self.capsule_lifecycle_gate.read().await;
         let Some(mut row) = self.ch_job(job_id).await? else {
             return Ok(());
         };
+        self.reject_deleted_capsule(&row.capability_capsule_id)?;
         if let Some(s) = status {
             row.status = s.to_owned();
         }
@@ -165,6 +178,8 @@ impl EmbeddingJobStore for ClickHouseBackend {
         &self,
         insert: EmbeddingJobInsert,
     ) -> Result<bool, StorageError> {
+        let _lifecycle_guard = self.capsule_lifecycle_gate.read().await;
+        self.reject_deleted_capsule(&insert.capability_capsule_id)?;
         // Skip if a live (pending|processing) job already covers this content.
         let existing: Vec<u64> = self
             .client
@@ -183,6 +198,7 @@ impl EmbeddingJobStore for ClickHouseBackend {
         if existing.first().copied().unwrap_or(0) > 0 {
             return Ok(false);
         }
+        let row_version = initial_job_row_version(&insert.job_id);
         self.ch_write_job(&ChJobRow {
             job_id: insert.job_id,
             tenant: insert.tenant,
@@ -195,7 +211,50 @@ impl EmbeddingJobStore for ClickHouseBackend {
             available_at: insert.available_at,
             created_at: insert.created_at,
             updated_at: insert.updated_at,
-            row_version: now_version(),
+            row_version,
+        })
+        .await?;
+        Ok(true)
+    }
+
+    async fn ensure_embedding_job(&self, insert: EmbeddingJobInsert) -> Result<bool, StorageError> {
+        // Serialize the process-local count→insert critical section against
+        // other ensure/try-enqueue calls and hard delete. Cross-process replay
+        // converges via the service's deterministic ingest job_id and this
+        // table's ReplacingMergeTree(job_id).
+        let _lifecycle_guard = self.capsule_lifecycle_gate.write().await;
+        self.reject_deleted_capsule(&insert.capability_capsule_id)?;
+        let existing: Vec<u64> = self
+            .client
+            .query(
+                "SELECT count() FROM embedding_jobs FINAL \
+                 WHERE tenant = ? AND capability_capsule_id = ? AND target_content_hash = ? \
+                 AND provider = ?",
+            )
+            .bind(&insert.tenant)
+            .bind(&insert.capability_capsule_id)
+            .bind(&insert.target_content_hash)
+            .bind(&insert.provider)
+            .fetch_all::<u64>()
+            .await
+            .map_err(ch_err)?;
+        if existing.first().copied().unwrap_or(0) > 0 {
+            return Ok(false);
+        }
+        let row_version = initial_job_row_version(&insert.job_id);
+        self.ch_write_job(&ChJobRow {
+            job_id: insert.job_id,
+            tenant: insert.tenant,
+            capability_capsule_id: insert.capability_capsule_id,
+            target_content_hash: insert.target_content_hash,
+            provider: insert.provider,
+            status: "pending".to_owned(),
+            attempt_count: 0,
+            last_error: String::new(),
+            available_at: insert.available_at,
+            created_at: insert.created_at,
+            updated_at: insert.updated_at,
+            row_version,
         })
         .await?;
         Ok(true)
@@ -217,6 +276,7 @@ impl EmbeddingJobStore for ClickHouseBackend {
         max_retries: u32,
         n: usize,
     ) -> Result<Vec<ClaimedEmbeddingJob>, StorageError> {
+        let _lifecycle_guard = self.capsule_lifecycle_gate.read().await;
         // Lease parity with Lance (EMBEDDING_JOB_LEASE_MS, commit
         // 81a9302): a `processing` row whose lease elapsed is an orphan
         // from a crashed/restarted worker — reclaim it, else the capsule
@@ -242,6 +302,7 @@ impl EmbeddingJobStore for ClickHouseBackend {
             .map_err(ch_err)?;
         let mut claimed = Vec::with_capacity(rows.len());
         for mut row in rows {
+            self.reject_deleted_capsule(&row.capability_capsule_id)?;
             row.status = "processing".to_owned();
             row.attempt_count += 1;
             row.updated_at = now.to_owned();
@@ -326,6 +387,8 @@ impl EmbeddingJobStore for ClickHouseBackend {
         provider: &str,
         now: &str,
     ) -> Result<usize, StorageError> {
+        let _lifecycle_guard = self.capsule_lifecycle_gate.read().await;
+        self.reject_deleted_capsule(capability_capsule_id)?;
         self.client
             .query(
                 "ALTER TABLE embedding_jobs UPDATE status = 'stale', updated_at = ? \
@@ -536,5 +599,16 @@ impl EmbeddingJobStore for ClickHouseBackend {
         job_id: &str,
     ) -> Result<Option<String>, StorageError> {
         Ok(self.ch_tx_job(job_id).await?.map(|r| r.status))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::initial_job_row_version;
+
+    #[test]
+    fn deterministic_ingest_receipts_start_below_state_transitions() {
+        assert_eq!(initial_job_row_version("ej_ingest_deadbeef"), 0);
+        assert!(initial_job_row_version("ej_admin_rebuild") > 0);
     }
 }

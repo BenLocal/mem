@@ -315,14 +315,13 @@ impl TranscriptStore for ClickHouseBackend {
         time_to: Option<&str>,
         role: Option<&str>,
         block_type: Option<&str>,
-        cursor: Option<(&str, i64, i64)>,
+        cursor: Option<(&str, i64, i64, Option<&str>)>,
         limit: usize,
     ) -> Result<(Vec<ConversationMessage>, bool), StorageError> {
         // Cross-session range scan (`session_id != ''`, half-open
-        // [time_from, time_to)), with the same composite cursor + role /
-        // block_type filters as the per-session paged read. Mirrors the postgres
-        // backend. String values bind via `?`; the integer cursor components and
-        // the LIMIT are inlined (ClickHouse rejects a bound LIMIT param).
+        // [time_from, time_to)), with message_block_id as the final cursor /
+        // ordering key. String values bind via `?`; the integer cursor
+        // components and LIMIT are inlined (ClickHouse rejects a bound LIMIT).
         let mut sql = String::from(
             "SELECT ?fields FROM conversation_messages FINAL \
              WHERE tenant = ? AND session_id != ''",
@@ -344,18 +343,27 @@ impl TranscriptStore for ClickHouseBackend {
             sql.push_str(" AND block_type = ?");
             binds.push(bt.to_string());
         }
-        if let Some((ca, line, block)) = cursor {
+        if let Some((ca, line, block, message_block_id)) = cursor {
             sql.push_str(&format!(
                 " AND (created_at > ? \
                  OR (created_at = ? AND line_number > {line}) \
-                 OR (created_at = ? AND line_number = {line} AND block_index > {block}))"
+                 OR (created_at = ? AND line_number = {line} AND block_index > {block})"
             ));
             binds.push(ca.to_string());
             binds.push(ca.to_string());
             binds.push(ca.to_string());
+            if let Some(message_block_id) = message_block_id {
+                sql.push_str(&format!(
+                    " OR (created_at = ? AND line_number = {line} AND block_index = {block} \
+                     AND message_block_id > ?)"
+                ));
+                binds.push(ca.to_string());
+                binds.push(message_block_id.to_string());
+            }
+            sql.push(')');
         }
         sql.push_str(&format!(
-            " ORDER BY created_at ASC, line_number ASC, block_index ASC LIMIT {}",
+            " ORDER BY created_at ASC, line_number ASC, block_index ASC, message_block_id ASC LIMIT {}",
             limit + 1
         ));
 
@@ -395,7 +403,7 @@ impl TranscriptStore for ClickHouseBackend {
         primary_id: &str,
         k_before: usize,
         k_after: usize,
-        _include_tool_blocks: bool,
+        include_tool_blocks: bool,
     ) -> Result<ContextWindow, StorageError> {
         let primary = self
             .ch_messages(
@@ -406,29 +414,76 @@ impl TranscriptStore for ClickHouseBackend {
             .await?
             .into_iter()
             .next()
-            .ok_or_else(|| {
-                StorageError::InvalidInput(format!("conversation block {primary_id} not found"))
-            })?;
-        let sid = primary.session_id.clone().unwrap_or_default();
-        let before = self
-            .ch_messages(
-                "SELECT ?fields FROM conversation_messages FINAL \
-                 WHERE tenant = ? AND session_id = ? AND created_at < ? \
-                 ORDER BY created_at DESC LIMIT ?",
-                &[tenant, &sid, &primary.created_at, &k_before.to_string()],
+            .ok_or(StorageError::NotFound("transcript primary block"))?;
+        let Some(sid) = primary.session_id.clone() else {
+            return Ok(ContextWindow {
+                primary,
+                before: Vec::new(),
+                after: Vec::new(),
+            });
+        };
+
+        let type_filter = if include_tool_blocks {
+            ""
+        } else {
+            "AND block_type IN ('text', 'thinking') "
+        };
+        let line = primary.line_number;
+        let block = primary.block_index;
+
+        let mut before = if k_before == 0 {
+            Vec::new()
+        } else {
+            self.ch_messages(
+                &format!(
+                    "SELECT ?fields FROM conversation_messages FINAL \
+                     WHERE tenant = ? AND session_id = ? \
+                       AND (created_at < ? \
+                         OR (created_at = ? AND line_number < {line}) \
+                         OR (created_at = ? AND line_number = {line} AND block_index < {block})) \
+                       {type_filter}\
+                     ORDER BY created_at DESC, line_number DESC, block_index DESC \
+                     LIMIT {k_before}"
+                ),
+                &[
+                    tenant,
+                    &sid,
+                    &primary.created_at,
+                    &primary.created_at,
+                    &primary.created_at,
+                ],
             )
-            .await?;
-        let after = self
-            .ch_messages(
-                "SELECT ?fields FROM conversation_messages FINAL \
-                 WHERE tenant = ? AND session_id = ? AND created_at > ? \
-                 ORDER BY created_at ASC LIMIT ?",
-                &[tenant, &sid, &primary.created_at, &k_after.to_string()],
+            .await?
+        };
+        before.reverse();
+
+        let after = if k_after == 0 {
+            Vec::new()
+        } else {
+            self.ch_messages(
+                &format!(
+                    "SELECT ?fields FROM conversation_messages FINAL \
+                     WHERE tenant = ? AND session_id = ? \
+                       AND (created_at > ? \
+                         OR (created_at = ? AND line_number > {line}) \
+                         OR (created_at = ? AND line_number = {line} AND block_index > {block})) \
+                       {type_filter}\
+                     ORDER BY created_at ASC, line_number ASC, block_index ASC \
+                     LIMIT {k_after}"
+                ),
+                &[
+                    tenant,
+                    &sid,
+                    &primary.created_at,
+                    &primary.created_at,
+                    &primary.created_at,
+                ],
             )
-            .await?;
+            .await?
+        };
         Ok(ContextWindow {
             primary,
-            before: before.into_iter().rev().collect(),
+            before,
             after,
         })
     }

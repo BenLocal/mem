@@ -150,6 +150,30 @@ pg_test!(accept_pending_transitions_status, backend, {
     assert_eq!(got.status, CapabilityCapsuleStatus::Active);
 });
 
+pg_test!(concurrent_review_verdict_allows_one_winner, backend, {
+    backend
+        .insert_capability_capsule(fixture(
+            "review_race",
+            CapabilityCapsuleStatus::PendingConfirmation,
+        ))
+        .await
+        .unwrap();
+    let (accepted, rejected) = tokio::join!(
+        backend.accept_pending("t", "review_race"),
+        backend.reject_pending("t", "review_race"),
+    );
+    assert_eq!(
+        usize::from(accepted.is_ok()) + usize::from(rejected.is_ok()),
+        1
+    );
+    assert!(accepted
+        .err()
+        .or_else(|| rejected.err())
+        .unwrap()
+        .to_string()
+        .contains("review conflict"));
+});
+
 pg_test!(list_pending_review_filters_status, backend, {
     backend
         .insert_capability_capsule(fixture("act", CapabilityCapsuleStatus::Active))
@@ -215,6 +239,86 @@ pg_test!(apply_feedback_moves_confidence, backend, {
     assert!(
         after > before,
         "useful feedback raises confidence ({before} -> {after})"
+    );
+});
+
+pg_test!(
+    concurrent_feedback_adds_every_delta_from_live_row,
+    backend,
+    {
+        let original = fixture("feedback_race", CapabilityCapsuleStatus::Active);
+        backend
+            .insert_capability_capsule(original.clone())
+            .await
+            .unwrap();
+        let useful = FeedbackEvent {
+            feedback_id: "feedback_race_useful".into(),
+            capability_capsule_id: original.capability_capsule_id.clone(),
+            feedback_kind: "useful".into(),
+            created_at: "00000000000000000001".into(),
+            note: None,
+        };
+        let outdated = FeedbackEvent {
+            feedback_id: "feedback_race_outdated".into(),
+            capability_capsule_id: original.capability_capsule_id.clone(),
+            feedback_kind: "outdated".into(),
+            created_at: "00000000000000000002".into(),
+            note: None,
+        };
+
+        let (useful_result, outdated_result) = tokio::join!(
+            backend.apply_feedback(&original, useful),
+            backend.apply_feedback(&original, outdated),
+        );
+        useful_result.unwrap();
+        outdated_result.unwrap();
+
+        let updated = backend
+            .get_capability_capsule_for_tenant("t", "feedback_race")
+            .await
+            .unwrap()
+            .unwrap();
+        assert!((updated.confidence - 0.6).abs() < 1e-6);
+        assert!((updated.decay_score - 0.2).abs() < 1e-6);
+        assert_eq!(
+            updated.last_validated_at.as_deref(),
+            Some("00000000000000000001")
+        );
+        assert_eq!(
+            backend
+                .feedback_summary("feedback_race")
+                .await
+                .unwrap()
+                .total,
+            2
+        );
+    }
+);
+
+pg_test!(feedback_missing_parent_rolls_back_audit_event, backend, {
+    let missing = fixture("feedback_missing", CapabilityCapsuleStatus::Active);
+    let error = backend
+        .apply_feedback(
+            &missing,
+            FeedbackEvent {
+                feedback_id: "feedback_missing_event".into(),
+                capability_capsule_id: missing.capability_capsule_id.clone(),
+                feedback_kind: "useful".into(),
+                created_at: current_timestamp(),
+                note: None,
+            },
+        )
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains("memory missing"));
+    assert_eq!(
+        backend
+            .feedback_summary(&missing.capability_capsule_id)
+            .await
+            .unwrap()
+            .total,
+        0,
+        "the transaction must roll back its audit row when the parent update misses",
     );
 });
 
@@ -994,6 +1098,51 @@ emb_test!(session_open_touch_close_latest, store, {
         .unwrap()
         .is_none());
 });
+
+emb_test!(
+    ingest_session_reconciliation_is_idempotent_and_monotonic,
+    store,
+    {
+        store
+            .open_session(
+                "session-reconcile",
+                "t",
+                "reconcile-agent",
+                "00000001778000000000",
+            )
+            .await
+            .unwrap();
+        let mut memory = fixture("session-receipt", CapabilityCapsuleStatus::Active);
+        memory.session_id = Some("session-reconcile".into());
+        memory.source_agent = "reconcile-agent".into();
+        store.insert_capability_capsule(memory).await.unwrap();
+
+        store
+            .reconcile_session_after_ingest(
+                "session-reconcile",
+                "session-receipt",
+                "00000001778000000002",
+            )
+            .await
+            .unwrap();
+        store
+            .reconcile_session_after_ingest(
+                "session-reconcile",
+                "session-receipt",
+                "00000001778000000001",
+            )
+            .await
+            .unwrap();
+
+        let session = store
+            .latest_active_session("t", "reconcile-agent")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(session.memory_count, 1);
+        assert_eq!(session.last_seen_at, "00000001778000000002");
+    }
+);
 
 fn episode(id: &str, tenant: &str, outcome: &str) -> EpisodeRecord {
     EpisodeRecord {
@@ -2156,6 +2305,60 @@ emb_test!(transcript_paged_range_and_by_ids, store, {
     assert_eq!(sessions[0].session_id, "sp");
     assert_eq!(sessions[0].block_count, 3);
     assert_eq!(sessions[0].caller_agent.as_deref(), Some("claude-code"));
+});
+
+emb_test!(transcript_range_cursor_is_total_across_sessions, store, {
+    store.set_transcript_job_provider("fake-test");
+    let tenant = "pg_range_cursor_v2";
+    let mut a = conv_msg(
+        "pg-range-a",
+        "pg-range-session-a",
+        7,
+        3,
+        BlockType::Text,
+        "a",
+    );
+    a.tenant = tenant.into();
+    a.created_at = "00000000000000000100".into();
+    let mut b = conv_msg(
+        "pg-range-b",
+        "pg-range-session-b",
+        7,
+        3,
+        BlockType::Text,
+        "b",
+    );
+    b.tenant = tenant.into();
+    b.created_at = "00000000000000000100".into();
+    store.create_conversation_messages(&[a, b]).await.unwrap();
+
+    let (page1, more1) = store
+        .list_conversation_messages_in_range(tenant, None, None, None, None, None, 1)
+        .await
+        .unwrap();
+    assert_eq!(page1[0].message_block_id, "pg-range-a");
+    assert!(more1);
+
+    let last = &page1[0];
+    let (page2, more2) = store
+        .list_conversation_messages_in_range(
+            tenant,
+            None,
+            None,
+            None,
+            None,
+            Some((
+                &last.created_at,
+                last.line_number as i64,
+                last.block_index as i64,
+                Some(&last.message_block_id),
+            )),
+            1,
+        )
+        .await
+        .unwrap();
+    assert_eq!(page2[0].message_block_id, "pg-range-b");
+    assert!(!more2);
 });
 
 emb_test!(transcript_context_window_and_anchors, store, {

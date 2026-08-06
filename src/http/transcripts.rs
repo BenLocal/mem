@@ -191,11 +191,15 @@ fn ingest_request_to_message(req: IngestRequest, id: String) -> ConversationMess
 // independent of the cursor.
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 pub struct CursorTuple {
     pub created_at: String,
     pub line_number: i64,
     pub block_index: i64,
+    /// Cross-session range scans add the row id as the final ordering key.
+    /// Optional so cursors minted before this field existed remain accepted.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub message_block_id: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -223,22 +227,21 @@ pub struct GetBySessionResponse {
     pub has_more: bool,
 }
 
-impl Serialize for CursorTuple {
-    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
-        use serde::ser::SerializeStruct;
-        let mut st = s.serialize_struct("CursorTuple", 3)?;
-        st.serialize_field("created_at", &self.created_at)?;
-        st.serialize_field("line_number", &self.line_number)?;
-        st.serialize_field("block_index", &self.block_index)?;
-        st.end()
-    }
-}
-
 fn make_cursor(m: &ConversationMessage) -> CursorTuple {
     CursorTuple {
         created_at: m.created_at.clone(),
         line_number: m.line_number as i64,
         block_index: m.block_index as i64,
+        message_block_id: None,
+    }
+}
+
+fn make_range_cursor(m: &ConversationMessage) -> CursorTuple {
+    CursorTuple {
+        created_at: m.created_at.clone(),
+        line_number: m.line_number as i64,
+        block_index: m.block_index as i64,
+        message_block_id: Some(m.message_block_id.clone()),
     }
 }
 
@@ -323,10 +326,14 @@ async fn post_range(
         MessageRole::System => "system",
     });
     let block_type = req.block_type.map(|b| b.as_db_str());
-    let cursor_ref = req
-        .cursor
-        .as_ref()
-        .map(|c| (c.created_at.as_str(), c.line_number, c.block_index));
+    let cursor_ref = req.cursor.as_ref().map(|c| {
+        (
+            c.created_at.as_str(),
+            c.line_number,
+            c.block_index,
+            c.message_block_id.as_deref(),
+        )
+    });
     let (messages, has_more) = state
         .transcript_service
         .list_in_range(
@@ -340,7 +347,7 @@ async fn post_range(
         )
         .await?;
     let next_cursor = if has_more {
-        messages.last().map(make_cursor)
+        messages.last().map(make_range_cursor)
     } else {
         None
     };

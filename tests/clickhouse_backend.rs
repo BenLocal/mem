@@ -25,7 +25,8 @@ mod ch {
     use mem::storage::types::EmbeddingJobInsert;
     use mem::storage::{
         current_timestamp, CapsuleStore, ClickHouseBackend, EmbeddingJobStore,
-        EmbeddingVectorStore, EntityRegistry, FeedbackEvent, GraphStore, TranscriptStore,
+        EmbeddingVectorStore, EntityRegistry, FeedbackEvent, GraphStore, SessionStore,
+        StorageError, TranscriptStore,
     };
 
     fn fixture(id: &str, status: CapabilityCapsuleStatus) -> CapabilityCapsuleRecord {
@@ -105,6 +106,31 @@ mod ch {
             .unwrap()
             .unwrap();
         assert_eq!(got.status, CapabilityCapsuleStatus::Active);
+    }
+
+    #[tokio::test]
+    async fn concurrent_review_verdict_allows_one_winner() {
+        let Some(store) = store().await else { return };
+        let id = format!("ch_review_race_{}", uuid::Uuid::now_v7());
+        store
+            .insert_capability_capsule(fixture(&id, CapabilityCapsuleStatus::PendingConfirmation))
+            .await
+            .unwrap();
+        let (accepted, rejected) = tokio::join!(
+            store.accept_pending("t", &id),
+            store.reject_pending("t", &id),
+        );
+        assert_eq!(
+            usize::from(accepted.is_ok()) + usize::from(rejected.is_ok()),
+            1,
+            "accepted={accepted:?}, rejected={rejected:?}"
+        );
+        assert!(accepted
+            .err()
+            .or_else(|| rejected.err())
+            .unwrap()
+            .to_string()
+            .contains("review conflict"));
     }
 
     #[tokio::test]
@@ -293,6 +319,51 @@ mod ch {
         assert_eq!(summary.total, 1);
     }
 
+    #[tokio::test]
+    async fn concurrent_feedback_adds_every_delta_from_live_row() {
+        let Some(store) = store().await else { return };
+        let id = format!("ch_feedback_race_{}", uuid::Uuid::now_v7());
+        let original = fixture(&id, CapabilityCapsuleStatus::Active);
+        store
+            .insert_capability_capsule(original.clone())
+            .await
+            .unwrap();
+        let useful = FeedbackEvent {
+            feedback_id: format!("{id}_useful"),
+            capability_capsule_id: id.clone(),
+            feedback_kind: "useful".into(),
+            created_at: "00000000000000000001".into(),
+            note: None,
+        };
+        let outdated = FeedbackEvent {
+            feedback_id: format!("{id}_outdated"),
+            capability_capsule_id: id.clone(),
+            feedback_kind: "outdated".into(),
+            created_at: "00000000000000000002".into(),
+            note: None,
+        };
+
+        let (useful_result, outdated_result) = tokio::join!(
+            store.apply_feedback(&original, useful),
+            store.apply_feedback(&original, outdated),
+        );
+        useful_result.unwrap();
+        outdated_result.unwrap();
+
+        let updated = store
+            .get_capability_capsule_for_tenant("t", &id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!((updated.confidence - 0.6).abs() < 1e-6);
+        assert!((updated.decay_score - 0.2).abs() < 1e-6);
+        assert_eq!(
+            updated.last_validated_at.as_deref(),
+            Some("00000000000000000001")
+        );
+        assert_eq!(store.feedback_summary(&id).await.unwrap().total, 2);
+    }
+
     fn edge(from: &str, to: &str, rel: &str) -> GraphEdge {
         GraphEdge {
             from_node_id: from.into(),
@@ -330,19 +401,56 @@ mod ch {
         e
     }
 
-    /// A hard-delete must close the deleted capsule's active graph edges so the
-    /// `capability_capsule:<id>` node doesn't dangle in active reads. Mirrors the
-    /// lance backend's cascade. ClickHouse `ALTER … UPDATE` mutations are async,
-    /// so the close is polled within a bounded window rather than asserted
-    /// instantly.
+    /// Hard-delete keeps the parent as the tenant authorization anchor, then
+    /// synchronously clears every capsule satellite before deleting the parent.
     #[tokio::test]
-    async fn hard_delete_closes_capsule_graph_edges() {
+    async fn hard_delete_is_tenant_safe_and_cascades_synchronously() {
         let Some(be) = ch_backend().await else { return };
-        be.insert_capability_capsule(fixture("c_del_ch", CapabilityCapsuleStatus::Active))
-            .await
-            .unwrap();
+        let id = format!("c_del_ch_{}", uuid::Uuid::now_v7());
+        let node = format!("capability_capsule:{id}");
+        let job_id = format!("job_{id}");
+        let memory = fixture(&id, CapabilityCapsuleStatus::Active);
+        be.insert_capability_capsule(memory.clone()).await.unwrap();
+        be.apply_feedback(
+            &memory,
+            FeedbackEvent {
+                feedback_id: format!("feedback_{id}"),
+                capability_capsule_id: id.clone(),
+                feedback_kind: "useful".into(),
+                created_at: current_timestamp(),
+                note: None,
+            },
+        )
+        .await
+        .unwrap();
+        let vector = vec![0.25_f32, 0.75];
+        be.upsert_capability_capsule_embedding_chunks(
+            &id,
+            "t",
+            "test-model",
+            2,
+            std::slice::from_ref(&vector),
+            &memory.content_hash,
+            &memory.updated_at,
+            &current_timestamp(),
+        )
+        .await
+        .unwrap();
+        let now = current_timestamp();
+        be.try_enqueue_embedding_job(EmbeddingJobInsert {
+            job_id: job_id.clone(),
+            tenant: "t".into(),
+            capability_capsule_id: id.clone(),
+            target_content_hash: memory.content_hash.clone(),
+            provider: "fake".into(),
+            available_at: now.clone(),
+            created_at: now.clone(),
+            updated_at: now,
+        })
+        .await
+        .unwrap();
         be.add_edge_direct(&dated_edge(
-            "capability_capsule:c_del_ch",
+            &node,
             "entity:e_del_ch",
             "mentions",
             "00000000000000000100",
@@ -354,7 +462,7 @@ mod ch {
         // new→canonical edge). A FROM-only close would strand this one.
         be.add_edge_direct(&dated_edge(
             "capability_capsule:c_del_ch_newer",
-            "capability_capsule:c_del_ch",
+            &node,
             "suspected_supersede",
             "00000000000000000101",
             None,
@@ -362,36 +470,81 @@ mod ch {
         .await
         .unwrap();
         assert_eq!(
-            be.neighbors("capability_capsule:c_del_ch")
-                .await
-                .unwrap()
-                .len(),
+            be.neighbors(&node).await.unwrap().len(),
             2,
             "both incident edges (outgoing + incoming) must be active before the delete"
         );
 
-        be.delete_capability_capsule_hard("t", "c_del_ch")
+        let wrong_tenant = be
+            .delete_capability_capsule_hard("other", &id)
             .await
-            .unwrap();
+            .unwrap_err();
+        assert!(matches!(wrong_tenant, StorageError::NotFound(_)));
+        assert!(be
+            .get_capability_capsule_for_tenant("t", &id)
+            .await
+            .unwrap()
+            .is_some());
 
-        // ALTER … UPDATE is an async mutation — poll until it applies.
-        let mut closed = false;
-        for _ in 0..50 {
-            if be
-                .neighbors("capability_capsule:c_del_ch")
+        be.delete_capability_capsule_hard("t", &id).await.unwrap();
+
+        assert!(be
+            .get_capability_capsule_for_tenant("t", &id)
+            .await
+            .unwrap()
+            .is_none());
+        assert_eq!(be.feedback_summary(&id).await.unwrap().total, 0);
+        assert_eq!(
+            be.get_capability_capsule_embedding_vector(&id)
                 .await
-                .unwrap()
-                .is_empty()
-            {
-                closed = true;
-                break;
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-        }
-        assert!(
-            closed,
-            "hard-delete must close the deleted capsule's active edges"
+                .unwrap(),
+            None
         );
+        assert_eq!(be.get_embedding_job_status(&job_id).await.unwrap(), None);
+        assert!(be.neighbors(&node).await.unwrap().is_empty());
+
+        let stale_feedback = be
+            .apply_feedback(
+                &memory,
+                FeedbackEvent {
+                    feedback_id: format!("late_feedback_{id}"),
+                    capability_capsule_id: id.clone(),
+                    feedback_kind: "useful".into(),
+                    created_at: current_timestamp(),
+                    note: None,
+                },
+            )
+            .await
+            .unwrap_err();
+        assert!(stale_feedback.to_string().contains("hard-deleted"));
+
+        let now = current_timestamp();
+        let stale_job = be
+            .try_enqueue_embedding_job(EmbeddingJobInsert {
+                job_id: format!("late_job_{id}"),
+                tenant: "t".into(),
+                capability_capsule_id: id.clone(),
+                target_content_hash: memory.content_hash.clone(),
+                provider: "fake".into(),
+                available_at: now.clone(),
+                created_at: now.clone(),
+                updated_at: now,
+            })
+            .await
+            .unwrap_err();
+        assert!(stale_job.to_string().contains("hard-deleted"));
+
+        let stale_edge = be
+            .add_edge_direct(&dated_edge(
+                &node,
+                "entity:late-write",
+                "mentions",
+                "00000000000000000102",
+                None,
+            ))
+            .await
+            .unwrap_err();
+        assert!(stale_edge.to_string().contains("hard-deleted"));
     }
 
     /// (e) neighbors_within must honor the point-in-time `as_of` window, not
@@ -682,6 +835,223 @@ mod ch {
         assert_eq!(users[0].message_block_id, "r2");
     }
 
+    #[tokio::test]
+    async fn transcript_range_cursor_is_total_across_sessions() {
+        let Some(be) = ch_backend().await else { return };
+        let tenant = "tr_range_cursor_v2";
+
+        fn tied(tenant: &str, id: &str, session: &str) -> ConversationMessage {
+            ConversationMessage {
+                message_block_id: id.into(),
+                session_id: Some(session.into()),
+                tenant: tenant.into(),
+                caller_agent: "test".into(),
+                transcript_path: format!("/tmp/{id}.jsonl"),
+                line_number: 7,
+                block_index: 3,
+                message_uuid: None,
+                role: MessageRole::Assistant,
+                block_type: BlockType::Text,
+                content: id.into(),
+                tool_name: None,
+                tool_use_id: None,
+                embed_eligible: false,
+                created_at: "00000000000000000100".into(),
+                meta_json: None,
+            }
+        }
+
+        be.create_conversation_messages(&[
+            tied(tenant, "ch-range-a", "ch-range-session-a"),
+            tied(tenant, "ch-range-b", "ch-range-session-b"),
+        ])
+        .await
+        .unwrap();
+
+        let (page1, more1) = be
+            .list_conversation_messages_in_range(tenant, None, None, None, None, None, 1)
+            .await
+            .unwrap();
+        assert_eq!(page1[0].message_block_id, "ch-range-a");
+        assert!(more1);
+
+        let last = &page1[0];
+        let (page2, more2) = be
+            .list_conversation_messages_in_range(
+                tenant,
+                None,
+                None,
+                None,
+                None,
+                Some((
+                    &last.created_at,
+                    last.line_number as i64,
+                    last.block_index as i64,
+                    Some(&last.message_block_id),
+                )),
+                1,
+            )
+            .await
+            .unwrap();
+        assert_eq!(page2[0].message_block_id, "ch-range-b");
+        assert!(!more2);
+    }
+
+    /// Context windows use the same chronological tuple and neighbor filter
+    /// contract as Lance/Postgres, including safe handling of NULL sessions.
+    #[tokio::test]
+    async fn transcript_context_window_honors_portable_contract() {
+        let Some(be) = ch_backend().await else { return };
+        let tenant = "tr_ctx_contract_v2";
+
+        fn msg(
+            tenant: &str,
+            id: &str,
+            session_id: Option<&str>,
+            line_number: u64,
+            block_index: u32,
+            block_type: BlockType,
+            created_at: &str,
+        ) -> ConversationMessage {
+            ConversationMessage {
+                message_block_id: id.into(),
+                session_id: session_id.map(str::to_string),
+                tenant: tenant.into(),
+                caller_agent: "test".into(),
+                transcript_path: format!("/tmp/{tenant}.jsonl"),
+                line_number,
+                block_index,
+                message_uuid: None,
+                role: MessageRole::Assistant,
+                block_type,
+                content: id.into(),
+                tool_name: None,
+                tool_use_id: None,
+                embed_eligible: false,
+                created_at: created_at.into(),
+                meta_json: None,
+            }
+        }
+
+        let tied_at = "00000000000000000100";
+        be.create_conversation_messages(&[
+            msg(
+                tenant,
+                "ctx-text-before",
+                Some("ctx-session"),
+                1,
+                0,
+                BlockType::Text,
+                tied_at,
+            ),
+            msg(
+                tenant,
+                "ctx-tool-before",
+                Some("ctx-session"),
+                2,
+                0,
+                BlockType::ToolUse,
+                tied_at,
+            ),
+            msg(
+                tenant,
+                "ctx-primary",
+                Some("ctx-session"),
+                3,
+                0,
+                BlockType::Text,
+                tied_at,
+            ),
+            msg(
+                tenant,
+                "ctx-tool-after",
+                Some("ctx-session"),
+                3,
+                1,
+                BlockType::ToolResult,
+                tied_at,
+            ),
+            msg(
+                tenant,
+                "ctx-thinking-after",
+                Some("ctx-session"),
+                4,
+                0,
+                BlockType::Thinking,
+                tied_at,
+            ),
+            msg(
+                tenant,
+                "ctx-null-primary",
+                None,
+                10,
+                0,
+                BlockType::Text,
+                "00000000000000000200",
+            ),
+            msg(
+                tenant,
+                "ctx-null-other",
+                None,
+                9,
+                0,
+                BlockType::Text,
+                "00000000000000000199",
+            ),
+        ])
+        .await
+        .unwrap();
+
+        let filtered = be
+            .context_window_for_block(tenant, "ctx-primary", 5, 5, false)
+            .await
+            .unwrap();
+        assert_eq!(
+            filtered
+                .before
+                .iter()
+                .map(|m| m.message_block_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["ctx-text-before"]
+        );
+        assert_eq!(
+            filtered
+                .after
+                .iter()
+                .map(|m| m.message_block_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["ctx-thinking-after"]
+        );
+
+        let with_tools = be
+            .context_window_for_block(tenant, "ctx-primary", 5, 5, true)
+            .await
+            .unwrap();
+        assert_eq!(
+            with_tools
+                .before
+                .iter()
+                .map(|m| m.message_block_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["ctx-text-before", "ctx-tool-before"]
+        );
+        assert_eq!(
+            with_tools
+                .after
+                .iter()
+                .map(|m| m.message_block_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["ctx-tool-after", "ctx-thinking-after"]
+        );
+
+        let null_session = be
+            .context_window_for_block(tenant, "ctx-null-primary", 5, 5, true)
+            .await
+            .unwrap();
+        assert!(null_session.before.is_empty());
+        assert!(null_session.after.is_empty());
+    }
+
     /// P5 EntityRegistry: resolve creates an entity; a second resolve of the
     /// same alias returns the same id; get_entity surfaces it.
     #[tokio::test]
@@ -727,6 +1097,43 @@ mod ch {
             be.get_embedding_job_status("j1").await.unwrap(),
             Some("completed".to_string())
         );
+    }
+
+    #[tokio::test]
+    async fn ingest_session_reconciliation_is_idempotent_and_monotonic() {
+        let Some(be) = ch_backend().await else { return };
+        let suffix = uuid::Uuid::now_v7();
+        let capsule_id = format!("ch_session_receipt_{suffix}");
+        let session_id = format!("ch_session_{suffix}");
+        let caller_agent = format!("ch_session_agent_{suffix}");
+        be.open_session(&session_id, "t", &caller_agent, "00000001778000000000")
+            .await
+            .unwrap();
+        let mut memory = fixture(&capsule_id, CapabilityCapsuleStatus::Active);
+        memory.session_id = Some(session_id.clone());
+        memory.source_agent = caller_agent.clone();
+        be.insert_capability_capsule(memory).await.unwrap();
+
+        be.reconcile_session_after_ingest(&session_id, &capsule_id, "00000001778000000002")
+            .await
+            .unwrap();
+        be.reconcile_session_after_ingest(&session_id, &capsule_id, "00000001778000000001")
+            .await
+            .unwrap();
+        be.touch_session(&session_id, "00000001778000000001")
+            .await
+            .unwrap();
+        be.close_session(&session_id, "00000001778000000003")
+            .await
+            .unwrap();
+
+        let session = be
+            .open_session(&session_id, "t", &caller_agent, "00000001778000000004")
+            .await
+            .unwrap();
+        assert_eq!(session.memory_count, 2);
+        assert_eq!(session.last_seen_at, "00000001778000000002");
+        assert_eq!(session.ended_at.as_deref(), Some("00000001778000000003"));
     }
 
     /// Audit 2026-07-03 ⑨⑩ — graph-read parity with lance/pg:

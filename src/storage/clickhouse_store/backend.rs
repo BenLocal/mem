@@ -3,6 +3,8 @@
 //! **UNVALIDATED scaffold — not yet run against a real ClickHouse
 //! (clickhouse-backend P1).**
 
+use std::{collections::HashSet, sync::Arc};
+
 use clickhouse::Client;
 
 use crate::storage::types::StorageError;
@@ -14,6 +16,8 @@ use crate::storage::types::StorageError;
 /// [`CapsuleStore`]: crate::storage::capsule_store::CapsuleStore
 pub struct ClickHouseBackend {
     pub(crate) client: Client,
+    pub(crate) capsule_lifecycle_gate: Arc<tokio::sync::RwLock<()>>,
+    pub(crate) deleted_capsule_ids: Arc<std::sync::RwLock<HashSet<String>>>,
 }
 
 impl ClickHouseBackend {
@@ -42,7 +46,26 @@ impl ClickHouseBackend {
         if let Some(p) = password {
             client = client.with_password(p);
         }
-        Ok(Self { client })
+        Ok(Self {
+            client,
+            capsule_lifecycle_gate: Arc::new(tokio::sync::RwLock::new(())),
+            deleted_capsule_ids: Arc::new(std::sync::RwLock::new(HashSet::new())),
+        })
+    }
+
+    pub(super) fn reject_deleted_capsule(&self, capsule_id: &str) -> Result<(), StorageError> {
+        if self
+            .deleted_capsule_ids
+            .read()
+            .expect("deleted_capsule_ids lock poisoned")
+            .contains(capsule_id)
+        {
+            Err(StorageError::InvalidInput(
+                "capsule has been hard-deleted".to_owned(),
+            ))
+        } else {
+            Ok(())
+        }
     }
 
     /// Idempotently apply `migrations/clickhouse/0001_capsule_store.sql`
@@ -57,6 +80,7 @@ impl ClickHouseBackend {
             include_str!("../../../migrations/clickhouse/0002_embeddings.sql"),
             include_str!("../../../migrations/clickhouse/0003_graph_transcript_jobs.sql"),
             include_str!("../../../migrations/clickhouse/0004_registry_session_misc.sql"),
+            include_str!("../../../migrations/clickhouse/0005_review_token.sql"),
         ];
         for sql in MIGRATIONS {
             // Strip `--` line comments from the WHOLE file FIRST, then split on
@@ -75,9 +99,11 @@ impl ClickHouseBackend {
                 if trimmed.is_empty() {
                     continue;
                 }
-                self.client.query(trimmed).execute().await.map_err(|e| {
-                    StorageError::InvalidInput(format!("clickhouse migration: {e}"))
-                })?;
+                self.client
+                    .query(trimmed)
+                    .execute()
+                    .await
+                    .map_err(|e| StorageError::backend("clickhouse migration", e))?;
             }
         }
         Ok(())

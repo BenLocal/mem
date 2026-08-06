@@ -258,6 +258,34 @@ async fn accepting_pending_memory_marks_it_active() {
 }
 
 #[tokio::test]
+async fn competing_review_verdict_returns_conflict() {
+    let app = seeded_app_with_pending_preference().await;
+
+    let accepted = app
+        .post_json(
+            "/reviews/pending/accept",
+            json!({
+                "tenant": "local",
+                "capability_capsule_id": "mem_123"
+            }),
+        )
+        .await;
+    assert_eq!(accepted.status(), 200, "response body: {}", accepted.body);
+
+    let rejected = app
+        .post_json(
+            "/reviews/pending/reject",
+            json!({
+                "tenant": "local",
+                "capability_capsule_id": "mem_123"
+            }),
+        )
+        .await;
+
+    assert_eq!(rejected.status(), 409, "response body: {}", rejected.body);
+}
+
+#[tokio::test]
 async fn accepting_pending_memory_with_embedding_job_marks_it_active() {
     let app = seeded_app_with_pending_preference().await;
     let now = "2026-03-21T00:00:10Z".to_string();

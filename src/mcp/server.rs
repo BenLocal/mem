@@ -691,6 +691,8 @@ pub struct TranscriptCursor {
     pub created_at: String,
     pub line_number: i64,
     pub block_index: i64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub message_block_id: Option<String>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -1710,7 +1712,7 @@ impl MemMcpServer {
 
     // ------------------- transcripts_range -------------------
     #[tool(
-        description = "Cross-session time-window scan over the transcript archive. Returns every block for the tenant inside `[time_from, time_to)` (each bound optional), chronologically ordered and paginated by a composite cursor. Optional `role` / `block_type` narrow the result. Use when you want 'everything between time X and Y across all sessions' or 'recent activity since cursor Z' rather than per-session drill-down (`transcript_session_get`) or content search (`transcripts_search`)."
+        description = "Cross-session time-window scan over the transcript archive. Returns every block for the tenant inside `[time_from, time_to)` (each bound optional), chronologically ordered and paginated by a stable composite cursor whose final `message_block_id` breaks cross-session ties. Optional `role` / `block_type` narrow the result. Use when you want 'everything between time X and Y across all sessions' or 'recent activity since cursor Z' rather than per-session drill-down (`transcript_session_get`) or content search (`transcripts_search`)."
     )]
     async fn transcripts_range(
         &self,

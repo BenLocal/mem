@@ -387,6 +387,66 @@ mod http_routes {
         assert_eq!(msgs[2]["content"], "msg-4");
     }
 
+    /// A cross-session range cursor must identify one row inside a timestamp /
+    /// line / block tie. Otherwise page 2's strict tuple predicate skips every
+    /// remaining session that shares the page-1 boundary.
+    #[tokio::test]
+    async fn post_transcripts_range_cursor_is_total_across_sessions() {
+        let (app, _dir, repo) = build_router().await;
+
+        for (id, session, path) in [
+            ("mb-range-a", "sess-range-a", "/tmp/range-a.jsonl"),
+            ("mb-range-b", "sess-range-b", "/tmp/range-b.jsonl"),
+        ] {
+            let mut message = sample_message(id, false, BlockType::Text);
+            message.message_block_id = id.to_string();
+            message.session_id = Some(session.to_string());
+            message.transcript_path = path.to_string();
+            message.created_at = "2026-04-30T00:00:00Z".to_string();
+            message.line_number = 7;
+            message.block_index = 3;
+            repo.create_conversation_message(&message).await.unwrap();
+        }
+
+        async fn post_range(app: &axum::Router, cursor: Option<Value>) -> Value {
+            let mut body = json!({"tenant": "local", "limit": 1});
+            if let Some(cursor) = cursor {
+                body["cursor"] = cursor;
+            }
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri("/transcripts/range")
+                        .header("content-type", "application/json")
+                        .body(Body::from(body.to_string()))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK, "body: {body}");
+            serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap())
+                .unwrap()
+        }
+
+        let page1 = post_range(&app, None).await;
+        assert_eq!(page1["messages"].as_array().unwrap().len(), 1);
+        assert_eq!(page1["has_more"], true);
+        let cursor = page1["next_cursor"].clone();
+        assert_eq!(cursor["message_block_id"], "mb-range-a");
+
+        let page2 = post_range(&app, Some(cursor)).await;
+        let ids: Vec<&str> = page2["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|message| message["message_block_id"].as_str().unwrap())
+            .collect();
+        assert_eq!(ids, vec!["mb-range-b"]);
+        assert_eq!(page2["has_more"], false);
+    }
+
     #[tokio::test]
     async fn post_transcripts_search_filters_by_role_and_block_type() {
         let (app, _dir, _repo) = build_router().await;

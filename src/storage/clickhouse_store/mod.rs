@@ -22,6 +22,7 @@
 //! [`EmbeddingVectorStore`]: crate::storage::embedding_vector_store::EmbeddingVectorStore
 
 mod backend;
+mod capsule_mutations;
 mod capsule_store;
 mod cursor;
 mod embedding;
