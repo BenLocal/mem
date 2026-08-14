@@ -1,5 +1,6 @@
 pub mod admin;
 pub mod capability_capsule;
+pub mod completed_tool_rounds;
 pub mod embeddings;
 pub mod entities;
 pub mod fact_check;
@@ -20,6 +21,7 @@ pub fn router() -> Router<AppState> {
     Router::<AppState>::new()
         .merge(health::router::<AppState>())
         .merge(capability_capsule::router())
+        .merge(completed_tool_rounds::router())
         .merge(embeddings::router())
         .merge(review::router())
         .merge(graph::router())

@@ -20,15 +20,21 @@ cargo run -- mcp                  # stdio MCP forwarder to MEM_BASE_URL
 cargo run -- crystallize          # H4 dry run
 cargo run -- crystallize --accept # write synthesized Workflow capsules
 
-cargo test -q
+make test-one TEST=search_api       # preferred integration-test iteration
+make test-filter FILTER=ingest::compute_content # preferred named/unit iteration
+make test-rounds                    # completed_tool_round vertical slice
+make test-candidates                # deterministic Skill-candidate + durable queue
+make test-full                      # explicit full-suite gate; capped at 4 build jobs
 cargo test --test search_api
-cargo test ingest::compute_content
+cargo test --lib ingest::compute_content
 cargo fmt --check
 cargo clippy --all-targets -- -D warnings
 cross build --release
 ```
 
 Before every commit, both `cargo fmt --check` and `cargo clippy --all-targets -- -D warnings` must pass. CI checks all targets, including integration tests and benches. Fix lints; do not add `#[allow(...)]` without a documented reason.
+
+During implementation, run the narrowest relevant unit or integration target. Do **not** run bare `cargo test` after every edit: this repository has 55 integration crates and each links the full Lance/Arrow/Candle graph. Use `make test-one`, `make test-filter` (lib tests only), or a feature-specific target such as `make test-rounds` / `make test-candidates`; reserve `make test-full` for an explicit pre-commit/release gate or when the user asks for a full regression. The Make targets cap local Cargo build parallelism and test execution at `CARGO_TEST_JOBS=4` / `RUST_TEST_THREADS=2` (override deliberately when running on a dedicated builder).
 
 Tests live in root `tests/`; unit tests live in inline `#[cfg(test)] mod tests`. Do not introduce colocated `*_test.rs` files. Rust edition is 2021; use snake_case. Prefer small focused functions/files, explicit error handling, and no hardcoded secrets.
 
@@ -61,6 +67,7 @@ Core:
 - `MEM_DB_PATH`: Lance dataset directory. Legacy directories may still be named `mem.duckdb`; they are not DuckDB files.
 - `BIND_ADDR`: HTTP bind address.
 - `MEM_BASE_URL` / `MEM_TENANT`: MCP forwarder target/default tenant.
+- `MEM_ADMIN_TOKEN`: Bearer credential required by completed-tool-round admin rebuild/read routes; the CLI sends it automatically.
 - `MEM_BACKEND`: `lance` (default), `postgres`, or `clickhouse`; alternate backends require `MEM_POSTGRES_URL` or `MEM_CLICKHOUSE_URL`. All backends are compiled into every build.
 - `MEM_MCP_EXPOSE_EMBEDDINGS=1`: expose admin embedding tools.
 

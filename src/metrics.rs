@@ -66,6 +66,20 @@ pub struct Metrics {
     rerank_merges_vetoed: AtomicU64,
     recall_semantic_timeouts: AtomicU64,
     recall_semantic_skips: AtomicU64,
+    round_projection_rebuilds: AtomicU64,
+    round_projection_source_blocks: AtomicU64,
+    round_projection_completed: AtomicU64,
+    round_projection_gapped: AtomicU64,
+    round_projection_incomplete: AtomicU64,
+    round_projection_errors: AtomicU64,
+    round_projection_read_degraded: AtomicU64,
+    skill_candidate_reconciles: AtomicU64,
+    skill_candidate_evidence: AtomicU64,
+    skill_candidate_jobs_inserted: AtomicU64,
+    skill_candidate_jobs_existing: AtomicU64,
+    skill_candidate_jobs_staled: AtomicU64,
+    skill_candidate_reconcile_errors: AtomicU64,
+    skill_candidate_capacity_rejections: AtomicU64,
     /// Current Lance version-manifest count per managed table, refreshed by
     /// the vacuum sweep. A gauge (overwritten, not incremented), so it needs a
     /// lock — the only non-atomic field. Early-warning signal for version
@@ -175,6 +189,66 @@ impl Metrics {
         self.recall_semantic_skips.fetch_add(1, Ordering::Relaxed);
     }
 
+    pub fn inc_round_projection_rebuild(&self) {
+        self.round_projection_rebuilds
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn record_round_projection(
+        &self,
+        source_blocks: u64,
+        completed: u64,
+        gapped: u64,
+        incomplete: u64,
+    ) {
+        self.round_projection_source_blocks
+            .fetch_add(source_blocks, Ordering::Relaxed);
+        self.round_projection_completed
+            .fetch_add(completed, Ordering::Relaxed);
+        self.round_projection_gapped
+            .fetch_add(gapped, Ordering::Relaxed);
+        self.round_projection_incomplete
+            .fetch_add(incomplete, Ordering::Relaxed);
+    }
+
+    pub fn inc_round_projection_error(&self) {
+        self.round_projection_errors.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn inc_round_projection_read_degraded(&self) {
+        self.round_projection_read_degraded
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn record_skill_candidate_reconcile(
+        &self,
+        evidence: u64,
+        inserted: u64,
+        existing: u64,
+        staled: u64,
+    ) {
+        self.skill_candidate_reconciles
+            .fetch_add(1, Ordering::Relaxed);
+        self.skill_candidate_evidence
+            .fetch_add(evidence, Ordering::Relaxed);
+        self.skill_candidate_jobs_inserted
+            .fetch_add(inserted, Ordering::Relaxed);
+        self.skill_candidate_jobs_existing
+            .fetch_add(existing, Ordering::Relaxed);
+        self.skill_candidate_jobs_staled
+            .fetch_add(staled, Ordering::Relaxed);
+    }
+
+    pub fn inc_skill_candidate_reconcile_error(&self) {
+        self.skill_candidate_reconcile_errors
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn inc_skill_candidate_capacity_rejection(&self) {
+        self.skill_candidate_capacity_rejections
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
     /// Overwrite the per-table Lance version-count gauge (called by the vacuum
     /// sweep each pass). A poisoned lock silently no-ops — a stale gauge must
     /// never break the vacuum path.
@@ -208,6 +282,20 @@ impl Metrics {
             rerank_merges_vetoed: load(&self.rerank_merges_vetoed),
             recall_semantic_timeouts: load(&self.recall_semantic_timeouts),
             recall_semantic_skips: load(&self.recall_semantic_skips),
+            round_projection_rebuilds: load(&self.round_projection_rebuilds),
+            round_projection_source_blocks: load(&self.round_projection_source_blocks),
+            round_projection_completed: load(&self.round_projection_completed),
+            round_projection_gapped: load(&self.round_projection_gapped),
+            round_projection_incomplete: load(&self.round_projection_incomplete),
+            round_projection_errors: load(&self.round_projection_errors),
+            round_projection_read_degraded: load(&self.round_projection_read_degraded),
+            skill_candidate_reconciles: load(&self.skill_candidate_reconciles),
+            skill_candidate_evidence: load(&self.skill_candidate_evidence),
+            skill_candidate_jobs_inserted: load(&self.skill_candidate_jobs_inserted),
+            skill_candidate_jobs_existing: load(&self.skill_candidate_jobs_existing),
+            skill_candidate_jobs_staled: load(&self.skill_candidate_jobs_staled),
+            skill_candidate_reconcile_errors: load(&self.skill_candidate_reconcile_errors),
+            skill_candidate_capacity_rejections: load(&self.skill_candidate_capacity_rejections),
             table_versions: self
                 .table_versions
                 .lock()
@@ -241,6 +329,20 @@ pub struct MetricsSnapshot {
     pub rerank_merges_vetoed: u64,
     pub recall_semantic_timeouts: u64,
     pub recall_semantic_skips: u64,
+    pub round_projection_rebuilds: u64,
+    pub round_projection_source_blocks: u64,
+    pub round_projection_completed: u64,
+    pub round_projection_gapped: u64,
+    pub round_projection_incomplete: u64,
+    pub round_projection_errors: u64,
+    pub round_projection_read_degraded: u64,
+    pub skill_candidate_reconciles: u64,
+    pub skill_candidate_evidence: u64,
+    pub skill_candidate_jobs_inserted: u64,
+    pub skill_candidate_jobs_existing: u64,
+    pub skill_candidate_jobs_staled: u64,
+    pub skill_candidate_reconcile_errors: u64,
+    pub skill_candidate_capacity_rejections: u64,
     /// Lance version-manifest count per managed table (empty until the first
     /// vacuum sweep populates it). Watch for a table climbing into the
     /// thousands — that's version-history bloat brewing.

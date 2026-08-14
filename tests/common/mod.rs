@@ -22,10 +22,15 @@ use std::sync::Arc;
 
 use mem::{
     app::AppState,
-    service::{CapabilityCapsuleService, EntityService, FactCheckService, TranscriptService},
+    service::{
+        CapabilityCapsuleService, CompletedToolRoundService, EntityService, FactCheckService,
+        TranscriptService,
+    },
     storage::Store,
 };
 use tempfile::TempDir;
+
+pub const TEST_ADMIN_TOKEN: &str = "test-admin-token-with-at-least-32-bytes";
 
 /// Open a fresh [`Store`] under a tempdir. Returned `TempDir` must be
 /// kept alive (and dropped only after the store) — `Store` holds open
@@ -52,12 +57,14 @@ pub fn test_app_state(
     capability_capsule_service: CapabilityCapsuleService,
 ) -> AppState {
     let transcript_service = Arc::new(TranscriptService::new(store.clone(), None));
+    let completed_tool_round_service = Arc::new(CompletedToolRoundService::new(store.clone()));
     let entity_service = EntityService::new(store.clone());
     let fact_check_service = FactCheckService::new(store);
     AppState {
         capability_capsule_service,
-        config: mem::config::Config::local(),
+        config: mem::config::Config::local().with_admin_token(TEST_ADMIN_TOKEN),
         transcript_service,
+        completed_tool_round_service,
         entity_service,
         fact_check_service,
     }

@@ -4,6 +4,7 @@ use axum::{
     Json,
 };
 use serde_json::json;
+use thiserror::Error;
 
 use crate::{
     service::capability_capsule_service::ServiceError,
@@ -14,6 +15,16 @@ pub type Result<T> = std::result::Result<T, anyhow::Error>;
 
 #[derive(Debug)]
 pub struct AppError(anyhow::Error);
+
+#[derive(Debug, Error)]
+#[error("admin authorization required")]
+struct UnauthorizedAdmin;
+
+impl AppError {
+    pub fn unauthorized_admin() -> Self {
+        Self(UnauthorizedAdmin.into())
+    }
+}
 
 impl From<StorageError> for AppError {
     fn from(error: StorageError) -> Self {
@@ -66,6 +77,13 @@ fn internal_server_error(error: &anyhow::Error) -> Response {
 
 impl IntoResponse for AppError {
     fn into_response(self) -> Response {
+        if self.0.downcast_ref::<UnauthorizedAdmin>().is_some() {
+            return (
+                StatusCode::UNAUTHORIZED,
+                Json(json!({ "error": "admin authorization required" })),
+            )
+                .into_response();
+        }
         // Service-layer errors first (memory pipeline). NotFound carries a
         // canonical "memory not found" message; nested InvalidInput maps to 400.
         if let Some(svc) = self.0.downcast_ref::<ServiceError>() {
@@ -84,6 +102,11 @@ impl IntoResponse for AppError {
                 ServiceError::Storage(StorageError::Conflict(msg)) => {
                     (StatusCode::CONFLICT, Json(json!({ "error": msg }))).into_response()
                 }
+                ServiceError::Storage(StorageError::Unsupported(capability)) => (
+                    StatusCode::NOT_IMPLEMENTED,
+                    Json(json!({ "error": format!("unsupported capability: {capability}") })),
+                )
+                    .into_response(),
                 _ => internal_server_error(&self.0),
             };
         }
@@ -101,6 +124,13 @@ impl IntoResponse for AppError {
         }
         if let Some(StorageError::Conflict(msg)) = self.0.downcast_ref::<StorageError>() {
             return (StatusCode::CONFLICT, Json(json!({ "error": msg }))).into_response();
+        }
+        if let Some(StorageError::Unsupported(capability)) = self.0.downcast_ref::<StorageError>() {
+            return (
+                StatusCode::NOT_IMPLEMENTED,
+                Json(json!({ "error": format!("unsupported capability: {capability}") })),
+            )
+                .into_response();
         }
         // Graph-layer caller validation (K12: inverted bitemporal
         // interval) is a client error, not a backend fault → 400.

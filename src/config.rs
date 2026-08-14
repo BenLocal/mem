@@ -1,8 +1,10 @@
 use std::{
+    fmt,
     path::PathBuf,
     sync::atomic::{AtomicU64, Ordering},
 };
 
+use sha2::{Digest, Sha256};
 use thiserror::Error;
 
 use crate::domain::capability_capsule::CapabilityCapsuleType;
@@ -394,10 +396,31 @@ pub enum EvolutionSynthesisMode {
     Review,
 }
 
+/// Deterministic completed-tool-round to Skill-candidate reconciliation.
+/// Default OFF: enabling it only materializes durable candidate jobs; there is
+/// no extractor/LLM consumer or capsule mutation in this phase.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SkillCandidateSettings {
+    pub enabled: bool,
+    pub interval_secs: u64,
+    pub max_builds: usize,
+    pub max_rounds: usize,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct AdminTokenHash([u8; 32]);
+
+impl fmt::Debug for AdminTokenHash {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("AdminTokenHash([REDACTED])")
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct Config {
     pub bind_addr: String,
     pub db_path: PathBuf,
+    admin_token_hash: Option<AdminTokenHash>,
     pub embedding: EmbeddingSettings,
     pub auto_promote: AutoPromoteSettings,
     pub vacuum: VacuumSettings,
@@ -408,6 +431,7 @@ pub struct Config {
     pub edge_dynamics: EdgeDynamicsSettings,
     pub cooccurrence: CooccurrenceSettings,
     pub evolution: EvolutionSettings,
+    pub skill_candidate: SkillCandidateSettings,
     /// Which storage backend `mem serve` runs on. Default `Lance`
     /// (on-disk Lance datasets, read lance-native). `Postgres` requires the
     /// `postgres` cargo feature and `postgres_url`.
@@ -529,6 +553,10 @@ pub enum ConfigError {
     InvalidMaxIngestPerSession(String),
     #[error("invalid MEM_INGEST_MIN_CONTENT_LEN: {0}")]
     InvalidMinContentLen(String),
+    #[error("invalid {var}: {value}")]
+    InvalidSkillCandidateSetting { var: &'static str, value: String },
+    #[error("MEM_ADMIN_TOKEN must be 32..=1024 printable ASCII bytes")]
+    InvalidAdminToken,
 }
 
 impl EmbeddingSettings {
@@ -1322,11 +1350,73 @@ impl IngestSettings {
     }
 }
 
+impl SkillCandidateSettings {
+    pub fn development_defaults() -> Self {
+        Self {
+            enabled: false,
+            interval_secs: 300,
+            max_builds: 100_000,
+            max_rounds: 20_000,
+        }
+    }
+
+    pub fn from_env_vars(get: impl Fn(&str) -> Option<String>) -> Result<Self, ConfigError> {
+        let mut settings = Self::development_defaults();
+        if let Some(raw) = get("MEM_SKILL_CANDIDATE_ENABLED") {
+            settings.enabled = matches!(
+                raw.trim().to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes"
+            );
+        }
+        if let Some(raw) = get("MEM_SKILL_CANDIDATE_INTERVAL_SECS") {
+            settings.interval_secs = parse_skill_candidate_setting(
+                "MEM_SKILL_CANDIDATE_INTERVAL_SECS",
+                &raw,
+                10,
+                86_400,
+            )?;
+        }
+        if let Some(raw) = get("MEM_SKILL_CANDIDATE_MAX_BUILDS") {
+            settings.max_builds =
+                parse_skill_candidate_setting("MEM_SKILL_CANDIDATE_MAX_BUILDS", &raw, 1, 100_000)?
+                    as usize;
+        }
+        if let Some(raw) = get("MEM_SKILL_CANDIDATE_MAX_ROUNDS") {
+            settings.max_rounds =
+                parse_skill_candidate_setting("MEM_SKILL_CANDIDATE_MAX_ROUNDS", &raw, 1, 100_000)?
+                    as usize;
+        }
+        Ok(settings)
+    }
+}
+
+fn parse_skill_candidate_setting(
+    var: &'static str,
+    raw: &str,
+    min: u64,
+    max: u64,
+) -> Result<u64, ConfigError> {
+    let value = raw
+        .parse::<u64>()
+        .map_err(|_| ConfigError::InvalidSkillCandidateSetting {
+            var,
+            value: raw.to_string(),
+        })?;
+    if !(min..=max).contains(&value) {
+        return Err(ConfigError::InvalidSkillCandidateSetting {
+            var,
+            value: raw.to_string(),
+        });
+    }
+    Ok(value)
+}
+
 impl Config {
     pub fn local() -> Self {
         Self {
             bind_addr: "127.0.0.1:3000".to_string(),
             db_path: default_db_path(),
+            admin_token_hash: None,
             embedding: EmbeddingSettings::development_defaults(),
             auto_promote: AutoPromoteSettings::development_defaults(),
             vacuum: VacuumSettings::development_defaults(),
@@ -1337,6 +1427,7 @@ impl Config {
             edge_dynamics: EdgeDynamicsSettings::development_defaults(),
             cooccurrence: CooccurrenceSettings::development_defaults(),
             evolution: EvolutionSettings::development_defaults(),
+            skill_candidate: SkillCandidateSettings::development_defaults(),
             backend: BackendKind::Lance,
             postgres_url: None,
             clickhouse_url: None,
@@ -1349,6 +1440,7 @@ impl Config {
         Ok(Self {
             bind_addr,
             db_path: default_db_path(),
+            admin_token_hash: admin_token_hash_from_env(|key| std::env::var(key).ok())?,
             embedding: EmbeddingSettings::from_env_vars(|k| std::env::var(k).ok())?,
             auto_promote: AutoPromoteSettings::from_env_vars(|k| std::env::var(k).ok())?,
             vacuum: VacuumSettings::from_env_vars(|k| std::env::var(k).ok())?,
@@ -1359,10 +1451,58 @@ impl Config {
             edge_dynamics: EdgeDynamicsSettings::from_env_vars(|k| std::env::var(k).ok())?,
             cooccurrence: CooccurrenceSettings::from_env_vars(|k| std::env::var(k).ok())?,
             evolution: EvolutionSettings::from_env_vars(|k| std::env::var(k).ok())?,
+            skill_candidate: SkillCandidateSettings::from_env_vars(|k| std::env::var(k).ok())?,
             backend,
             postgres_url,
             clickhouse_url,
         })
+    }
+
+    /// Configure the bearer credential for privileged HTTP routes. The raw
+    /// token is never retained in `Config` or its `Debug` output.
+    pub fn with_admin_token(mut self, token: &str) -> Self {
+        self.admin_token_hash = validated_admin_token_hash(token);
+        self
+    }
+
+    pub fn authorizes_admin_bearer(&self, authorization: Option<&str>) -> bool {
+        let Some(expected) = self.admin_token_hash else {
+            return false;
+        };
+        let Some(token) = authorization.and_then(|value| value.strip_prefix("Bearer ")) else {
+            return false;
+        };
+        let Some(actual) = validated_admin_token_hash(token) else {
+            return false;
+        };
+        expected
+            .0
+            .iter()
+            .zip(actual.0)
+            .fold(0_u8, |difference, (left, right)| {
+                difference | (*left ^ right)
+            })
+            == 0
+    }
+}
+
+fn admin_token_hash_from_env(
+    get: impl Fn(&str) -> Option<String>,
+) -> Result<Option<AdminTokenHash>, ConfigError> {
+    match get("MEM_ADMIN_TOKEN") {
+        None => Ok(None),
+        Some(token) => validated_admin_token_hash(&token)
+            .map(Some)
+            .ok_or(ConfigError::InvalidAdminToken),
+    }
+}
+
+fn validated_admin_token_hash(token: &str) -> Option<AdminTokenHash> {
+    if token.len() < 32 || token.len() > 1_024 || !token.bytes().all(|byte| byte.is_ascii_graphic())
+    {
+        None
+    } else {
+        Some(AdminTokenHash(Sha256::digest(token.as_bytes()).into()))
     }
 }
 
@@ -1913,5 +2053,63 @@ mod tests {
             "default dedup threshold must be 0.95 (mirror-only), got {}",
             s.threshold
         );
+    }
+
+    #[test]
+    fn skill_candidate_reconcile_is_default_off_and_bounded() {
+        let settings = SkillCandidateSettings::from_env_vars(env(&[])).unwrap();
+        assert!(!settings.enabled);
+        assert_eq!(settings.interval_secs, 300);
+        assert_eq!(settings.max_builds, 100_000);
+        assert_eq!(settings.max_rounds, 20_000);
+    }
+
+    #[test]
+    fn skill_candidate_reconcile_settings_parse_and_reject_zero_limits() {
+        let settings = SkillCandidateSettings::from_env_vars(env(&[
+            ("MEM_SKILL_CANDIDATE_ENABLED", "true"),
+            ("MEM_SKILL_CANDIDATE_INTERVAL_SECS", "60"),
+            ("MEM_SKILL_CANDIDATE_MAX_BUILDS", "500"),
+            ("MEM_SKILL_CANDIDATE_MAX_ROUNDS", "1000"),
+        ]))
+        .unwrap();
+        assert!(settings.enabled);
+        assert_eq!(settings.interval_secs, 60);
+        assert_eq!(settings.max_builds, 500);
+        assert_eq!(settings.max_rounds, 1000);
+        for variable in [
+            "MEM_SKILL_CANDIDATE_INTERVAL_SECS",
+            "MEM_SKILL_CANDIDATE_MAX_BUILDS",
+            "MEM_SKILL_CANDIDATE_MAX_ROUNDS",
+        ] {
+            assert!(SkillCandidateSettings::from_env_vars(env(&[(variable, "0")])).is_err());
+        }
+        assert!(SkillCandidateSettings::from_env_vars(env(&[(
+            "MEM_SKILL_CANDIDATE_INTERVAL_SECS",
+            "1"
+        ),]))
+        .is_err());
+        assert!(SkillCandidateSettings::from_env_vars(env(&[(
+            "MEM_SKILL_CANDIDATE_MAX_ROUNDS",
+            "100001"
+        ),]))
+        .is_err());
+    }
+
+    #[test]
+    fn admin_bearer_is_fail_closed_and_raw_token_is_not_retained() {
+        const TOKEN: &str = "secret-admin-token-with-at-least-32-bytes";
+        let unconfigured = Config::local();
+        assert!(!unconfigured.authorizes_admin_bearer(Some(&format!("Bearer {TOKEN}"))));
+
+        let configured = Config::local().with_admin_token(TOKEN);
+        assert!(configured.authorizes_admin_bearer(Some(&format!("Bearer {TOKEN}"))));
+        assert!(!configured.authorizes_admin_bearer(Some("Bearer wrong")));
+        assert!(!configured.authorizes_admin_bearer(None));
+        assert!(!format!("{configured:?}").contains(TOKEN));
+        assert!(format!("{configured:?}").contains("AdminTokenHash([REDACTED])"));
+        assert!(admin_token_hash_from_env(env(&[])).unwrap().is_none());
+        assert!(admin_token_hash_from_env(env(&[("MEM_ADMIN_TOKEN", "")])).is_err());
+        assert!(admin_token_hash_from_env(env(&[("MEM_ADMIN_TOKEN", "too-short")])).is_err());
     }
 }

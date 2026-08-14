@@ -255,6 +255,10 @@ const ALL_TABLES: &[&str] = &[
     // is what let it balloon to 806M / 9169 version manifests. Both are
     // fixed now (batched writes + this line); vacuum keeps it bounded.
     "evolution_candidates",
+    "completed_tool_rounds",
+    "completed_tool_round_index_builds",
+    "completed_tool_round_index_heads",
+    "skill_candidate_jobs",
     // Lazy-created on first upsert; open_table fails if absent and
     // we skip without erroring.
     "capability_capsule_embeddings",

@@ -1,4 +1,5 @@
 pub mod common;
+pub mod completed_tool_rounds;
 pub mod crystallize;
 pub mod feedback;
 pub mod heuristic_extract;

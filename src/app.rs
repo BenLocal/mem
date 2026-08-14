@@ -8,9 +8,23 @@ use tracing::{info, warn};
 
 use crate::{
     http,
-    service::{CapabilityCapsuleService, EntityService, FactCheckService, TranscriptService},
-    storage::{Backend, Store},
+    service::{
+        CapabilityCapsuleService, CompletedToolRoundService, EntityService, FactCheckService,
+        TranscriptService,
+    },
+    storage::{Backend, Store, UnsupportedCompletedToolRoundStore},
 };
+
+type EdgeAccessSender =
+    tokio::sync::mpsc::UnboundedSender<crate::worker::potentiation_worker::EdgeAccess>;
+type CapsuleUsedSender =
+    tokio::sync::mpsc::UnboundedSender<crate::worker::last_used_worker::CapsuleUsed>;
+type BackendAssembly = (
+    Arc<dyn Backend>,
+    Option<EdgeAccessSender>,
+    CapsuleUsedSender,
+    Arc<CompletedToolRoundService>,
+);
 
 #[derive(Clone)]
 pub struct AppState {
@@ -18,6 +32,9 @@ pub struct AppState {
     pub config: crate::config::Config,
     /// Service façade backing the `/transcripts/*` HTTP routes.
     pub transcript_service: Arc<TranscriptService>,
+    /// Rebuildable transcript-derived tool-round index. Its storage adapter is
+    /// Lance-backed today and explicitly unsupported on alternate backends.
+    pub completed_tool_round_service: Arc<CompletedToolRoundService>,
     /// Service façade backing the `/entities/*` HTTP routes.
     pub entity_service: EntityService,
     /// Service façade backing `POST /fact_check` — pre-ingest
@@ -28,6 +45,9 @@ pub struct AppState {
 
 impl AppState {
     pub async fn from_config(config: crate::config::Config) -> anyhow::Result<Self> {
+        if config.skill_candidate.enabled && config.backend != crate::config::BackendKind::Lance {
+            anyhow::bail!("MEM_SKILL_CANDIDATE_ENABLED is supported only with MEM_BACKEND=lance");
+        }
         // Embedding provider — needed for both write-time auto-embed
         // (via the EmbeddingFunction adapter on LanceStore) and
         // search-time query embedding.
@@ -59,13 +79,8 @@ impl AppState {
         //   * `capsule_used_tx: UnboundedSender<…>` — O1 last-used sender
         // so everything below this `match` is backend-agnostic and stays
         // byte-for-byte identical to the pre-Postgres single-backend path.
-        let (store, edge_access_tx, capsule_used_tx): (
-            Arc<dyn Backend>,
-            Option<
-                tokio::sync::mpsc::UnboundedSender<crate::worker::potentiation_worker::EdgeAccess>,
-            >,
-            tokio::sync::mpsc::UnboundedSender<crate::worker::last_used_worker::CapsuleUsed>,
-        ) = match config.backend {
+        let (store, edge_access_tx, capsule_used_tx, completed_tool_round_service): BackendAssembly =
+            match config.backend {
             crate::config::BackendKind::Lance => {
                 // LanceStore creates the schema + FTS indexes and serves
                 // both reads and writes. We hold a concrete `Arc<Store>`
@@ -129,8 +144,30 @@ impl AppState {
                     });
                 }
 
+                let completed_tool_round_service =
+                    Arc::new(CompletedToolRoundService::new(store_concrete.clone()));
+                if config.skill_candidate.enabled {
+                    let settings = config.skill_candidate.clone();
+                    let candidate_service = Arc::new(
+                        crate::service::SkillCandidateService::with_limits(
+                            store_concrete.clone(),
+                            crate::domain::SkillCandidatePolicy::default(),
+                            settings.max_builds,
+                            settings.max_rounds,
+                        ),
+                    );
+                    tokio::spawn(async move {
+                        crate::worker::skill_candidate_worker::run(candidate_service, settings)
+                            .await;
+                    });
+                }
                 let store: Arc<dyn Backend> = store_concrete;
-                (store, edge_access_tx, capsule_used_tx)
+                (
+                    store,
+                    edge_access_tx,
+                    capsule_used_tx,
+                    completed_tool_round_service,
+                )
             }
             crate::config::BackendKind::Postgres => {
                 // Connect + idempotently migrate. The Store-glue
@@ -159,7 +196,10 @@ impl AppState {
                 info!(backend = "postgres", "storage initialized");
                 let store: Arc<dyn Backend> = pg;
                 let (capsule_used_tx, _rx) = tokio::sync::mpsc::unbounded_channel();
-                (store, None, capsule_used_tx)
+                let completed_tool_round_service = Arc::new(CompletedToolRoundService::new(
+                    Arc::new(UnsupportedCompletedToolRoundStore),
+                ));
+                (store, None, capsule_used_tx, completed_tool_round_service)
             }
             crate::config::BackendKind::Clickhouse => {
                 // P2: `ClickHouseBackend` now impls all 11 sub-traits (the
@@ -188,9 +228,12 @@ impl AppState {
                 info!(backend = "clickhouse", "storage initialized");
                 let store: Arc<dyn Backend> = Arc::new(ch);
                 let (capsule_used_tx, _rx) = tokio::sync::mpsc::unbounded_channel();
-                (store, None, capsule_used_tx)
+                let completed_tool_round_service = Arc::new(CompletedToolRoundService::new(
+                    Arc::new(UnsupportedCompletedToolRoundStore),
+                ));
+                (store, None, capsule_used_tx, completed_tool_round_service)
             }
-        };
+            };
 
         // ── Workers ─────────────────────────────────────────────
         let provider_worker = provider.clone();
@@ -310,6 +353,7 @@ impl AppState {
             capability_capsule_service,
             config,
             transcript_service,
+            completed_tool_round_service,
             entity_service,
             fact_check_service,
         })
@@ -342,4 +386,23 @@ pub async fn router() -> anyhow::Result<Router> {
 pub async fn router_with_config(config: crate::config::Config) -> anyhow::Result<Router> {
     let state = AppState::from_config(config).await?;
     Ok(http::router().with_state(state))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn candidate_worker_rejects_an_unsupported_backend_before_connecting() {
+        let mut config = crate::config::Config::local();
+        config.skill_candidate.enabled = true;
+        config.backend = crate::config::BackendKind::Postgres;
+
+        let error = match AppState::from_config(config).await {
+            Ok(_) => panic!("unsupported candidate backend unexpectedly started"),
+            Err(error) => error,
+        };
+
+        assert!(error.to_string().contains("MEM_BACKEND=lance"));
+    }
 }

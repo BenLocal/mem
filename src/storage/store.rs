@@ -59,11 +59,15 @@ use crate::domain::session::Session;
 use crate::domain::{AddAliasOutcome, ConversationMessage, Entity, EntityKind, EntityWithAliases};
 
 /// Handle carried by every service / worker / HTTP component. Cheap
-/// to clone (just two `Arc`s).
+/// to clone (only shared `Arc` state).
 #[derive(Clone)]
 pub struct Store {
     /// Reads and writes both flow here.
     pub(crate) lance: Arc<LanceStore>,
+    /// Process-local transaction boundary for the Lance-backed Skill candidate
+    /// queue. Lance has no unique constraints or multi-statement transaction,
+    /// so ensure/claim/finish must not interleave across `Store` clones.
+    pub(crate) skill_candidate_queue_gate: Arc<tokio::sync::Mutex<()>>,
     /// Open-time advisory lock — held for the full lifetime of every
     /// `Store` clone (`Arc` keeps it alive until the last clone drops).
     /// `None` when `MEM_OPEN_LOCK_DISABLED=1` skipped acquisition. See
@@ -85,6 +89,7 @@ impl Store {
         let lance = LanceStore::open(path).await?;
         Ok(Self {
             lance: Arc::new(lance),
+            skill_candidate_queue_gate: Arc::new(tokio::sync::Mutex::new(())),
             _open_lock: Arc::new(lock),
         })
     }
@@ -105,6 +110,7 @@ impl Store {
         let lance = LanceStore::open_with_provider(path, provider).await?;
         Ok(Self {
             lance: Arc::new(lance),
+            skill_candidate_queue_gate: Arc::new(tokio::sync::Mutex::new(())),
             _open_lock: Arc::new(lock),
         })
     }

@@ -482,7 +482,10 @@ fn parse_codex_rollout(
                     content: text,
                     tool_name: None,
                     tool_use_id: None,
-                    meta_json: None,
+                    meta_json: payload["phase"]
+                        .as_str()
+                        .filter(|phase| !phase.is_empty())
+                        .map(|phase| serde_json::json!({ "phase": phase }).to_string()),
                 }
             }
             "reasoning" => {
@@ -542,9 +545,10 @@ fn parse_codex_rollout(
 /// Parse a pi session JSONL into `(memories, archive blocks)` — same output
 /// shape as the Claude path. The leading `{"type":"session","id":..}` line
 /// supplies the session id; each `{"type":"message", message:{role, content}}`
-/// line is one message whose `content[]` blocks are Anthropic-shaped (text /
-/// thinking / tool_use / tool_result), so block handling mirrors the Claude
-/// parser. pi's per-line `id` is a stable message uuid (never reminted).
+/// line is one message. Current pi sessions use camelCase `toolCall` blocks
+/// and whole-message `toolResult` records; legacy Anthropic-shaped block names
+/// remain accepted for backward compatibility. pi's per-line `id` is a stable
+/// message uuid (never reminted).
 fn parse_pi_session(
     path: &Path,
     heuristic: bool,
@@ -576,12 +580,41 @@ fn parse_pi_session(
         }
 
         let msg = &value["message"];
-        let role = match msg["role"].as_str() {
-            Some(r @ ("user" | "assistant" | "system")) => r,
+        let source_role = msg["role"].as_str().unwrap_or("");
+        let role = match source_role {
+            r @ ("user" | "assistant" | "system") => r,
+            // Real pi tool results are whole messages, not Anthropic-style
+            // content blocks. Normalize them to the archive's established
+            // user/tool_result representation.
+            "toolResult" => "user",
             _ => continue,
         };
         let timestamp = value["timestamp"].as_str().unwrap_or("").to_string();
         let message_uuid = value["id"].as_str().map(|s| s.to_string());
+        let parent_uuid = value["parentId"].as_str();
+
+        if source_role == "toolResult" {
+            blocks.push(ArchivedBlock {
+                session_id: session_id.clone(),
+                timestamp,
+                line_number,
+                block_index: 0,
+                message_uuid,
+                role: role.to_string(),
+                block_type: "tool_result".to_string(),
+                content: pi_tool_result_text(&msg["content"]),
+                tool_name: msg["toolName"].as_str().map(str::to_string),
+                tool_use_id: msg["toolCallId"].as_str().map(str::to_string),
+                meta_json: build_meta_json(
+                    None,
+                    None,
+                    parent_uuid,
+                    msg["isError"].as_bool(),
+                    msg["stopReason"].as_str(),
+                ),
+            });
+            continue;
+        }
 
         // pi content is always an array of blocks. Accept a bare string
         // defensively (mirror the Claude parser's string-shape fallback).
@@ -624,7 +657,13 @@ fn parse_pi_session(
                     content: item["text"].as_str().unwrap_or("").to_string(),
                     tool_name: None,
                     tool_use_id: None,
-                    meta_json: None,
+                    meta_json: build_meta_json(
+                        None,
+                        None,
+                        parent_uuid,
+                        None,
+                        msg["stopReason"].as_str(),
+                    ),
                 }),
                 "thinking" => Some(ArchivedBlock {
                     session_id: session_id.clone(),
@@ -637,9 +676,15 @@ fn parse_pi_session(
                     content: item["thinking"].as_str().unwrap_or("").to_string(),
                     tool_name: None,
                     tool_use_id: None,
-                    meta_json: None,
+                    meta_json: build_meta_json(
+                        None,
+                        None,
+                        parent_uuid,
+                        None,
+                        msg["stopReason"].as_str(),
+                    ),
                 }),
-                "tool_use" => Some(ArchivedBlock {
+                "tool_use" | "toolCall" => Some(ArchivedBlock {
                     session_id: session_id.clone(),
                     timestamp: timestamp.clone(),
                     line_number,
@@ -647,12 +692,22 @@ fn parse_pi_session(
                     message_uuid: message_uuid.clone(),
                     role: role.to_string(),
                     block_type: "tool_use".to_string(),
-                    content: item["input"].to_string(),
+                    content: item
+                        .get("arguments")
+                        .or_else(|| item.get("input"))
+                        .map(Value::to_string)
+                        .unwrap_or_default(),
                     tool_name: item["name"].as_str().map(|s| s.to_string()),
                     tool_use_id: item["id"].as_str().map(|s| s.to_string()),
-                    meta_json: None,
+                    meta_json: build_meta_json(
+                        None,
+                        None,
+                        parent_uuid,
+                        None,
+                        msg["stopReason"].as_str(),
+                    ),
                 }),
-                "tool_result" => Some(ArchivedBlock {
+                "tool_result" | "toolResult" => Some(ArchivedBlock {
                     session_id: session_id.clone(),
                     timestamp: timestamp.clone(),
                     line_number,
@@ -661,9 +716,18 @@ fn parse_pi_session(
                     role: role.to_string(),
                     block_type: "tool_result".to_string(),
                     content: pi_tool_result_text(&item["content"]),
-                    tool_name: None,
-                    tool_use_id: item["tool_use_id"].as_str().map(|s| s.to_string()),
-                    meta_json: None,
+                    tool_name: item["toolName"].as_str().map(str::to_string),
+                    tool_use_id: item["tool_use_id"]
+                        .as_str()
+                        .or_else(|| item["toolCallId"].as_str())
+                        .map(str::to_string),
+                    meta_json: build_meta_json(
+                        None,
+                        None,
+                        parent_uuid,
+                        item["isError"].as_bool(),
+                        msg["stopReason"].as_str(),
+                    ),
                 }),
                 _ => None,
             };
@@ -756,6 +820,9 @@ pub fn parse_transcript_full(
         let envelope_parent = value["parentUuid"]
             .as_str()
             .or_else(|| value["parent_uuid"].as_str());
+        let envelope_stop_reason = value["message"]["stop_reason"]
+            .as_str()
+            .or_else(|| value["message"]["stopReason"].as_str());
 
         // Claude Code emits user messages in two shapes: an array of
         // structured blocks (when the message has tool-uses or
@@ -791,6 +858,7 @@ pub fn parse_transcript_full(
                 envelope_branch,
                 envelope_parent,
                 block_is_error,
+                envelope_stop_reason,
             );
 
             // Memory extraction (legacy path) only runs on assistant
@@ -916,6 +984,7 @@ fn build_meta_json(
     git_branch: Option<&str>,
     parent_uuid: Option<&str>,
     is_error: Option<bool>,
+    stop_reason: Option<&str>,
 ) -> Option<String> {
     let mut map = serde_json::Map::new();
     if let Some(s) = cwd.filter(|s| !s.is_empty()) {
@@ -929,6 +998,9 @@ fn build_meta_json(
     }
     if let Some(b) = is_error {
         map.insert("is_error".into(), Value::Bool(b));
+    }
+    if let Some(s) = stop_reason.filter(|s| !s.is_empty()) {
+        map.insert("stop_reason".into(), Value::String(s.to_string()));
     }
     if map.is_empty() {
         None

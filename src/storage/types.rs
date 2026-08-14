@@ -97,6 +97,10 @@ pub enum StorageError {
     InvalidData(&'static str),
     #[error("invalid input: {0}")]
     InvalidInput(String),
+    /// The selected backend does not implement an optional capability. This
+    /// is an explicit deployment limitation, not a transient backend fault.
+    #[error("unsupported capability: {0}")]
+    Unsupported(&'static str),
     #[error("storage backend failure ({backend})")]
     Backend {
         backend: &'static str,

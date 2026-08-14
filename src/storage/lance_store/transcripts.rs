@@ -14,7 +14,7 @@ use super::{
     sql_quote, transcript_embedding_job_row_to_record_batch,
     transcript_embedding_job_rows_to_record_batch, LanceStore, TranscriptEmbeddingJobRow,
 };
-use crate::domain::ConversationMessage;
+use crate::domain::{BlockType, ConversationMessage};
 use crate::embedding::wire::decode_f32_blob;
 use crate::storage::types::{
     ClaimedTranscriptEmbeddingJob, ContextWindow, StorageError, TranscriptSessionSummary,
@@ -546,6 +546,54 @@ impl LanceStore {
         Ok(out)
     }
 
+    async fn query_conversation_messages_capped(
+        &self,
+        filter: String,
+        max_blocks: usize,
+        max_bytes: usize,
+    ) -> Result<Vec<ConversationMessage>, StorageError> {
+        let table = self
+            .conn
+            .open_table("conversation_messages")
+            .execute()
+            .await
+            .map_err(lancedb_err)?;
+        let mut stream = table
+            .query()
+            .only_if(filter)
+            .limit(max_blocks)
+            .execute()
+            .await
+            .map_err(lancedb_err)?;
+        let mut out = Vec::new();
+        let mut source_bytes = 0usize;
+        while let Some(batch) = stream
+            .try_next()
+            .await
+            .map_err(|error| StorageError::backend("lancedb stream", error))?
+        {
+            let rows = record_batch_to_conversation_messages(&batch)?;
+            for row in rows {
+                source_bytes = source_bytes.saturating_add(row.owned_string_bytes());
+                if source_bytes > max_bytes {
+                    return Err(StorageError::InvalidInput(format!(
+                        "session exceeds completed tool round source limit of {max_bytes} bytes"
+                    )));
+                }
+                let projected = if row.block_type == BlockType::Text {
+                    row
+                } else {
+                    ConversationMessage {
+                        content: String::new(),
+                        ..row
+                    }
+                };
+                out.push(projected);
+            }
+        }
+        Ok(out)
+    }
+
     /// Route-B bucket "transcript fetch-by-ids": native lancedb-Rust
     /// equivalent of `DuckDbQuery::fetch_conversation_messages_by_ids` — bulk
     /// fetch by `message_block_id` list, scoped to `tenant`.
@@ -717,6 +765,31 @@ impl LanceStore {
                 sql_quote(tenant),
                 sql_quote(session_id),
             ))
+            .await?;
+        rows.sort_by(chrono_asc);
+        Ok(rows)
+    }
+
+    /// Bounded source scan for rebuildable transcript-derived indexes. The
+    /// caller requests `cap + 1` rows so it can reject an oversized session
+    /// without materializing the full transcript.
+    pub async fn get_conversation_messages_by_session_capped(
+        &self,
+        tenant: &str,
+        session_id: &str,
+        max_blocks: usize,
+        max_bytes: usize,
+    ) -> Result<Vec<ConversationMessage>, StorageError> {
+        let mut rows = self
+            .query_conversation_messages_capped(
+                format!(
+                    "tenant = {} AND session_id = {}",
+                    sql_quote(tenant),
+                    sql_quote(session_id),
+                ),
+                max_blocks,
+                max_bytes,
+            )
             .await?;
         rows.sort_by(chrono_asc);
         Ok(rows)

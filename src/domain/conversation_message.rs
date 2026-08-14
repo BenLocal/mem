@@ -35,6 +35,26 @@ pub struct ConversationMessage {
     pub meta_json: Option<String>,
 }
 
+impl ConversationMessage {
+    /// Approximate heap bytes retained by this parsed row's owned strings.
+    /// Used to keep derived-index rebuilds bounded after Lance materializes a
+    /// record; numeric/enumerated fields are inline and intentionally omitted.
+    pub(crate) fn owned_string_bytes(&self) -> usize {
+        self.message_block_id
+            .len()
+            .saturating_add(self.session_id.as_ref().map_or(0, String::len))
+            .saturating_add(self.tenant.len())
+            .saturating_add(self.caller_agent.len())
+            .saturating_add(self.transcript_path.len())
+            .saturating_add(self.message_uuid.as_ref().map_or(0, String::len))
+            .saturating_add(self.content.len())
+            .saturating_add(self.tool_name.as_ref().map_or(0, String::len))
+            .saturating_add(self.tool_use_id.as_ref().map_or(0, String::len))
+            .saturating_add(self.created_at.len())
+            .saturating_add(self.meta_json.as_ref().map_or(0, String::len))
+    }
+}
+
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 pub enum MessageRole {
@@ -99,6 +119,38 @@ impl MessageRole {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn owned_string_bytes_counts_every_materialized_string_field() {
+        let message = ConversationMessage {
+            message_block_id: "block".into(),
+            session_id: Some("session".into()),
+            tenant: "tenant".into(),
+            caller_agent: "agent".into(),
+            transcript_path: "path".into(),
+            line_number: 1,
+            block_index: 0,
+            message_uuid: Some("uuid".into()),
+            role: MessageRole::Assistant,
+            block_type: BlockType::ToolUse,
+            content: "content".into(),
+            tool_name: Some("tool".into()),
+            tool_use_id: Some("call".into()),
+            embed_eligible: false,
+            created_at: "created".into(),
+            meta_json: Some("meta".into()),
+        };
+
+        let expected: usize = [
+            "block", "session", "tenant", "agent", "path", "uuid", "content", "tool", "call",
+            "created", "meta",
+        ]
+        .iter()
+        .map(|value| value.len())
+        .sum();
+
+        assert_eq!(message.owned_string_bytes(), expected);
+    }
 
     #[test]
     fn embed_eligible_default_truth_table() {

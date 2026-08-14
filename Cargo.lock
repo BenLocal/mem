@@ -5760,6 +5760,7 @@ dependencies = [
  "candle-core 0.9.2",
  "candle-nn 0.9.2",
  "candle-transformers 0.9.2",
+ "chrono",
  "clap",
  "clickhouse",
  "embed_anything",
@@ -5793,6 +5794,7 @@ dependencies = [
  "tower",
  "tracing",
  "tracing-subscriber",
+ "unicode-normalization",
  "uuid",
 ]
 

@@ -209,6 +209,8 @@ Example compose (build context is repo root): [deploy/docker-compose.yml](deploy
 
 Default in the image: `BIND_ADDR=0.0.0.0:3000`, `MEM_DB_PATH=/data/mem.lance`. Point MCP clients at the same host with `MEM_BASE_URL` (for example `http://127.0.0.1:3000`).
 
+> **Network trust boundary:** most of mem's HTTP API, including other `/admin/*` and transcript metadata routes, does not provide built-in authentication. The completed-tool-round admin routes additionally require `MEM_ADMIN_TOKEN`, but that is not a service-wide auth layer. Do not publish port 3000 to an untrusted network. Bind to loopback, restrict the container port at the firewall, or place an authenticated reverse proxy in front of it.
+
 ## Release (GHCR + binaries)
 
 1. Push a semver tag: `git tag v0.1.0 && git push origin v0.1.0` (triggers both **CI** and **Release**; the Docker image build uses the GitHub Actions cache to speed up repeated builds).
@@ -272,10 +274,17 @@ Expected response shapes:
 ## Verification
 
 ```bash
-cargo test -q
+# Development loop: run only the affected test crate or named test.
+make test-one TEST=search_api
+make test-filter FILTER=ingest::compute_content
+
+# Full regression is an explicit gate, capped at four concurrent build jobs.
+make test-full
 cargo fmt --check
 cargo clippy --all-targets -- -D warnings
 ```
+
+`cargo test` links 55 integration-test binaries against the full Lance/Arrow/Candle dependency graph. On a shared server, prefer the scoped commands above; `CARGO_TEST_JOBS` and `RUST_TEST_THREADS` can override the Makefile's conservative defaults of `4` on a dedicated builder. `test-filter` is deliberately `--lib`; select an integration crate with `test-one` first, then pass a normal test-harness filter if needed.
 
 ## Design Principles
 
@@ -449,6 +458,45 @@ curl -X POST localhost:3000/transcripts/search \
 ```
 
 Response shape: `{ "windows": [{ "session_id": "...", "blocks": [...], "primary_ids": [...], "score": 47 }] }`. Each window is a conversation snippet around one or more primary hits; `is_primary: true` flags the actual matches inside the `blocks` array.
+
+**Completed tool rounds (rebuildable derived index)** — the transcript remains the only verbatim source. The derived rows contain source coordinates, canonical tool families, pairing counts, and integrity flags; they never copy prompts, tool arguments/results, or final answers. Rebuild one bounded session through the running single writer. Both admin routes fail closed unless `MEM_ADMIN_TOKEN` is configured on the server and supplied by the caller:
+
+```bash
+export MEM_ADMIN_TOKEN="$(openssl rand -hex 32)"
+mem transcript-rounds rebuild --tenant local --session sess_abc --dry-run
+mem transcript-rounds rebuild --tenant local --session sess_abc
+
+curl -H "authorization: Bearer $MEM_ADMIN_TOKEN" \
+  'localhost:3000/admin/transcript-rounds?tenant=local&session_id=sess_abc'
+```
+
+Each rebuild publishes a new immutable generation only when the source fingerprint changed, then atomically advances a per-session head pointer. Interrupted generations remain invisible and the previous completed generation stays readable. The admin read response is capped at 1,000 rounds and omits local paths, message/tool-call IDs, raw tool names, and internal fingerprints. `MEM_ADMIN_TOKEN` must contain 32–1,024 printable ASCII bytes; authentication runs before query/body parsing. This first implementation is Lance-only; PostgreSQL and ClickHouse return `501 Not Implemented`. It does not run an LLM, create Skills, or modify transcript rows.
+
+**Deterministic Skill-candidate queue (opt in)** — set
+`MEM_SKILL_CANDIDATE_ENABLED=1` to periodically reconcile only the latest
+completed round generation per session. A clean round becomes one durable,
+content-free candidate when it has at least 10 matched tool calls, or when the
+same normalized task appears in at least 3 clean rounds (each with at least 3
+matched calls) across at least 2 sessions within 30 days. The first repeat
+cohort uses 3 rounds; every cohort independently spans at least 2 sessions and
+at most 30 days. Trailing evidence waits until the next complete cohort, while
+high-volume evidence uses the latest bounded window. Stable evidence is
+idempotent across generation rebuilds, and a new cohort creates a new durable
+receipt. Job identity binds the actual evidence fingerprint; its revision is
+audit metadata, not part of identity. Jobs are leased FIFO with at most one in
+flight per `tenant + agent`. If a corrected head removes supporting evidence,
+pending or lease-expired work becomes `stale`; restoring the same evidence
+reactivates the same receipt. A live processing lease is never preempted by
+reconcile. Trigger/task-signal version upgrades also stale obsolete receipts.
+Before a future consumer writes any `PendingConfirmation` proposal it must
+revalidate the current head/evidence; lease ownership alone is insufficient.
+This phase has no job consumer: it does not call an LLM, write a Skill/capsule,
+or rewrite transcript content. The worker is Lance-only and startup fails
+explicitly if it is enabled with PostgreSQL/ClickHouse. Reconcile defaults to every 300 seconds and is
+bounded by `MEM_SKILL_CANDIDATE_MAX_BUILDS` (100,000 current session heads) and
+`MEM_SKILL_CANDIDATE_MAX_ROUNDS` (20,000). Exceeding either configured capacity
+refuses that reconcile rather than silently planning from partial evidence;
+capacity refusals increment `skill_candidate_capacity_rejections`.
 
 **New request fields** (all optional; transcripts pipeline only):
 - `anchor_session_id` — boost blocks from this session above topical matches; useful when continuing a known conversation.
@@ -642,4 +690,3 @@ After ingest, `graph_edges.to_node_id` is `"entity:<uuid>"` for every entity-typ
 **Aliases & normalization**: alias matching is lowercase + whitespace-collapsed; punctuation preserved (`C++` ≠ `c`). Caller's verbatim spelling lives on `entities.canonical_name`.
 
 **MCP**: the registry is HTTP-only; no MCP surface (matches the conversation-archive / transcript-recall convention).
-

@@ -58,6 +58,10 @@ enum Command {
     /// LLM gateway. Dry-run by default; `--accept` writes. Inert unless
     /// `LLM_API_BASE` + `LLM_MODEL` are set.
     Crystallize(mem::cli::crystallize::CrystallizeArgs),
+    /// Inspect or rebuild transcript-derived completed tool rounds via the
+    /// running `mem serve` writer.
+    #[command(subcommand)]
+    TranscriptRounds(mem::cli::completed_tool_rounds::TranscriptRoundsCommand),
 }
 
 fn main() -> error::Result<()> {
@@ -137,6 +141,10 @@ async fn async_main(command: Command) -> error::Result<()> {
         }
         Command::Sync(args) => {
             let code = mem::cli::sync::run(args).await;
+            std::process::exit(code);
+        }
+        Command::TranscriptRounds(command) => {
+            let code = mem::cli::completed_tool_rounds::run(command).await;
             std::process::exit(code);
         }
     }

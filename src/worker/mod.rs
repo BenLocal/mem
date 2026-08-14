@@ -54,6 +54,9 @@
 //!   `suspected_supersede` edge. Opt-in (`MEM_INGEST_NEARDUP_ENABLED`).
 //! - `transcript_embedding_worker` — same shape for
 //!   `transcript_embedding_jobs` → `conversation_message_embeddings`.
+//! - `skill_candidate_worker` — opt-in, bounded reconciliation from latest
+//!   completed tool-round generations into durable content-free candidate
+//!   jobs. It intentionally has no extractor consumer in this phase.
 //!
 //! There is no `fts_worker` — BM25 index is built once at
 //! `LanceStore::open` time on `(memories, content)` and
@@ -69,6 +72,7 @@ pub mod evolution_worker;
 pub mod idle_archive_worker;
 pub mod last_used_worker;
 pub mod potentiation_worker;
+pub mod skill_candidate_worker;
 pub mod topic_tunnel_worker;
 pub mod transcript_embedding_worker;
 pub mod vacuum_worker;

@@ -3,11 +3,14 @@
 
 .DEFAULT_GOAL := help
 .PHONY: help build release install run serve mcp repair-check repair-rebuild \
-        test test-unit test-fast fmt fmt-check clippy lint check watch watch-check \
+        test test-full test-unit test-fast test-one test-filter test-rounds test-candidates \
+        fmt fmt-check clippy lint check watch watch-check \
         cross cross-linux-gnu cross-linux-musl cross-arm64 \
         clean bench-recall
 
 CARGO ?= cargo
+CARGO_TEST_JOBS ?= 4
+RUST_TEST_THREADS ?= 2
 
 help: ## Show available targets
 	@awk 'BEGIN {FS = ":.*?## "} /^[a-zA-Z0-9_-]+:.*?## / {printf "  \033[36m%-22s\033[0m %s\n", $$1, $$2}' $(MAKEFILE_LIST)
@@ -46,13 +49,37 @@ repair-rebuild: ## Force-rebuild the sidecar (stop mem serve first)
 
 # ==== Tests ====
 
-test: ## Full test suite (includes tests/ integration tests)
-	$(CARGO) test -q
+test: test-full ## Full test suite; prefer test-one/test-filter while iterating
+
+test-full: ## Full suite (55 integration crates); reserved for explicit gates
+	RUST_TEST_THREADS=$(RUST_TEST_THREADS) $(CARGO) test -j $(CARGO_TEST_JOBS) -q
 
 test-unit: ## Unit tests only (in-lib #[cfg(test)] mod tests)
-	$(CARGO) test --lib -q
+	RUST_TEST_THREADS=$(RUST_TEST_THREADS) $(CARGO) test -j $(CARGO_TEST_JOBS) --lib -q
 
 test-fast: test-unit ## Alias for test-unit
+
+test-one: ## One integration crate: make test-one TEST=search_api
+	@test -n "$(TEST)" || { echo "usage: make test-one TEST=<tests filename without .rs>" >&2; exit 2; }
+	RUST_TEST_THREADS=$(RUST_TEST_THREADS) $(CARGO) test -j $(CARGO_TEST_JOBS) --test $(TEST)
+
+test-filter: ## One named lib test: make test-filter FILTER=ingest::compute_content
+	@test -n "$(FILTER)" || { echo "usage: make test-filter FILTER=<test name or module path>" >&2; exit 2; }
+	RUST_TEST_THREADS=$(RUST_TEST_THREADS) $(CARGO) test -j $(CARGO_TEST_JOBS) --lib $(FILTER)
+
+test-rounds: ## completed_tool_round projector, rebuild, and HTTP contract only
+	RUST_TEST_THREADS=$(RUST_TEST_THREADS) $(CARGO) test -j $(CARGO_TEST_JOBS) --lib completed_tool_round_service::tests::
+	RUST_TEST_THREADS=$(RUST_TEST_THREADS) $(CARGO) test -j $(CARGO_TEST_JOBS) --lib cli::completed_tool_rounds::tests::
+	RUST_TEST_THREADS=$(RUST_TEST_THREADS) $(CARGO) test -j $(CARGO_TEST_JOBS) --lib config::tests::admin_bearer_is_fail_closed
+	RUST_TEST_THREADS=$(RUST_TEST_THREADS) $(CARGO) test -j $(CARGO_TEST_JOBS) --test completed_tool_rounds
+	RUST_TEST_THREADS=$(RUST_TEST_THREADS) $(CARGO) test -j $(CARGO_TEST_JOBS) --test completed_tool_round_rebuild
+	RUST_TEST_THREADS=$(RUST_TEST_THREADS) $(CARGO) test -j $(CARGO_TEST_JOBS) --test completed_tool_round_api
+
+test-candidates: ## deterministic Skill-candidate planner and durable queue only
+	RUST_TEST_THREADS=$(RUST_TEST_THREADS) $(CARGO) test -j $(CARGO_TEST_JOBS) --lib config::tests::skill_candidate
+	RUST_TEST_THREADS=$(RUST_TEST_THREADS) $(CARGO) test -j $(CARGO_TEST_JOBS) --lib app::tests::candidate_worker_rejects
+	RUST_TEST_THREADS=$(RUST_TEST_THREADS) $(CARGO) test -j $(CARGO_TEST_JOBS) --lib skill_candidate_store::tests::
+	RUST_TEST_THREADS=$(RUST_TEST_THREADS) $(CARGO) test -j $(CARGO_TEST_JOBS) --test skill_candidate_jobs
 
 # ==== Code quality ====
 
@@ -69,7 +96,7 @@ lint: fmt-check clippy ## fmt-check + clippy
 
 # ==== Workflow ====
 
-check: fmt-check clippy test ## Pre-commit gate: fmt-check + clippy + full test suite
+check: fmt-check clippy test-full ## Explicit pre-commit gate, including the full suite
 
 # Only watch paths that affect the binary output, so docs / Dockerfile /
 # .github / hooks changes don't SIGTERM mem serve mid-handler. The schema

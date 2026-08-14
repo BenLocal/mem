@@ -408,6 +408,24 @@ mem 里有**两条平行管道**,共享零状态,这是理解全局的一个关�
 - **capsule 管道**:抽取出的结构化记忆,走完整的 ingest→retrieve→compress→workflow 四阶段、生命周期、演化、图谱。
 - **transcript 管道**:逐字会话归档,不做记忆抽取(那是 capsule 管道的事),只归档 + 独立的语义搜索。`mem mine` 是**双 sink**:一次 transcript 扫描既写抽取出的记忆(进 capsule 管道),又把每个 block(text/tool_use/tool_result/thinking)写进 transcript 档案。
 
+transcript 之上另有一个**可删除、可重建的派生索引**:`completed_tool_rounds`。纯投影器按 `tenant + caller_agent + session_id + transcript_path` 隔离流,把 Claude Code/Codex/Pi 已归一化的 block 切成完整 human tool round;索引只存 source anchors、canonical tool family 和结构完整性统计,不复制 prompt、tool 参数/result 或最终答复。`completed_tool_round_index_builds` 以 immutable generation 的 `building → completed` 发布,`completed_tool_round_index_heads` 再按 tenant/session 原子指向当前代；失败重建不会遮住上一代，历史 build/round 也不互相脱节。
+
+其上的 `skill_candidate_jobs` 是第二层派生状态：纯 planner 只接收 head 指向的 completed generation，按确定性工具量/重复任务规则创建 content-free job receipt。`job_id` 由 length-prefixed 的 `tenant + caller_agent + task_fingerprint + trigger_version + input_fingerprint` 决定；`candidate_revision` 只是当前证据覆盖水位，不参与 identity。同一 evidence cohort 的 generation 重建保持幂等，完整的新 cohort/高工具量窗口才产生新 receipt；同时命中两种 trigger 时证据取并集。重复 cohort 在完整时间线上稳定分桶，每个 cohort 自身必须满足跨 session 且时间跨度不超过 30 天。queue 以 lease token fencing 管理 `pending → processing → completed | retry_wait | dead_letter | stale`，每个 `tenant + caller_agent` lane 严格 FIFO且同一时刻最多一个 processing；不同 lane 可并行。head 修正导致支撑 round 消失、task-signal version 改变或 trigger version 升级时，未领取/已过租约的 receipt 转 `stale`；证据恢复会用同一 job identity 重新激活，尚未过期的 processing lease 不被 reconcile 抢占。`MEM_SKILL_CANDIDATE_ENABLED` 默认 OFF，当前 worker 只 reconcile、不消费任务，所以没有 LLM/Skill/capsule 写入；该开关仅支持 Lance，其他 backend 启动时显式拒绝。head 扫描默认 hard cap 100,000，queue 在写前计算 `existing - to_stale + additions`，超过容量直接拒绝并计 `skill_candidate_capacity_rejections`，不会先插入半批任务再失败。
+
+未来接 extractor/Skill publisher 时，live lease 只代表 worker ownership，不代表 evidence 仍 current；任何 LLM 调用后的持久副作用前必须重新校验 head/evidence，并且只允许写 `PendingConfirmation` 提案。
+
+显式重建由唯一 writer 执行:
+
+```bash
+export MEM_ADMIN_TOKEN="$(openssl rand -hex 32)"
+mem transcript-rounds rebuild --tenant local --session <session-id> --dry-run
+mem transcript-rounds rebuild --tenant local --session <session-id>
+```
+
+第一版只在默认 Lance backend 启用;Postgres/ClickHouse 明确返回 HTTP 501,不伪装成空索引。completed-round 重建本身不接 LLM 或 Skill 提案，因此不会自行改写或激活任何 capsule。
+
+重建输入最多读取 20,000 个 source blocks / 64 MiB 结构投影,tool 参数/result 正文不会被物化到 projector,tenant/session 标识有长度上限,并发重建会快速返回冲突而不是在全局 publisher 后无限排队。candidate 证据扫描和 queue 调度都使用窄列，stale round-ref 扫描另有 64 MiB 上限。admin read 最多返回 1,000 条且去掉内部路径、message/tool-call ID、raw tool name 与 fingerprint。两条 completed-round admin 路由强制校验 `MEM_ADMIN_TOKEN` Bearer；token 必须是 32–1024 字节 printable ASCII，服务只保留带 redacted Debug 的 SHA-256 wrapper，不保留明文。未配置或未携带时统一 401，且鉴权先于 JSON/query 解析。
+
 **为什么分开**:记忆是被打分、演化、会归档的"提炼物";transcript 是永不改写的"原始证据"。两者生命周期、redaction 策略、索引方式都不同,硬凑一条管道会互相拖累。
 
 transcript 读路径有一个重要的**软降级**特性,见 §10.4。
@@ -577,13 +595,14 @@ mem 内建一个**带有效期的知识图谱**(valid-time 时序,见 §15.2),�
 
 ### 12.1 HTTP(`src/http/`)
 
-axum 0.8,`http::router()` merge 12 个子路由 + 一个 logging 中间件:
+axum 0.8,`http::router()` merge 13 个子路由 + 一个 logging 中间件:
 
 | 子路由 | 覆盖 |
 |--------|------|
 | `health` | `/health`(read-only,不鉴权) |
 | `capability_capsule` | 记忆 CRUD / search / ingest / batch / feedback / supersede / review / bootstrap … |
 | `transcripts` | `/transcripts/messages` · `/transcripts/search` · `/transcripts?session_id=…`(仅 HTTP) |
+| `completed_tool_rounds` | `POST /admin/transcript-rounds/rebuild` · `GET /admin/transcript-rounds`(要求 `MEM_ADMIN_TOKEN` Bearer；Lance 派生索引,去内部 locator/fingerprint,最多 1,000 条) |
 | `embeddings` | 嵌入 job / provider / rebuild(admin) |
 | `review` | 审查队列 accept/edit_accept/reject |
 | `graph` | 图边 / 邻居 / stats |
@@ -602,7 +621,7 @@ stdio JSON-RPC 转发器,把工具调用转成 HTTP 打到 `MEM_BASE_URL`。默�
 
 ### 12.3 CLI 子命令(`src/cli/`)
 
-`serve` / `mcp` 之外的一次性工具:`mine`(双 sink 挖记忆 + 归档)、`import`(纯归档)、`wake-up`(会话启动注入)、`feedback-from-transcript`(补反馈)、`hook`(Claude Code 钩子入口)、`sync`(跨后端迁移)、`init`(脚手架)。启发式/LLM 抽取 lane 在 `cli/heuristic_extract.rs`(O7b,`MEM_MINE_HEURISTIC_EXTRACT`)/ `cli/llm_extract.rs`(O7c,`MEM_MINE_LLM_EXTRACT` + `LLM_*`),都默认 OFF、都走审查门。
+`serve` / `mcp` 之外的一次性工具:`mine`(双 sink 挖记忆 + 归档)、`import`(纯归档)、`transcript-rounds rebuild`(通过 HTTP 重建一条 session 的派生 tool-round generation)、`wake-up`(会话启动注入)、`feedback-from-transcript`(补反馈)、`hook`(Claude Code 钩子入口)、`sync`(跨后端迁移)、`init`(脚手架)。启发式/LLM 抽取 lane 在 `cli/heuristic_extract.rs`(O7b,`MEM_MINE_HEURISTIC_EXTRACT`)/ `cli/llm_extract.rs`(O7c,`MEM_MINE_LLM_EXTRACT` + `LLM_*`),都默认 OFF、都走审查门。
 
 ### 12.4 Claude Code 钩子集成
 

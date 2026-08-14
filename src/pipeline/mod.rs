@@ -1,4 +1,5 @@
 pub mod chunk;
+pub mod completed_tool_round;
 pub mod compress;
 pub mod entity_normalize;
 pub mod eval_metrics;
@@ -7,5 +8,6 @@ pub mod ranking;
 pub mod redact;
 pub mod retrieve;
 pub mod session;
+pub mod skill_candidate;
 pub mod transcript_recall;
 pub mod workflow;
