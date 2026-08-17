@@ -73,7 +73,8 @@ use crate::storage::{current_timestamp, Backend, EvolutionCandidate, FeedbackEve
 /// evolution proposals are review-gated BY DESIGN (doc §6.2 — products
 /// are forced through PendingConfirmation, never directly Active) and
 /// auto-promote would silently bypass that gate (E1.6).
-pub const EVOLUTION_SOURCE_AGENT: &str = "evolution_worker";
+pub const EVOLUTION_SOURCE_AGENT: &str =
+    crate::domain::capability_capsule::EVOLUTION_PROPOSAL_SOURCE_AGENT;
 
 /// Mean-confidence floor for ② generalize sources (doc §4② — fixed in
 /// E1, not env-tunable).

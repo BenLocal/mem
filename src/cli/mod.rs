@@ -1,6 +1,8 @@
 pub mod common;
 pub mod completed_tool_rounds;
 pub mod crystallize;
+mod crystallize_adapters;
+pub mod crystallize_candidates;
 pub mod feedback;
 pub mod heuristic_extract;
 pub mod hook;

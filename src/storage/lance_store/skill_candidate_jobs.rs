@@ -16,7 +16,7 @@ use crate::domain::{
     SkillCandidateEnsureReport, SkillCandidateJob, SkillCandidateJobSpec, SkillCandidateJobStatus,
     SkillCandidateRoundRef, SkillCandidateTriggerReason,
 };
-use crate::storage::StorageError;
+use crate::storage::{timestamp_add_ms, StorageError};
 
 pub(super) const TABLE: &str = "skill_candidate_jobs";
 const MAX_ENSURE_BATCH: usize = 256;
@@ -24,6 +24,8 @@ const MAX_CLAIM_BATCH: usize = 256;
 const MAX_NONTERMINAL_SCAN_ROWS: usize = 100_000;
 const MAX_STALE_SCAN_BYTES: usize = 64 * 1024 * 1024;
 const STALE_REACTIVATION_PAGE_ROWS: usize = 1_000;
+const LEASE_HARD_DEADLINE_MS: u128 = 10 * 60 * 1_000;
+const MAX_LEASE_RENEWALS: u32 = 2;
 
 #[derive(Debug)]
 struct SkillCandidateQueueRow {
@@ -42,6 +44,7 @@ struct SkillCandidateStaleRow {
     trigger_version: u32,
     status: SkillCandidateJobStatus,
     lease_expires_at: Option<String>,
+    trigger_reasons: Vec<SkillCandidateTriggerReason>,
     round_refs: Vec<SkillCandidateRoundRef>,
 }
 
@@ -60,6 +63,32 @@ pub(super) async fn ensure_skill_candidate_jobs_table(
             .add_columns(
                 NewColumnTransform::AllNulls(Arc::new(Schema::new(vec![Field::new(
                     "candidate_revision",
+                    DataType::UInt32,
+                    true,
+                )]))),
+                None,
+            )
+            .await
+            .map_err(lancedb_err)?;
+    }
+    if current.field_with_name("lease_hard_deadline").is_err() {
+        table
+            .add_columns(
+                NewColumnTransform::AllNulls(Arc::new(Schema::new(vec![Field::new(
+                    "lease_hard_deadline",
+                    DataType::Utf8,
+                    true,
+                )]))),
+                None,
+            )
+            .await
+            .map_err(lancedb_err)?;
+    }
+    if current.field_with_name("lease_renewal_count").is_err() {
+        table
+            .add_columns(
+                NewColumnTransform::AllNulls(Arc::new(Schema::new(vec![Field::new(
+                    "lease_renewal_count",
                     DataType::UInt32,
                     true,
                 )]))),
@@ -91,6 +120,8 @@ fn schema() -> Schema {
         Field::new("available_at", DataType::Utf8, false),
         Field::new("lease_token", DataType::Utf8, true),
         Field::new("lease_expires_at", DataType::Utf8, true),
+        Field::new("lease_hard_deadline", DataType::Utf8, true),
+        Field::new("lease_renewal_count", DataType::UInt32, true),
         Field::new("last_error_code", DataType::Utf8, true),
         Field::new("created_at", DataType::Utf8, false),
         Field::new("updated_at", DataType::Utf8, false),
@@ -117,6 +148,8 @@ fn jobs_to_record_batch(jobs: &[SkillCandidateJob]) -> Result<RecordBatch, Stora
     let mut available_at = StringBuilder::new();
     let mut lease_token = StringBuilder::new();
     let mut lease_expires_at = StringBuilder::new();
+    let mut lease_hard_deadline = StringBuilder::new();
+    let mut lease_renewal_count = UInt32Builder::new();
     let mut last_error_code = StringBuilder::new();
     let mut created_at = StringBuilder::new();
     let mut updated_at = StringBuilder::new();
@@ -141,6 +174,8 @@ fn jobs_to_record_batch(jobs: &[SkillCandidateJob]) -> Result<RecordBatch, Stora
         available_at.append_value(&job.available_at);
         append_optional(&mut lease_token, job.lease_token.as_deref());
         append_optional(&mut lease_expires_at, job.lease_expires_at.as_deref());
+        lease_hard_deadline.append_null();
+        lease_renewal_count.append_value(0);
         append_optional(&mut last_error_code, job.last_error_code.as_deref());
         created_at.append_value(&job.created_at);
         updated_at.append_value(&job.updated_at);
@@ -168,6 +203,8 @@ fn jobs_to_record_batch(jobs: &[SkillCandidateJob]) -> Result<RecordBatch, Stora
             Arc::new(available_at.finish()),
             Arc::new(lease_token.finish()),
             Arc::new(lease_expires_at.finish()),
+            Arc::new(lease_hard_deadline.finish()),
+            Arc::new(lease_renewal_count.finish()),
             Arc::new(last_error_code.finish()),
             Arc::new(created_at.finish()),
             Arc::new(updated_at.finish()),
@@ -272,6 +309,8 @@ impl LanceStore {
                     .column("available_at", sql_quote(now))
                     .column("lease_token", "CAST(NULL AS string)")
                     .column("lease_expires_at", "CAST(NULL AS string)")
+                    .column("lease_hard_deadline", "CAST(NULL AS string)")
+                    .column("lease_renewal_count", "0")
                     .column("last_error_code", "CAST(NULL AS string)")
                     .column("updated_at", sql_quote(now))
                     .execute()
@@ -329,15 +368,18 @@ impl LanceStore {
             })
             .filter(|job| {
                 job.trigger_version != current_trigger_version
-                    || job.round_refs.is_empty()
-                    || job.round_refs.iter().any(|reference| {
-                        !active_evidence_keys.contains(&skill_candidate_evidence_key(
-                            &reference.round_id,
-                            &reference.source_fingerprint,
-                            reference.projector_version,
-                            reference.task_signal_version,
-                        ))
-                    })
+                    || (!job
+                        .trigger_reasons
+                        .contains(&SkillCandidateTriggerReason::NegativeFeedback)
+                        && (job.round_refs.is_empty()
+                            || job.round_refs.iter().any(|reference| {
+                                !active_evidence_keys.contains(&skill_candidate_evidence_key(
+                                    &reference.round_id,
+                                    &reference.source_fingerprint,
+                                    reference.projector_version,
+                                    reference.task_signal_version,
+                                ))
+                            })))
             })
             .map(|job| job.job_id)
             .collect())
@@ -433,6 +475,8 @@ impl LanceStore {
                 .column("status", "'stale'")
                 .column("lease_token", "CAST(NULL AS string)")
                 .column("lease_expires_at", "CAST(NULL AS string)")
+                .column("lease_hard_deadline", "CAST(NULL AS string)")
+                .column("lease_renewal_count", "0")
                 .column("last_error_code", "'evidence_superseded'")
                 .column("updated_at", sql_quote(now))
                 .execute()
@@ -482,6 +526,8 @@ impl LanceStore {
                 .column("available_at", sql_quote(now))
                 .column("lease_token", "CAST(NULL AS string)")
                 .column("lease_expires_at", "CAST(NULL AS string)")
+                .column("lease_hard_deadline", "CAST(NULL AS string)")
+                .column("lease_renewal_count", "0")
                 .column("last_error_code", "CAST(NULL AS string)")
                 .column("updated_at", sql_quote(now))
                 .execute()
@@ -545,6 +591,41 @@ impl LanceStore {
         max_retries: u32,
         limit: usize,
     ) -> Result<Vec<ClaimedSkillCandidateJob>, StorageError> {
+        self.claim_skill_candidate_jobs_scoped(None, now, lease_expires_at, max_retries, limit)
+            .await
+    }
+
+    pub async fn claim_skill_candidate_jobs_for_tenant(
+        &self,
+        tenant: &str,
+        now: &str,
+        lease_expires_at: &str,
+        max_retries: u32,
+        limit: usize,
+    ) -> Result<Vec<ClaimedSkillCandidateJob>, StorageError> {
+        if tenant.is_empty() || tenant.len() > 256 || tenant.chars().any(char::is_control) {
+            return Err(StorageError::InvalidInput(
+                "invalid Skill candidate claim tenant".into(),
+            ));
+        }
+        self.claim_skill_candidate_jobs_scoped(
+            Some(tenant),
+            now,
+            lease_expires_at,
+            max_retries,
+            limit,
+        )
+        .await
+    }
+
+    async fn claim_skill_candidate_jobs_scoped(
+        &self,
+        tenant: Option<&str>,
+        now: &str,
+        lease_expires_at: &str,
+        max_retries: u32,
+        limit: usize,
+    ) -> Result<Vec<ClaimedSkillCandidateJob>, StorageError> {
         if limit == 0 {
             return Ok(Vec::new());
         }
@@ -563,17 +644,21 @@ impl LanceStore {
                 "skill candidate lease timestamps are invalid".into(),
             ));
         }
+        let lease_hard_deadline = timestamp_add_ms(now, LEASE_HARD_DEADLINE_MS);
         let table = self
             .conn
             .open_table(TABLE)
             .execute()
             .await
             .map_err(lancedb_err)?;
+        let tenant_clause = tenant
+            .map(|tenant| format!(" AND tenant = {}", sql_quote(tenant)))
+            .unwrap_or_default();
         table
             .update()
             .only_if(format!(
-                "status IN ('pending', 'retry_wait') AND attempt_count >= {}",
-                max_retries
+                "status IN ('pending', 'retry_wait') AND attempt_count >= {}{}",
+                max_retries, tenant_clause
             ))
             .column("status", "'dead_letter'")
             .column("last_error_code", "'max_attempts_lowered'")
@@ -584,21 +669,28 @@ impl LanceStore {
         table
             .update()
             .only_if(format!(
-                "status = 'processing' AND attempt_count >= {} AND (lease_expires_at IS NULL OR lease_expires_at <= {})",
+                "status = 'processing' AND attempt_count >= {} AND (lease_expires_at IS NULL OR lease_expires_at <= {}){}",
                 max_retries,
-                sql_quote(now)
+                sql_quote(now),
+                tenant_clause,
             ))
             .column("status", "'dead_letter'")
             .column("lease_token", "CAST(NULL AS string)")
             .column("lease_expires_at", "CAST(NULL AS string)")
+            .column("lease_hard_deadline", "CAST(NULL AS string)")
+            .column("lease_renewal_count", "0")
             .column("last_error_code", "'lease_expired_after_max_attempts'")
             .column("updated_at", sql_quote(now))
             .execute()
             .await
             .map_err(lancedb_err)?;
+        let queue_filter = format!(
+            "status IN ('pending', 'retry_wait', 'processing'){}",
+            tenant_clause
+        );
         let mut jobs = self
             .query_skill_candidate_queue_rows(
-                Some("status IN ('pending', 'retry_wait', 'processing')".to_string()),
+                Some(queue_filter),
                 MAX_NONTERMINAL_SCAN_ROWS.saturating_add(1),
             )
             .await?;
@@ -658,13 +750,16 @@ impl LanceStore {
             table
                 .update()
                 .only_if(format!(
-                    "job_id = {} AND {eligibility}",
-                    sql_quote(&job.job_id)
+                    "job_id = {} AND {eligibility}{}",
+                    sql_quote(&job.job_id),
+                    tenant_clause,
                 ))
                 .column("status", "'processing'")
                 .column("attempt_count", (job.attempt_count + 1).to_string())
                 .column("lease_token", sql_quote(&token))
                 .column("lease_expires_at", sql_quote(lease_expires_at))
+                .column("lease_hard_deadline", sql_quote(&lease_hard_deadline))
+                .column("lease_renewal_count", "0")
                 .column("updated_at", sql_quote(now))
                 .execute()
                 .await
@@ -672,9 +767,10 @@ impl LanceStore {
             if let Some(job) = self
                 .query_skill_candidate_jobs(
                     Some(format!(
-                        "job_id = {} AND status = 'processing' AND lease_token = {}",
+                        "job_id = {} AND status = 'processing' AND lease_token = {}{}",
                         sql_quote(&job.job_id),
-                        sql_quote(&token)
+                        sql_quote(&token),
+                        tenant_clause,
                     )),
                     2,
                 )
@@ -727,7 +823,202 @@ impl LanceStore {
             .column("status", "'completed'")
             .column("lease_token", "CAST(NULL AS string)")
             .column("lease_expires_at", "CAST(NULL AS string)")
+            .column("lease_hard_deadline", "CAST(NULL AS string)")
+            .column("lease_renewal_count", "0")
             .column("completed_at", sql_quote(now))
+            .column("updated_at", sql_quote(now))
+            .execute()
+            .await
+            .map_err(lancedb_err)?;
+        Ok(())
+    }
+
+    pub async fn get_skill_candidate_job(
+        &self,
+        job_id: &str,
+    ) -> Result<Option<SkillCandidateJob>, StorageError> {
+        if job_id.is_empty() || job_id.len() > 512 || job_id.chars().any(char::is_control) {
+            return Err(StorageError::InvalidInput(
+                "skill candidate job id is invalid".into(),
+            ));
+        }
+        let jobs = self
+            .query_skill_candidate_jobs(Some(format!("job_id = {}", sql_quote(job_id))), 2)
+            .await?;
+        if jobs.len() > 1 {
+            return Err(StorageError::InvalidData(
+                "duplicate skill candidate job id",
+            ));
+        }
+        Ok(jobs.into_iter().next())
+    }
+
+    pub async fn list_skill_candidate_jobs(
+        &self,
+        limit: usize,
+    ) -> Result<Vec<SkillCandidateJob>, StorageError> {
+        if limit == 0 || limit > 1_000 {
+            return Err(StorageError::InvalidInput(
+                "skill candidate list limit is invalid".into(),
+            ));
+        }
+        self.query_skill_candidate_jobs(None, limit).await
+    }
+
+    pub async fn list_skill_candidate_jobs_for_tenant(
+        &self,
+        tenant: &str,
+        limit: usize,
+    ) -> Result<Vec<SkillCandidateJob>, StorageError> {
+        if tenant.is_empty()
+            || tenant.len() > 256
+            || tenant.chars().any(char::is_control)
+            || limit == 0
+            || limit > 1_000
+        {
+            return Err(StorageError::InvalidInput(
+                "tenant-scoped Skill candidate list is invalid".into(),
+            ));
+        }
+        self.query_skill_candidate_jobs(Some(format!("tenant = {}", sql_quote(tenant))), limit)
+            .await
+    }
+
+    pub async fn preview_skill_candidate_jobs_for_tenant(
+        &self,
+        tenant: &str,
+        limit: usize,
+    ) -> Result<Vec<SkillCandidateJob>, StorageError> {
+        if tenant.is_empty()
+            || tenant.len() > 256
+            || tenant.chars().any(char::is_control)
+            || limit == 0
+            || limit > 1_000
+        {
+            return Err(StorageError::InvalidInput(
+                "tenant-scoped Skill candidate preview is invalid".into(),
+            ));
+        }
+        let mut queue = self
+            .query_skill_candidate_queue_rows(
+                Some(format!(
+                    "tenant = {} AND status IN ('pending', 'retry_wait')",
+                    sql_quote(tenant),
+                )),
+                MAX_NONTERMINAL_SCAN_ROWS.saturating_add(1),
+            )
+            .await?;
+        if queue.len() > MAX_NONTERMINAL_SCAN_ROWS {
+            return Err(StorageError::InvalidInput(
+                "Skill candidate preview capacity exceeded".into(),
+            ));
+        }
+        queue.sort_by(|left, right| {
+            left.created_at
+                .cmp(&right.created_at)
+                .then_with(|| left.job_id.cmp(&right.job_id))
+        });
+        let ids: Vec<_> = queue
+            .into_iter()
+            .take(limit)
+            .map(|job| sql_quote(&job.job_id))
+            .collect();
+        if ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        self.query_skill_candidate_jobs(Some(format!("job_id IN ({})", ids.join(", "))), limit)
+            .await
+    }
+
+    pub async fn renew_skill_candidate_job_lease(
+        &self,
+        job_id: &str,
+        lease_token: &str,
+        now: &str,
+        lease_expires_at: &str,
+    ) -> Result<(), StorageError> {
+        if !valid_timestamp(now) || !valid_timestamp(lease_expires_at) || lease_expires_at <= now {
+            return Err(StorageError::InvalidInput(
+                "skill candidate lease timestamps are invalid".into(),
+            ));
+        }
+        let filter = format!(
+            "job_id = {} AND status = 'processing' AND lease_token = {} AND lease_expires_at > {}",
+            sql_quote(job_id),
+            sql_quote(lease_token),
+            sql_quote(now)
+        );
+        let table = self
+            .conn
+            .open_table(TABLE)
+            .execute()
+            .await
+            .map_err(lancedb_err)?;
+        let batches: Vec<RecordBatch> = table
+            .query()
+            .select(Select::columns(&[
+                "lease_expires_at",
+                "lease_hard_deadline",
+                "lease_renewal_count",
+            ]))
+            .only_if(filter.clone())
+            .limit(2)
+            .execute()
+            .await
+            .map_err(lancedb_err)?
+            .try_collect()
+            .await
+            .map_err(|error| StorageError::backend("skill candidate lease stream", error))?;
+        let mut lease_states = Vec::new();
+        for batch in &batches {
+            let expires = parse_col::<StringArray>(batch, TABLE, "lease_expires_at")?;
+            let hard_deadline = parse_col::<StringArray>(batch, TABLE, "lease_hard_deadline")?;
+            let renewal_count = parse_col::<UInt32Array>(batch, TABLE, "lease_renewal_count")?;
+            lease_states.extend((0..batch.num_rows()).map(|index| {
+                (
+                    optional_string(expires, index),
+                    optional_string(hard_deadline, index),
+                    if renewal_count.is_null(index) {
+                        0
+                    } else {
+                        renewal_count.value(index)
+                    },
+                )
+            }));
+        }
+        if lease_states.len() != 1 {
+            return Err(StorageError::Conflict("skill candidate lease lost"));
+        }
+        let (current_expiry, hard_deadline, renewal_count) = lease_states
+            .pop()
+            .expect("lease state length checked above");
+        let current_expiry =
+            current_expiry.ok_or(StorageError::Conflict("skill candidate lease lost"))?;
+        let hard_deadline = hard_deadline
+            .filter(|deadline| valid_timestamp(deadline) && deadline.as_str() > now)
+            .ok_or(StorageError::Conflict(
+                "skill candidate hard deadline reached",
+            ))?;
+        if renewal_count >= MAX_LEASE_RENEWALS {
+            return Err(StorageError::Conflict(
+                "skill candidate lease renewal limit reached",
+            ));
+        }
+        let bounded_expiry = lease_expires_at.min(hard_deadline.as_str());
+        if bounded_expiry <= current_expiry.as_str() {
+            return Err(StorageError::InvalidInput(
+                "skill candidate lease renewal must extend the lease".into(),
+            ));
+        }
+        table
+            .update()
+            .only_if(format!(
+                "{filter} AND lease_hard_deadline = {} AND lease_renewal_count = {}",
+                sql_quote(&hard_deadline),
+                renewal_count,
+            ))
+            .column("lease_expires_at", sql_quote(bounded_expiry))
+            .column("lease_renewal_count", (renewal_count + 1).to_string())
             .column("updated_at", sql_quote(now))
             .execute()
             .await
@@ -801,11 +1092,57 @@ impl LanceStore {
             .column("available_at", sql_quote(available_at))
             .column("lease_token", "CAST(NULL AS string)")
             .column("lease_expires_at", "CAST(NULL AS string)")
+            .column("lease_hard_deadline", "CAST(NULL AS string)")
+            .column("lease_renewal_count", "0")
             .column("last_error_code", sql_quote(error_code))
             .column("updated_at", sql_quote(now))
             .execute()
             .await
             .map_err(lancedb_err)?;
+        Ok(())
+    }
+
+    pub async fn stale_claimed_skill_candidate_job(
+        &self,
+        job_id: &str,
+        lease_token: &str,
+        now: &str,
+    ) -> Result<(), StorageError> {
+        if job_id.is_empty()
+            || lease_token.is_empty()
+            || !valid_timestamp(now)
+            || job_id.len() > 128
+            || lease_token.len() > 256
+        {
+            return Err(StorageError::InvalidInput(
+                "invalid claimed Skill candidate stale request".into(),
+            ));
+        }
+        let table = self
+            .conn
+            .open_table(TABLE)
+            .execute()
+            .await
+            .map_err(lancedb_err)?;
+        let result = table
+            .update()
+            .only_if(format!(
+                "job_id = {} AND status = 'processing' AND lease_token = {}",
+                sql_quote(job_id),
+                sql_quote(lease_token),
+            ))
+            .column("status", "'stale'")
+            .column("lease_token", "NULL")
+            .column("lease_expires_at", "NULL")
+            .column("lease_hard_deadline", "NULL")
+            .column("lease_renewal_count", "0")
+            .column("updated_at", sql_quote(now))
+            .execute()
+            .await
+            .map_err(lancedb_err)?;
+        if result.rows_updated != 1 {
+            return Err(StorageError::Conflict("skill candidate lease lost"));
+        }
         Ok(())
     }
 
@@ -930,6 +1267,7 @@ impl LanceStore {
                 "trigger_version",
                 "status",
                 "lease_expires_at",
+                "trigger_reasons_json",
                 "round_refs_json",
             ]))
             .limit(limit)
@@ -948,10 +1286,13 @@ impl LanceStore {
             let job_id = parse_col::<StringArray>(&batch, TABLE, "job_id")?;
             let lease_expires_at = parse_col::<StringArray>(&batch, TABLE, "lease_expires_at")?;
             let round_refs_json = parse_col::<StringArray>(&batch, TABLE, "round_refs_json")?;
+            let trigger_reasons_json =
+                parse_col::<StringArray>(&batch, TABLE, "trigger_reasons_json")?;
             for index in 0..batch.num_rows() {
                 scanned_bytes = scanned_bytes
                     .saturating_add(job_id.value(index).len())
                     .saturating_add(optional_string_bytes(lease_expires_at, index))
+                    .saturating_add(trigger_reasons_json.value(index).len())
                     .saturating_add(round_refs_json.value(index).len());
                 if scanned_bytes > MAX_STALE_SCAN_BYTES {
                     crate::metrics::metrics().inc_skill_candidate_capacity_rejection();
@@ -983,15 +1324,19 @@ fn validate_job_specs(specs: &[SkillCandidateJobSpec]) -> Result<(), StorageErro
             && spec.serial_key.len() <= 256
             && spec.candidate_key.len() <= 256
             && spec.input_fingerprint.len() <= 256;
-        let refs_valid = !spec.round_refs.is_empty()
-            && spec.round_refs.len() <= 8
-            && spec.round_refs.iter().all(|reference| {
-                !reference.session_id.is_empty()
-                    && reference.session_id.len() <= 1_024
-                    && reference.round_id.len() <= 256
-                    && reference.source_fingerprint.len() <= 256
-                    && reference.generation_id.len() <= 256
-            });
+        let feedback_trigger =
+            spec.trigger_reasons == [SkillCandidateTriggerReason::NegativeFeedback];
+        let refs_valid = (feedback_trigger && spec.round_refs.is_empty())
+            || (!feedback_trigger
+                && !spec.round_refs.is_empty()
+                && spec.round_refs.len() <= 8
+                && spec.round_refs.iter().all(|reference| {
+                    !reference.session_id.is_empty()
+                        && reference.session_id.len() <= 1_024
+                        && reference.round_id.len() <= 256
+                        && reference.source_fingerprint.len() <= 256
+                        && reference.generation_id.len() <= 256
+                }));
         let serial_key_valid =
             spec.serial_key == skill_candidate_serial_key(&spec.tenant, &spec.caller_agent);
         if !scalar_lengths_valid
@@ -1046,6 +1391,7 @@ fn record_batch_to_stale_rows(
     let trigger_version = parse_col::<UInt32Array>(batch, TABLE, "trigger_version")?;
     let status = parse_col::<StringArray>(batch, TABLE, "status")?;
     let lease_expires_at = parse_col::<StringArray>(batch, TABLE, "lease_expires_at")?;
+    let trigger_reasons_json = parse_col::<StringArray>(batch, TABLE, "trigger_reasons_json")?;
     let round_refs_json = parse_col::<StringArray>(batch, TABLE, "round_refs_json")?;
     let mut rows = Vec::with_capacity(batch.num_rows());
     for index in 0..batch.num_rows() {
@@ -1056,6 +1402,7 @@ fn record_batch_to_stale_rows(
                 StorageError::InvalidData("invalid skill candidate stale status"),
             )?,
             lease_expires_at: optional_string(lease_expires_at, index),
+            trigger_reasons: serde_json::from_str(trigger_reasons_json.value(index))?,
             round_refs: serde_json::from_str(round_refs_json.value(index))?,
         });
     }

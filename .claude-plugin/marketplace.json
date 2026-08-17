@@ -13,6 +13,15 @@
       "author": { "name": "BenLocal" },
       "homepage": "https://github.com/BenLocal/mem",
       "license": "MIT"
+    },
+    {
+      "name": "mem-skill-compiler",
+      "source": "./.claude-plugin/compiler",
+      "description": "Dedicated least-privilege Agent-as-Compiler profile for mem Skill candidates. No review or activation authority.",
+      "version": "0.1.0",
+      "author": { "name": "BenLocal" },
+      "homepage": "https://github.com/BenLocal/mem",
+      "license": "MIT"
     }
   ]
 }

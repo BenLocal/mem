@@ -48,6 +48,58 @@ pub trait SkillCandidateStore: Send + Sync {
         limit: usize,
     ) -> Result<Vec<ClaimedSkillCandidateJob>, StorageError>;
 
+    async fn claim_skill_candidate_jobs_for_tenant(
+        &self,
+        tenant: &str,
+        now: &str,
+        lease_expires_at: &str,
+        max_retries: u32,
+        limit: usize,
+    ) -> Result<Vec<ClaimedSkillCandidateJob>, StorageError> {
+        let _ = (tenant, now, lease_expires_at, max_retries, limit);
+        Err(StorageError::Unsupported(
+            "tenant-scoped Skill candidate claims",
+        ))
+    }
+
+    async fn get_skill_candidate_job(
+        &self,
+        job_id: &str,
+    ) -> Result<Option<crate::domain::SkillCandidateJob>, StorageError>;
+
+    async fn list_skill_candidate_jobs(
+        &self,
+        limit: usize,
+    ) -> Result<Vec<crate::domain::SkillCandidateJob>, StorageError>;
+
+    async fn list_skill_candidate_jobs_for_tenant(
+        &self,
+        tenant: &str,
+        limit: usize,
+    ) -> Result<Vec<crate::domain::SkillCandidateJob>, StorageError> {
+        let _ = (tenant, limit);
+        Err(StorageError::Unsupported(
+            "tenant-scoped Skill candidate list",
+        ))
+    }
+
+    async fn preview_skill_candidate_jobs_for_tenant(
+        &self,
+        tenant: &str,
+        limit: usize,
+    ) -> Result<Vec<crate::domain::SkillCandidateJob>, StorageError> {
+        self.list_skill_candidate_jobs_for_tenant(tenant, limit)
+            .await
+    }
+
+    async fn renew_skill_candidate_job_lease(
+        &self,
+        job_id: &str,
+        lease_token: &str,
+        now: &str,
+        lease_expires_at: &str,
+    ) -> Result<(), StorageError>;
+
     async fn complete_skill_candidate_job(
         &self,
         job_id: &str,
@@ -64,6 +116,18 @@ pub trait SkillCandidateStore: Send + Sync {
         now: &str,
         max_attempts: u32,
     ) -> Result<(), StorageError>;
+
+    async fn stale_claimed_skill_candidate_job(
+        &self,
+        job_id: &str,
+        lease_token: &str,
+        now: &str,
+    ) -> Result<(), StorageError> {
+        let _ = (job_id, lease_token, now);
+        Err(StorageError::Unsupported(
+            "claimed Skill candidate stale transition",
+        ))
+    }
 }
 
 #[async_trait]
@@ -182,6 +246,29 @@ impl SkillCandidateStore for Store {
         .await
     }
 
+    async fn claim_skill_candidate_jobs_for_tenant(
+        &self,
+        tenant: &str,
+        now: &str,
+        lease_expires_at: &str,
+        max_retries: u32,
+        limit: usize,
+    ) -> Result<Vec<ClaimedSkillCandidateJob>, StorageError> {
+        let _guard = self.skill_candidate_queue_gate.lock().await;
+        self.commit_lance_write(
+            self.lance
+                .claim_skill_candidate_jobs_for_tenant(
+                    tenant,
+                    now,
+                    lease_expires_at,
+                    max_retries,
+                    limit,
+                )
+                .await,
+        )
+        .await
+    }
+
     async fn complete_skill_candidate_job(
         &self,
         job_id: &str,
@@ -195,6 +282,56 @@ impl SkillCandidateStore for Store {
                 .await,
         )
         .await
+    }
+
+    async fn renew_skill_candidate_job_lease(
+        &self,
+        job_id: &str,
+        lease_token: &str,
+        now: &str,
+        lease_expires_at: &str,
+    ) -> Result<(), StorageError> {
+        let _guard = self.skill_candidate_queue_gate.lock().await;
+        self.commit_lance_write(
+            self.lance
+                .renew_skill_candidate_job_lease(job_id, lease_token, now, lease_expires_at)
+                .await,
+        )
+        .await
+    }
+
+    async fn get_skill_candidate_job(
+        &self,
+        job_id: &str,
+    ) -> Result<Option<crate::domain::SkillCandidateJob>, StorageError> {
+        self.lance.get_skill_candidate_job(job_id).await
+    }
+
+    async fn list_skill_candidate_jobs(
+        &self,
+        limit: usize,
+    ) -> Result<Vec<crate::domain::SkillCandidateJob>, StorageError> {
+        self.lance.list_skill_candidate_jobs(limit).await
+    }
+
+    async fn list_skill_candidate_jobs_for_tenant(
+        &self,
+        tenant: &str,
+        limit: usize,
+    ) -> Result<Vec<crate::domain::SkillCandidateJob>, StorageError> {
+        self.lance
+            .list_skill_candidate_jobs_for_tenant(tenant, limit)
+            .await
+    }
+
+    async fn preview_skill_candidate_jobs_for_tenant(
+        &self,
+        tenant: &str,
+        limit: usize,
+    ) -> Result<Vec<crate::domain::SkillCandidateJob>, StorageError> {
+        self.lance
+            .preview_skill_candidate_jobs_for_tenant(tenant, limit)
+            .await
     }
 
     async fn fail_skill_candidate_job(
@@ -217,6 +354,21 @@ impl SkillCandidateStore for Store {
                     now,
                     max_attempts,
                 )
+                .await,
+        )
+        .await
+    }
+
+    async fn stale_claimed_skill_candidate_job(
+        &self,
+        job_id: &str,
+        lease_token: &str,
+        now: &str,
+    ) -> Result<(), StorageError> {
+        let _guard = self.skill_candidate_queue_gate.lock().await;
+        self.commit_lance_write(
+            self.lance
+                .stale_claimed_skill_candidate_job(job_id, lease_token, now)
                 .await,
         )
         .await

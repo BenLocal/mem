@@ -412,7 +412,31 @@ transcript 之上另有一个**可删除、可重建的派生索引**:`completed
 
 其上的 `skill_candidate_jobs` 是第二层派生状态：纯 planner 只接收 head 指向的 completed generation，按确定性工具量/重复任务规则创建 content-free job receipt。`job_id` 由 length-prefixed 的 `tenant + caller_agent + task_fingerprint + trigger_version + input_fingerprint` 决定；`candidate_revision` 只是当前证据覆盖水位，不参与 identity。同一 evidence cohort 的 generation 重建保持幂等，完整的新 cohort/高工具量窗口才产生新 receipt；同时命中两种 trigger 时证据取并集。重复 cohort 在完整时间线上稳定分桶，每个 cohort 自身必须满足跨 session 且时间跨度不超过 30 天。queue 以 lease token fencing 管理 `pending → processing → completed | retry_wait | dead_letter | stale`，每个 `tenant + caller_agent` lane 严格 FIFO且同一时刻最多一个 processing；不同 lane 可并行。head 修正导致支撑 round 消失、task-signal version 改变或 trigger version 升级时，未领取/已过租约的 receipt 转 `stale`；证据恢复会用同一 job identity 重新激活，尚未过期的 processing lease 不被 reconcile 抢占。`MEM_SKILL_CANDIDATE_ENABLED` 默认 OFF，当前 worker 只 reconcile、不消费任务，所以没有 LLM/Skill/capsule 写入；该开关仅支持 Lance，其他 backend 启动时显式拒绝。head 扫描默认 hard cap 100,000，queue 在写前计算 `existing - to_stale + additions`，超过容量直接拒绝并计 `skill_candidate_capacity_rejections`，不会先插入半批任务再失败。
 
-未来接 extractor/Skill publisher 时，live lease 只代表 worker ownership，不代表 evidence 仍 current；任何 LLM 调用后的持久副作用前必须重新校验 head/evidence，并且只允许写 `PendingConfirmation` 提案。
+`mem crystallize --candidate-jobs` 现在是显式的一次性 consumer：服务端 claim 后按 round anchor 有界重取 transcript，执行不可关闭的 hard secret scrub 与环境参数化，再把安全 evidence 和至多 5 个已清洗 Workflow 候选交给 CLI；服务端另对全量可见 Workflow 做 canonical exact-dedup，避免 catalog 截断产生漏重。CLI 通过 `llm_entry` 做五分类、严格 JSON 校验和 create/duplicate/update 决策；客户端禁用环境代理、优先从 `/models` 读取 context budget，并限制 prompt/output 与 1 MiB response。默认只 preview，不 claim；`--propose` 才领取任务。发布前服务端在 hydrate 后再次校验 lease、current head/evidence，以及 update 的 capsule/skill/version 三元组只能来自本次 catalog；最终只能写 `Workflow + PendingConfirmation`，并将 compiler/model/round/version/target 元数据写入 content-free `skill_proposals` receipt。duplicate/classified/nothing-to-save 也写 immutable `skill_compile_decisions` receipt，HTTP 丢响应后按同一终态重放。LLM 不持有 accept/update/archive 权限。
+
+除 gateway CLI 外，`mem mcp --profile compiler` 提供 Agent-as-Compiler 路径：它是独立 stdio profile，只读取 `MEM_SKILL_COMPILER_TOKEN`（禁止 reviewer/admin fallback），tool router硬裁剪为 6 个 `skill_compiler_*` 工具。真实 job/lease只保存在进程内的有界 `claim_handle` map，模型只拿 `UNTRUSTED` 标记的 sanitized evidence和 catalog；tenant/job/lease/model id/target三元组均由 handle或进程环境派生。普通 mem MCP profile反向隐藏全部 compiler tools。两种 profile不能加载进同一个 Agent上下文，review仍由独立会话完成。
+
+每次 durable claim 同时由 `mem serve` 写入固定十分钟
+`lease_hard_deadline` 和归零的 `lease_renewal_count`。renew 请求不接受
+caller deadline，只能在存储 CAS 内把 lease 延长到
+`min(now+5m, stored_deadline)`，且最多两次；直接持有 compiler bearer 也
+不能滚动延长 lane。MCP HTTP 总超时为 30 秒，进程内 reservation 为 35
+秒，Pi JSON-RPC 单次请求为 25 秒；取消/超时后容量可回收，晚到请求由
+lease token 和 durable terminal receipt 幂等栅栏兜底。
+
+MCP 无法证明 harness 当前底层模型或精确 token usage，因此 receipt 固定诚实记录 `agent-mcp/<compiler-id>/model-unknown`、`finish_reason=agent_tool_call` 和 usage=0；这些字段表示可信的 compiler surface，不冒充模型供应商计量。Claude/Codex使用独立 `mem-skill-compiler` 插件，Pi使用独立 `packaging/pi/compiler` extension；两者都不加载普通 recall/review hooks。
+
+Skill proposal 的运行时发布是第二道独立闸。普通 review accept/edit_accept、auto-promote、generic feedback 和 hard-delete 都拒绝 `source_agent=skill-proposal-compiler` 的 Workflow。专用 reviewer accept 按“unreferenced blob → staged immutable bundle → head CAS → accepted receipt → Active anchor”推进；runtime 同时要求 Active anchor，因此任一中途失败都不可执行，重放会从 immutable proposal/bundle receipt 修复未完成后缀。生成的 `SKILL.md` 含 Agent Skills YAML frontmatter；manifest 只接受有界、不可执行、UTF-8 的文本资源，并拒绝 traversal、Windows drive/ADS、非 NFC、尾随点/空格等路径。
+
+`agent_loadouts` 只绑定 Shared/System accepted head。`session_skill_pins` 保存 `expires_at + revision`：24 小时内 first-seen version 不漂移，到期后用 revision-fenced CAS 跟随当前 head。resource 必须同时匹配 enabled binding 和 exact live session pin，不能凭 runtime token读取任意历史 version。`skill_bundle_revocations` 是 append-only 安全事实；revoked bundle 的 resolve/resource 立即 fail closed，不自动 rollback 或 repin。
+
+Compiler Workflow capsule 只是 bundle 的 review/audit anchor，不属于普通 recall 权威集：`retrieve` 在 pool+hybrid 合并和 graph hydration 两处过滤 `SkillBundleRequired`，wake-up fast path也同样过滤。这样旧版或 revoked anchor 即使仍为 `Active`，也不能绕过 Loadout/pin/revocation变成 `suggested_workflow`；direct get/review/audit仍保留。
+
+当前 wake-up/hybrid 会先 4× overfetch 再过滤 anchor，以补足大多数普通候选；极端情况下若 anchor 数超过补偿窗口，可能降低普通 recall 的有效候选数，但不会返回 anchor 内容。后续可把 `source_agent` 排除进一步下推到 BM25/ANN/recent 查询与 graph traversal，以消除这项质量污染。
+
+Skill feedback 按 bundle version append-only 记录。当前 head 每累计完整 3 条负反馈就创建一个确定、幂等的 `NegativeFeedback` durable candidate，并把 base Skill + hard-scrubbed feedback 送回同一 compiler lane；publish 强制更新该 base 的 capsule/skill/version 三元组，产物仍为 `PendingConfirmation`。同一 base 的 revision job 仍为 Pending/Processing/RetryWait 时，后续负反馈返回 429 且不落 event/job，避免 runtime token堆积 backlog；终态后才开始下一组三条。旧 head/revoked version 的反馈只保留审计，不产生可发布 job；任何反馈、compiler 或后台 worker 都不能直接推进 head。Skill API 的 compiler/reviewer/runtime bearer 分权且 role token 只允许 `MEM_TENANT`，`MEM_ADMIN_TOKEN` 保留为显式 superuser。
+
+并发 review 时若 expected head 已改变，旧 proposal 进入 `NeedsRebase` 终态并保留审计；它不能原地改写 draft/target，reviewer 可显式 reject 清理。后续必须由新的 tool/feedback evidence 生成绑定新 head 的 successor candidate，避免把旧模型输出静默套到新基线上。
 
 显式重建由唯一 writer 执行:
 
@@ -604,7 +628,9 @@ axum 0.8,`http::router()` merge 13 个子路由 + 一个 logging 中间件:
 | `transcripts` | `/transcripts/messages` · `/transcripts/search` · `/transcripts?session_id=…`(仅 HTTP) |
 | `completed_tool_rounds` | `POST /admin/transcript-rounds/rebuild` · `GET /admin/transcript-rounds`(要求 `MEM_ADMIN_TOKEN` Bearer；Lance 派生索引,去内部 locator/fingerprint,最多 1,000 条) |
 | `embeddings` | 嵌入 job / provider / rebuild(admin) |
-| `review` | 审查队列 accept/edit_accept/reject |
+| `review` | 审查队列 accept/edit_accept/reject（要求 tenant-scoped `MEM_SKILL_REVIEWER_TOKEN` 或 admin superuser；Skill proposal 禁止 generic accept） |
+| `skill_proposals` | `/admin/skill-proposals/{preview,claim,renew,publish,complete,fail,accept,reject}` |
+| `skills` | `/admin/agent-loadouts/{bind,resolve}` · version-scoped feedback · content-addressed resource fetch |
 | `graph` | 图边 / 邻居 / stats |
 | `entities` | 实体 CRUD / alias |
 | `fact_check` | `POST /fact_check`(pre-ingest 实体+KG sanity check,无 LLM) |

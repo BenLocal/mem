@@ -3,7 +3,8 @@ use std::collections::{HashMap, HashSet};
 use crate::{
     domain::{
         capability_capsule::{
-            CapabilityCapsuleRecord, CapabilityCapsuleStatus, CapabilityCapsuleType, Scope,
+            ActivationPolicy, CapabilityCapsuleRecord, CapabilityCapsuleStatus,
+            CapabilityCapsuleType, Scope,
         },
         query::SearchCapabilityCapsuleRequest,
     },
@@ -23,6 +24,13 @@ struct ScoredMemory {
 /// textual or semantic signal at all. Tunable via `MEM_MIN_SCORE`. Raise
 /// it to be more aggressive about filtering scope-only matches.
 const DEFAULT_MIN_RELEVANCE_SCORE: i64 = 25;
+
+/// Compiler-managed Skill anchors are governance/index records, not ordinary
+/// recall facts. They are loaded only through Agent Loadout + session pin so
+/// old/revoked versions cannot bypass runtime policy through Workflow recall.
+pub fn allowed_in_ordinary_recall(capsule: &CapabilityCapsuleRecord) -> bool {
+    capsule.activation_policy() != ActivationPolicy::SkillBundleRequired
+}
 
 fn min_relevance_score() -> i64 {
     std::env::var("MEM_MIN_SCORE")
@@ -222,7 +230,7 @@ pub async fn rank_with_hybrid_and_graph(
     let now = crate::storage::current_timestamp();
     let candidates: Vec<CapabilityCapsuleRecord> = candidates
         .into_iter()
-        .filter(|m| !is_expired(m, &now))
+        .filter(|m| allowed_in_ordinary_recall(m) && !is_expired(m, &now))
         .collect();
 
     let floor = effective_floor(query);
@@ -295,6 +303,7 @@ pub async fn rank_with_hybrid_and_graph(
                     );
                     for m in rows {
                         if m.status == CapabilityCapsuleStatus::Active
+                            && allowed_in_ordinary_recall(&m)
                             && !is_expired(&m, &now)
                             && !matches!(m.capability_capsule_type, CapabilityCapsuleType::Diary)
                             && !superseded.contains(&m.capability_capsule_id)

@@ -3,7 +3,7 @@
 
 .DEFAULT_GOAL := help
 .PHONY: help build release install run serve mcp repair-check repair-rebuild \
-        test test-full test-unit test-fast test-one test-filter test-rounds test-candidates \
+        test test-full test-unit test-fast test-one test-filter test-rounds test-candidates test-skill-compiler \
         fmt fmt-check clippy lint check watch watch-check \
         cross cross-linux-gnu cross-linux-musl cross-arm64 \
         clean bench-recall
@@ -80,6 +80,23 @@ test-candidates: ## deterministic Skill-candidate planner and durable queue only
 	RUST_TEST_THREADS=$(RUST_TEST_THREADS) $(CARGO) test -j $(CARGO_TEST_JOBS) --lib app::tests::candidate_worker_rejects
 	RUST_TEST_THREADS=$(RUST_TEST_THREADS) $(CARGO) test -j $(CARGO_TEST_JOBS) --lib skill_candidate_store::tests::
 	RUST_TEST_THREADS=$(RUST_TEST_THREADS) $(CARGO) test -j $(CARGO_TEST_JOBS) --test skill_candidate_jobs
+
+test-skill-compiler: ## Skill proposal compiler and review-gated lifecycle only
+	RUST_TEST_THREADS=$(RUST_TEST_THREADS) $(CARGO) test -j $(CARGO_TEST_JOBS) --lib skill_proposal
+	RUST_TEST_THREADS=$(RUST_TEST_THREADS) $(CARGO) test -j $(CARGO_TEST_JOBS) --lib skill_bundle
+	RUST_TEST_THREADS=$(RUST_TEST_THREADS) $(CARGO) test -j $(CARGO_TEST_JOBS) --lib skill_store
+	RUST_TEST_THREADS=$(RUST_TEST_THREADS) $(CARGO) test -j $(CARGO_TEST_JOBS) --lib mcp::config::tests::
+	RUST_TEST_THREADS=$(RUST_TEST_THREADS) $(CARGO) test -j $(CARGO_TEST_JOBS) --lib mcp::compiler::tests::
+	RUST_TEST_THREADS=$(RUST_TEST_THREADS) $(CARGO) test -j $(CARGO_TEST_JOBS) --test skill_proposal_lifecycle
+	RUST_TEST_THREADS=$(RUST_TEST_THREADS) $(CARGO) test -j $(CARGO_TEST_JOBS) --test skill_bundle_lifecycle
+	RUST_TEST_THREADS=$(RUST_TEST_THREADS) $(CARGO) test -j $(CARGO_TEST_JOBS) --test skill_proposal_api
+	RUST_TEST_THREADS=$(RUST_TEST_THREADS) $(CARGO) test -j $(CARGO_TEST_JOBS) --test skill_proposal_safety
+	RUST_TEST_THREADS=$(RUST_TEST_THREADS) $(CARGO) test -j $(CARGO_TEST_JOBS) --test skill_bundle_validation
+	RUST_TEST_THREADS=$(RUST_TEST_THREADS) $(CARGO) test -j $(CARGO_TEST_JOBS) --test skill_role_auth
+	RUST_TEST_THREADS=$(RUST_TEST_THREADS) $(CARGO) test -j $(CARGO_TEST_JOBS) --test skill_feedback_candidates
+	RUST_TEST_THREADS=$(RUST_TEST_THREADS) $(CARGO) test -j $(CARGO_TEST_JOBS) --test mcp_skill_compiler_tools
+	RUST_TEST_THREADS=$(RUST_TEST_THREADS) $(CARGO) test -j $(CARGO_TEST_JOBS) --test plugin_assets
+	npm --prefix packaging/pi/compiler run check
 
 # ==== Code quality ====
 

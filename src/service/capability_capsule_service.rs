@@ -12,7 +12,7 @@ use crate::embedding::EmbeddingProvider;
 use crate::{
     domain::{
         capability_capsule::{
-            CapabilityCapsuleRecord, CapabilityCapsuleStatus, EditPendingRequest,
+            ActivationPolicy, CapabilityCapsuleRecord, CapabilityCapsuleStatus, EditPendingRequest,
             EditPendingResponse, FeedbackKind, GraphEdge, IngestCapabilityCapsuleRequest,
         },
         episode::{EpisodeRecord, IngestEpisodeRequest},
@@ -893,6 +893,16 @@ impl CapabilityCapsuleService {
         tenant: &str,
         capability_capsule_id: &str,
     ) -> Result<(), ServiceError> {
+        let target = self
+            .store
+            .get_capability_capsule_for_tenant(tenant, capability_capsule_id)
+            .await?
+            .ok_or(ServiceError::NotFound)?;
+        if target.activation_policy() == ActivationPolicy::SkillBundleRequired {
+            return Err(ServiceError::Storage(StorageError::Conflict(
+                "bundle-managed Skill requires Skill governance",
+            )));
+        }
         match self
             .store
             .delete_capability_capsule_hard(tenant, capability_capsule_id)
@@ -1068,6 +1078,7 @@ impl CapabilityCapsuleService {
         let original = self
             .pending_for_review(tenant, capability_capsule_id)
             .await?;
+        require_generic_review_accept(&original)?;
         let accepted = self
             .store
             .accept_pending(tenant, capability_capsule_id)
@@ -1079,6 +1090,27 @@ impl CapabilityCapsuleService {
                 .await?;
         }
         Ok(accepted)
+    }
+
+    /// Specialized activation seam used only after Skill bundle validation.
+    /// Generic review routes reject these proposals before reaching storage.
+    pub async fn accept_skill_proposal_capsule(
+        &self,
+        tenant: &str,
+        capability_capsule_id: &str,
+    ) -> Result<CapabilityCapsuleRecord, ServiceError> {
+        let original = self
+            .pending_for_review(tenant, capability_capsule_id)
+            .await?;
+        if original.activation_policy() != ActivationPolicy::SkillBundleRequired {
+            return Err(ServiceError::Storage(StorageError::InvalidInput(
+                "capsule is not a Skill bundle proposal".into(),
+            )));
+        }
+        Ok(self
+            .store
+            .accept_pending(tenant, capability_capsule_id)
+            .await?)
     }
 
     /// Flip the evolution candidate whose execution produced
@@ -1148,9 +1180,39 @@ impl CapabilityCapsuleService {
         let original = self
             .pending_for_review(tenant, capability_capsule_id)
             .await?;
+        if original.activation_policy() == ActivationPolicy::SkillBundleRequired {
+            return Err(ServiceError::Storage(StorageError::Conflict(
+                "skill proposal requires bundle review",
+            )));
+        }
+        self.reject_pending_record(tenant, original).await
+    }
+
+    pub async fn reject_skill_proposal_capsule(
+        &self,
+        tenant: &str,
+        capability_capsule_id: &str,
+    ) -> Result<CapabilityCapsuleRecord, ServiceError> {
+        let original = self
+            .pending_for_review(tenant, capability_capsule_id)
+            .await?;
+        if original.activation_policy() != ActivationPolicy::SkillBundleRequired {
+            return Err(ServiceError::Storage(StorageError::InvalidInput(
+                "capsule is not a Skill bundle proposal".into(),
+            )));
+        }
+        self.reject_pending_record(tenant, original).await
+    }
+
+    async fn reject_pending_record(
+        &self,
+        tenant: &str,
+        original: CapabilityCapsuleRecord,
+    ) -> Result<CapabilityCapsuleRecord, ServiceError> {
+        let capability_capsule_id = original.capability_capsule_id.clone();
         let rejected = self
             .store
-            .reject_pending(tenant, capability_capsule_id)
+            .reject_pending(tenant, &capability_capsule_id)
             .await?;
 
         // Terminal transition: close incident edges so active graph
@@ -1160,7 +1222,7 @@ impl CapabilityCapsuleService {
         // close). Edge hygiene must not fail the reject itself.
         if let Err(e) = self
             .store
-            .close_edges_for_capability_capsule(capability_capsule_id)
+            .close_edges_for_capability_capsule(&capability_capsule_id)
             .await
         {
             tracing::warn!(error = %e, "edge close failed on reject; edges left active");
@@ -1172,7 +1234,7 @@ impl CapabilityCapsuleService {
         // — but as a fresh candidate it has to re-earn the K-cycle gate
         // before another placeholder reaches the review queue.
         if original.source_agent == crate::worker::evolution_worker::EVOLUTION_SOURCE_AGENT {
-            self.settle_evolution_candidate(tenant, capability_capsule_id, "rejected")
+            self.settle_evolution_candidate(tenant, &capability_capsule_id, "rejected")
                 .await?;
         }
         Ok(rejected)
@@ -1285,6 +1347,7 @@ impl CapabilityCapsuleService {
     ) -> Result<EditPendingResponse, ServiceError> {
         let original_memory_id = patch.capability_capsule_id.clone();
         let original = self.pending_for_review(tenant, &original_memory_id).await?;
+        require_generic_review_accept(&original)?;
 
         let superseding = self
             .store
@@ -1683,10 +1746,14 @@ impl CapabilityCapsuleService {
             };
 
             let candidates = if query.scope_filters.is_empty() {
-                self.store
-                    .recent_active_capability_capsules(tenant, WAKE_UP_LIMIT)
+                let mut recent = self
+                    .store
+                    .recent_active_capability_capsules(tenant, WAKE_UP_LIMIT * 4)
                     .await
-                    .map_err(ServiceError::Storage)?
+                    .map_err(ServiceError::Storage)?;
+                recent.retain(crate::pipeline::retrieve::allowed_in_ordinary_recall);
+                recent.truncate(WAKE_UP_LIMIT);
+                recent
             } else {
                 // Repo-scoped wake-up: the SessionStart hook passes
                 // `repo:<dir>` / `project:<dir>` so the boot context is
@@ -1696,11 +1763,12 @@ impl CapabilityCapsuleService {
                 // global rows so a brand-new repo still gets useful seed
                 // context instead of an empty block.
                 let widened = (WAKE_UP_LIMIT * 4).min(512);
-                let recent = self
+                let mut recent = self
                     .store
                     .recent_active_capability_capsules(tenant, widened)
                     .await
                     .map_err(ServiceError::Storage)?;
+                recent.retain(crate::pipeline::retrieve::allowed_in_ordinary_recall);
                 let (mut in_scope, rest): (Vec<_>, Vec<_>) = recent.into_iter().partition(|c| {
                     crate::pipeline::retrieve::matches_scope_filters(c, &query.scope_filters)
                 });
@@ -1746,6 +1814,7 @@ impl CapabilityCapsuleService {
         // exemption in `retrieve::finalize`, and lifecycle / scope /
         // intent signals score against the broader pool.
         const HYBRID_K: usize = 48;
+        const HYBRID_FETCH_K: usize = HYBRID_K * 4;
         let pool_fut = self.store.search_candidates(tenant);
         // Query embedding under the semantic-channel deadline (same knob as
         // the ANN seam in `hybrid_candidates_compose`): a stalled embed —
@@ -1789,9 +1858,14 @@ impl CapabilityCapsuleService {
         let pool = pool_res.map_err(ServiceError::Storage)?;
         let hybrid_hits = self
             .store
-            .hybrid_candidates(tenant, &query.query, &query_vec, HYBRID_K)
+            .hybrid_candidates(tenant, &query.query, &query_vec, HYBRID_FETCH_K)
             .await
             .map_err(ServiceError::Storage)?;
+        let hybrid_hits: Vec<_> = hybrid_hits
+            .into_iter()
+            .filter(|(capsule, _)| crate::pipeline::retrieve::allowed_in_ordinary_recall(capsule))
+            .take(HYBRID_K)
+            .collect();
 
         // K9: when edge dynamics is enabled, weight the graph boost by
         // each connecting edge's decayed strength and enqueue co-access
@@ -1956,6 +2030,15 @@ impl CapabilityCapsuleService {
         }
         Ok(())
     }
+}
+
+fn require_generic_review_accept(capsule: &CapabilityCapsuleRecord) -> Result<(), ServiceError> {
+    if capsule.activation_policy() == ActivationPolicy::SkillBundleRequired {
+        return Err(ServiceError::Storage(StorageError::Conflict(
+            "skill proposal requires bundle review",
+        )));
+    }
+    Ok(())
 }
 
 /// Resolve a batch of `GraphEdgeDraft`s into concrete `GraphEdge`s with stable

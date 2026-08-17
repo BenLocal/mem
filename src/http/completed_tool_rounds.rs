@@ -1,8 +1,5 @@
-use std::future::Future;
-
 use axum::{
-    extract::{FromRequestParts, Query, State},
-    http::{header::AUTHORIZATION, request::Parts},
+    extract::{Query, State},
     routing::{get, post},
     Json, Router,
 };
@@ -11,6 +8,7 @@ use serde::Deserialize;
 use crate::{
     app::AppState,
     error::AppError,
+    http::admin_auth::AdminAuthorized,
     service::{CompletedToolRoundRead, CompletedToolRoundRebuildReport},
 };
 
@@ -26,30 +24,6 @@ struct RebuildRequest {
     session_id: String,
     #[serde(default)]
     dry_run: bool,
-}
-
-struct AdminAuthorized;
-
-impl FromRequestParts<AppState> for AdminAuthorized {
-    type Rejection = AppError;
-
-    fn from_request_parts(
-        parts: &mut Parts,
-        state: &AppState,
-    ) -> impl Future<Output = Result<Self, Self::Rejection>> + Send {
-        let authorization = parts
-            .headers
-            .get(AUTHORIZATION)
-            .and_then(|value| value.to_str().ok());
-        let authorized = state.config.authorizes_admin_bearer(authorization);
-        async move {
-            if authorized {
-                Ok(Self)
-            } else {
-                Err(AppError::unauthorized_admin())
-            }
-        }
-    }
 }
 
 async fn rebuild_session(

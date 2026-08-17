@@ -19,7 +19,7 @@ use tokio::time::sleep;
 use tracing::{info, warn};
 
 use crate::config::AutoPromoteSettings;
-use crate::domain::capability_capsule::{CapabilityCapsuleRecord, FeedbackKind};
+use crate::domain::capability_capsule::{ActivationPolicy, CapabilityCapsuleRecord, FeedbackKind};
 use crate::storage::types::StorageError;
 use crate::storage::{current_timestamp, Backend, FeedbackEvent};
 
@@ -79,7 +79,7 @@ pub async fn sweep_once(
         // un-reviewed raw-material placeholder would bypass that gate.
         // Filtered here (not in SQL) so the dry-run preview and the
         // real path can never disagree (E1.6).
-        .filter(|c| c.source_agent != crate::worker::evolution_worker::EVOLUTION_SOURCE_AGENT)
+        .filter(|c| c.activation_policy() == ActivationPolicy::AutoEligible)
         .collect();
 
     if dry_run {

@@ -1,0 +1,13 @@
+{
+  "mcpServers": {
+    "mem": {
+      "command": "mem",
+      "args": ["mcp", "--profile", "compiler"],
+      "env": {
+        "MEM_BASE_URL": "http://127.0.0.1:3000",
+        "MEM_TENANT": "local",
+        "MEM_AGENT_COMPILER_ID": "agent-plugin"
+      }
+    }
+  }
+}

@@ -1,4 +1,5 @@
 pub mod admin;
+pub mod admin_auth;
 pub mod capability_capsule;
 pub mod completed_tool_rounds;
 pub mod embeddings;
@@ -11,6 +12,8 @@ pub mod maintenance;
 pub mod metrics;
 pub mod mine_cursors;
 pub mod review;
+pub mod skill_proposals;
+pub mod skills;
 pub mod transcripts;
 
 use axum::{middleware, Router};
@@ -24,6 +27,8 @@ pub fn router() -> Router<AppState> {
         .merge(completed_tool_rounds::router())
         .merge(embeddings::router())
         .merge(review::router())
+        .merge(skill_proposals::router())
+        .merge(skills::router())
         .merge(graph::router())
         .merge(transcripts::router())
         .merge(entities::router())

@@ -29,7 +29,8 @@ use std::sync::Mutex;
 use async_trait::async_trait;
 
 use crate::domain::capability_capsule::{
-    CapabilityCapsuleRecord, CapabilityCapsuleStatus, CapsuleStats, FeedbackSummary,
+    ActivationPolicy, CapabilityCapsuleRecord, CapabilityCapsuleStatus, CapsuleStats,
+    FeedbackSummary,
 };
 use crate::storage::types::{FeedbackEvent, StorageError};
 use crate::storage::Store;
@@ -53,13 +54,17 @@ pub(crate) fn validate_feedback_target(
     memory: &CapabilityCapsuleRecord,
     feedback: &FeedbackEvent,
 ) -> Result<(), StorageError> {
-    if memory.capability_capsule_id == feedback.capability_capsule_id {
-        Ok(())
-    } else {
-        Err(StorageError::InvalidInput(
+    if memory.capability_capsule_id != feedback.capability_capsule_id {
+        return Err(StorageError::InvalidInput(
             "feedback target does not match capsule".to_owned(),
-        ))
+        ));
     }
+    if memory.activation_policy() == ActivationPolicy::SkillBundleRequired {
+        return Err(StorageError::Conflict(
+            "skill proposal feedback requires skill governance",
+        ));
+    }
+    Ok(())
 }
 
 /// Backend-agnostic capsule CRUD + lifecycle. Phase 2 validation

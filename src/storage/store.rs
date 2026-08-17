@@ -68,6 +68,9 @@ pub struct Store {
     /// queue. Lance has no unique constraints or multi-statement transaction,
     /// so ensure/claim/finish must not interleave across `Store` clones.
     pub(crate) skill_candidate_queue_gate: Arc<tokio::sync::Mutex<()>>,
+    /// Process-local transaction boundary for immutable Skill artifacts,
+    /// mutable heads/loadouts, first-seen pins, and feedback receipts.
+    pub(crate) skill_runtime_gate: Arc<tokio::sync::Mutex<()>>,
     /// Open-time advisory lock — held for the full lifetime of every
     /// `Store` clone (`Arc` keeps it alive until the last clone drops).
     /// `None` when `MEM_OPEN_LOCK_DISABLED=1` skipped acquisition. See
@@ -90,6 +93,7 @@ impl Store {
         Ok(Self {
             lance: Arc::new(lance),
             skill_candidate_queue_gate: Arc::new(tokio::sync::Mutex::new(())),
+            skill_runtime_gate: Arc::new(tokio::sync::Mutex::new(())),
             _open_lock: Arc::new(lock),
         })
     }
@@ -111,6 +115,7 @@ impl Store {
         Ok(Self {
             lance: Arc::new(lance),
             skill_candidate_queue_gate: Arc::new(tokio::sync::Mutex::new(())),
+            skill_runtime_gate: Arc::new(tokio::sync::Mutex::new(())),
             _open_lock: Arc::new(lock),
         })
     }

@@ -209,7 +209,7 @@ Example compose (build context is repo root): [deploy/docker-compose.yml](deploy
 
 Default in the image: `BIND_ADDR=0.0.0.0:3000`, `MEM_DB_PATH=/data/mem.lance`. Point MCP clients at the same host with `MEM_BASE_URL` (for example `http://127.0.0.1:3000`).
 
-> **Network trust boundary:** most of mem's HTTP API, including other `/admin/*` and transcript metadata routes, does not provide built-in authentication. The completed-tool-round admin routes additionally require `MEM_ADMIN_TOKEN`, but that is not a service-wide auth layer. Do not publish port 3000 to an untrusted network. Bind to loopback, restrict the container port at the firewall, or place an authenticated reverse proxy in front of it.
+> **Network trust boundary:** most of mem's ordinary capsule/transcript HTTP API still does not provide built-in authentication. Completed-tool-round routes require `MEM_ADMIN_TOKEN`; review and Skill routes require the scoped role/admin tokens described below. These are not a service-wide auth layer. Do not publish port 3000 to an untrusted network. Bind to loopback, restrict the container port at the firewall, or place an authenticated reverse proxy in front of it.
 
 ## Release (GHCR + binaries)
 
@@ -232,7 +232,8 @@ curl -X POST localhost:3000/memories \
     "tenant": "local"
   }'
 curl localhost:3000/memories/mem_123
-curl 'localhost:3000/reviews/pending?tenant=local'
+curl -H "authorization: Bearer $MEM_SKILL_REVIEWER_TOKEN" \
+  'localhost:3000/reviews/pending?tenant=local'
 curl -X POST localhost:3000/memories/search \
   -H 'content-type: application/json' \
   -d '{
@@ -488,15 +489,116 @@ flight per `tenant + agent`. If a corrected head removes supporting evidence,
 pending or lease-expired work becomes `stale`; restoring the same evidence
 reactivates the same receipt. A live processing lease is never preempted by
 reconcile. Trigger/task-signal version upgrades also stale obsolete receipts.
-Before a future consumer writes any `PendingConfirmation` proposal it must
-revalidate the current head/evidence; lease ownership alone is insufficient.
-This phase has no job consumer: it does not call an LLM, write a Skill/capsule,
-or rewrite transcript content. The worker is Lance-only and startup fails
-explicitly if it is enabled with PostgreSQL/ClickHouse. Reconcile defaults to every 300 seconds and is
+Before the one-shot consumer writes any `PendingConfirmation` proposal it
+revalidates the current head/evidence after bounded hydration and again checks
+the lease; lease ownership alone is insufficient. The resident worker still
+only reconciles and remains LLM-free. Explicit
+`mem crystallize --candidate-jobs` previews bounded, hard-scrubbed evidence;
+adding `--propose` claims jobs and may write only a `PendingConfirmation`
+Workflow plus a content-free provenance receipt. Publish revalidates current
+head/evidence after the LLM call. The gateway client bypasses ambient proxies,
+reads model context metadata from `/models` when available, applies a
+conservative prompt/output budget, and caps response bodies at 1 MiB.
+Duplicate/classified/nothing-to-save terminal decisions also receive immutable,
+content-free decision receipts, so a lost HTTP response replays the same
+outcome instead of re-running the model.
+
+Human acceptance is a separate reviewer operation that stages an immutable
+content-addressed Bundle, CASes its head, records the accepted receipt, and only
+then activates the capsule anchor. Crash replay repairs any incomplete suffix;
+runtime resolution additionally requires an Active anchor, so a partial accept
+fails closed. `SKILL.md` uses Agent Skills YAML frontmatter, and manifests allow
+only bounded, non-executable UTF-8 text resources with portable relative paths.
+Loadout pins are first-seen for 24 hours; an unexpired session stays on its
+original version, while an expired pin CAS-repins to the then-current head.
+Reviewer-only append-only revocation immediately blocks resolve and resource
+fetch without silently rolling sessions to another version. Resource fetches
+must match an enabled loadout and the exact live `tenant + agent + session +
+skill + version` pin.
+Compiler-managed Workflow anchors are excluded from ordinary capsule recall
+(including wake-up and graph hydration); they are executable guidance only
+through Loadout + pin, so old or revoked bundles cannot bypass runtime policy.
+
+Version-scoped negative feedback is append-only. Every complete cohort of three
+negative events for the current head creates one stable `negative_feedback`
+durable candidate. Its compiler evidence contains the published base Skill and
+hard-scrubbed feedback, and publish is forced to update that exact base
+skill/version/capsule triple. The result still enters `PendingConfirmation`;
+feedback never advances the head or activates a bundle by itself. Feedback for
+a non-head or revoked version remains audit data but does not create a
+publishable revision job. While one base-version revision job is nonterminal,
+additional negative feedback for that base returns `429` without writing, so a
+runtime credential cannot build an unbounded pending backlog.
+
+Skill routes support three least-privilege bearer credentials:
+`MEM_SKILL_COMPILER_TOKEN` (preview/claim/renew/publish/complete/fail),
+`MEM_SKILL_REVIEWER_TOKEN` (generic/Skill review, bind, revoke), and
+`MEM_SKILL_RUNTIME_TOKEN` (resolve/resource/feedback). Each must be a distinct
+32–1,024 byte printable token and is restricted to `MEM_TENANT`; the admin token
+remains an explicit cross-tenant superuser. No path rewrites transcript content
+or lets the compiler activate an asset. The queue/runtime is Lance-only and startup fails explicitly if the
+reconcile worker is enabled with PostgreSQL/ClickHouse. Reconcile defaults to every 300 seconds and is
 bounded by `MEM_SKILL_CANDIDATE_MAX_BUILDS` (100,000 current session heads) and
 `MEM_SKILL_CANDIDATE_MAX_ROUNDS` (20,000). Exceeding either configured capacity
 refuses that reconcile rather than silently planning from partial evidence;
 capacity refusals increment `skill_candidate_capacity_rejections`.
+
+**Agent-as-Compiler (no extra LLM gateway)** — a dedicated MCP profile lets a
+Codex/Claude/Pi agent use its own model to compile candidates:
+
+```bash
+MEM_SKILL_COMPILER_TOKEN=... MEM_AGENT_COMPILER_ID=codex \
+  mem mcp --profile compiler
+```
+
+This profile exposes exactly six `skill_compiler_*` tools and no memory review,
+delete, transcript or Skill-accept tools. HTTP job/lease credentials remain in
+the MCP process; the model sees only an opaque process-local `claim_handle`,
+bounded sanitized evidence and a cleaned dedup catalog. Handles are capped at
+8, expire with the lease, allow at most two renewals and have a ten-minute hard
+deadline. The deadline and renewal count are created and persisted by
+`mem serve`; HTTP/MCP callers cannot extend or replace them. Identity, tenant,
+job, lease, update target tuple and model provenance
+come from the handle/process rather than model arguments. Use the separate
+`mem-skill-compiler` plugin/Agent session; do not load the ordinary reviewer-capable
+mem plugin into the same model context. Published output remains
+`PendingConfirmation` and requires a separate reviewer session.
+Because MCP cannot attest the harness's active model or token accounting,
+receipts honestly record `agent-mcp/<compiler-id>/model-unknown`,
+`finish_reason=agent_tool_call`, and zero token usage rather than accepting
+self-reported model metadata.
+
+Role tokens may be set in the process environment. On Unix, MCP also reads
+`MEM_CONFIG_ENV` (or `$HOME/.mem/config.env`) only when the file is owned by the
+current user with mode `0600` and its non-symlink parent is owned by that user
+with mode `0700`; unsafe paths fail closed. Non-Unix builds require explicit
+environment variables because an equivalent ACL check is not implemented.
+
+Start a dedicated compiler-only Agent context (after installing the compiler
+plugin/package) with one of these patterns, then run
+`/crystallize-candidates propose 1`:
+
+```bash
+# Codex: use a separate CODEX_HOME that contains only this compiler plugin.
+CODEX_HOME="$HOME/.codex-mem-skill-compiler" codex
+
+# Claude: load only this plugin and disable every built-in tool.
+claude --bare --tools "" \
+  --plugin-dir /path/to/mem/.claude-plugin/compiler
+
+# Pi: explicitly load only the compiler extension, with no built-in tools.
+pi --no-extensions --no-builtin-tools \
+  --extension /path/to/mem/packaging/pi/compiler/compiler-extension.ts \
+  --no-prompt-templates \
+  --prompt-template /path/to/mem/packaging/pi/compiler/prompts
+```
+
+For Codex and Claude, enter compilation only through
+`/crystallize-candidates`; its `allowed-tools` frontmatter is an exact six-tool
+hard gate and excludes shell, filesystem, web, transcript, review and accept
+tools. Do not send sanitized evidence to a free-form compiler prompt. Pi
+enforces the same set again with `setActiveTools` on every session and aborts
+startup if any extra tool remains active.
 
 **New request fields** (all optional; transcripts pipeline only):
 - `anchor_session_id` — boost blocks from this session above topical matches; useful when continuing a known conversation.

@@ -40,6 +40,7 @@ pub mod open_lock;
 pub mod postgres_store;
 pub mod session_store;
 pub mod skill_candidate_store;
+pub mod skill_store;
 pub mod store;
 pub mod time;
 pub mod transcript_store;
@@ -61,6 +62,7 @@ pub use mine_cursor_store::{MineCursor, MineCursorStore};
 pub use postgres_store::PostgresCapsuleStore;
 pub use session_store::SessionStore;
 pub use skill_candidate_store::SkillCandidateStore;
+pub use skill_store::SkillStore;
 pub use store::Store;
 pub use time::{current_timestamp, timestamp_add_ms, timestamp_sub_ms};
 

@@ -397,8 +397,9 @@ pub enum EvolutionSynthesisMode {
 }
 
 /// Deterministic completed-tool-round to Skill-candidate reconciliation.
-/// Default OFF: enabling it only materializes durable candidate jobs; there is
-/// no extractor/LLM consumer or capsule mutation in this phase.
+/// Default OFF: enabling it only materializes durable candidate jobs. The
+/// explicit `mem crystallize --candidate-jobs --propose` one-shot consumer is
+/// a separate review-gated operation; the resident worker remains LLM-free.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SkillCandidateSettings {
     pub enabled: bool,
@@ -421,6 +422,10 @@ pub struct Config {
     pub bind_addr: String,
     pub db_path: PathBuf,
     admin_token_hash: Option<AdminTokenHash>,
+    compiler_token_hash: Option<AdminTokenHash>,
+    reviewer_token_hash: Option<AdminTokenHash>,
+    runtime_token_hash: Option<AdminTokenHash>,
+    skill_auth_tenant: String,
     pub embedding: EmbeddingSettings,
     pub auto_promote: AutoPromoteSettings,
     pub vacuum: VacuumSettings,
@@ -557,6 +562,10 @@ pub enum ConfigError {
     InvalidSkillCandidateSetting { var: &'static str, value: String },
     #[error("MEM_ADMIN_TOKEN must be 32..=1024 printable ASCII bytes")]
     InvalidAdminToken,
+    #[error("{0} must be 32..=1024 printable ASCII bytes")]
+    InvalidRoleToken(&'static str),
+    #[error("admin and Skill role bearer tokens must all be distinct")]
+    DuplicateSkillRoleTokens,
 }
 
 impl EmbeddingSettings {
@@ -1417,6 +1426,10 @@ impl Config {
             bind_addr: "127.0.0.1:3000".to_string(),
             db_path: default_db_path(),
             admin_token_hash: None,
+            compiler_token_hash: None,
+            reviewer_token_hash: None,
+            runtime_token_hash: None,
+            skill_auth_tenant: "local".to_string(),
             embedding: EmbeddingSettings::development_defaults(),
             auto_promote: AutoPromoteSettings::development_defaults(),
             vacuum: VacuumSettings::development_defaults(),
@@ -1437,10 +1450,31 @@ impl Config {
     pub fn from_env() -> Result<Self, ConfigError> {
         let bind_addr = std::env::var("BIND_ADDR").unwrap_or_else(|_| "127.0.0.1:3000".to_string());
         let (backend, postgres_url, clickhouse_url) = parse_backend(|k| std::env::var(k).ok())?;
+        let admin_token_hash = admin_token_hash_from_env(|key| std::env::var(key).ok())?;
+        let compiler_token_hash =
+            role_token_hash_from_env("MEM_SKILL_COMPILER_TOKEN", |key| std::env::var(key).ok())?;
+        let reviewer_token_hash =
+            role_token_hash_from_env("MEM_SKILL_REVIEWER_TOKEN", |key| std::env::var(key).ok())?;
+        let runtime_token_hash =
+            role_token_hash_from_env("MEM_SKILL_RUNTIME_TOKEN", |key| std::env::var(key).ok())?;
+        let skill_auth_tenant = std::env::var("MEM_TENANT")
+            .ok()
+            .filter(|tenant| !tenant.trim().is_empty())
+            .unwrap_or_else(|| "local".to_string());
+        ensure_distinct_privileged_tokens([
+            admin_token_hash,
+            compiler_token_hash,
+            reviewer_token_hash,
+            runtime_token_hash,
+        ])?;
         Ok(Self {
             bind_addr,
             db_path: default_db_path(),
-            admin_token_hash: admin_token_hash_from_env(|key| std::env::var(key).ok())?,
+            admin_token_hash,
+            compiler_token_hash,
+            reviewer_token_hash,
+            runtime_token_hash,
+            skill_auth_tenant,
             embedding: EmbeddingSettings::from_env_vars(|k| std::env::var(k).ok())?,
             auto_promote: AutoPromoteSettings::from_env_vars(|k| std::env::var(k).ok())?,
             vacuum: VacuumSettings::from_env_vars(|k| std::env::var(k).ok())?,
@@ -1465,25 +1499,75 @@ impl Config {
         self
     }
 
-    pub fn authorizes_admin_bearer(&self, authorization: Option<&str>) -> bool {
-        let Some(expected) = self.admin_token_hash else {
-            return false;
-        };
-        let Some(token) = authorization.and_then(|value| value.strip_prefix("Bearer ")) else {
-            return false;
-        };
-        let Some(actual) = validated_admin_token_hash(token) else {
-            return false;
-        };
-        expected
-            .0
-            .iter()
-            .zip(actual.0)
-            .fold(0_u8, |difference, (left, right)| {
-                difference | (*left ^ right)
-            })
-            == 0
+    pub fn with_skill_compiler_token(mut self, token: &str) -> Self {
+        self.compiler_token_hash = validated_admin_token_hash(token);
+        self
     }
+
+    pub fn with_skill_reviewer_token(mut self, token: &str) -> Self {
+        self.reviewer_token_hash = validated_admin_token_hash(token);
+        self
+    }
+
+    pub fn with_skill_runtime_token(mut self, token: &str) -> Self {
+        self.runtime_token_hash = validated_admin_token_hash(token);
+        self
+    }
+
+    pub fn authorizes_admin_bearer(&self, authorization: Option<&str>) -> bool {
+        bearer_matches(self.admin_token_hash, authorization)
+    }
+
+    pub fn authorizes_skill_compiler_bearer(&self, authorization: Option<&str>) -> bool {
+        self.authorizes_admin_bearer(authorization)
+            || bearer_matches(self.compiler_token_hash, authorization)
+    }
+
+    pub fn authorizes_skill_compiler_role_bearer(&self, authorization: Option<&str>) -> bool {
+        bearer_matches(self.compiler_token_hash, authorization)
+    }
+
+    pub fn authorizes_skill_reviewer_bearer(&self, authorization: Option<&str>) -> bool {
+        self.authorizes_admin_bearer(authorization)
+            || bearer_matches(self.reviewer_token_hash, authorization)
+    }
+
+    pub fn authorizes_skill_reviewer_role_bearer(&self, authorization: Option<&str>) -> bool {
+        bearer_matches(self.reviewer_token_hash, authorization)
+    }
+
+    pub fn authorizes_skill_runtime_bearer(&self, authorization: Option<&str>) -> bool {
+        self.authorizes_admin_bearer(authorization)
+            || bearer_matches(self.runtime_token_hash, authorization)
+    }
+
+    pub fn authorizes_skill_runtime_role_bearer(&self, authorization: Option<&str>) -> bool {
+        bearer_matches(self.runtime_token_hash, authorization)
+    }
+
+    pub fn skill_auth_tenant(&self) -> &str {
+        &self.skill_auth_tenant
+    }
+}
+
+fn bearer_matches(expected: Option<AdminTokenHash>, authorization: Option<&str>) -> bool {
+    let Some(expected) = expected else {
+        return false;
+    };
+    let Some(token) = authorization.and_then(|value| value.strip_prefix("Bearer ")) else {
+        return false;
+    };
+    let Some(actual) = validated_admin_token_hash(token) else {
+        return false;
+    };
+    expected
+        .0
+        .iter()
+        .zip(actual.0)
+        .fold(0_u8, |difference, (left, right)| {
+            difference | (*left ^ right)
+        })
+        == 0
 }
 
 fn admin_token_hash_from_env(
@@ -1495,6 +1579,29 @@ fn admin_token_hash_from_env(
             .map(Some)
             .ok_or(ConfigError::InvalidAdminToken),
     }
+}
+
+fn role_token_hash_from_env(
+    key: &'static str,
+    get: impl Fn(&str) -> Option<String>,
+) -> Result<Option<AdminTokenHash>, ConfigError> {
+    match get(key) {
+        None => Ok(None),
+        Some(token) => validated_admin_token_hash(&token)
+            .map(Some)
+            .ok_or(ConfigError::InvalidRoleToken(key)),
+    }
+}
+
+fn ensure_distinct_privileged_tokens(
+    tokens: [Option<AdminTokenHash>; 4],
+) -> Result<(), ConfigError> {
+    for (index, token) in tokens.iter().enumerate() {
+        if token.is_some() && tokens[index + 1..].contains(token) {
+            return Err(ConfigError::DuplicateSkillRoleTokens);
+        }
+    }
+    Ok(())
 }
 
 fn validated_admin_token_hash(token: &str) -> Option<AdminTokenHash> {
@@ -2111,5 +2218,27 @@ mod tests {
         assert!(admin_token_hash_from_env(env(&[])).unwrap().is_none());
         assert!(admin_token_hash_from_env(env(&[("MEM_ADMIN_TOKEN", "")])).is_err());
         assert!(admin_token_hash_from_env(env(&[("MEM_ADMIN_TOKEN", "too-short")])).is_err());
+    }
+
+    #[test]
+    fn skill_role_tokens_must_be_distinct() {
+        let token = validated_admin_token_hash("role-token-with-at-least-thirty-two-bytes")
+            .expect("valid role token");
+        assert!(matches!(
+            ensure_distinct_privileged_tokens([None, Some(token), Some(token), None]),
+            Err(ConfigError::DuplicateSkillRoleTokens)
+        ));
+        assert!(ensure_distinct_privileged_tokens([
+            validated_admin_token_hash("admin-token-with-at-least-32-bytes-long"),
+            validated_admin_token_hash("compiler-token-with-at-least-32-bytes"),
+            validated_admin_token_hash("reviewer-token-with-at-least-32-bytes"),
+            validated_admin_token_hash("runtime-token-with-at-least-32-bytes"),
+        ])
+        .is_ok());
+        let admin = validated_admin_token_hash("shared-admin-role-token-with-32-bytes");
+        assert!(matches!(
+            ensure_distinct_privileged_tokens([admin, admin, None, None]),
+            Err(ConfigError::DuplicateSkillRoleTokens)
+        ));
     }
 }

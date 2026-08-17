@@ -24,7 +24,7 @@ use mem::{
     app::AppState,
     service::{
         CapabilityCapsuleService, CompletedToolRoundService, EntityService, FactCheckService,
-        TranscriptService,
+        SkillGovernanceService, SkillProposalService, SkillRuntimeService, TranscriptService,
     },
     storage::Store,
 };
@@ -58,6 +58,25 @@ pub fn test_app_state(
 ) -> AppState {
     let transcript_service = Arc::new(TranscriptService::new(store.clone(), None));
     let completed_tool_round_service = Arc::new(CompletedToolRoundService::new(store.clone()));
+    let skill_proposal_service = Some(Arc::new(SkillProposalService::new(
+        store.clone(),
+        store.clone(),
+        capability_capsule_service.clone(),
+        store.clone(),
+    )));
+    let skill_governance_service = Some(Arc::new(SkillGovernanceService::new(
+        store.clone(),
+        capability_capsule_service.clone(),
+        skill_proposal_service
+            .as_ref()
+            .expect("test Skill proposal service")
+            .clone(),
+    )));
+    let skill_runtime_service = Some(Arc::new(SkillRuntimeService::new(
+        store.clone(),
+        store.clone(),
+        capability_capsule_service.clone(),
+    )));
     let entity_service = EntityService::new(store.clone());
     let fact_check_service = FactCheckService::new(store);
     AppState {
@@ -65,6 +84,9 @@ pub fn test_app_state(
         config: mem::config::Config::local().with_admin_token(TEST_ADMIN_TOKEN),
         transcript_service,
         completed_tool_round_service,
+        skill_proposal_service,
+        skill_governance_service,
+        skill_runtime_service,
         entity_service,
         fact_check_service,
     }

@@ -1,0 +1,20 @@
+{
+  "name": "@shibenenen/pi-mem-skill-compiler",
+  "version": "0.1.0",
+  "description": "Dedicated least-privilege mem Agent-as-Compiler extension for pi",
+  "keywords": ["pi-package"],
+  "type": "module",
+  "pi": {
+    "extensions": ["./compiler-extension.ts"],
+    "prompts": ["./prompts/crystallize-candidates.md"]
+  },
+  "scripts": {
+    "check": "tsc --noEmit"
+  },
+  "devDependencies": {
+    "@earendil-works/pi-coding-agent": "^0.74.2",
+    "@types/node": "^20.19.0",
+    "typescript": "^5.9.0"
+  },
+  "license": "MIT"
+}

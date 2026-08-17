@@ -91,6 +91,10 @@ impl TestApp {
         let request = Request::builder()
             .method("POST")
             .uri(path)
+            .header(
+                "authorization",
+                format!("Bearer {}", common::TEST_ADMIN_TOKEN),
+            )
             .header("content-type", "application/json")
             .body(Body::from(body.to_string()))
             .expect("request build");

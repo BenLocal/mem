@@ -77,6 +77,12 @@ The `plugin:mem:mem` MCP server forwards to the local HTTP service. Use these to
 
 Set `MEM_MCP_EXPOSE_EMBEDDINGS=1` to also get the admin `embeddings_*` tools (rebuild, list_jobs, providers).
 
+Agent-as-Compiler is intentionally a separate plugin/profile. Install and run
+`mem-skill-compiler` in a dedicated Agent session to get the six
+`skill_compiler_*` tools; never combine it with this review-capable profile in
+one model context. The compiler profile uses the Agent's own model and does not
+require `LLM_API_BASE` / `LLM_MODEL`.
+
 ## CLI subcommands (run from the repo with `cargo run --`)
 
 - `mem serve` — HTTP server on `BIND_ADDR` (default `127.0.0.1:3000`)

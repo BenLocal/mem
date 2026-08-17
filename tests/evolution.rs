@@ -691,6 +691,10 @@ async fn http_reviews_evolution_dry_run_previews() {
     let request = Request::builder()
         .method("POST")
         .uri("/reviews/evolution")
+        .header(
+            "authorization",
+            format!("Bearer {}", common::TEST_ADMIN_TOKEN),
+        )
         .header("content-type", "application/json")
         .body(Body::from(
             serde_json::json!({"tenant": TENANT, "dry_run": true}).to_string(),

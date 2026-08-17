@@ -19,11 +19,15 @@ cargo run -- serve
 cargo run -- mcp                  # stdio MCP forwarder to MEM_BASE_URL
 cargo run -- crystallize          # H4 dry run
 cargo run -- crystallize --accept # write synthesized Workflow capsules
+cargo run -- crystallize --candidate-jobs # safe candidate preview; no claim/write
+cargo run -- crystallize --candidate-jobs --propose # write PendingConfirmation Skill proposals
+cargo run -- mcp --profile compiler # dedicated Agent-as-Compiler MCP; compiler tools only
 
 make test-one TEST=search_api       # preferred integration-test iteration
 make test-filter FILTER=ingest::compute_content # preferred named/unit iteration
 make test-rounds                    # completed_tool_round vertical slice
 make test-candidates                # deterministic Skill-candidate + durable queue
+make test-skill-compiler            # compiler + lifecycle + bundle/loadout/pin slice
 make test-full                      # explicit full-suite gate; capped at 4 build jobs
 cargo test --test search_api
 cargo test --lib ingest::compute_content
@@ -67,7 +71,8 @@ Core:
 - `MEM_DB_PATH`: Lance dataset directory. Legacy directories may still be named `mem.duckdb`; they are not DuckDB files.
 - `BIND_ADDR`: HTTP bind address.
 - `MEM_BASE_URL` / `MEM_TENANT`: MCP forwarder target/default tenant.
-- `MEM_ADMIN_TOKEN`: Bearer credential required by completed-tool-round admin rebuild/read routes; the CLI sends it automatically.
+- `MEM_ADMIN_TOKEN`: cross-tenant superuser Bearer for completed-round, review and Skill admin routes. Skill least-privilege roles use distinct 32+ byte `MEM_SKILL_COMPILER_TOKEN`, `MEM_SKILL_REVIEWER_TOKEN`, and `MEM_SKILL_RUNTIME_TOKEN`, each restricted to `MEM_TENANT`.
+- `MEM_AGENT_COMPILER_ID`: trusted harness/profile label persisted in Agent-as-Compiler receipts; compiler MCP derives it from process env and never accepts it from tool arguments.
 - `MEM_BACKEND`: `lance` (default), `postgres`, or `clickhouse`; alternate backends require `MEM_POSTGRES_URL` or `MEM_CLICKHOUSE_URL`. All backends are compiled into every build.
 - `MEM_MCP_EXPOSE_EMBEDDINGS=1`: expose admin embedding tools.
 
@@ -95,7 +100,7 @@ Extraction, governance, and safety:
 - `MEM_INGEST_NEARDUP_ENABLED=1` / `MEM_INGEST_NEARDUP_THRESHOLD` (default OFF / `0.92`): after embedding an Active ingest, identify its near-duplicate cluster, choose the longest/earliest canonical, and propose `suspected_supersede`. It must remain review-gated and verbatim-safe; never auto-merge/archive.
 - `MEM_MINE_HEURISTIC_EXTRACT=1`: default-off zero-LLM extraction for untagged assistant text. Candidates use `write_mode:"propose"` and must never become Active directly.
 - `MEM_MINE_LLM_EXTRACT=1` plus `LLM_API_BASE`, `LLM_MODEL`, optional `LLM_API_KEY`: default-off generative extraction. Missing base/model disables the lane; all LLM errors degrade to empty/fallback; output is propose-only; client uses `.no_proxy()`. Limit remains ≤5 candidates/block and ≤40 blocks/run.
-- The same LLM variables serve `mem crystallize`. Invoking the subcommand is its enable gate; it never writes without `--accept`, and synthesis errors are swallowed safely.
+- The same LLM variables serve `mem crystallize`. Invoking the subcommand is its enable gate. Legacy H4 writes only with `--accept`; candidate mode previews by default and writes only `PendingConfirmation` proposals with `--candidate-jobs --propose`. Synthesis errors never activate an asset.
 - `MEM_REDACT_SECRETS_DISABLED=1`: opt out of default-on secret redaction. Redact prompt/index outputs and both embedding inputs, but keep stored capsule/transcript content verbatim. Explicit verbatim fetches (`capability_capsule_get`, `transcripts_range`, `get_by_session`) intentionally remain unredacted.
 - `MEM_KG_FUNCTIONAL_PREDICATES`: comma-separated, default empty/OFF. Only list genuinely single-valued predicates; a new `(from,predicate,to)` closes active conflicting targets. Never configure multi-valued predicates such as `uses`.
 - `MEM_RERANK_OFFLINE_ENABLED=1`, `MEM_RERANK_PROVIDER`, `MEM_RERANK_MODEL_DIR`, `MEM_RERANK_MERGE_FLOOR` (default OFF; floor `0.5`): gate evolution merges with the offline reranker. Low score cancels; errors fail-closed/HOLD. `fake` is the deterministic test provider. Do not add interactive query-path reranking. Procedural-sibling detection remains the primary merge defense. See `docs/offline-reranker-lane.md`.

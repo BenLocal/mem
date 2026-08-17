@@ -55,6 +55,23 @@ pub enum Visibility {
     System,
 }
 
+/// Governs which transition path may make a pending capsule authoritative.
+///
+/// This is deliberately derived from existing persisted fields instead of
+/// adding another column to the verbatim capsule table. The compiler publish
+/// path owns `SKILL_PROPOSAL_SOURCE_AGENT`, so an external caller can only make
+/// an ordinary capsule *more* restrictive by copying the marker; it cannot
+/// weaken a real compiler proposal.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ActivationPolicy {
+    AutoEligible,
+    HumanReviewOnly,
+    SkillBundleRequired,
+}
+
+pub const SKILL_PROPOSAL_SOURCE_AGENT: &str = "skill-proposal-compiler";
+pub const EVOLUTION_PROPOSAL_SOURCE_AGENT: &str = "evolution_worker";
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum WriteMode {
@@ -328,6 +345,26 @@ impl Default for CapabilityCapsuleRecord {
             last_used_at: None,
             last_recalled_at: None,
             expires_at: None,
+        }
+    }
+}
+
+impl CapabilityCapsuleRecord {
+    /// Central lifecycle policy used by review and every automatic status
+    /// worker. Tags and summaries are intentionally ignored.
+    pub fn activation_policy(&self) -> ActivationPolicy {
+        if self.capability_capsule_type == CapabilityCapsuleType::Workflow
+            && self.source_agent == SKILL_PROPOSAL_SOURCE_AGENT
+        {
+            ActivationPolicy::SkillBundleRequired
+        } else if matches!(
+            self.capability_capsule_type,
+            CapabilityCapsuleType::Preference | CapabilityCapsuleType::Workflow
+        ) || self.source_agent == EVOLUTION_PROPOSAL_SOURCE_AGENT
+        {
+            ActivationPolicy::HumanReviewOnly
+        } else {
+            ActivationPolicy::AutoEligible
         }
     }
 }

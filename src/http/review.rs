@@ -6,7 +6,10 @@ use axum::{
 };
 use serde::{Deserialize, Serialize};
 
-use crate::{app::AppState, domain::capability_capsule::EditPendingRequest, error::AppError};
+use crate::{
+    app::AppState, domain::capability_capsule::EditPendingRequest, error::AppError,
+    http::admin_auth::ReviewerAuthorized,
+};
 
 pub fn router() -> Router<AppState> {
     Router::new()
@@ -40,8 +43,10 @@ struct PendingReviewActionRequest {
 
 async fn list_pending(
     State(app): State<AppState>,
+    reviewer: ReviewerAuthorized,
     Query(query): Query<PendingReviewQuery>,
 ) -> Result<Json<Vec<crate::domain::capability_capsule::CapabilityCapsuleRecord>>, AppError> {
+    reviewer.require_tenant(&query.tenant)?;
     Ok(Json(
         app.capability_capsule_service
             .list_pending_review(&query.tenant)
@@ -51,8 +56,10 @@ async fn list_pending(
 
 async fn accept_pending(
     State(app): State<AppState>,
+    reviewer: ReviewerAuthorized,
     Json(request): Json<PendingReviewActionRequest>,
 ) -> Result<Json<crate::domain::capability_capsule::CapabilityCapsuleRecord>, AppError> {
+    reviewer.require_tenant(&request.tenant)?;
     Ok(Json(
         app.capability_capsule_service
             .accept_pending(&request.tenant, &request.capability_capsule_id)
@@ -62,8 +69,10 @@ async fn accept_pending(
 
 async fn reject_pending(
     State(app): State<AppState>,
+    reviewer: ReviewerAuthorized,
     Json(request): Json<PendingReviewActionRequest>,
 ) -> Result<Json<crate::domain::capability_capsule::CapabilityCapsuleRecord>, AppError> {
+    reviewer.require_tenant(&request.tenant)?;
     Ok(Json(
         app.capability_capsule_service
             .reject_pending(&request.tenant, &request.capability_capsule_id)
@@ -73,8 +82,10 @@ async fn reject_pending(
 
 async fn edit_and_accept_pending(
     State(app): State<AppState>,
+    reviewer: ReviewerAuthorized,
     Json(request): Json<HttpEditPendingRequest>,
 ) -> Result<Json<crate::domain::capability_capsule::EditPendingResponse>, AppError> {
+    reviewer.require_tenant(&request.tenant)?;
     let tenant = request.tenant.clone();
     Ok(Json(
         app.capability_capsule_service
@@ -138,8 +149,10 @@ struct AutoPromoteResponse {
 
 async fn auto_promote(
     State(app): State<AppState>,
+    reviewer: ReviewerAuthorized,
     Json(request): Json<AutoPromoteRequest>,
 ) -> Result<Json<AutoPromoteResponse>, AppError> {
+    reviewer.require_tenant(&request.tenant)?;
     let ids = app
         .capability_capsule_service
         .auto_promote_sweep(&request.tenant, &app.config.auto_promote, request.dry_run)
@@ -179,8 +192,10 @@ struct IdleArchiveResponse {
 
 async fn idle_archive(
     State(app): State<AppState>,
+    reviewer: ReviewerAuthorized,
     Json(request): Json<IdleArchiveRequest>,
 ) -> Result<Json<IdleArchiveResponse>, AppError> {
+    reviewer.require_tenant(&request.tenant)?;
     let ids = app
         .capability_capsule_service
         .idle_archive_sweep(&request.tenant, &app.config.idle_archive, request.dry_run)
@@ -207,8 +222,10 @@ struct EvolutionRequest {
 
 async fn evolution(
     State(app): State<AppState>,
+    reviewer: ReviewerAuthorized,
     Json(request): Json<EvolutionRequest>,
 ) -> Result<Json<crate::worker::evolution_worker::EvolutionReport>, AppError> {
+    reviewer.require_tenant(&request.tenant)?;
     Ok(Json(
         app.capability_capsule_service
             .evolution_sweep(&request.tenant, &app.config.evolution, request.dry_run)
@@ -231,8 +248,10 @@ struct EvolutionRollbackRequest {
 
 async fn evolution_rollback(
     State(app): State<AppState>,
+    reviewer: ReviewerAuthorized,
     Json(request): Json<EvolutionRollbackRequest>,
 ) -> Result<Json<crate::worker::evolution_worker::RollbackReport>, AppError> {
+    reviewer.require_tenant(&request.tenant)?;
     Ok(Json(
         app.capability_capsule_service
             .evolution_rollback(&request.tenant, &request.candidate_id)

@@ -24,7 +24,7 @@ enum Command {
     /// Run the HTTP memory service (default).
     Serve,
     /// Run the MCP (Model Context Protocol) stdio server.
-    Mcp,
+    Mcp(mem::cli::mcp::McpArgs),
     /// Scaffold a new `.mem/` directory with mode-based env defaults +
     /// a taxonomy starter file. First-run UX — analogous to mempalace's
     /// `onboarding.py`.
@@ -75,7 +75,7 @@ fn main() -> error::Result<()> {
 
     let cli = Cli::parse();
     let command = cli.command.unwrap_or(Command::Serve);
-    let is_mcp = matches!(&command, Command::Mcp);
+    let is_mcp = matches!(&command, Command::Mcp(_));
 
     init_tracing(is_mcp);
 
@@ -104,7 +104,7 @@ fn main() -> error::Result<()> {
 async fn async_main(command: Command) -> error::Result<()> {
     match command {
         Command::Serve => mem::cli::serve::run().await,
-        Command::Mcp => mem::cli::mcp::run().await,
+        Command::Mcp(args) => mem::cli::mcp::run(args).await,
         Command::Init(args) => {
             let code = mem::cli::init::run(args);
             std::process::exit(code);

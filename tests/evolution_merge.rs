@@ -412,6 +412,10 @@ async fn http_reviews_evolution_rollback_round_trip() {
     let request = Request::builder()
         .method("POST")
         .uri("/reviews/evolution/rollback")
+        .header(
+            "authorization",
+            format!("Bearer {}", common::TEST_ADMIN_TOKEN),
+        )
         .header("content-type", "application/json")
         .body(Body::from(
             serde_json::json!({"tenant": TENANT, "candidate_id": candidate_id}).to_string(),

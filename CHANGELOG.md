@@ -8,6 +8,42 @@ are organized by feature wave (merge commit ranges on `master`).
 
 ## [Unreleased]
 
+### Added — review-gated Skill self-evolution loop (2026-08-17)
+
+- `crystallize --candidate-jobs` consumes deterministic completed-tool-round
+  receipts through a leased, token-fenced admin lane. Evidence is bounded,
+  hard-redacted independently of the normal redaction opt-out, environment
+  parameterized, strictly classified and exact-deduplicated before any write.
+- Candidate writes are proposal-only: `Workflow + PendingConfirmation` with a
+  content-free provenance receipt; non-artifact terminal decisions receive
+  immutable replay receipts. Generic review, auto-promote and feedback
+  cannot activate compiler proposals. Compiler/reviewer/runtime routes now use
+  distinct role bearer tokens scoped to `MEM_TENANT` (with admin as explicit
+  superuser), and authentication runs before body parsing.
+- Specialized human acceptance publishes a content-addressed `SKILL.md`,
+  canonical manifest and immutable Bundle version, then advances a single
+  mutable Skill head with compare-and-set semantics. Replays repair staged
+  partial states; runtime remains blocked until the anchor is Active.
+- Shared/System Agent Loadout bindings resolve accepted heads and use
+  revision-fenced 24-hour session pins, so a head update affects new/expired
+  sessions without changing an in-flight session. Resource fetches require the
+  exact live pin, and append-only bundle revocation fails closed.
+- Version-scoped feedback is append-only. Each complete cohort of three
+  negative events for the current head creates a stable durable revision job;
+  its hard-scrubbed evidence is compiled against the exact base bundle and the
+  result re-enters `PendingConfirmation` rather than mutating runtime state.
+- Compiler-managed Workflow anchors are excluded from ordinary recall and can
+  be loaded only through an exact Loadout/session pin, so old or revoked Skill
+  versions cannot reappear as `suggested_workflow`.
+- Added a dedicated `mem mcp --profile compiler` Agent-as-Compiler surface with
+  six compiler-only tools. It uses opaque process-local claim handles, never
+  exposes job/lease credentials, has no reviewer/accept tools, and lets the
+  current Codex/Claude/Pi model compile Skills without a second LLM gateway.
+  Lease hard deadlines and the two-renewal limit are persisted and enforced by
+  `mem serve`; callers cannot roll the deadline forward. Local role-token files
+  are accepted only from an owned `0700` directory and owned `0600` non-symlink
+  file on Unix; other platforms require explicit environment credentials.
+
 ### Added — H4 skill crystallization: `mem crystallize` (2026-08-01)
 
 H4 was marked ✅ but only its **detection** half had landed:

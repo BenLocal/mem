@@ -9,7 +9,8 @@ use mem::domain::{
 use mem::pipeline::skill_candidate::plan_skill_candidate_jobs;
 use mem::service::SkillCandidateService;
 use mem::storage::{
-    current_timestamp, CompletedToolRoundStore, SkillCandidateStore, StorageError, Store,
+    current_timestamp, timestamp_add_ms, CompletedToolRoundStore, SkillCandidateStore,
+    StorageError, Store,
 };
 
 fn completed_round(
@@ -617,6 +618,42 @@ async fn claim_takes_only_the_oldest_job_per_tenant_agent_lane() {
 }
 
 #[tokio::test]
+async fn tenant_scoped_claim_never_leases_another_tenants_job() {
+    let (_dir, store) = common::test_store().await;
+    store
+        .ensure_skill_candidate_jobs(
+            &[
+                job_spec("local-job", "local", "codex"),
+                job_spec("other-job", "other", "codex"),
+            ],
+            "00000001786800001000",
+        )
+        .await
+        .unwrap();
+    let claimed = store
+        .claim_skill_candidate_jobs_for_tenant(
+            "local",
+            "00000001786800002000",
+            "00000001786800302000",
+            3,
+            10,
+        )
+        .await
+        .unwrap();
+    assert_eq!(claimed.len(), 1);
+    assert_eq!(claimed[0].job.job_id, "local-job");
+    assert_eq!(claimed[0].job.tenant, "local");
+    let jobs = store.list_skill_candidate_jobs(10).await.unwrap();
+    assert_eq!(
+        jobs.iter()
+            .find(|job| job.job_id == "other-job")
+            .unwrap()
+            .status,
+        mem::domain::SkillCandidateJobStatus::Pending
+    );
+}
+
+#[tokio::test]
 async fn expired_lease_is_reclaimed_with_a_fenced_token() {
     let (_dir, store) = common::test_store().await;
     store
@@ -661,6 +698,125 @@ async fn expired_lease_is_reclaimed_with_a_fenced_token() {
         )
         .await
         .unwrap();
+}
+
+#[tokio::test]
+async fn lease_renewal_extends_only_the_current_fenced_claim() {
+    let (_dir, store) = common::test_store().await;
+    store
+        .ensure_skill_candidate_jobs(
+            &[job_spec("renew-1", "local", "codex")],
+            "00000001786800001000",
+        )
+        .await
+        .unwrap();
+    let claimed = store
+        .claim_skill_candidate_jobs("00000001786800002000", "00000001786800003000", 3, 1)
+        .await
+        .unwrap()
+        .remove(0);
+
+    store
+        .renew_skill_candidate_job_lease(
+            &claimed.job.job_id,
+            &claimed.lease_token,
+            "00000001786800002500",
+            "00000001786800005000",
+        )
+        .await
+        .unwrap();
+    store
+        .renew_skill_candidate_job_lease(
+            &claimed.job.job_id,
+            &claimed.lease_token,
+            "00000001786800002600",
+            "00000001786800006000",
+        )
+        .await
+        .unwrap();
+    assert!(matches!(
+        store
+            .renew_skill_candidate_job_lease(
+                &claimed.job.job_id,
+                &claimed.lease_token,
+                "00000001786800002700",
+                "00000001786800007000",
+            )
+            .await,
+        Err(StorageError::Conflict(_))
+    ));
+    assert!(matches!(
+        store
+            .renew_skill_candidate_job_lease(
+                &claimed.job.job_id,
+                "stale-token",
+                "00000001786800002600",
+                "00000001786800006000",
+            )
+            .await,
+        Err(StorageError::Conflict(_))
+    ));
+    assert!(store
+        .claim_skill_candidate_jobs("00000001786800004000", "00000001786800007000", 3, 1)
+        .await
+        .unwrap()
+        .is_empty());
+    store
+        .complete_skill_candidate_job(
+            &claimed.job.job_id,
+            &claimed.lease_token,
+            "00000001786800004500",
+        )
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn lease_renewal_is_clamped_to_the_server_owned_hard_deadline() {
+    let (_dir, store) = common::test_store().await;
+    store
+        .ensure_skill_candidate_jobs(
+            &[job_spec("renew-hard-deadline", "local", "codex")],
+            "00000001786800001000",
+        )
+        .await
+        .unwrap();
+    let claim_now = "00000001786800002000";
+    let claimed = store
+        .claim_skill_candidate_jobs(claim_now, "00000001786800003000", 3, 1)
+        .await
+        .unwrap()
+        .remove(0);
+
+    store
+        .renew_skill_candidate_job_lease(
+            &claimed.job.job_id,
+            &claimed.lease_token,
+            "00000001786800002500",
+            "99999999999999999999",
+        )
+        .await
+        .unwrap();
+    let renewed = store
+        .get_skill_candidate_job(&claimed.job.job_id)
+        .await
+        .unwrap()
+        .expect("renewed job");
+    assert_eq!(
+        renewed.lease_expires_at.as_deref(),
+        Some(timestamp_add_ms(claim_now, 10 * 60 * 1_000).as_str())
+    );
+    assert!(matches!(
+        store
+            .renew_skill_candidate_job_lease(
+                &claimed.job.job_id,
+                &claimed.lease_token,
+                "00000001786800002600",
+                "99999999999999999999",
+            )
+            .await,
+        Err(StorageError::InvalidInput(_))
+    ));
 }
 
 #[tokio::test]
@@ -1231,7 +1387,7 @@ async fn corrected_head_does_not_cancel_a_live_processing_lease() {
     let service = SkillCandidateService::new(store.clone());
     service.reconcile().await.unwrap();
     let claimed = store
-        .claim_skill_candidate_jobs("00000001786800002000", "99999999999999999999", 3, 1)
+        .claim_skill_candidate_jobs("99999999999999999990", "99999999999999999999", 3, 1)
         .await
         .unwrap()
         .remove(0);
@@ -1250,7 +1406,7 @@ async fn corrected_head_does_not_cancel_a_live_processing_lease() {
         .complete_skill_candidate_job(
             &claimed.job.job_id,
             &claimed.lease_token,
-            "00000001786800004000",
+            "99999999999999999995",
         )
         .await
         .unwrap();
@@ -1291,7 +1447,7 @@ async fn restored_evidence_reactivates_the_same_stale_receipt() {
     assert_eq!(restored.staled_job_count, 0);
     assert_eq!(
         store
-            .claim_skill_candidate_jobs("00000001786800004000", "00000001786800005000", 3, 10)
+            .claim_skill_candidate_jobs("99999999999999999990", "99999999999999999999", 3, 10)
             .await
             .unwrap()
             .len(),

@@ -24,6 +24,11 @@ type BackendAssembly = (
     Option<EdgeAccessSender>,
     CapsuleUsedSender,
     Arc<CompletedToolRoundService>,
+    Option<(
+        Arc<dyn crate::storage::SkillCandidateStore>,
+        Arc<dyn crate::storage::CompletedToolRoundStore>,
+        Arc<dyn crate::storage::SkillStore>,
+    )>,
 );
 
 #[derive(Clone)]
@@ -35,6 +40,11 @@ pub struct AppState {
     /// Rebuildable transcript-derived tool-round index. Its storage adapter is
     /// Lance-backed today and explicitly unsupported on alternate backends.
     pub completed_tool_round_service: Arc<CompletedToolRoundService>,
+    /// Explicit, admin-driven Skill compiler queue surface. `None` on
+    /// backends whose completed-round/candidate parity has not landed.
+    pub skill_proposal_service: Option<Arc<crate::service::SkillProposalService>>,
+    pub skill_governance_service: Option<Arc<crate::service::SkillGovernanceService>>,
+    pub skill_runtime_service: Option<Arc<crate::service::SkillRuntimeService>>,
     /// Service façade backing the `/entities/*` HTTP routes.
     pub entity_service: EntityService,
     /// Service façade backing `POST /fact_check` — pre-ingest
@@ -79,8 +89,13 @@ impl AppState {
         //   * `capsule_used_tx: UnboundedSender<…>` — O1 last-used sender
         // so everything below this `match` is backend-agnostic and stays
         // byte-for-byte identical to the pre-Postgres single-backend path.
-        let (store, edge_access_tx, capsule_used_tx, completed_tool_round_service): BackendAssembly =
-            match config.backend {
+        let (
+            store,
+            edge_access_tx,
+            capsule_used_tx,
+            completed_tool_round_service,
+            skill_proposal_stores,
+        ): BackendAssembly = match config.backend {
             crate::config::BackendKind::Lance => {
                 // LanceStore creates the schema + FTS indexes and serves
                 // both reads and writes. We hold a concrete `Arc<Store>`
@@ -144,18 +159,22 @@ impl AppState {
                     });
                 }
 
+                let round_store: Arc<dyn crate::storage::CompletedToolRoundStore> =
+                    store_concrete.clone();
+                let candidate_store: Arc<dyn crate::storage::SkillCandidateStore> =
+                    store_concrete.clone();
+                let skill_store: Arc<dyn crate::storage::SkillStore> = store_concrete.clone();
                 let completed_tool_round_service =
-                    Arc::new(CompletedToolRoundService::new(store_concrete.clone()));
+                    Arc::new(CompletedToolRoundService::new(round_store.clone()));
                 if config.skill_candidate.enabled {
                     let settings = config.skill_candidate.clone();
-                    let candidate_service = Arc::new(
-                        crate::service::SkillCandidateService::with_limits(
+                    let candidate_service =
+                        Arc::new(crate::service::SkillCandidateService::with_limits(
                             store_concrete.clone(),
                             crate::domain::SkillCandidatePolicy::default(),
                             settings.max_builds,
                             settings.max_rounds,
-                        ),
-                    );
+                        ));
                     tokio::spawn(async move {
                         crate::worker::skill_candidate_worker::run(candidate_service, settings)
                             .await;
@@ -167,6 +186,7 @@ impl AppState {
                     edge_access_tx,
                     capsule_used_tx,
                     completed_tool_round_service,
+                    Some((candidate_store, round_store, skill_store)),
                 )
             }
             crate::config::BackendKind::Postgres => {
@@ -199,7 +219,13 @@ impl AppState {
                 let completed_tool_round_service = Arc::new(CompletedToolRoundService::new(
                     Arc::new(UnsupportedCompletedToolRoundStore),
                 ));
-                (store, None, capsule_used_tx, completed_tool_round_service)
+                (
+                    store,
+                    None,
+                    capsule_used_tx,
+                    completed_tool_round_service,
+                    None,
+                )
             }
             crate::config::BackendKind::Clickhouse => {
                 // P2: `ClickHouseBackend` now impls all 11 sub-traits (the
@@ -231,9 +257,15 @@ impl AppState {
                 let completed_tool_round_service = Arc::new(CompletedToolRoundService::new(
                     Arc::new(UnsupportedCompletedToolRoundStore),
                 ));
-                (store, None, capsule_used_tx, completed_tool_round_service)
+                (
+                    store,
+                    None,
+                    capsule_used_tx,
+                    completed_tool_round_service,
+                    None,
+                )
             }
-            };
+        };
 
         // ── Workers ─────────────────────────────────────────────
         let provider_worker = provider.clone();
@@ -349,11 +381,37 @@ impl AppState {
         capability_capsule_service =
             capability_capsule_service.with_last_used_sender(capsule_used_tx);
 
+        let (skill_proposal_service, skill_governance_service, skill_runtime_service) =
+            skill_proposal_stores
+                .map(|(candidate_store, round_store, skill_store)| {
+                    let proposal = Arc::new(crate::service::SkillProposalService::new(
+                        candidate_store.clone(),
+                        round_store,
+                        capability_capsule_service.clone(),
+                        skill_store.clone(),
+                    ));
+                    let governance = Arc::new(crate::service::SkillGovernanceService::new(
+                        skill_store.clone(),
+                        capability_capsule_service.clone(),
+                        proposal.clone(),
+                    ));
+                    let runtime = Arc::new(crate::service::SkillRuntimeService::new(
+                        skill_store,
+                        candidate_store,
+                        capability_capsule_service.clone(),
+                    ));
+                    (Some(proposal), Some(governance), Some(runtime))
+                })
+                .unwrap_or((None, None, None));
+
         Ok(Self {
             capability_capsule_service,
             config,
             transcript_service,
             completed_tool_round_service,
+            skill_proposal_service,
+            skill_governance_service,
+            skill_runtime_service,
             entity_service,
             fact_check_service,
         })

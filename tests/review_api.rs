@@ -100,6 +100,10 @@ impl TestApp {
         let request = Request::builder()
             .method("GET")
             .uri(path)
+            .header(
+                "authorization",
+                format!("Bearer {}", common::TEST_ADMIN_TOKEN),
+            )
             .body(Body::empty())
             .expect("request should build");
         let response = self
@@ -122,6 +126,10 @@ impl TestApp {
         let request = Request::builder()
             .method("POST")
             .uri(path)
+            .header(
+                "authorization",
+                format!("Bearer {}", common::TEST_ADMIN_TOKEN),
+            )
             .header("content-type", "application/json")
             .body(Body::from(body.to_string()))
             .expect("request should build");

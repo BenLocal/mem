@@ -120,6 +120,7 @@ impl From<CompletedToolRound> for SkillCandidateRoundEvidence {
 pub enum SkillCandidateTriggerReason {
     ToolVolume,
     RepeatedTask,
+    NegativeFeedback,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -189,7 +190,7 @@ impl SkillCandidateJobStatus {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct SkillCandidateJob {
     pub job_id: String,
     pub tenant: String,
@@ -215,10 +216,43 @@ pub struct SkillCandidateJob {
     pub completed_at: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+impl std::fmt::Debug for SkillCandidateJob {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("SkillCandidateJob")
+            .field("job_id", &self.job_id)
+            .field("tenant", &self.tenant)
+            .field("caller_agent", &self.caller_agent)
+            .field("candidate_revision", &self.candidate_revision)
+            .field("trigger_version", &self.trigger_version)
+            .field("trigger_reasons", &self.trigger_reasons)
+            .field("status", &self.status)
+            .field("attempt_count", &self.attempt_count)
+            .field(
+                "lease_token",
+                &self.lease_token.as_ref().map(|_| "[REDACTED]"),
+            )
+            .field("lease_expires_at", &self.lease_expires_at)
+            .finish_non_exhaustive()
+    }
+}
+
+#[derive(Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ClaimedSkillCandidateJob {
     pub job: SkillCandidateJob,
     pub lease_token: String,
+}
+
+impl std::fmt::Debug for ClaimedSkillCandidateJob {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ClaimedSkillCandidateJob")
+            .field("job_id", &self.job.job_id)
+            .field("tenant", &self.job.tenant)
+            .field("status", &self.job.status)
+            .field("lease_token", &"[REDACTED]")
+            .finish()
+    }
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]

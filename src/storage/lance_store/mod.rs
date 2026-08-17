@@ -55,6 +55,7 @@ mod maintenance;
 pub(crate) mod mine_cursors;
 mod sessions;
 mod skill_candidate_jobs;
+mod skills;
 mod transcripts;
 
 pub use maintenance::{index_build_in_flight, IndexMaintenanceStats, VacuumStats};
@@ -197,6 +198,7 @@ impl LanceStore {
         ensure_evolution_candidates_table(&conn).await?;
         completed_tool_rounds::ensure_completed_tool_round_tables(&conn).await?;
         skill_candidate_jobs::ensure_skill_candidate_jobs_table(&conn).await?;
+        skills::ensure_skill_runtime_tables(&conn).await?;
         // capability_capsule_embeddings is lazy-created on first upsert (dim is
         // provider-dependent and unknown here without provider).
         //

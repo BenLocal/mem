@@ -134,7 +134,18 @@ pub fn run(args: InitArgs) -> i32 {
 /// so unit tests can drive it directly without a CLI dance.
 pub fn scaffold(mem_dir: &Path, mode: InitMode) -> std::io::Result<()> {
     fs::create_dir_all(mem_dir)?;
-    fs::write(mem_dir.join("config.env"), config_env(mode))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(mem_dir, fs::Permissions::from_mode(0o700))?;
+    }
+    let config_path = mem_dir.join("config.env");
+    fs::write(&config_path, config_env(mode))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&config_path, fs::Permissions::from_mode(0o600))?;
+    }
     fs::write(mem_dir.join("taxonomy.toml"), taxonomy_toml(mode))?;
     fs::write(mem_dir.join("README.md"), readme_md(mode))?;
     Ok(())
@@ -293,6 +304,22 @@ mod tests {
         assert!(mem_dir.join("config.env").is_file());
         assert!(mem_dir.join("taxonomy.toml").is_file());
         assert!(mem_dir.join("README.md").is_file());
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                std::fs::metadata(&mem_dir).unwrap().permissions().mode() & 0o777,
+                0o700
+            );
+            assert_eq!(
+                std::fs::metadata(mem_dir.join("config.env"))
+                    .unwrap()
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                0o600
+            );
+        }
     }
 
     #[test]

@@ -5769,6 +5769,7 @@ dependencies = [
  "http-body-util",
  "jieba-rs 0.9.0",
  "lancedb",
+ "libc",
  "once_cell",
  "pgvector",
  "rand 0.10.0",
