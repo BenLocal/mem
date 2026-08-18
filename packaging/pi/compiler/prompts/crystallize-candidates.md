@@ -20,8 +20,10 @@ For `propose`:
    settlement.
 4. Choose exactly one terminal action per claim:
    - Reusable workflow: `skill_compiler_publish_proposal` with a concise title,
-     1-32 reusable one-line steps, and a declared parameter for each
-     `{{placeholder}}`. Use a catalog capsule ID only for a genuine update.
+     1-32 reusable one-line steps, and parameters matching the steps'
+     `{{placeholders}}` exactly in both directions — declare every placeholder
+     you write, and never declare a parameter you did not write into a step.
+     Use a catalog capsule ID only for a genuine update.
    - Exact duplicate: `skill_compiler_complete_decision` with
      `decision_kind=duplicate` and a capsule ID from this claim.
    - Other durable artifact: the same tool with

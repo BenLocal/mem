@@ -47,9 +47,12 @@ write, or call another tool.
    before settling if significant reasoning elapsed.
 4. Choose exactly one terminal action per claim:
    - Reusable Skill: call `mcp__mem__skill_compiler_publish_proposal` with the
-     `claim_handle`, a concise title, 1–32 reusable one-line steps, declared
-     parameters for every `{{placeholder}}`, and optionally a target capsule ID
-     copied from this claim's catalog for a genuine update.
+     `claim_handle`, a concise title, 1–32 reusable one-line steps, and
+     parameters that match the steps' `{{placeholders}}` exactly in both
+     directions — declare every placeholder you write, and never declare a
+     parameter you did not write into a step (send no parameters when no step
+     needs one). Optionally add a target capsule ID copied from this claim's
+     catalog for a genuine update.
    - Exact duplicate: call `mcp__mem__skill_compiler_complete_decision` with
      `decision_kind=duplicate` and a selected capsule ID from this claim.
    - Memory/wiki/code_graph/ephemeral: call the same tool with
