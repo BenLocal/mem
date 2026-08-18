@@ -29,6 +29,14 @@ mod ch {
         StorageError, TranscriptStore,
     };
 
+    /// `claim_next_n_embedding_jobs` is a queue-wide claim: it takes the
+    /// oldest eligible rows across every tenant and provider, so two tests
+    /// claiming in parallel steal each other's jobs and whichever asserts on
+    /// its own job id loses the race. Hold this for the whole enqueue→claim
+    /// span of any test that claims from the capsule embedding queue. (The
+    /// transcript queue is a separate table with a single claiming test.)
+    static EMBEDDING_CLAIM_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
     fn fixture(id: &str, status: CapabilityCapsuleStatus) -> CapabilityCapsuleRecord {
         CapabilityCapsuleRecord {
             capability_capsule_id: id.into(),
@@ -90,18 +98,19 @@ mod ch {
     #[tokio::test]
     async fn accept_pending_transitions_status() {
         let Some(store) = store().await else { return };
+        // Unique id: the accept is a one-way transition, so re-running this
+        // against the same database would find the row already Active and
+        // fail with a review conflict.
+        let id = format!("ch_pending_{}", uuid::Uuid::now_v7());
         store
-            .insert_capability_capsule(fixture(
-                "ch_pending",
-                CapabilityCapsuleStatus::PendingConfirmation,
-            ))
+            .insert_capability_capsule(fixture(&id, CapabilityCapsuleStatus::PendingConfirmation))
             .await
             .unwrap();
-        let updated = store.accept_pending("t", "ch_pending").await.unwrap();
+        let updated = store.accept_pending("t", &id).await.unwrap();
         assert_eq!(updated.status, CapabilityCapsuleStatus::Active);
         // The latest version read should also reflect Active (ReplacingMergeTree).
         let got = store
-            .get_capability_capsule_for_tenant("t", "ch_pending")
+            .get_capability_capsule_for_tenant("t", &id)
             .await
             .unwrap()
             .unwrap();
@@ -353,14 +362,20 @@ mod ch {
     #[tokio::test]
     async fn feedback_summary_counts_kinds() {
         let Some(store) = store().await else { return };
-        let row = fixture("ch_fb", CapabilityCapsuleStatus::Active);
+        // A fresh id per run, like the feedback-race test below: this suite
+        // shares one ClickHouse database and `feedback_summary` counts every
+        // event ever recorded for the capsule, so a fixed id makes the second
+        // run against the same server fail on a count of 2. CI gets a new
+        // service each time and would never have caught it.
+        let id = format!("ch_fb_{}", uuid::Uuid::now_v7());
+        let row = fixture(&id, CapabilityCapsuleStatus::Active);
         store.insert_capability_capsule(row.clone()).await.unwrap();
         store
             .apply_feedback(
                 &row,
                 FeedbackEvent {
-                    feedback_id: "fb1".into(),
-                    capability_capsule_id: "ch_fb".into(),
+                    feedback_id: format!("fb1_{id}"),
+                    capability_capsule_id: id.clone(),
                     feedback_kind: "useful".into(),
                     created_at: current_timestamp(),
                     note: None,
@@ -368,7 +383,7 @@ mod ch {
             )
             .await
             .unwrap();
-        let summary = store.feedback_summary("ch_fb").await.unwrap();
+        let summary = store.feedback_summary(&id).await.unwrap();
         assert_eq!(summary.useful, 1);
         assert_eq!(summary.total, 1);
     }
@@ -460,6 +475,11 @@ mod ch {
     #[tokio::test]
     async fn hard_delete_is_tenant_safe_and_cascades_synchronously() {
         let Some(be) = ch_backend().await else { return };
+        // This test owns an embedding job across a delete cascade. A parallel
+        // queue-wide claim would flip that row to `processing` — a newer
+        // ReplacingMergeTree version than the delete — and the job would
+        // reappear after the cascade.
+        let _serial = EMBEDDING_CLAIM_LOCK.lock().await;
         let id = format!("c_del_ch_{}", uuid::Uuid::now_v7());
         let node = format!("capability_capsule:{id}");
         let job_id = format!("job_{id}");
@@ -1129,15 +1149,27 @@ mod ch {
     #[tokio::test]
     async fn embedding_job_enqueue_claim_complete() {
         let Some(be) = ch_backend().await else { return };
+        let _serial = EMBEDDING_CLAIM_LOCK.lock().await;
         let now = current_timestamp();
+        // Fresh ids per run: the enqueue probe declines a (tenant, capsule,
+        // hash, provider) tuple this suite already wrote, so fixed ids make a
+        // second run against the same ClickHouse fail on `ok`.
+        let suffix = uuid::Uuid::now_v7();
+        let job_id = format!("ch_job_{suffix}");
+        // Claim is global — `ORDER BY available_at ASC LIMIT n` over every
+        // pending row plus every stale `processing` one. Rows this suite left
+        // behind on earlier runs are older, so a job queued at `now` slides
+        // out of the batch once enough have piled up. Queue this one at the
+        // front of the queue instead of racing the leftovers.
+        let earliest = "00000000000000000001";
         let ok = be
             .try_enqueue_embedding_job(EmbeddingJobInsert {
-                job_id: "j1".into(),
+                job_id: job_id.clone(),
                 tenant: "t".into(),
-                capability_capsule_id: "cap1".into(),
-                target_content_hash: "h1".into(),
+                capability_capsule_id: format!("ch_job_cap_{suffix}"),
+                target_content_hash: format!("ch_job_hash_{suffix}"),
                 provider: "fake".into(),
-                available_at: now.clone(),
+                available_at: earliest.into(),
                 created_at: now.clone(),
                 updated_at: now.clone(),
             })
@@ -1145,10 +1177,10 @@ mod ch {
             .unwrap();
         assert!(ok);
         let claimed = be.claim_next_n_embedding_jobs(&now, 3, 10).await.unwrap();
-        assert!(claimed.iter().any(|c| c.job_id == "j1"));
-        be.complete_embedding_job("j1", &now).await.unwrap();
+        assert!(claimed.iter().any(|c| c.job_id == job_id));
+        be.complete_embedding_job(&job_id, &now).await.unwrap();
         assert_eq!(
-            be.get_embedding_job_status("j1").await.unwrap(),
+            be.get_embedding_job_status(&job_id).await.unwrap(),
             Some("completed".to_string())
         );
     }
@@ -1270,6 +1302,7 @@ mod ch {
     async fn embedding_job_lease_reclaims_orphaned_processing() {
         use mem::storage::{timestamp_add_ms, EMBEDDING_JOB_LEASE_MS};
         let Some(be) = ch_backend().await else { return };
+        let _serial = EMBEDDING_CLAIM_LOCK.lock().await;
         // Unique ids: this suite shares one database across tests/runs.
         let job_id = format!("lease_{}", uuid::Uuid::now_v7());
         let cap = format!("cap_{job_id}");
