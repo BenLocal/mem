@@ -43,6 +43,13 @@ are organized by feature wave (merge commit ranges on `master`).
   `mem serve`; callers cannot roll the deadline forward. Local role-token files
   are accepted only from an owned `0700` directory and owned `0600` non-symlink
   file on Unix; other platforms require explicit environment credentials.
+- The compiler plugin now ships a native `.codex-plugin/plugin.json` plus a
+  `$crystallize-candidates` Skill, with compiler plugin version `0.1.1` to
+  invalidate the broken `0.1.0` cache. Codex no longer depends on unsupported
+  Claude `commands/` migration to discover the workflow. Because Codex Skill
+  metadata is not a host tool sandbox, the Skill fails closed before fetching
+  evidence unless the surrounding Agent exposes exactly the six compiler MCP
+  tools.
 
 ### Added — H4 skill crystallization: `mem crystallize` (2026-08-01)
 

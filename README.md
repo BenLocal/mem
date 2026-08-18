@@ -575,11 +575,14 @@ with mode `0700`; unsafe paths fail closed. Non-Unix builds require explicit
 environment variables because an equivalent ACL check is not implemented.
 
 Start a dedicated compiler-only Agent context (after installing the compiler
-plugin/package) with one of these patterns, then run
-`/crystallize-candidates propose 1`:
+plugin/package) with one of these patterns:
 
 ```bash
-# Codex: use a separate CODEX_HOME that contains only this compiler plugin.
+# Codex: install into a separate CODEX_HOME that contains only this plugin.
+CODEX_HOME="$HOME/.codex-mem-skill-compiler" \
+  codex plugin marketplace add /path/to/mem
+CODEX_HOME="$HOME/.codex-mem-skill-compiler" \
+  codex plugin add mem-skill-compiler@mem
 CODEX_HOME="$HOME/.codex-mem-skill-compiler" codex
 
 # Claude: load only this plugin and disable every built-in tool.
@@ -593,12 +596,36 @@ pi --no-extensions --no-builtin-tools \
   --prompt-template /path/to/mem/packaging/pi/compiler/prompts
 ```
 
-For Codex and Claude, enter compilation only through
-`/crystallize-candidates`; its `allowed-tools` frontmatter is an exact six-tool
-hard gate and excludes shell, filesystem, web, transcript, review and accept
-tools. Do not send sanitized evidence to a free-form compiler prompt. Pi
-enforces the same set again with `setActiveTools` on every session and aborts
-startup if any extra tool remains active.
+Then enter compilation through the harness-native packaged workflow:
+
+- Codex: `$crystallize-candidates propose 1` (only inside an externally
+  enforced exact-six-tool Agent sandbox)
+- Claude: `/mem-skill-compiler:crystallize-candidates propose 1`
+- Pi: `/crystallize-candidates propose 1`
+
+Codex loads the native `skills/crystallize-candidates/SKILL.md`, but Codex does
+not treat Skill frontmatter as a harness-level tool allowlist. A separate
+`CODEX_HOME` isolates plugin MCPs; it does not remove built-in shell,
+filesystem, web, app/connector tools or same-user credential access. The Skill
+therefore fails closed before preview/claim when any non-compiler tool is
+available. Do not use the Codex Agent-as-Compiler path without an OS/container
+or harness boundary that exposes exactly the six compiler MCP tools and no
+reviewer/admin credentials.
+
+Claude loads the namespaced command and enforces its exact six-tool
+`allowed-tools` gate. Pi enforces the same set with `setActiveTools` on every
+session and aborts startup if any extra tool remains active. Do not send
+sanitized evidence to a free-form compiler prompt. Without an enforceable
+Codex boundary, use the Claude/Pi path above or the gateway-backed
+`mem crystallize --candidate-jobs --propose` CLI.
+
+After updating this local plugin, reinstall it and start a new Agent session;
+Codex runs the cached installed copy rather than rereading the marketplace
+source in an existing session. Interactive Codex may still request approval
+before an MCP call. A displayed skill and a started-then-cancelled tool call
+prove discovery only, not successful compiler execution; keep write-tool
+approval enabled unless the surrounding exact-six-tool sandbox is itself the
+enforced security boundary.
 
 **New request fields** (all optional; transcripts pipeline only):
 - `anchor_session_id` — boost blocks from this session above topical matches; useful when continuing a known conversation.

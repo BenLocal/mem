@@ -1,7 +1,7 @@
 {
   "name": "mem-skill-compiler",
   "description": "Dedicated least-privilege Agent-as-Compiler profile for mem Skill candidates. Exposes compiler tools only; no review or activation authority.",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "author": { "name": "BenLocal" },
   "homepage": "https://github.com/BenLocal/mem",
   "repository": "https://github.com/BenLocal/mem",

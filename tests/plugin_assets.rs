@@ -103,6 +103,95 @@ fn crystallize_candidates_command_allows_only_compiler_tools() {
 }
 
 #[test]
+fn codex_compiler_plugin_packages_an_invocable_skill() {
+    let manifest: serde_json::Value = serde_json::from_str(
+        &fs::read_to_string(repo_path(
+            ".claude-plugin/compiler/.codex-plugin/plugin.json",
+        ))
+        .expect("read Codex compiler plugin manifest"),
+    )
+    .expect("Codex compiler plugin manifest JSON");
+    assert_eq!(manifest["name"], "mem-skill-compiler");
+    assert_eq!(manifest["version"], "0.1.1");
+    assert_eq!(manifest["skills"], "./skills/");
+    assert_eq!(manifest["mcpServers"], "./.mcp.json");
+
+    let relative = ".claude-plugin/compiler/skills/crystallize-candidates/SKILL.md";
+    let content = fs::read_to_string(repo_path(relative))
+        .expect("read Codex crystallize-candidates skill")
+        .replace("\r\n", "\n");
+    let frontmatter = content
+        .strip_prefix("---\n")
+        .and_then(|body| body.split_once("\n---\n"))
+        .map(|(yaml, _)| yaml)
+        .expect("Codex crystallize-candidates skill has closed YAML frontmatter");
+    let yaml: serde_yaml_ng::Value =
+        serde_yaml_ng::from_str(frontmatter).expect("Codex skill frontmatter is valid YAML");
+    let mapping = yaml.as_mapping().expect("Codex skill frontmatter mapping");
+    assert_eq!(
+        mapping
+            .get(serde_yaml_ng::Value::String("name".to_owned()))
+            .and_then(serde_yaml_ng::Value::as_str),
+        Some("crystallize-candidates")
+    );
+    let description = mapping
+        .get(serde_yaml_ng::Value::String("description".to_owned()))
+        .and_then(serde_yaml_ng::Value::as_str)
+        .expect("Codex skill description is present");
+    assert!(description.contains("Preview"));
+    assert!(description.contains("preview/propose"));
+    assert_eq!(
+        mapping.len(),
+        2,
+        "Codex Skill frontmatter is discovery metadata, not a tool sandbox"
+    );
+    let normalized_content = content.split_whitespace().collect::<Vec<_>>().join(" ");
+    assert!(content.contains("PendingConfirmation"));
+    assert!(normalized_content.contains("stop before calling any compiler tool"));
+    assert!(normalized_content.contains("not a harness-level security boundary"));
+    assert!(normalized_content.contains(
+        "A separate `CODEX_HOME` or compiler plugin/profile alone does not remove built-in tools"
+    ));
+    assert!(!content.contains("skill_proposal_accept"));
+    assert!(!content.contains("capability_capsule_review_accept"));
+
+    let readme = fs::read_to_string(repo_path("README.md")).expect("read README");
+    let normalized_readme = readme.split_whitespace().collect::<Vec<_>>().join(" ");
+    assert!(normalized_readme
+        .contains("Codex does not treat Skill frontmatter as a harness-level tool allowlist"));
+    assert!(readme.contains("codex plugin marketplace add /path/to/mem\n"));
+    assert!(!readme.contains("codex plugin marketplace add /path/to/mem/.claude-plugin"));
+    assert!(!readme.contains("Each has an exact six-tool `allowed-tools` hard gate"));
+
+    let claude_manifest: serde_json::Value = serde_json::from_str(
+        &fs::read_to_string(repo_path(
+            ".claude-plugin/compiler/.claude-plugin/plugin.json",
+        ))
+        .expect("read Claude compiler plugin manifest"),
+    )
+    .expect("Claude compiler plugin manifest JSON");
+    for field in ["name", "version", "mcpServers"] {
+        assert_eq!(
+            manifest[field], claude_manifest[field],
+            "Codex and Claude compiler manifests must agree on {field}"
+        );
+    }
+
+    let marketplace: serde_json::Value = serde_json::from_str(
+        &fs::read_to_string(repo_path(".claude-plugin/marketplace.json"))
+            .expect("read plugin marketplace"),
+    )
+    .expect("plugin marketplace JSON");
+    let compiler_entry = marketplace["plugins"]
+        .as_array()
+        .expect("marketplace plugins")
+        .iter()
+        .find(|plugin| plugin["name"] == "mem-skill-compiler")
+        .expect("compiler marketplace entry");
+    assert_eq!(compiler_entry["version"], manifest["version"]);
+}
+
+#[test]
 fn compiler_plugin_launches_only_the_dedicated_mcp_profile() {
     let marketplace: serde_json::Value = serde_json::from_str(
         &fs::read_to_string(repo_path(".claude-plugin/marketplace.json"))

@@ -1,0 +1,35 @@
+{
+  "name": "mem-skill-compiler",
+  "version": "0.1.1",
+  "description": "Dedicated least-privilege Agent-as-Compiler profile for review-gated mem Skill candidates.",
+  "author": {
+    "name": "BenLocal"
+  },
+  "homepage": "https://github.com/BenLocal/mem",
+  "repository": "https://github.com/BenLocal/mem",
+  "license": "MIT",
+  "keywords": [
+    "memory",
+    "skill",
+    "compiler",
+    "mcp",
+    "agent"
+  ],
+  "skills": "./skills/",
+  "mcpServers": "./.mcp.json",
+  "interface": {
+    "displayName": "mem Skill Compiler",
+    "shortDescription": "Compile review-gated mem Skill candidates",
+    "longDescription": "Use an isolated compiler-only MCP profile to preview or propose durable mem Skills without review or activation authority.",
+    "developerName": "BenLocal",
+    "category": "Developer Tools",
+    "capabilities": [
+      "Interactive",
+      "Write"
+    ],
+    "websiteURL": "https://github.com/BenLocal/mem",
+    "defaultPrompt": [
+      "Use $crystallize-candidates to preview one durable Skill candidate."
+    ]
+  }
+}
