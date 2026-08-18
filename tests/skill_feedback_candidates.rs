@@ -387,3 +387,85 @@ async fn negative_feedback_thresholds_create_stable_sanitized_revision_candidate
         "feedback for a non-head bundle must not create a publishable update job",
     );
 }
+
+/// A Skill anchor answers only to Skill governance: `/admin/skills/feedback`
+/// counts negatives toward a review-gated revision, while ordinary capsule
+/// feedback must not touch it at all. `incorrect` is the sharp case — it
+/// archives its target, and an archived anchor fails `require_active_anchor`,
+/// so admitting it would let one call retire a published Skill from outside
+/// governance. `validate_feedback_target` enforces this for every kind in all
+/// three backends and had no test; the rule is scoped to anchors, so an
+/// ordinary capsule still archives on `incorrect`.
+#[tokio::test]
+async fn ordinary_capsule_feedback_cannot_touch_a_bundle_managed_skill_anchor() {
+    let app = test_app().await;
+    install_bundle(&app, V1, None, None).await;
+    let anchor_id = format!("capsule-{V1}");
+
+    for kind in ["incorrect", "applies_here", "useful", "outdated"] {
+        let (status, body) = post_json(
+            &app,
+            "/capability_capsules/feedback",
+            json!({
+                "tenant": TENANT,
+                "capability_capsule_id": anchor_id,
+                "feedback_kind": kind,
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CONFLICT, "{kind}: {body:?}");
+        assert_eq!(
+            app.store
+                .get_capability_capsule_for_tenant(TENANT, &anchor_id)
+                .await
+                .expect("anchor read")
+                .expect("anchor row")
+                .status,
+            CapabilityCapsuleStatus::Active,
+            "{kind} must leave the anchor active"
+        );
+    }
+
+    let ordinary_id = "capsule-ordinary-feedback";
+    app.store
+        .insert_capability_capsule(CapabilityCapsuleRecord {
+            capability_capsule_id: ordinary_id.to_owned(),
+            tenant: TENANT.to_owned(),
+            capability_capsule_type: CapabilityCapsuleType::Experience,
+            status: CapabilityCapsuleStatus::Active,
+            scope: Scope::Workspace,
+            visibility: Visibility::Shared,
+            version: 1,
+            summary: "Ordinary capsule".to_owned(),
+            content: "An ordinary experience capsule".to_owned(),
+            confidence: 0.9,
+            content_hash: format!("{:0>64}", "ordinary"),
+            source_agent: "test".to_owned(),
+            created_at: NOW.to_owned(),
+            updated_at: NOW.to_owned(),
+            ..Default::default()
+        })
+        .await
+        .expect("insert ordinary capsule");
+    let (status, _) = post_json(
+        &app,
+        "/capability_capsules/feedback",
+        json!({
+            "tenant": TENANT,
+            "capability_capsule_id": ordinary_id,
+            "feedback_kind": "incorrect",
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        app.store
+            .get_capability_capsule_for_tenant(TENANT, ordinary_id)
+            .await
+            .expect("ordinary read")
+            .expect("ordinary row")
+            .status,
+        CapabilityCapsuleStatus::Archived,
+        "the rule is scoped to Skill anchors"
+    );
+}
