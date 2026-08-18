@@ -180,6 +180,12 @@ impl ClaimHandle {
                 "title": args.draft.title,
                 "steps": args.draft.steps,
                 "parameters": args.draft.parameters,
+                // Left blank on purpose. The publish route revalidates every
+                // draft through `validate_proposal_draft` and recomputes this
+                // from the normalized title/steps/parameters, so a value sent
+                // from here would be discarded — and trusting one would let a
+                // compiler name any hash it likes and dodge exact-duplicate
+                // detection.
                 "canonical_signature": "",
             },
             "model_id": format!("agent-mcp/{compiler_id}/model-unknown"),

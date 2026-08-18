@@ -304,10 +304,13 @@ mod tests {
 
     use serde_json::{json, Value};
 
-    use super::{compile_parameterized_model_output, prepare_model_input};
+    use super::{
+        canonical_proposal_signature, compile_parameterized_model_output, prepare_model_input,
+        validate_proposal_draft, MAX_STEPS,
+    };
     use crate::domain::skill_proposal::{
         ArtifactClass, CompileDecision, CompileError, DedupCandidateStatus, ParameterKind,
-        RawSkillEvidence, WorkflowDedupCandidate,
+        RawSkillEvidence, SkillParameter, SkillProposalDraft, WorkflowDedupCandidate,
     };
     use crate::pipeline::environment_parameterizer::EnvironmentContext;
 
@@ -659,5 +662,125 @@ mod tests {
             compile_parameterized_model_output(&raw("new evidence"), &unknown, &[candidate]),
             Err(CompileError::InvalidModelOutput)
         ));
+    }
+
+    fn draft(
+        steps: Vec<&str>,
+        parameters: Vec<SkillParameter>,
+        signature: &str,
+    ) -> SkillProposalDraft {
+        SkillProposalDraft {
+            title: "Inspect a service safely".to_owned(),
+            steps: steps.into_iter().map(ToOwned::to_owned).collect(),
+            parameters,
+            canonical_signature: signature.to_owned(),
+        }
+    }
+
+    fn parameter(name: &str, kind: ParameterKind, default: Option<&str>) -> SkillParameter {
+        SkillParameter {
+            name: name.to_owned(),
+            kind,
+            required: true,
+            default: default.map(ToOwned::to_owned),
+        }
+    }
+
+    /// `validate_proposal_draft` is the ONLY compile-time gate on the
+    /// Agent-as-Compiler path: the MCP tool forwards an agent-authored draft
+    /// straight to the publish route without running
+    /// `compile_parameterized_model_output`. Everything the gateway lane gets
+    /// from parsing model output has to be re-derived here, or an agent could
+    /// publish a draft the CLI could never produce.
+    #[test]
+    fn server_side_draft_validation_enforces_the_compile_contract() {
+        let ok = draft(
+            vec!["Restart {{service_name}} and wait for health"],
+            vec![parameter("service_name", ParameterKind::String, None)],
+            "",
+        );
+        assert!(matches!(
+            validate_proposal_draft(ok),
+            Ok(SkillProposalDraft { .. })
+        ));
+
+        let unused = draft(
+            vec!["Restart the service and wait for health"],
+            vec![parameter("service_name", ParameterKind::String, None)],
+            "",
+        );
+        assert!(matches!(
+            validate_proposal_draft(unused),
+            Err(CompileError::UnusedParameter { .. })
+        ));
+
+        let undeclared = draft(vec!["Restart {{service_name}} and wait"], Vec::new(), "");
+        assert!(matches!(
+            validate_proposal_draft(undeclared),
+            Err(CompileError::UndeclaredPlaceholder { .. })
+        ));
+
+        let secret_default = draft(
+            vec!["Read {{api_token}} from the environment"],
+            vec![parameter(
+                "api_token",
+                ParameterKind::SecretRef,
+                Some("t0ps3cret"),
+            )],
+            "",
+        );
+        assert!(matches!(
+            validate_proposal_draft(secret_default),
+            Err(CompileError::SecretDefaultNotAllowed { .. })
+        ));
+
+        let leaked = draft(
+            vec!["Run the deploy with password=hunter2hunter2"],
+            Vec::new(),
+            "",
+        );
+        assert!(matches!(
+            validate_proposal_draft(leaked),
+            Err(CompileError::UnsafeGeneratedOutput { .. })
+        ));
+
+        let multiline = draft(vec!["First line\nsecond line"], Vec::new(), "");
+        assert!(matches!(
+            validate_proposal_draft(multiline),
+            Err(CompileError::InvalidModelOutput)
+        ));
+
+        let too_many = draft(vec!["Step"; MAX_STEPS + 1], Vec::new(), "");
+        assert!(matches!(
+            validate_proposal_draft(too_many),
+            Err(CompileError::InvalidModelOutput)
+        ));
+    }
+
+    /// The MCP compiler tool sends `canonical_signature: ""` because only the
+    /// server can compute the authoritative value, and exact-duplicate
+    /// detection at publish compares against it. A caller-supplied signature
+    /// must never survive: trusting one would let a compiler dodge dedup (or
+    /// forge a collision) by naming any hash it likes.
+    #[test]
+    fn caller_supplied_canonical_signature_is_recomputed() {
+        let steps = vec!["Restart {{service_name}} and wait for health".to_owned()];
+        let parameters = vec![parameter("service_name", ParameterKind::String, None)];
+        let title = "Inspect a service safely".to_owned();
+        let expected = canonical_proposal_signature(&title, &steps, &parameters);
+
+        for supplied in ["", "0".repeat(64).as_str(), "not-a-signature"] {
+            let validated = validate_proposal_draft(SkillProposalDraft {
+                title: title.clone(),
+                steps: steps.clone(),
+                parameters: parameters.clone(),
+                canonical_signature: supplied.to_owned(),
+            })
+            .expect("valid draft");
+            assert_eq!(
+                validated.canonical_signature, expected,
+                "signature must be recomputed, not echoed ({supplied})"
+            );
+        }
     }
 }

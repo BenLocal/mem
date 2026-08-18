@@ -315,11 +315,20 @@ fn expected_proposal_id(request: &PublishSkillProposalRequest) -> String {
     let job = processing_job();
     let mut key_hash = Sha256::new();
     key_hash.update(b"mem.skill_proposal.publish.v1");
+    // Mirrors `proposal_idempotency_key`: the three update-target fields are
+    // part of the key too, hashed as empty strings for a fresh proposal.
+    let empty = String::new();
     for value in [
         &job.tenant,
         &job.job_id,
         &job.input_fingerprint,
         &request.draft.canonical_signature,
+        request.target_skill_id.as_ref().unwrap_or(&empty),
+        request.target_bundle_version_id.as_ref().unwrap_or(&empty),
+        request
+            .target_capability_capsule_id
+            .as_ref()
+            .unwrap_or(&empty),
     ] {
         key_hash.update((value.len() as u64).to_le_bytes());
         key_hash.update(value.as_bytes());
@@ -371,6 +380,109 @@ async fn lease_lost_after_hydrate_writes_no_capsule_or_proposal() {
         .await
         .expect("proposal read")
         .is_none());
+}
+
+/// The Agent-as-Compiler path never runs the gateway lane's model-output
+/// parser: the MCP tool forwards an agent-authored draft (with an empty
+/// `canonical_signature`, since only the server can compute the real one)
+/// straight to this route. So the route itself has to be the gate. Each of
+/// these drafts is one the CLI compiler could not have produced, and none of
+/// them may leave a capsule or a proposal behind.
+#[tokio::test]
+async fn publish_rejects_drafts_the_compiler_contract_forbids() {
+    let cases: Vec<(
+        &str,
+        Vec<String>,
+        Vec<mem::domain::skill_proposal::SkillParameter>,
+    )> = vec![
+        (
+            "declared parameter never written into a step",
+            vec!["Restart the service and wait for health".to_owned()],
+            vec![mem::domain::skill_proposal::SkillParameter {
+                name: "service_name".to_owned(),
+                kind: mem::domain::skill_proposal::ParameterKind::String,
+                required: true,
+                default: None,
+            }],
+        ),
+        (
+            "placeholder with no declared parameter",
+            vec!["Restart {{service_name}} and wait".to_owned()],
+            Vec::new(),
+        ),
+        (
+            "credential assignment inside a step",
+            vec!["Deploy with password=hunter2hunter2".to_owned()],
+            Vec::new(),
+        ),
+        (
+            "step that is not a single line",
+            vec!["Stop the service\nthen start it".to_owned()],
+            Vec::new(),
+        ),
+    ];
+
+    for (label, steps, parameters) in cases {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = Arc::new(
+            Store::open(dir.path().join("publish-contract.lance"))
+                .await
+                .unwrap(),
+        );
+        let mut request = publish_request();
+        request.draft.steps = steps;
+        request.draft.parameters = parameters;
+        // What the MCP compiler tool actually puts on the wire.
+        request.draft.canonical_signature = String::new();
+
+        let result = service(store.clone(), CandidateState::new(), false)
+            .publish(request)
+            .await;
+
+        assert!(result.is_err(), "{label} must be rejected");
+        assert!(
+            store
+                .list_capability_capsules_for_tenant(TENANT)
+                .await
+                .expect("capsule list")
+                .is_empty(),
+            "{label} must not write a capsule"
+        );
+    }
+}
+
+/// A valid draft still publishes when its signature is blank or wrong: the
+/// server recomputes it, and exact-duplicate detection compares against that
+/// recomputed value rather than anything the compiler claimed.
+#[tokio::test]
+async fn publish_recomputes_a_caller_supplied_canonical_signature() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let store = Arc::new(
+        Store::open(dir.path().join("publish-signature.lance"))
+            .await
+            .unwrap(),
+    );
+    let honest = publish_request();
+    let proposal_id = expected_proposal_id(&honest);
+    let mut request = publish_request();
+    request.draft.canonical_signature = "not-a-signature".to_owned();
+
+    service(store.clone(), CandidateState::new(), false)
+        .publish(request)
+        .await
+        .expect("valid draft publishes");
+
+    let stored = store
+        .get_skill_proposal(TENANT, &proposal_id)
+        .await
+        .expect("proposal read")
+        .expect("proposal is stored under the recomputed signature");
+    let stored_draft: mem::domain::skill_proposal::SkillProposalDraft =
+        serde_json::from_str(&stored.draft_json).expect("stored draft json");
+    assert_eq!(
+        stored_draft.canonical_signature, honest.draft.canonical_signature,
+        "the stored signature is the recomputed one"
+    );
 }
 
 #[tokio::test]
