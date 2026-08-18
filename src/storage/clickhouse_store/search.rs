@@ -395,7 +395,16 @@ impl CapsuleSearchStore for ClickHouseBackend {
         // tenants, then keep this tenant's, collapsing chunks by min distance.
         // (The migration creates the table eagerly, so there's no lance-style
         // lazy-missing-table case here.)
+        //
+        // The dimension guard is load-bearing, not cosmetic: `cosineDistance`
+        // raises SIZES_OF_ARRAYS_DONT_MATCH (code 190) for a single row whose
+        // vector length differs from the query, and because the tenant filter
+        // is a POSTfilter that row does not even have to belong to this
+        // tenant. Without the guard one leftover row from another embedding
+        // model turns every semantic search into a hard error; with it, rows
+        // of a foreign dimension are simply not candidates.
         let qvec = query_embedding.to_vec();
+        let dim = qvec.len() as u64;
         let rows = self
             .client
             .query(
@@ -403,12 +412,14 @@ impl CapsuleSearchStore for ClickHouseBackend {
                    SELECT capability_capsule_id, tenant, \
                           cosineDistance(embedding, ?) AS d \
                    FROM capability_capsule_embeddings FINAL \
+                   WHERE length(embedding) = ? \
                    ORDER BY d ASC LIMIT ? \
                  ) WHERE tenant = ? \
                  GROUP BY capability_capsule_id \
                  ORDER BY min(d) ASC, capability_capsule_id ASC",
             )
             .bind(qvec)
+            .bind(dim)
             .bind(k)
             .bind(tenant)
             .fetch_all::<IdRow>()

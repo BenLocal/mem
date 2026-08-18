@@ -1472,6 +1472,19 @@ emb_test!(vacuum_old_versions_is_noop, store, {
 
 // ──────────────────────────── EmbeddingJobStore ─────────────────────────
 
+/// `try_enqueue_embedding_job` / `ensure_embedding_job` take a `FOR UPDATE`
+/// row lock on the parent capsule and reject a missing parent (bf5256e); the
+/// durable capsule row is the serialization key for concurrent replays. Real
+/// ingest always writes the capsule before queueing its embedding job, so a
+/// test that exercises those two entry points has to seed the parent too.
+/// The bulk `enqueue_embedding_jobs` path takes no such lock and needs none.
+async fn seed_job_parent(store: &PostgresCapsuleStore, capsule: &str) {
+    store
+        .insert_capability_capsule(fixture(capsule, CapabilityCapsuleStatus::Active))
+        .await
+        .unwrap();
+}
+
 fn job_insert(job_id: &str, capsule: &str, hash: &str) -> EmbeddingJobInsert {
     EmbeddingJobInsert {
         job_id: job_id.into(),
@@ -1486,6 +1499,7 @@ fn job_insert(job_id: &str, capsule: &str, hash: &str) -> EmbeddingJobInsert {
 }
 
 emb_test!(embedding_job_enqueue_idempotent, store, {
+    seed_job_parent(&store, "cap1").await;
     // First try_enqueue inserts → true; a second over the same
     // (tenant, capsule, hash, provider) live tuple → false.
     assert!(store
@@ -1627,6 +1641,7 @@ emb_test!(embedding_job_reschedule_then_reclaim, store, {
 });
 
 emb_test!(embedding_job_stale_delete_and_latest_status, store, {
+    seed_job_parent(&store, "capS").await;
     store
         .enqueue_embedding_jobs(&[job_insert("s1", "capS", "hs")])
         .await
@@ -2522,6 +2537,7 @@ emb_test!(embedding_job_lease_reclaims_orphaned_processing, store, {
     // stays owned; past it, the orphan is reclaimed.
     use mem::storage::{timestamp_add_ms, EMBEDDING_JOB_LEASE_MS};
     let claimed_at = "00000001778000000000";
+    seed_job_parent(&store, "capO").await;
     assert!(store
         .try_enqueue_embedding_job(job_insert("orph", "capO", "ho"))
         .await

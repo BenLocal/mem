@@ -446,7 +446,11 @@ impl EmbeddingJobStore for PostgresCapsuleStore {
         // Mirrors the Lance count→insert window; PG gives us a real
         // transaction so the probe + insert are atomic.
         let mut tx = self.pool().begin().await.map_err(sqlx_err)?;
-        let parent: Option<i64> = sqlx::query_scalar(
+        // Existence + row lock only: never decode the projected column.
+        // `SELECT 1` is INT4 in Postgres, so a scalar decode into i64 errors
+        // for exactly the rows that DO exist — which turned a present parent
+        // into a storage error and stopped the job from ever being enqueued.
+        let parent = sqlx::query(
             "SELECT 1 FROM capability_capsules \
              WHERE tenant = $1 AND capability_capsule_id = $2 FOR UPDATE",
         )
@@ -503,7 +507,11 @@ impl EmbeddingJobStore for PostgresCapsuleStore {
         // count-then-insert transaction under READ COMMITTED still permits two
         // concurrent replays to observe zero; the durable parent row is the
         // natural lock key and exists before this phase starts.
-        let parent: Option<i64> = sqlx::query_scalar(
+        // Existence + row lock only: never decode the projected column.
+        // `SELECT 1` is INT4 in Postgres, so a scalar decode into i64 errors
+        // for exactly the rows that DO exist — which turned a present parent
+        // into a storage error and stopped the job from ever being enqueued.
+        let parent = sqlx::query(
             "SELECT 1 FROM capability_capsules \
              WHERE tenant = $1 AND capability_capsule_id = $2 FOR UPDATE",
         )

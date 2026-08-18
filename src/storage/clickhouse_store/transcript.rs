@@ -552,16 +552,23 @@ impl TranscriptStore for ClickHouseBackend {
         // cosineDistance over conversation_message_embeddings, chunk-collapse
         // (GROUP BY message_block_id min(dist)), then hydrate. Mirrors the
         // capsule ANN in search.rs. similarity = 1 - dist (normalized vectors).
+        // `length(embedding) = ?` mirrors the capsule ANN guard in search.rs:
+        // one row written by a different embedding model would otherwise fail
+        // the whole query with SIZES_OF_ARRAYS_DONT_MATCH instead of dropping
+        // out of the candidate set.
         let q = query_embedding.to_vec();
+        let dim = q.len() as u64;
         let hits = self
             .client
             .query(
                 "SELECT message_block_id, min(cosineDistance(embedding, ?)) AS dist \
                  FROM conversation_message_embeddings FINAL \
-                 WHERE tenant = ? GROUP BY message_block_id ORDER BY dist ASC LIMIT ?",
+                 WHERE tenant = ? AND length(embedding) = ? \
+                 GROUP BY message_block_id ORDER BY dist ASC LIMIT ?",
             )
             .bind(q)
             .bind(tenant)
+            .bind(dim)
             .bind(oversample as u64)
             .fetch_all::<(String, f32)>()
             .await

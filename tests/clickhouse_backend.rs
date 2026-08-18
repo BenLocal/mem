@@ -296,6 +296,60 @@ mod ch {
         );
     }
 
+    /// A row written by a different embedding model must not break search.
+    /// `cosineDistance` raises SIZES_OF_ARRAYS_DONT_MATCH on the first
+    /// length mismatch it evaluates, and the capsule ANN filters tenants
+    /// *after* the distance, so a foreign-tenant row of another dimension
+    /// used to make every semantic query a hard error.
+    #[tokio::test]
+    async fn ann_survives_rows_of_another_dimension() {
+        use mem::storage::CapsuleSearchStore;
+        let Some(be) = ch_backend().await else { return };
+
+        // Own tenants throughout: this suite shares one ClickHouse database,
+        // and `ann_candidate_ids` reads the embeddings table alone, so no
+        // capsule rows are needed and tenant "t" stays untouched.
+        let matching = vec![1.0_f32, 0.0, 0.0];
+        be.upsert_capability_capsule_embedding_chunks(
+            "ch_dim_ok",
+            "t-dim",
+            "m",
+            3,
+            std::slice::from_ref(&matching),
+            "h_dim_ok",
+            &current_timestamp(),
+            &current_timestamp(),
+        )
+        .await
+        .unwrap();
+
+        // Same tenant, different model width, plus one under another tenant
+        // (the ANN postfilter cannot exclude it before the distance runs).
+        let wider = vec![0.5_f32, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5];
+        for (id, tenant) in [("ch_dim_wide", "t-dim"), ("ch_dim_other", "t-dim-other")] {
+            be.upsert_capability_capsule_embedding_chunks(
+                id,
+                tenant,
+                "wide-model",
+                8,
+                std::slice::from_ref(&wider),
+                "h_dim_wide",
+                &current_timestamp(),
+                &current_timestamp(),
+            )
+            .await
+            .unwrap();
+        }
+
+        let ann = be.ann_candidate_ids("t-dim", &matching, 10).await.unwrap();
+        assert_eq!(
+            ann.iter().map(|(id, _)| id.as_str()).collect::<Vec<_>>(),
+            vec!["ch_dim_ok"],
+            "same-dimension row survives; foreign-dimension rows drop out \
+             instead of failing the query"
+        );
+    }
+
     #[tokio::test]
     async fn feedback_summary_counts_kinds() {
         let Some(store) = store().await else { return };
