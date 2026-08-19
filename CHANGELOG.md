@@ -3,10 +3,61 @@
 All notable changes to `mem` are documented here. Format inspired by
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
-This project does not yet publish versioned releases; entries below
-are organized by feature wave (merge commit ranges on `master`).
+Versioned sections start at 0.3.0. Everything below `## [0.3.0]` predates
+that convention and is organized by feature wave (merge commit ranges on
+`master`); those waves shipped across the v0.1.7 … v0.2.5 tags.
 
 ## [Unreleased]
+
+## [0.3.0] - 2026-08-19
+
+### Changed — storage engine and MCP library majors
+
+- LanceDB 0.31 → 0.37.1, which moves the storage engine from lance 8 to
+  lance 10 and DataFusion 53 to 54. `arrow-array` deliberately stays on 58:
+  lancedb 0.37 still requires `^58.0.0`, and bumping it alone would leave two
+  `RecordBatch` types that fail to typecheck at the `Table::add` boundary.
+  Only one lancedb API changed — `add_columns` became a builder. Verified by
+  running the new binary against a copy of a real lance-8 dataset: reads
+  return existing capsules and writes succeed. **Reading lance-10 data with an
+  older binary is unverified — back the dataset up before upgrading.**
+- rmcp 1.8 → 3.1.3. The macro DSL (`#[tool_router]`, `#[tool_handler]`,
+  `#[tool]`), `Parameters`, `CallToolResult`, `ServerHandler` and `ServiceExt`
+  are unchanged; only `Content` became the `ContentBlock` enum.
+- sqlx 0.8 → 0.9. Dynamic SQL now requires an explicit injection audit; that
+  audit is recorded at both `postgres_store` import sites. Also fs4 1.1
+  (`try_lock_exclusive` → `try_lock`), tiktoken-rs 0.12, tikv-jemalloc* 0.7.
+
+### Changed — release binary halved (318.1 → 157.9 MiB)
+
+- `[profile.release]` now sets `strip = "symbols"`, `lto = true` and
+  `codegen-units = 1`. mem's own code is ~1% of the binary, so the levers are
+  link-time. `panic = "unwind"` is kept on purpose: a worker panic must not
+  kill a process whose read paths are required to soft-degrade. Cold builds
+  go from ~11 to ~28 minutes, and the LTO link is single-threaded.
+- Dropped two duplicated dependency stacks: `jieba-rs` was a direct dep no
+  code referenced (the tokenizer comes from `tantivy-jieba`) that put a second
+  jieba and dictionary in the binary, and the stale `candle-*` 0.9 pin carried
+  a full second core/nn/transformers stack after embed_anything moved to 0.11.
+  `cargo tree -d` is the check for both.
+
+### Fixed — backend parity
+
+- Postgres: the embedding-job parent probe decoded `SELECT 1` (INT4) as i64,
+  so it errored for exactly the rows that exist — `try_enqueue_embedding_job`
+  and `ensure_embedding_job` were unusable on this backend, silently dropping
+  every embedding job.
+- ClickHouse: `cosineDistance` runs before the tenant postfilter, so a single
+  row of another embedding dimension — in any tenant — failed the whole ANN
+  query instead of dropping out of the candidate set. Both the capsule and
+  transcript ANN paths now guard on `length(embedding)`.
+
+### Fixed — Skill compiler prompt
+
+- The compiler system prompt never stated that declared parameters and
+  `{{placeholders}}` must match in both directions, and its schema example
+  demonstrated the exact shape `validate_parameters` rejects. Compilations
+  that produced a valid Skill were dead-lettered after three attempts.
 
 ### Added — review-gated Skill self-evolution loop (2026-08-17)
 
