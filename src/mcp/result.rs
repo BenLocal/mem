@@ -1,19 +1,20 @@
-use rmcp::model::{CallToolResult, Content};
+// rmcp 3 renamed `Content` to the `ContentBlock` enum; `text()` is unchanged.
+use rmcp::model::{CallToolResult, ContentBlock};
 use serde_json::Value;
 
 pub fn ok_json(value: &Value) -> CallToolResult {
     let text = serde_json::to_string_pretty(value).unwrap_or_else(|_| value.to_string());
-    CallToolResult::success(vec![Content::text(text)])
+    CallToolResult::success(vec![ContentBlock::text(text)])
 }
 
 pub fn ok_json_with_content(notice: &str, content: &str, value: &Value) -> CallToolResult {
     let text = serde_json::to_string_pretty(value).unwrap_or_else(|_| value.to_string());
     let message = format!("{}: {}\n\n{}", notice, content, text);
-    CallToolResult::success(vec![Content::text(message)])
+    CallToolResult::success(vec![ContentBlock::text(message)])
 }
 
 pub fn err_text(message: impl Into<String>) -> CallToolResult {
-    let mut result = CallToolResult::success(vec![Content::text(message.into())]);
+    let mut result = CallToolResult::success(vec![ContentBlock::text(message.into())]);
     result.is_error = Some(true);
     result
 }
