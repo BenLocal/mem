@@ -9,3 +9,13 @@ updates:
     directory: /
     schedule:
       interval: weekly
+    ignore:
+      # `arrow-array` is not independently upgradable: its major must match the
+      # one lancedb pulls transitively (lancedb 0.37 requires `^58.0.0`). A
+      # solo bump leaves two `arrow-array` majors in the graph and therefore
+      # two incompatible `RecordBatch` types, which fail to typecheck at the
+      # `Table::add` boundary — PR #41 (58 -> 59) took all three workflows red
+      # exactly this way. The pin moves when lancedb moves; see the comment on
+      # the dependency in Cargo.toml.
+      - dependency-name: arrow-array
+        update-types: ["version-update:semver-major"]
