@@ -60,40 +60,31 @@ pub(super) async fn ensure_skill_candidate_jobs_table(
     let current = table.schema().await.map_err(lancedb_err)?;
     if current.field_with_name("candidate_revision").is_err() {
         table
-            .add_columns(
-                NewColumnTransform::AllNulls(Arc::new(Schema::new(vec![Field::new(
-                    "candidate_revision",
-                    DataType::UInt32,
-                    true,
-                )]))),
-                None,
-            )
+            .add_columns()
+            .transform(NewColumnTransform::AllNulls(Arc::new(Schema::new(vec![
+                Field::new("candidate_revision", DataType::UInt32, true),
+            ]))))
+            .execute()
             .await
             .map_err(lancedb_err)?;
     }
     if current.field_with_name("lease_hard_deadline").is_err() {
         table
-            .add_columns(
-                NewColumnTransform::AllNulls(Arc::new(Schema::new(vec![Field::new(
-                    "lease_hard_deadline",
-                    DataType::Utf8,
-                    true,
-                )]))),
-                None,
-            )
+            .add_columns()
+            .transform(NewColumnTransform::AllNulls(Arc::new(Schema::new(vec![
+                Field::new("lease_hard_deadline", DataType::Utf8, true),
+            ]))))
+            .execute()
             .await
             .map_err(lancedb_err)?;
     }
     if current.field_with_name("lease_renewal_count").is_err() {
         table
-            .add_columns(
-                NewColumnTransform::AllNulls(Arc::new(Schema::new(vec![Field::new(
-                    "lease_renewal_count",
-                    DataType::UInt32,
-                    true,
-                )]))),
-                None,
-            )
+            .add_columns()
+            .transform(NewColumnTransform::AllNulls(Arc::new(Schema::new(vec![
+                Field::new("lease_renewal_count", DataType::UInt32, true),
+            ]))))
+            .execute()
             .await
             .map_err(lancedb_err)?;
     }

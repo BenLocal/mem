@@ -478,10 +478,9 @@ async fn migrate_graph_edges_add_columns(conn: &Connection) -> Result<(), Storag
         return Ok(());
     }
     table
-        .add_columns(
-            NewColumnTransform::AllNulls(Arc::new(Schema::new(missing))),
-            None,
-        )
+        .add_columns()
+        .transform(NewColumnTransform::AllNulls(Arc::new(Schema::new(missing))))
+        .execute()
         .await
         .map_err(lancedb_err)?;
     Ok(())
@@ -512,14 +511,11 @@ async fn migrate_capability_capsules_add_columns(conn: &Connection) -> Result<()
             continue;
         }
         table
-            .add_columns(
-                NewColumnTransform::AllNulls(Arc::new(Schema::new(vec![Field::new(
-                    col,
-                    DataType::Utf8,
-                    true,
-                )]))),
-                None,
-            )
+            .add_columns()
+            .transform(NewColumnTransform::AllNulls(Arc::new(Schema::new(vec![
+                Field::new(col, DataType::Utf8, true),
+            ]))))
+            .execute()
             .await
             .map_err(lancedb_err)?;
     }

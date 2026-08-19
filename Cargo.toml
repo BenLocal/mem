@@ -13,7 +13,7 @@ doctest = false
 # runtime via `MEM_BACKEND` + `MEM_POSTGRES_URL`/`MEM_CLICKHOUSE_URL`, so
 # there is no longer a cargo feature gating them. sqlx + libpq machinery is
 # always in the dep graph.
-sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "tls-rustls", "postgres", "uuid"] }
+sqlx = { version = "0.9", default-features = false, features = ["runtime-tokio", "tls-rustls", "postgres", "uuid"] }
 # ClickHouse backend — default dependency (see the sqlx note above). Pulls the
 # clickhouse-rs HTTP client + lz4 into every build.
 clickhouse = { version = "0.15", default-features = false, features = ["lz4"] }
@@ -23,13 +23,14 @@ pgvector = { version = "0.4", default-features = false, features = ["sqlx"] }
 # LanceDB is the storage backend (on-disk Lance datasets) for both
 # reads and writes — reads go through the lancedb Rust API natively
 # (read_consistency_interval(0)). Single, unconditional storage path.
-lancedb = "0.31"
-# arrow-array must track lancedb's transitive arrow major — lancedb 0.30
-# is on 58.x, so our direct dep has to be 58 too. Otherwise cargo keeps
-# a second `arrow-array` 57.x in the graph for our dep, leaving two
-# distinct `RecordBatch` types that fail to typecheck across the
-# `Table::add` boundary. (lancedb re-exports `arrow_schema` via
-# `lancedb::arrow::arrow_schema`, so we don't need a direct dep on that.)
+lancedb = "0.37"
+# arrow-array must track lancedb's transitive arrow major. lancedb 0.37 is
+# still on arrow 58 (checked against its manifest: `arrow-array = "^58.0.0"`),
+# so this stays 58 even though arrow 59 exists — bumping it alone would leave
+# two distinct `RecordBatch` types in the graph that fail to typecheck across
+# the `Table::add` boundary. Re-check this pin on every lancedb upgrade.
+# (lancedb re-exports `arrow_schema` via `lancedb::arrow::arrow_schema`, so we
+# don't need a direct dep on that.)
 arrow-array = "58"
 # `futures::TryStreamExt::try_collect` collapses LanceDB's
 # `SendableRecordBatchStream` into a `Vec<RecordBatch>`. lancedb
@@ -44,15 +45,25 @@ rmcp = { version = "1.5", features = ["server", "macros", "transport-io"] }
 schemars = "1.2"
 embed_anything = { git = "https://github.com/StarlightSearch/EmbedAnything" }
 # I2 offline reranker (docs/offline-reranker-lane.md): direct handles on the
-# candle stack embed_anything already pins transitively — same lock entries,
-# zero new resolution. Used by src/rerank/candle_qwen3.rs only.
-candle-core = "0.9.2"
-candle-nn = "0.9.2"
-candle-transformers = "0.9.2"
+# candle stack embed_anything already pins transitively. Keep this version in
+# lockstep with embed_anything's — it moved to 0.11 and the stale 0.9 pin here
+# put a SECOND full candle stack (core + nn + transformers) in the graph,
+# compiled and linked twice for nothing. `cargo tree -d` is the check.
+# Used by src/rerank/candle_qwen3.rs only.
+candle-core = "0.11"
+candle-nn = "0.11"
+candle-transformers = "0.11"
 tokenizers = "0.21.4"
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.149"
 regex = "1"
+# Deliberately NOT on 0.11. The graph carries both majors either way (0.10 for
+# sqlx-core and lopdf, 0.11 for datafusion-functions/hf-hub/sqlx-postgres), so
+# moving this pin saves no binary size — it only trades which copy mem shares.
+# What it does cost is real: digest 0.11 drops `LowerHex` on the output type,
+# so all 15 `format!("{:x}", …)` sites — the ones that compute `content_hash`,
+# skill ids and bundle digests — would need hand-written hex encoding, on the
+# primitive that every stored capsule's dedup and idempotency key depends on.
 sha2 = "0.10"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 thiserror = "2"
@@ -63,7 +74,7 @@ tempfile = "3"
 once_cell = "1"
 chrono = { version = "0.4", default-features = false, features = ["std"] }
 unicode-normalization = "0.1"
-tiktoken-rs = "0.11"
+tiktoken-rs = "0.12"
 uuid = { version = "1", features = ["v5", "v7"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
@@ -74,27 +85,28 @@ rust-embed = { version = "8", features = ["debug-embed"] }
 # that documented contract into a runtime guard. fs4 was already in the
 # tree transitively (via lancedb's storage layer); promoting it to a
 # direct dep so we can import it.
-fs4 = "0.8"
+fs4 = "1.1"
 # jemalloc as the Rust global allocator. glibc's per-thread arenas ratcheted
 # RSS on this 96-core box (5→8GB over days) and never returned freed memory to
 # the OS even capped with MALLOC_ARENA_MAX. jemalloc's decay + background_thread
 # return idle memory aggressively (local A/B: ~94% returned on idle). Governs
 # all Rust-side allocs (embedding inference via Candle/gemm is the dominant
 # churn).
-tikv-jemallocator = "0.6"
-tikv-jemalloc-ctl = "0.6"
+tikv-jemallocator = "0.7"
+tikv-jemalloc-ctl = "0.7"
 # Tantivy is the route-B full-text (BM25) subsystem (replaced the old
 # DuckDB `lance_fts` path; see `docs/remove-duckdb-keep-lance.md` §4).
 # A pure-Rust embedded inverted index — no external service, fits the
 # local-first single-binary constraint. `tantivy-jieba` is the Chinese
-# segmenter (jieba precision mode) registered on the `content` field;
-# `jieba-rs` is pulled directly so the query layer can term-split CJK
-# runs into BM25 terms (Tantivy's QueryParser treats an unspaced CJK
-# run as a phrase query → 0 hits, so the query MUST be tokenized into a
-# should/OR boolean of terms — see `FtsIndex::bm25`).
+# segmenter (jieba precision mode) registered on the `content` field, and
+# `FtsIndex::bm25` runs the query text back through that same tokenizer
+# (Tantivy's QueryParser treats an unspaced CJK run as a phrase query → 0
+# hits, so the query MUST be split into a should/OR boolean of terms).
+# There is deliberately no direct `jieba-rs` dep: nothing in this crate
+# names it, and pinning it separately from tantivy-jieba's own version put
+# a second jieba — with its own embedded dictionary — in the binary.
 tantivy = "0.26"
 tantivy-jieba = "0.20"
-jieba-rs = "0.9"
 libc = "0.2"
 
 [dev-dependencies]
@@ -111,3 +123,23 @@ serde_yaml_ng = "0.10"
 # precedence over this profile key, so CI's leaner setting is unchanged.
 [profile.test]
 debug = "line-tables-only"
+
+# Release size. mem's own code is ~1% of the binary; the rest is the
+# lancedb → lance → datafusion → arrow chain plus the monomorphization it
+# generates, so the levers that matter are link-time ones, not our source.
+#
+# `strip = "symbols"` drops the ~90 MiB symbol table (there is no debuginfo
+# in this profile to begin with). The cost is real: a production panic
+# backtrace becomes addresses instead of function names, so read
+# `mem.err.log` together with the commit that built the binary.
+#
+# `lto = true` (fat) + `codegen-units = 1` let the linker discard code
+# across crate boundaries — the only way to reach the generic instantiations
+# that arrow/datafusion emit and nothing calls. Both trade build time for
+# size; deploys here are manual and infrequent, so that is the right side of
+# the trade. Keep `panic = "unwind"`: a worker panic must not take down a
+# process whose read paths are required to soft-degrade.
+[profile.release]
+strip = "symbols"
+lto = true
+codegen-units = 1

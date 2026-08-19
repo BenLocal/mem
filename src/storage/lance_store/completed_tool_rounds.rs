@@ -56,14 +56,11 @@ async fn migrate_completed_tool_round_build_columns(
     let schema = table.schema().await.map_err(lancedb_err)?;
     if schema.field_with_name("task_signal_version").is_err() {
         table
-            .add_columns(
-                NewColumnTransform::AllNulls(Arc::new(Schema::new(vec![Field::new(
-                    "task_signal_version",
-                    DataType::UInt32,
-                    true,
-                )]))),
-                None,
-            )
+            .add_columns()
+            .transform(NewColumnTransform::AllNulls(Arc::new(Schema::new(vec![
+                Field::new("task_signal_version", DataType::UInt32, true),
+            ]))))
+            .execute()
             .await
             .map_err(lancedb_err)?;
     }
@@ -94,10 +91,9 @@ async fn migrate_completed_tool_round_task_signal_columns(
         return Ok(());
     }
     table
-        .add_columns(
-            NewColumnTransform::AllNulls(Arc::new(Schema::new(missing))),
-            None,
-        )
+        .add_columns()
+        .transform(NewColumnTransform::AllNulls(Arc::new(Schema::new(missing))))
+        .execute()
         .await
         .map_err(lancedb_err)?;
     Ok(())

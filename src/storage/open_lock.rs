@@ -129,7 +129,11 @@ pub fn acquire(db_path: &Path) -> Result<Option<OpenLock>, StorageError> {
         .open(&sentinel)
         .map_err(StorageError::Io)?;
 
-    match FileExt::try_lock_exclusive(&file) {
+    // fs4 1.x renamed `try_lock_exclusive` to `try_lock` and returns
+    // `Result<(), TryLockError>` instead of an io::Result. Both arms below
+    // keep their previous meaning: `Ok` means we own the lock, and any error
+    // (WouldBlock or an io failure) means we must refuse to open.
+    match FileExt::try_lock(&file) {
         Ok(()) => {
             // We own the lock — overwrite the sentinel body with our
             // PID + timestamp for diagnostics. Truncate first so a

@@ -22,7 +22,17 @@
 //! Schema is in `migrations/postgres/0001_capsule_store.sql` —
 //! apply it before instantiating the backend.
 
+// sqlx 0.9 refuses a non-'static SQL string unless it is wrapped, to force an
+// injection audit. That audit was done for every site in this file: the only
+// values interpolated into SQL *text* are the `SELECT_COLUMNS`,
+// `CONVERSATION_COLS` and `GRAPH_EDGE_COLS` constants, numeric config
+// (embedding dim, pool bound), fixed fragments chosen by a bool/Option branch
+// (`type_filter`, `validity`, `bound_clause`), and the `mem_test_<uuid>`
+// schema used only by `connect_fresh`. Every caller-supplied value —
+// tenants, ids, LIKE patterns, timestamps — is passed as a bind parameter.
+// Re-run that audit before adding an interpolation.
 use async_trait::async_trait;
+use sqlx::AssertSqlSafe;
 use sqlx::{PgPool, Row};
 
 use super::super::CapsuleStore;
@@ -215,7 +225,7 @@ impl PostgresCapsuleStore {
             .connect_with(base.clone())
             .await
             .map_err(sqlx_err)?;
-        sqlx::raw_sql(&format!("CREATE SCHEMA \"{schema}\";"))
+        sqlx::raw_sql(AssertSqlSafe(format!("CREATE SCHEMA \"{schema}\";")))
             .execute(&bootstrap)
             .await
             .map_err(sqlx_err)?;
@@ -509,7 +519,7 @@ impl CapsuleStore for PostgresCapsuleStore {
             "SELECT {SELECT_COLUMNS} FROM capability_capsules \
              WHERE capability_capsule_id = $1 LIMIT 1"
         );
-        let row = sqlx::query(&sql)
+        let row = sqlx::query(AssertSqlSafe(sql.as_str()))
             .bind(&capability_capsule_id)
             .fetch_optional(&self.pool)
             .await
@@ -526,7 +536,7 @@ impl CapsuleStore for PostgresCapsuleStore {
             "SELECT {SELECT_COLUMNS} FROM capability_capsules \
              WHERE tenant = $1 AND capability_capsule_id = $2 LIMIT 1"
         );
-        let row = sqlx::query(&sql)
+        let row = sqlx::query(AssertSqlSafe(sql.as_str()))
             .bind(tenant)
             .bind(capability_capsule_id)
             .fetch_optional(&self.pool)
@@ -546,7 +556,7 @@ impl CapsuleStore for PostgresCapsuleStore {
                  AND status = 'pending_confirmation' \
              LIMIT 1"
         );
-        let row = sqlx::query(&sql)
+        let row = sqlx::query(AssertSqlSafe(sql.as_str()))
             .bind(tenant)
             .bind(capability_capsule_id)
             .fetch_optional(&self.pool)
@@ -571,7 +581,7 @@ impl CapsuleStore for PostgresCapsuleStore {
                     OR content_hash = $3) \
              LIMIT 1"
         );
-        let row = sqlx::query(&sql)
+        let row = sqlx::query(AssertSqlSafe(sql.as_str()))
             .bind(tenant)
             .bind(idempotency_key.as_deref())
             .bind(content_hash)
@@ -594,7 +604,7 @@ impl CapsuleStore for PostgresCapsuleStore {
                AND capability_capsule_type != 'diary' \
              ORDER BY updated_at DESC, version DESC, capability_capsule_id ASC"
         );
-        let rows = sqlx::query(&sql)
+        let rows = sqlx::query(AssertSqlSafe(sql.as_str()))
             .bind(tenant)
             .fetch_all(&self.pool)
             .await
@@ -611,7 +621,7 @@ impl CapsuleStore for PostgresCapsuleStore {
              WHERE tenant = $1 AND status = 'pending_confirmation' \
              ORDER BY created_at DESC"
         );
-        let rows = sqlx::query(&sql)
+        let rows = sqlx::query(AssertSqlSafe(sql.as_str()))
             .bind(tenant)
             .fetch_all(&self.pool)
             .await
@@ -636,7 +646,7 @@ impl CapsuleStore for PostgresCapsuleStore {
              WHERE tenant = $1 AND capability_capsule_id = ANY($2)"
         );
         let owned_ids: Vec<String> = ids.iter().map(|s| s.to_string()).collect();
-        let rows = sqlx::query(&sql)
+        let rows = sqlx::query(AssertSqlSafe(sql.as_str()))
             .bind(tenant)
             .bind(&owned_ids)
             .fetch_all(&self.pool)
@@ -1106,7 +1116,7 @@ impl CapsuleStore for PostgresCapsuleStore {
              ORDER BY updated_at DESC, capability_capsule_id ASC \
              LIMIT $10"
         );
-        let rows = sqlx::query(&sql)
+        let rows = sqlx::query(AssertSqlSafe(sql.as_str()))
             .bind(tenant)
             .bind(project)
             .bind(repo)

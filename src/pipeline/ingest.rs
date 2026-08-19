@@ -1074,4 +1074,43 @@ mod tests {
         // And of course a project is still allowed (treated as metadata).
         assert!(validate_scope_boundary(&Scope::Global, Some("any")).is_ok());
     }
+
+    /// `content_hash` is the dedup and idempotency key for every stored
+    /// capsule, so its bytes are a compatibility contract with data already on
+    /// disk — not an implementation detail. The expected digest here was
+    /// computed independently of this crate (sha256 of the canonical JSON
+    /// string), so the assertion still means something after a `sha2` major
+    /// bump: it catches both a hashing change and any reordering or reshaping
+    /// of `canonical_request_json`. The pre-existing coverage only checked
+    /// that the function agrees with itself, which no such change would break.
+    #[test]
+    fn content_hash_matches_an_externally_computed_digest() {
+        let request = IngestCapabilityCapsuleRequest {
+            tenant: "local".to_owned(),
+            capability_capsule_type: CapabilityCapsuleType::Experience,
+            content: "hash pin".to_owned(),
+            evidence: vec!["e1".to_owned()],
+            code_refs: vec!["src/lib.rs".to_owned()],
+            scope: Scope::Repo,
+            visibility: Visibility::Private,
+            project: Some("mem".to_owned()),
+            repo: Some("mem".to_owned()),
+            module: Some("ingest".to_owned()),
+            task_type: Some("test".to_owned()),
+            tags: vec!["t".to_owned()],
+            source_agent: "test".to_owned(),
+            ..Default::default()
+        };
+
+        assert_eq!(
+            canonical_request_json(&request).to_string(),
+            r#"{"capability_capsule_type":"experience","code_refs":["src/lib.rs"],"content":"hash pin","evidence":["e1"],"module":"ingest","project":"mem","repo":"mem","scope":"repo","source_agent":"test","tags":["t"],"task_type":"test","tenant":"local","visibility":"private"}"#,
+            "canonical JSON is part of the on-disk contract"
+        );
+        assert_eq!(
+            compute_content_hash(&request),
+            "666cea5f1bfb4e0cde51931983d3d45ada8c1a0f644401784f840d95991b9e0b",
+            "content_hash must stay byte-identical to what is already stored"
+        );
+    }
 }

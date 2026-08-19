@@ -17,7 +17,17 @@
 //! gates it). The backend is selected at runtime via `MEM_BACKEND=postgres`
 //! + `MEM_POSTGRES_URL`.
 
+// sqlx 0.9 refuses a non-'static SQL string unless it is wrapped, to force an
+// injection audit. That audit was done for every site in this file: the only
+// values interpolated into SQL *text* are the `SELECT_COLUMNS`,
+// `CONVERSATION_COLS` and `GRAPH_EDGE_COLS` constants, numeric config
+// (embedding dim, pool bound), fixed fragments chosen by a bool/Option branch
+// (`type_filter`, `validity`, `bound_clause`), and the `mem_test_<uuid>`
+// schema used only by `connect_fresh`. Every caller-supplied value —
+// tenants, ids, LIKE patterns, timestamps — is passed as a bind parameter.
+// Re-run that audit before adding an interpolation.
 use async_trait::async_trait;
+use sqlx::AssertSqlSafe;
 
 use super::super::{
     CapsuleSearchStore, EmbeddingJobStore, EmbeddingVectorStore, EntityRegistry,
@@ -121,7 +131,7 @@ impl CapsuleSearchStore for PostgresCapsuleStore {
                {bound_clause}\
              ORDER BY c.updated_at DESC, c.version DESC, c.capability_capsule_id ASC"
         );
-        let rows = sqlx::query(&sql)
+        let rows = sqlx::query(AssertSqlSafe(sql.as_str()))
             .bind(tenant)
             .fetch_all(self.pool())
             .await
@@ -145,7 +155,7 @@ impl CapsuleSearchStore for PostgresCapsuleStore {
              ORDER BY updated_at DESC, version DESC, capability_capsule_id ASC \
              LIMIT $2"
         );
-        let rows = sqlx::query(&sql)
+        let rows = sqlx::query(AssertSqlSafe(sql.as_str()))
             .bind(tenant)
             .bind(lim)
             .fetch_all(self.pool())
@@ -305,7 +315,7 @@ impl CapsuleSearchStore for PostgresCapsuleStore {
                      AND s.tenant = m.tenant AND s.status = 'active' \
                )"
         );
-        let hydrated_rows = sqlx::query(&hydrate_sql)
+        let hydrated_rows = sqlx::query(AssertSqlSafe(hydrate_sql.as_str()))
             .bind(tenant)
             .bind(&owned_ids)
             .fetch_all(self.pool())
@@ -1068,7 +1078,7 @@ async fn ensure_capability_capsule_embeddings_table(
             created_at TEXT, \
             PRIMARY KEY (capability_capsule_id, chunk_index))"
     );
-    sqlx::raw_sql(&ddl)
+    sqlx::raw_sql(AssertSqlSafe(ddl.as_str()))
         .execute(store.pool())
         .await
         .map_err(sqlx_err)?;
@@ -1101,7 +1111,7 @@ async fn ensure_conversation_message_embeddings_table(
             created_at TEXT, \
             PRIMARY KEY (message_block_id, chunk_index))"
     );
-    sqlx::raw_sql(&ddl)
+    sqlx::raw_sql(AssertSqlSafe(ddl.as_str()))
         .execute(store.pool())
         .await
         .map_err(sqlx_err)?;
@@ -1446,7 +1456,7 @@ impl GraphStore for PostgresCapsuleStore {
              WHERE (from_node_id = $1 OR to_node_id = $1) AND valid_to IS NULL \
              ORDER BY relation, from_node_id, to_node_id"
         );
-        let rows = sqlx::query(&sql)
+        let rows = sqlx::query(AssertSqlSafe(sql.as_str()))
             .bind(node_id)
             .fetch_all(self.pool())
             .await
@@ -1495,7 +1505,9 @@ impl GraphStore for PostgresCapsuleStore {
                AND {validity} \
              ORDER BY relation, from_node_id, to_node_id, valid_from"
         );
-        let mut q = sqlx::query(&sql).bind(node_id).bind(hops);
+        let mut q = sqlx::query(AssertSqlSafe(sql.as_str()))
+            .bind(node_id)
+            .bind(hops);
         if let Some(ts) = as_of {
             q = q.bind(ts);
         }
@@ -1527,7 +1539,7 @@ impl GraphStore for PostgresCapsuleStore {
              WHERE from_node_id = $1 OR to_node_id = $1 \
              ORDER BY valid_from ASC, relation ASC, from_node_id ASC, to_node_id ASC"
         );
-        let rows = sqlx::query(&sql)
+        let rows = sqlx::query(AssertSqlSafe(sql.as_str()))
             .bind(node_id)
             .fetch_all(self.pool())
             .await
@@ -1549,7 +1561,7 @@ impl GraphStore for PostgresCapsuleStore {
                     OR (valid_from <= $2 AND (valid_to IS NULL OR valid_to > $2))) \
              ORDER BY valid_from ASC, from_node_id ASC, to_node_id ASC"
         );
-        let rows = sqlx::query(&sql)
+        let rows = sqlx::query(AssertSqlSafe(sql.as_str()))
             .bind(predicate)
             .bind(as_of)
             .fetch_all(self.pool())
@@ -1566,7 +1578,7 @@ impl GraphStore for PostgresCapsuleStore {
              ORDER BY relation, from_node_id, to_node_id \
              LIMIT $1"
         );
-        let rows = sqlx::query(&sql)
+        let rows = sqlx::query(AssertSqlSafe(sql.as_str()))
             .bind(lim)
             .fetch_all(self.pool())
             .await
@@ -1594,7 +1606,7 @@ impl GraphStore for PostgresCapsuleStore {
              ORDER BY relation, from_node_id, to_node_id \
              LIMIT $3"
         );
-        let rows = sqlx::query(&sql)
+        let rows = sqlx::query(AssertSqlSafe(sql.as_str()))
             .bind(&like_a)
             .bind(&like_b)
             .bind(lim)
@@ -1631,7 +1643,7 @@ impl GraphStore for PostgresCapsuleStore {
                AND e.relation LIKE 'user_tunnel:%' AND e.valid_to IS NULL \
              ORDER BY relation, from_node_id, to_node_id"
         );
-        let rows = sqlx::query(&sql)
+        let rows = sqlx::query(AssertSqlSafe(sql.as_str()))
             .bind(node_id)
             .bind(hops)
             .fetch_all(self.pool())
@@ -1940,7 +1952,7 @@ impl PostgresCapsuleStore {
              ) \
              SELECT DISTINCT node FROM walk"
         );
-        let mut q = sqlx::query_scalar::<_, String>(&sql)
+        let mut q = sqlx::query_scalar::<_, String>(AssertSqlSafe(sql.as_str()))
             .bind(node_id)
             .bind(hops);
         if let Some(ts) = as_of {
@@ -2190,7 +2202,7 @@ impl TranscriptStore for PostgresCapsuleStore {
              WHERE tenant = $1 AND session_id = $2 \
              ORDER BY created_at ASC, line_number ASC, block_index ASC"
         );
-        let rows = sqlx::query(&sql)
+        let rows = sqlx::query(AssertSqlSafe(sql.as_str()))
             .bind(tenant)
             .bind(session_id)
             .fetch_all(self.pool())
@@ -2234,7 +2246,7 @@ impl TranscriptStore for PostgresCapsuleStore {
              ORDER BY created_at ASC, line_number ASC, block_index ASC \
              LIMIT $10"
         );
-        let mut out = sqlx::query(&sql)
+        let mut out = sqlx::query(AssertSqlSafe(sql.as_str()))
             .bind(tenant)
             .bind(session_id)
             .bind(since)
@@ -2323,7 +2335,7 @@ impl TranscriptStore for PostgresCapsuleStore {
              ORDER BY created_at ASC, line_number ASC, block_index ASC, message_block_id ASC \
              LIMIT $10"
         );
-        let mut out = sqlx::query(&sql)
+        let mut out = sqlx::query(AssertSqlSafe(sql.as_str()))
             .bind(tenant)
             .bind(time_from)
             .bind(time_to)
@@ -2362,7 +2374,7 @@ impl TranscriptStore for PostgresCapsuleStore {
             "SELECT {CONVERSATION_COLS} FROM conversation_messages \
              WHERE tenant = $1 AND message_block_id = ANY($2)"
         );
-        let fetched = sqlx::query(&sql)
+        let fetched = sqlx::query(AssertSqlSafe(sql.as_str()))
             .bind(tenant)
             .bind(&owned)
             .fetch_all(self.pool())
@@ -2397,7 +2409,7 @@ impl TranscriptStore for PostgresCapsuleStore {
             "SELECT {CONVERSATION_COLS} FROM conversation_messages \
              WHERE tenant = $1 AND message_block_id = $2"
         );
-        let primary_row = sqlx::query(&primary_sql)
+        let primary_row = sqlx::query(AssertSqlSafe(primary_sql.as_str()))
             .bind(tenant)
             .bind(primary_id)
             .fetch_optional(self.pool())
@@ -2441,7 +2453,7 @@ impl TranscriptStore for PostgresCapsuleStore {
              ORDER BY created_at DESC, line_number DESC, block_index DESC \
              LIMIT $6"
         );
-        let mut before = sqlx::query(&before_sql)
+        let mut before = sqlx::query(AssertSqlSafe(before_sql.as_str()))
             .bind(tenant)
             .bind(&session_id)
             .bind(&primary.created_at)
@@ -2467,7 +2479,7 @@ impl TranscriptStore for PostgresCapsuleStore {
              ORDER BY created_at ASC, line_number ASC, block_index ASC \
              LIMIT $6"
         );
-        let after = sqlx::query(&after_sql)
+        let after = sqlx::query(AssertSqlSafe(after_sql.as_str()))
             .bind(tenant)
             .bind(&session_id)
             .bind(&primary.created_at)
@@ -2524,7 +2536,7 @@ impl TranscriptStore for PostgresCapsuleStore {
              ORDER BY created_at DESC, line_number DESC, block_index DESC \
              LIMIT $2"
         );
-        let rows = sqlx::query(&sql)
+        let rows = sqlx::query(AssertSqlSafe(sql.as_str()))
             .bind(tenant)
             .bind(lim)
             .fetch_all(self.pool())
@@ -2560,7 +2572,7 @@ impl TranscriptStore for PostgresCapsuleStore {
                       m.message_block_id ASC \
              LIMIT $3"
         );
-        let rows = sqlx::query(&sql)
+        let rows = sqlx::query(AssertSqlSafe(sql.as_str()))
             .bind(tenant)
             .bind(query)
             .bind(k_i)
@@ -2608,7 +2620,7 @@ impl TranscriptStore for PostgresCapsuleStore {
              ORDER BY d.best_distance ASC \
              LIMIT $3"
         );
-        let rows = sqlx::query(&sql)
+        let rows = sqlx::query(AssertSqlSafe(sql.as_str()))
             .bind(qv)
             .bind(tenant)
             .bind(lim)
@@ -3164,7 +3176,7 @@ impl MaintenanceStore for PostgresCapsuleStore {
                AND capability_capsule_type = ANY($4) \
              ORDER BY created_at ASC"
         );
-        let rows = sqlx::query(&sql)
+        let rows = sqlx::query(AssertSqlSafe(sql.as_str()))
             .bind(tenant)
             .bind(cutoff_updated_at)
             .bind(max_decay)
